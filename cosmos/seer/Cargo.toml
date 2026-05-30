@@ -1,0 +1,15 @@
+[package]
+name = "seer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "SEER — the substrate-wide consult-and-reconcile primitive. One topic-keyed Query/Answer/Steer/Progress/Thought envelope rides the aether bus so every conversation socket (authoring, placement, policy, budget, fitness, consensus) shares one wire shape instead of forking a schema per role. One schema string, a closed topic enum, the reduction theorem (single-shot stays single-shot)."
+
+[dependencies]
+aether = { path = "../aether" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

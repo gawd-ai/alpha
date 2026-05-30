@@ -1,0 +1,16 @@
+[package]
+name = "agent-templated"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A reference AUTHORING creature. Bound to Role::AUTHORING; maps an AuthoringRequest (natural-language outcome + optional retry context) to AuthoringResponse{source, manifest_stub, deps}. Pattern-matched templates only — the seam an LLM-backed agent plugs into without touching the protocol."
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+build-cargo = { path = "../build-cargo" }
+serde = { workspace = true }
+serde_json = { workspace = true }

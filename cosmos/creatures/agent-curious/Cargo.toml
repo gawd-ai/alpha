@@ -1,0 +1,18 @@
+[package]
+name = "agent-curious"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A reference AUTHORING creature on the SEER authoring topic. Bound to Role::AUTHORING; on a known template match emits a terminal AuthoringReply (reduction theorem); when no template matches, emits AuthoringQuery (curiosity / alimentation seam) to consult the originating orchestrator, parks the exchange by (corr, query_id), and completes terminally when the AuthoringAnswer arrives. Also accepts AuthoringSteer{abort} to drop pending work mid-conversation."
+
+[dependencies]
+aether = { path = "../../aether" }
+seer = { path = "../../seer" }
+sigil = { path = "../../sigil" }
+agent-templated = { path = "../agent-templated" }
+build-cargo = { path = "../build-cargo" }
+serde = { workspace = true }
+serde_json = { workspace = true }

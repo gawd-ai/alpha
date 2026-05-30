@@ -1,0 +1,16 @@
+[package]
+name = "forge"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Creature-authoring surface. `declare_creature!` emits one extern \"C\" POD-only constructor that bridges to a user's `Creature` impl (collapses the seed's `define_face!` + `declare_app!`), plus the native bus shim and a prelude. Depends only on aether + sigil — never on the kernel."
+
+[dependencies]
+aether = { path = "../aether" }
+seer = { path = "../seer" }
+sigil = { path = "../sigil" }
+serde = { workspace = true }
+serde_json = { workspace = true }

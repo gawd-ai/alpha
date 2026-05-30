@@ -1,0 +1,20 @@
+[package]
+name = "sigil"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["gawd", "manifest", "ed25519", "capabilities"]
+categories = ["data-structures", "cryptography"]
+description = "The GAWD creature contract at rest / in transit: manifest, identity, capabilities, provenance. Pure data + verification mechanism — no bus, no kernel."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+# Real ed25519 (Ed25519Verifier). Stub* impls stay for unit tests.
+ring = { workspace = true }

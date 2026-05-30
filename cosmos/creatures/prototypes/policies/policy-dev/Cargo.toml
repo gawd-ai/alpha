@@ -1,0 +1,13 @@
+[package]
+name = "policy-dev"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected admission policy — *not* substrate. A permissive dev policy that admits everything, used to prove the Policy socket. Real-world policies require a valid signature by a known authoring key, a matching content address, opt-in capability sets, etc."
+
+[dependencies]
+sigil = { path = "../../../../sigil" }
+sanctum = { path = "../../../../sanctum" }

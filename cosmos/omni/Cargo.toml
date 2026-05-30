@@ -1,0 +1,35 @@
+[package]
+name = "omni"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The spine-only command core behind every GAWD control surface. The verb vocabulary (`Verb`), the one command function (`run_verb`), the request/reply helpers, the human/AI gate (`AiControl`), the node boot recipe, and the `ControlCore` translator creature that turns a `Role::CONTROL` envelope into bus effects. No tokio/axum/reqwest — control is plain bus traffic; the async surfaces (`surface-http`, `surface-mcp`) are separate creatures that drive this over the bus."
+
+[lib]
+name = "omni"
+path = "src/lib.rs"
+
+[dependencies]
+aether = { path = "../aether" }
+anima = { path = "../anima" }
+sigil = { path = "../sigil" }
+sanctum = { path = "../sanctum" }
+# The substrate's own organs, wired onto their Roles by the boot recipe (self-hosting). Their
+# message types (AuthoringRequest, BuildOp, BuildReply, BuildCritterOp, TransportCtl) are also the
+# payloads `run_verb` builds, so the core links them as the one source of the control vocabulary.
+agent-templated = { path = "../creatures/agent-templated" }
+build-cargo = { path = "../creatures/build-cargo" }
+build-critter = { path = "../creatures/build-critter" }
+registry-mem = { path = "../creatures/registry-mem" }
+transport-tcp = { path = "../creatures/transport-tcp" }
+monitor = { path = "../creatures/prototypes/monitor" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The control-on-the-bus integration test boots a real kernel (three engines + the dev policy) and
+# drives `Role::CONTROL` with `Verb` envelopes, asserting `VerbResult` envelopes come back.
+policy-dev = { path = "../creatures/prototypes/policies/policy-dev" }

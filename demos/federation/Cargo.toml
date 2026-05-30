@@ -1,0 +1,32 @@
+[package]
+name = "federation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Narrated, runnable demo of the GAWD federation fabric — several Sanctums in 2–3 Realms talk over real ed25519-authenticated TCP (loopback): within-Realm cross-node fetch, then cross-Realm pull anti-entropy, signed reputation, quarantine propagation, and Omega-addressed routing. The Acculturate loop, out of #[test] and into your terminal."
+
+# The demo body (`run`) lives in the lib so `alpha demo federation` can run it in-process;
+# the binary is a thin wrapper.
+[lib]
+name = "federation"
+path = "src/lib.rs"
+
+[[bin]]
+name = "federation"
+path = "src/main.rs"
+
+[dependencies]
+aether = { path = "../../cosmos/aether" }
+sigil = { path = "../../cosmos/sigil" }
+anima = { path = "../../cosmos/anima" }
+sanctum = { path = "../../cosmos/sanctum" }
+policy-signed = { path = "../../cosmos/creatures/prototypes/policies/policy-signed" }
+transport-tcp = { path = "../../cosmos/creatures/transport-tcp" }
+registry-mem = { path = "../../cosmos/creatures/registry-mem" }
+omega-federator = { path = "../../cosmos/creatures/omega-federator" }
+reputation-roundrobin = { path = "../../cosmos/creatures/prototypes/reputation/reputation-roundrobin" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

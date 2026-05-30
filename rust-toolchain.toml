@@ -1,0 +1,7 @@
+[toolchain]
+# GAWD tracks the latest stable Rust. clippy + rustfmt are required for the CI gate.
+# The `beast` tier runs WebAssembly via wasmtime's JIT at runtime — the host builds no
+# wasm32 artifact (the M0 beast test compiles inline WAT with the `wat` crate), so no
+# wasm32 target is needed to build or test this workspace.
+channel = "stable"
+components = ["rustfmt", "clippy"]

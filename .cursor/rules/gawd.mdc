@@ -1,0 +1,13 @@
+---
+description: GAWD repository orientation for AI agents
+alwaysApply: true
+---
+
+Read [AGENTS.md](mdc:AGENTS.md) at the repository root first — it is the machine-first map: the mental
+model, the repository layout (`modules/` organs · `examples/<seam>/` injected models · `fixtures/`
+test specimens), the build/run/test commands, and the **load-bearing invariants you must not break**
+(no `#[global_allocator]`; never `panic = "abort"`; manifest signing order; the daemon tier is
+trusted-by-admission; keep the kernel model-free).
+
+Before authoring or changing a creature, also read [docs/TOPICS.md](mdc:docs/TOPICS.md) (the pub/sub +
+SEER consult contract) and [sigil/README.md](mdc:sigil/README.md) (the manifest contract).

@@ -1,0 +1,15 @@
+[package]
+name = "distributor-requirements"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The Distributor: a creature bound to Role::DISTRIBUTOR (the Intent socket) that consults SEER on the `placement` topic, parses requirements as predicates, reconciles EmbodimentOffers from one or more advertisers (local + peer), and routes the Intent to the picked target. The consult fires even for N=1 local decisions, so cross-node placement never has to retrofit a synchronous local path."
+
+[dependencies]
+aether = { path = "../../aether" }
+seer = { path = "../../seer" }
+serde = { workspace = true }
+serde_json = { workspace = true }

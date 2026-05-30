@@ -1,0 +1,12 @@
+[package]
+name = "scorer-latency"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected fitness criterion: lower mean handle-latency scores higher, linearly against a configured ceiling. Proves the latency dimension fitness-selector's Observe op feeds. Not substrate — one of several reference FitnessScorers."
+
+[dependencies]
+fitness-selector = { path = "../../../../creatures/fitness-selector" }

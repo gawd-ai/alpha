@@ -1,0 +1,15 @@
+[package]
+name = "panic-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A hardening specimen: a native (.so) daemon that panics in `handle` on a specific input, proving the SDK's `catch_unwind` at the FFI seam contains the panic (no UB across `extern \"C\"`) and the kernel pulls the creature off the bus. The healthy creature beside it keeps serving."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge = { path = "../../../../forge" }

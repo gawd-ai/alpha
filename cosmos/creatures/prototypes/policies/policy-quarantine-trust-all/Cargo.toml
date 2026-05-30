@@ -1,0 +1,13 @@
+[package]
+name = "policy-quarantine-trust-all"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected QuarantineTrust: honors EVERY inbound cross-Realm quarantine notice. The bare-minimum reference for immune-response's trust socket — and a deliberately unsafe one (any peer can quarantine your creatures). Never appropriate in production; the realistic reference is policy-quarantine-trust-realm. Not substrate."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+immune-response = { path = "../../../../creatures/immune-response" }

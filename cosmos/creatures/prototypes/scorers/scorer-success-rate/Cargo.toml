@@ -1,0 +1,12 @@
+[package]
+name = "scorer-success-rate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected fitness criterion: score = useful-handles / total-handles. The bare-minimum FitnessScorer reference for fitness-selector. Not substrate — operators write their own (windowed averages, latency tradeoffs, peer-comparative percentiles)."
+
+[dependencies]
+fitness-selector = { path = "../../../../creatures/fitness-selector" }

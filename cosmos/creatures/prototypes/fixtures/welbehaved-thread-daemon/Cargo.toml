@@ -1,0 +1,15 @@
+[package]
+name = "welbehaved-thread-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A positive specimen: a native (.so) daemon that spawns a background thread via the SDK's managed `forge::spawn` and signals it to stop in `shutdown`. The SDK's `Threads::join_all` reaps it before the kernel `dlclose`s the library — clean unload, no leak, every cycle. Counter-specimen to runaway-thread-daemon."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge = { path = "../../../../forge" }

@@ -1,0 +1,17 @@
+[package]
+name = "omega-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A reference Omega-gateway creature — not substrate. Replies with the structured 'deferred' shape that proves the federation address seam; a minimal seam reference alongside the full omega-federator."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+sigil = { path = "../../../../sigil" }
+# The `omega` concept crate owns the gateway seam — the bound Role, the structured
+# `omega.deferred` wire contract, and the `OmegaRouting` trait this stub implements.
+omega = { path = "../../../../omega" }
+serde_json = { workspace = true }

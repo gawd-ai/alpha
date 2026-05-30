@@ -1,0 +1,12 @@
+[package]
+name = "loopback-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A walking-skeleton creature: a transport gateway whose Node-addressed envelopes round-trip through a real Unix socketpair (serialized bytes), then re-route locally — proving R4 (local↔remote symmetry: 'route off-node' is one more delivery case, not a subsystem)."
+
+[dependencies]
+aether = { path = "../../../../aether" }

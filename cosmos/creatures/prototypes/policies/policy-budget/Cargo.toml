@@ -1,0 +1,15 @@
+[package]
+name = "policy-budget"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected budget policy creature. Subscribes to PROPRIOCEPTION, consumes BudgetSignal events, and ships two reference responses: BudgetApoptosis (Hard -> KernelControl::Unload) and BudgetGraceful (Warn -> one-shot ExtendBudget for productive creatures, Hard -> Unload). NOT substrate — operators write their own grace / demote / log-and-continue policies."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+sanctum = { path = "../../../../sanctum" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

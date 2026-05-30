@@ -1,0 +1,19 @@
+[package]
+name = "abode"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The Abode snapshot/restore contract — the distributed *self* carried between Sanctum bodies. A signed, sha256-bound, size-bounded portable snapshot + the substrate-shipped admission gates (integrity / size / signature) the receiving migrator runs before any injected restore policy. Ships the bytes and the proofs, never a state lattice or a checkpoint scheduler."
+
+[dependencies]
+aether = { path = "../aether" }
+sigil = { path = "../sigil" }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

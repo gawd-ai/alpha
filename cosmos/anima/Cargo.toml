@@ -1,0 +1,40 @@
+[package]
+name = "anima"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Per-tier loaders: the Engine trait + native (libloading, extern \"C\" POD-only seam, safe-unload ordering), beast (wasmtime, first-class), and critter (a sandboxed, operation-metered Rhai interpreter)."
+
+[dependencies]
+aether = { path = "../aether" }
+sigil = { path = "../sigil" }
+libloading = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Trimmed to the minimal core-wasm runtime + compiler we actually use (`Module::new` compile,
+# `Store`, fuel metering, a custom `ResourceLimiter`). Dropping wasmtime's default features removes
+# the component-model, gc, async, threads, coredump, and profiling stacks we never touch — and with
+# `profiling` goes the transitive GPL-2.0/BSD `ittapi` dep (supply-chain + license hygiene; the
+# workspace is GPL-3.0-or-later). The dev-only `wat` crate (below) compiles test modules, so
+# wasmtime's own `wat` feature isn't needed either.
+wasmtime = { version = "45.0.0", default-features = false, features = ["cranelift", "runtime"] }
+# Native-from-bytes spills to a content-addressed tempfile; the short hash makes the file
+# debuggable next to other gawd tempfiles.
+sha2 = { workspace = true }
+# The critter (script) tier. Pure-Rust, MIT/Apache — no C toolchain, no
+# GPL-2.0 transitive (mirrors the wasmtime trim above), clears the deny.toml allow-list unchanged.
+# `sync` is REQUIRED, not optional: a `ScriptInstance` is moved onto its creature's drain thread, so
+# the `Engine`/`AST`/`Scope` it holds must be `Send` — which Rhai only is under `sync` (Arc/RwLock
+# instead of Rc/RefCell). `no_time` removes Rhai's `timestamp()`/time builtins — the only ambient,
+# non-deterministic function in the standard package; dropping it makes the bare engine both IoC-pure
+# (no ambient clock) and deterministic (same source + envelope ⇒ same op count) at the dependency
+# level, not just by convention. `no_module` removes `import` support entirely, so a critter is one
+# signed, static source file. Default features stay on for `std`; we deliberately do NOT enable
+# `unchecked` — `set_max_operations` is the critter's fuel analog and must keep its teeth.
+rhai = { version = "1", features = ["sync", "no_time", "no_module"] }
+
+[dev-dependencies]
+wat = "1"

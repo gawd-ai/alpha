@@ -1,0 +1,16 @@
+[package]
+name = "fitness-selector"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The Loop-2 (author→select→promote) consumer. Aggregates the kernel's proprioceptive fitness signal per watched creature, scores each by an INJECTED FitnessScorer, and on a Tick signs + writes a self-verifying promotion onto the registry's reputation slot. Substrate ships no fitness criterion (T4); the scorer is the operator's model."
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+registry-mem = { path = "../registry-mem" }
+serde = { workspace = true }
+serde_json = { workspace = true }

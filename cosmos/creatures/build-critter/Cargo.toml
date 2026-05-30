@@ -1,0 +1,24 @@
+[package]
+name = "build-critter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "BUILD creature for the critter (script) tier: the no-cargo sibling of build-cargo's documented extension pattern. Consumes a BuildCritterOp::Author{source, manifest_stub}, validates the Rhai source compiles + defines `fn handle(env)` (the critter analog of the cargo compile gate), assembles a Backend::Critter manifest (abi_tag gawd_critter_v1, artifact = the source bytes), fills + ed25519-signs provenance with the operator's Abode key, and replies with build-cargo's BuildReply::Built/Failed. No cargo, no .so — a critter ships as source text."
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+# Reuse build-cargo's wire vocabulary (ManifestStub / BuildReply / BuildErrorKind) so an authoring
+# agent and the node speak ONE reply shape across both builders — see lib.rs.
+build-cargo = { path = "../build-cargo" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Compile-validate the authored source (syntax + `fn handle` presence) before signing. `no_time` and
+# `no_module` mirror the runtime loader: no ambient clock and no imports, so the builder never signs
+# source the engine later refuses for using unavailable language surface. The validation engine is a
+# short-lived local, never stored across threads, so it does not need `sync`.
+rhai = { version = "1", features = ["no_time", "no_module"] }

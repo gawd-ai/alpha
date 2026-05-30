@@ -1,0 +1,20 @@
+# Build output
+/target
+**/target/
+
+# Editor / OS cruft
+*.swp
+*.rs.bk
+.DS_Store
+
+# Secrets / keys — never commit these (the substrate generates its own at runtime).
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+/ssl/
+
+# Keep Cargo.lock — this workspace produces binaries (`alpha`, demos).

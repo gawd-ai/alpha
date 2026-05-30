@@ -1,0 +1,17 @@
+[package]
+name = "build-cargo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A reference BUILD creature. Bound to Role::BUILD; consumes a BuildRequest{source, manifest_stub, deps, sandbox} and produces an admissible (manifest, artifact_bytes) pair — cargo invocation in an isolated workspace, sha256 of the output, manifest provenance filled and signed with the operator-supplied Abode key. The Sandbox enum is the operator-opt-in seam (None by default; Custom(Vec<String>) lets the operator wrap cargo in bwrap/firejail/nsjail/anything without build-cargo learning that vocabulary)."
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

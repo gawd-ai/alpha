@@ -1,0 +1,15 @@
+[package]
+name = "embodiment-advertiser"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The placement-topic SEER consumer. Configured with its self-node + a Vec<(CreatureId, Embodiment)> of advertised offers. On a placement Query, parses requirements as predicates, gathers matching offers, and answers with a Vec<EmbodimentOffer> tagged by node + creature_id. The distributor on receipt collapses node==self_node to local addressing. One creature per Sanctum; the operator decides which targets to advertise."
+
+[dependencies]
+aether = { path = "../../aether" }
+seer = { path = "../../seer" }
+serde = { workspace = true }
+serde_json = { workspace = true }

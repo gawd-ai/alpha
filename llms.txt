@@ -1,0 +1,39 @@
+# Alpha — the GAWD substrate
+
+> Alpha is the first public open-source substrate for GAWD — General Autonomous World Demiurge. AI
+> agents author, run, distribute, govern, and retire units of capability ("creatures") across a mesh
+> of nodes, on their own initiative. One bus, two contracts (the Envelope in motion, the Manifest at
+> rest), a model-free three-job kernel, and five governing loops — each realized by an injected,
+> hot-swappable creature. GPL-3.0-or-later.
+
+The governing principle: the substrate ships *sockets and mechanisms*; every *model* (placement,
+policy, fitness, consensus, trust) is an injected creature. Fabric, not model.
+
+Naming seam: **Alpha** = this repository, source release, binary, and current substrate
+implementation. **GAWD** = the company's overall goal and system universe, cosmology, and names that
+must remain stable across GAWD systems, such as the `gawd_creature_v1` wire ABI. Rule of thumb:
+commands, crates, release notes, and runtime UI in this repo say Alpha; cross-system contracts,
+realm-scale concepts, and the broader objective say GAWD.
+
+## Start here
+- [AGENTS.md](AGENTS.md): machine-first orientation — mental model, repository map, build/run/test commands, and the load-bearing invariants you must not break.
+- [README.md](README.md): the pitch, the workspace map, and runnable demos.
+
+## Concepts & architecture
+- [docs/CONCEPTS.md](docs/CONCEPTS.md): the cosmology + glossary (Sanctum, Abode, Realm, Omega, creature) with per-term build status.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): as-built engineering truth (v0.4), the per-creature table, and the workspace layout.
+- [docs/VISION.md](docs/VISION.md): the thesis and why now.
+- [docs/design/](docs/design/): design notes — the mechanism and reasoning behind each subsystem.
+
+## The two contracts (read before authoring a creature)
+- [docs/TOPICS.md](docs/TOPICS.md): the pub/sub + SEER consult contract — what a creature may listen to and emit (broadcast topics, consult topics, capability roles).
+- [cosmos/sigil/README.md](cosmos/sigil/README.md): the at-rest Manifest — field table, a minimal valid manifest per tier (daemon/beast/critter), and the signing rules. Machine-readable JSON Schema: [cosmos/sigil/manifest.schema.json](cosmos/sigil/manifest.schema.json) (drift-guarded against the Rust type).
+
+## Run it
+- [docs/quickstart/](docs/quickstart/): operator (run a node) + write your first creature on each tier (critter / daemon / beast).
+- [demos/](demos/): narrated, runnable walkthroughs — one node's whole loop, a multi-Realm federation, and a three-node cluster.
+- Drive a live node as an AI over MCP: see the HTTP/WS control plane in [README.md](README.md) and [.mcp.json.example](.mcp.json.example).
+
+## Browse the code
+- `cosmos/creatures/` production-capable organs ([index](cosmos/creatures/README.md)) · `cosmos/creatures/prototypes/<seam>/` injected models ([legend](cosmos/creatures/prototypes/README.md)) · `cosmos/creatures/prototypes/fixtures/` test specimens.
+- API docs: `cargo doc --workspace --no-deps --open` (every crate carries `//!` docs).

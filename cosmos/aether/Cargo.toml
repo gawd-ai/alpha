@@ -1,0 +1,18 @@
+[package]
+name = "aether"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The GAWD bus — the single logical spine. One typed/signed/ordered Envelope carries every interaction (creature↔creature, node↔node, control, telemetry); the Router owns the read-mostly address table, IoC role bindings, topics, and the history journal. The contract *in motion*."
+
+[dependencies]
+sigil = { path = "../sigil" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+# Real ed25519 (Ed25519Signer for the BusHandle). StubSigner stays for unit tests.
+ring = { workspace = true }

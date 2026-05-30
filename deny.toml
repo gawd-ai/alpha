@@ -1,0 +1,73 @@
+# cargo-deny — the supply-chain + license gate for the Alpha workspace.
+#
+# Run locally with `cargo install cargo-deny && cargo deny check`; CI enforces it on every push
+# (.github/workflows/ci.yml). The intent is critical-infrastructure hygiene: a new dependency that
+# carries a security advisory, an out-of-policy license, or an unexpected source fails the gate
+# rather than landing silently.
+#
+# The license allow-list is derived from the *actual* dependency tree (`cargo metadata`), so it is
+# exhaustive for the current graph; GPL-3.0-or-later is the workspace's own license. The wasmtime
+# feature trim in `anima/Cargo.toml` keeps the GPL-2.0/BSD `ittapi` profiling dependency out of the
+# tree entirely.
+
+[advisories]
+version = 2
+# A yanked crate is treated as a hard failure; the RustSec advisory DB (vulnerabilities,
+# unmaintained, unsound) is enforced by the `version = 2` defaults.
+yanked = "deny"
+
+[licenses]
+version = 2
+# Every SPDX license present in the dependency tree today. A dependency that introduces a license
+# outside this set fails CI — a deliberate human-review gate, not a silent accept.
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+    # Arrived with the daemon control plane's HTTP/WebSocket stack. OSI/FSF-recognized permissive
+    # license, one-way GPL-3-compatible. (The `MIT AND BSD-3-Clause` expression on some crates is
+    # satisfied once both halves are allowed.)
+    "BSD-3-Clause",        # common permissive license in the rustls chain (e.g. `subtle`)
+    # Public-domain dedication (FSF Free/Libre, GPL-3-compatible). Arrived with the critter tier:
+    # rhai → ahash (compile-time-rng) → const-random → tiny-keccak is CC0-1.0. ahash's feature is
+    # enabled transitively by rhai and cannot be subtracted (Cargo features only union), so the
+    # honest move is to allow the license, not to fight the graph.
+    "CC0-1.0",
+    # Weak (file-level) copyleft, OSI-approved, one-way GPL-compatible. Arrived with the critter
+    # tier: rhai → smartstring (its `ImmutableString` type) is MPL-2.0+. MPL copyleft binds only the
+    # MPL-licensed files themselves; we consume the crate unmodified, so it imposes nothing on GAWD's
+    # own GPL-3 code. A non-optional rhai dep — unavoidable without forking rhai.
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# A duplicated transitive version bloats the binary but is neither a correctness nor a licensing
+# problem (the cranelift/wasm stack legitimately pulls a few), so surface it without failing.
+multiple-versions = "warn"
+# Internal path dependencies are version-less by design; allow their wildcard requirement and only
+# warn on any genuine `*` version requirement on a published crate.
+wildcards = "warn"
+allow-wildcard-paths = true
+# Keep duplicate detection noisy for new cases, but suppress reviewed duplicates that are pinned by
+# upstream dependency trees rather than workspace choices.
+skip = [
+    { crate = "getrandom@0.2.17", reason = "ring and rhai/ahash's const-random chain still use getrandom 0.2 while ahash also uses 0.3 directly" },
+    { crate = "hashbrown@0.16.1", reason = "wasmtime's gimli/cranelift graph currently carries both 0.16 and 0.17 with no workspace-level version knob" },
+    { crate = "thiserror@1.0.69", reason = "tungstenite 0.24 (via axum ws / tokio-tungstenite) still uses thiserror 1 while the workspace uses thiserror 2" },
+    { crate = "thiserror-impl@1.0.69", reason = "paired proc-macro duplicate for tungstenite's thiserror 1 dependency" },
+    { crate = "windows-sys@0.52.0", reason = "ring still carries windows-sys 0.52 while ctrlc/wasmtime use 0.61" },
+]
+
+[sources]
+# Only crates.io. An unknown registry or a git dependency must be an explicit, reviewed decision.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

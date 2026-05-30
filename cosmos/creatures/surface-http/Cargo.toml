@@ -1,0 +1,32 @@
+[package]
+name = "surface-http"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A loadable HTTP-REST + WebSocket control surface. A `Creature` that owns an Axum/tokio runtime + its listener and tears them down on `shutdown` (the transport-tcp surface shape). Its handlers don't touch the kernel — they ship `Verb` envelopes to `Role::CONTROL` and read `VerbResult` envelopes back, so the HTTP plane is one composable surface among siblings: a node loads it only if it wants one, and can unload it to close the port."
+
+[lib]
+name = "surface_http"
+path = "src/lib.rs"
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+# The verb vocabulary + the control-envelope schemas this surface speaks on the bus.
+omni = { path = "../../omni" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# A lean posture: axum's ws feature, a multi-thread tokio for the
+# surface's own runtime (spawned in `bind`, dropped in `shutdown` to release the port).
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+
+[dev-dependencies]
+# The reload-after-unload test boots a real kernel + control plane, loads the surface, unloads it,
+# and proves the port was released by re-loading on the same port.
+sanctum = { path = "../../sanctum" }
+anima = { path = "../../anima" }
+policy-dev = { path = "../../creatures/prototypes/policies/policy-dev" }

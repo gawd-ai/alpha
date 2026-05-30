@@ -1,0 +1,2 @@
+# Runtime artifacts from the runbook (node logs / pids / captured pubkeys).
+run/

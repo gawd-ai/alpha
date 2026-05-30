@@ -1,0 +1,15 @@
+[package]
+name = "echo-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A walking-skeleton creature: a native (.so) daemon that reverses its envelope payload. Authored through forge::declare_creature! — the entire FFI seam is hidden by the macro. Proves the dynamic native load path (R1, R3) end-to-end."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge = { path = "../../../../forge" }

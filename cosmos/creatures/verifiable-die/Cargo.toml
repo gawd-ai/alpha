@@ -1,0 +1,16 @@
+[package]
+name = "verifiable-die"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A consumer of the envelope `commitment` slot (verifiable randomness). A commit-reveal 'verifiable die' — a fair pick among N options that any peer can audit: the die commits to a hidden seed, the requester then contributes a nonce, and pick = H(seed‖nonce) mod n is recomputable by anyone via verify_roll. Neither party alone controls the outcome. The scheme (sha256) + the entropy source are injected (IoC); the substrate ships only the slot."
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

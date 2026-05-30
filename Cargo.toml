@@ -1,0 +1,122 @@
+[workspace]
+resolver = "2"
+members = [
+    # ---- the α front door: the single outermost entry point AND the home of every operator surface's
+    #      composition root; dispatches in-process to `alpha node` / `alpha mcp` / `alpha http`.
+    #      `alpha demo <name>` is different: it spawns external demos from `demos/demos.json`.
+    #      It is the ONLY crate at the repository root — the door in the membrane wall ----
+    "alpha",
+
+    # ---- narrated, runnable demos (stay at the root, alongside the door they exercise) ----
+    "demos/walkthrough",
+    "demos/federation",
+
+    # ---- everything between α and Ω lives under cosmos/ ----
+
+    # ---- substrate spine + tooling ----
+    "cosmos/sigil",
+    "cosmos/aether",
+    "cosmos/anima",
+    "cosmos/sanctum",
+    "cosmos/forge",
+
+    # ---- first-class concept crates: promoted out of aether so future authority lands in a home that
+    #      already exists. abode/seer carry live contracts; realm/omega (= Ω) are embryos that imprint
+    #      the cosmology now. Layering: aether → {seer, abode, realm} → omega ----
+    "cosmos/abode",
+    "cosmos/seer",
+    "cosmos/realm",
+    "cosmos/omega",
+
+    # ---- control plane: the shared command core (omni) + the loadable surfaces
+    #      (the node daemon + MCP hub composition roots live in the `alpha` crate) ----
+    "cosmos/omni",
+    "cosmos/creatures/surface-http",
+    "cosmos/creatures/surface-mcp",
+
+    # ---- creatures: production-capable reference organs (the real substrate creatures) ----
+    "cosmos/creatures/transport-tcp",
+    "cosmos/creatures/registry-mem",
+    "cosmos/creatures/build-cargo",
+    "cosmos/creatures/build-critter",
+    "cosmos/creatures/agent-templated",
+    "cosmos/creatures/agent-curious",
+    "cosmos/creatures/distributor-requirements",
+    "cosmos/creatures/embodiment-advertiser",
+    "cosmos/creatures/omega-federator",
+    "cosmos/creatures/fitness-selector",
+    "cosmos/creatures/immune-response",
+    "cosmos/creatures/abode-migrator",
+    "cosmos/creatures/abode-reconciler",
+    "cosmos/creatures/verifiable-die",
+
+    # ---- prototypes: operator-replaceable injected models (policies, scorers, weighers, …) — the
+    #      reference strategy fillings for the IoC sockets. Nested under
+    #      creatures/ as a reduction gradient: production organs ⊃ prototypes ⊃ fixtures ----
+    # (the Rhai script prototypes under cosmos/creatures/prototypes/critters/* — including echo-critter
+    #  — are source artifacts, not crates, so they are not workspace members.)
+    "cosmos/creatures/prototypes/policies/policy-dev",
+    "cosmos/creatures/prototypes/policies/policy-signed",
+    "cosmos/creatures/prototypes/policies/policy-budget",
+    "cosmos/creatures/prototypes/policies/policy-abode-allowlist",
+    "cosmos/creatures/prototypes/policies/policy-prefer-promoted",
+    "cosmos/creatures/prototypes/policies/policy-quarantine-aware",
+    "cosmos/creatures/prototypes/policies/policy-quarantine-trust-all",
+    "cosmos/creatures/prototypes/policies/policy-quarantine-trust-realm",
+    "cosmos/creatures/prototypes/scorers/scorer-success-rate",
+    "cosmos/creatures/prototypes/scorers/scorer-latency",
+    "cosmos/creatures/prototypes/scorers/scorer-roundrobin",
+    "cosmos/creatures/prototypes/reputation/reputation-roundrobin",
+    "cosmos/creatures/prototypes/distributors/distributor-roundrobin",
+    "cosmos/creatures/prototypes/gateways/realm-gateway",
+    "cosmos/creatures/prototypes/gateways/omega-gateway",
+    "cosmos/creatures/prototypes/merge/merge-lww-map",
+    "cosmos/creatures/prototypes/monitor",
+
+    # ---- fixtures: test-only creatures — the most reduced prototype (walking-skeleton + fault
+    #      specimens; loaded by sanctum tests). Nested under prototypes/ ----
+    "cosmos/creatures/prototypes/fixtures/echo-daemon",
+    "cosmos/creatures/prototypes/fixtures/echo-daemon-v2",
+    "cosmos/creatures/prototypes/fixtures/loopback-gateway",
+    "cosmos/creatures/prototypes/fixtures/panic-daemon",
+    "cosmos/creatures/prototypes/fixtures/runaway-thread-daemon",
+    "cosmos/creatures/prototypes/fixtures/welbehaved-thread-daemon",
+]
+[workspace.package]
+version = "0.4.0"
+edition = "2021"
+authors = ["Alex Grenier <alex@gawd.ai>"]
+license = "GPL-3.0-or-later"
+homepage = "https://gawd.ai"
+repository = "https://github.com/gawd-ai/alpha"
+# Workspace crates are source-release artifacts by default. `sigil` intentionally omits
+# `publish.workspace = true` so the contract crate can be packaged for crates.io first.
+publish = false
+
+# WORKSPACE INVARIANT: no member may set a custom `#[global_allocator]`.
+# The native FFI seam currently does `Box::from_raw` on the host side over memory the creature
+# allocated inside its `.so` (the vtable). This is only sound while both sides share one allocator.
+# Lifting this requires the ABI extension that lets the creature free its own vtable (a
+# `gawd_creature_v1_destroy` symbol or a `vtable_drop` slot in `CreatureVTableV1`). Until then, any
+# crate that introduces jemalloc / mimalloc / etc. silently risks UB on every native unload.
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+libloading = "0.8"
+ring = "0.17"
+sha2 = "0.10"
+# wasmtime is a direct dependency of anima (the beast tier), not hoisted here.
+# ctrlc backs the `alpha` binary's clean SIGINT/SIGTERM shutdown only — it never enters a library
+# crate (the kernel spine stays dependency-light and signal-agnostic; time/signals are operator concerns).
+ctrlc = "3"
+
+[profile.release]
+# Smaller shipped binaries (alpha / the demos). Symbol stripping is purely a size win.
+strip = true
+# DO NOT set `panic = "abort"`. The fabric-integrity floor (R9) relies on `std::panic::catch_unwind`
+# at every creature boundary — the drain loop (sanctum::run_drain) and the native FFI glue
+# (forge::glue) catch a panicking creature and route it to unload instead of crashing the node.
+# `abort` would make those catches impossible and turn any creature panic into a node kill. Unwind
+# (the default) is load-bearing here, not a default we just never changed.

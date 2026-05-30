@@ -1,0 +1,15 @@
+[package]
+name = "runaway-thread-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A misbehaving specimen: a native (.so) daemon that uses raw `std::thread::spawn` (bypassing the SDK's managed `spawn`) and never joins. Proves the kernel's thread-count guard detects the leaked tid at unload and refuses `dlclose` (bounded library leak), so the runaway thread never UAFs against unmapped code."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge = { path = "../../../../forge" }

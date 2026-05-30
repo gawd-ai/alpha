@@ -1,0 +1,20 @@
+[package]
+name = "surface-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A loadable MCP (Model Context Protocol) control surface. A `Creature` that owns the process's stdio and speaks newline-delimited JSON-RPC 2.0 to an MCP host (Claude/Codex). Each tool call becomes a `Verb` envelope on GAWD's own bus, routed to a local or remote `Role::CONTROL`, and the `VerbResult` rides back — the consumer↔MCP edge stays the world's standard, but the MCP-server↔node hop is GAWD protocol. Loaded into the Alpha MCP control-hub Sanctum (`alpha-mcp`)."
+
+[lib]
+name = "surface_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+aether = { path = "../../aether" }
+# The verb vocabulary + the control-envelope schemas + the local/remote target. No HTTP client, no
+# tokio — a stdio server is a single blocking stream, and control rides the in-process bus.
+omni = { path = "../../omni" }
+serde_json = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "registry-mem"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "In-memory Bestiary seed — content-addressed (manifest, artifact_bytes) store with a `publish` / `fetch` RPC over the bus. Filled into Role::REGISTRY. Not substrate: cross-Realm anti-entropy and reputation propagation are layered by omega-federator, not by this local store."
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

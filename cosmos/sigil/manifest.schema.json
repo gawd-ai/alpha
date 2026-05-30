@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/gawd-ai/alpha/master/cosmos/sigil/manifest.schema.json",
+  "title": "GAWD Manifest",
+  "description": "The GAWD creature contract at rest / in transit: the sole metadata + permission source for a creature. Maintained and drift-guarded against the `sigil::Manifest` Rust type by cosmos/sigil/tests/manifest_schema.rs. See cosmos/sigil/README.md for prose and a minimal valid manifest per tier.",
+  "type": "object",
+  "required": ["name", "version", "abi"],
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string", "description": "Creature name." },
+    "version": { "type": "string", "description": "Semver string (validated non-empty)." },
+    "abi": { "$ref": "#/$defs/Abi" },
+    "entrypoints": {
+      "type": "array",
+      "description": "Advertised typed entries the creature exposes (e.g. `handle`).",
+      "items": { "$ref": "#/$defs/Entrypoint" }
+    },
+    "capabilities": { "$ref": "#/$defs/Capabilities" },
+    "requirements": { "$ref": "#/$defs/Requirements" },
+    "provenance": { "$ref": "#/$defs/Provenance" },
+    "content_address": {
+      "type": ["string", "null"],
+      "description": "`sha256:<hex>` over the manifest's identity shape. Set by the producer and re-derived + asserted by admission. Null/absent before it is stamped."
+    },
+    "provides": {
+      "type": "array",
+      "description": "Which inversion-of-control roles this creature can fill (e.g. `[\"distributor\", \"policy\"]`).",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "Abi": {
+      "type": "object",
+      "description": "The entry-boundary descriptor: which engine, what compatibility tag, what targets.",
+      "required": ["backend", "abi_tag"],
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "description": "The execution tier. `daemon` = native .so (trusted-by-admission); `beast` = WASM (sandboxed); `critter` = Rhai script (metered + sandboxed).",
+          "enum": ["daemon", "beast", "critter"]
+        },
+        "abi_tag": {
+          "type": "string",
+          "description": "Entry-boundary compatibility tag. `gawd_creature_v1` for daemon and beast; `gawd_critter_v1` for critter."
+        },
+        "target": {
+          "type": "array",
+          "description": "Opaque target labels (arch-os triples, `wasm32-unknown-unknown`, robot/satellite/edge embodiments). The fabric assigns no meaning; an injected matcher weighs them. Empty = unspecified/portable.",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "Entrypoint": {
+      "type": "object",
+      "description": "A typed entry the creature exposes.",
+      "required": ["name", "signature"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "description": "Entry name, e.g. `handle`. Non-empty; unique within the manifest." },
+        "signature": { "type": "string", "description": "Typed descriptor, e.g. `(Envelope) -> Outcome`. Non-empty." }
+      }
+    },
+    "Capabilities": {
+      "type": "object",
+      "description": "Bus-level + resource capabilities. Enforced only when an operator opts in.",
+      "additionalProperties": false,
+      "properties": {
+        "fs": {
+          "type": "array",
+          "description": "Filesystem paths the creature may touch.",
+          "items": { "type": "string" }
+        },
+        "net": {
+          "description": "Declared network reach. `none` is the safe default.",
+          "enum": ["none", "loopback", "outbound", "any"]
+        },
+        "cpu_ms": { "type": "integer", "minimum": 0, "description": "Soft CPU budget (ms); 0 = unset." },
+        "mem_bytes": { "type": "integer", "minimum": 0, "description": "Soft memory budget (bytes); 0 = unset." },
+        "calls": {
+          "type": "array",
+          "description": "Which addresses / intents / roles this creature may send to. Empty = unrestricted (dev default).",
+          "items": { "type": "string" }
+        },
+        "budget_warn_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Opt-in advisory threshold: emit a budget Warn after a successful handle once the consumed fraction of cpu_ms/mem_bytes crosses this percent. Intended range 0..=100; values >100 are clamped at engine load. Absent = no Warn ever fires."
+        }
+      }
+    },
+    "Requirements": {
+      "type": "object",
+      "description": "What a host must offer for this creature to run. The Distributor matches these against a node's advertised embodiment.",
+      "additionalProperties": false,
+      "properties": {
+        "accelerators": { "type": "array", "items": { "type": "string" } },
+        "sensors": { "type": "array", "items": { "type": "string" } },
+        "min_mem_bytes": { "type": "integer", "minimum": 0 },
+        "connectivity": { "type": ["string", "null"] },
+        "jurisdiction": { "type": ["string", "null"] }
+      }
+    },
+    "Provenance": {
+      "type": "object",
+      "description": "Authorship + integrity. `author` is the Abode key (the distributed self), not the node key. Verification is a mechanism; which roots to trust is injected policy.",
+      "additionalProperties": false,
+      "properties": {
+        "author": { "type": ["string", "null"], "description": "The Abode public key (authorship identity), encoded." },
+        "source_hash": { "type": ["string", "null"] },
+        "build_hash": { "type": ["string", "null"] },
+        "signature": { "type": ["string", "null"], "description": "Signature over the signing payload (the manifest with `signature` cleared). Set `content_address` BEFORE signing — it rides inside the signature." },
+        "realm": { "type": "string", "description": "Optional Realm the author asserts this creature belongs to. Signed alongside the rest. Absent = no claim." }
+      }
+    }
+  }
+}

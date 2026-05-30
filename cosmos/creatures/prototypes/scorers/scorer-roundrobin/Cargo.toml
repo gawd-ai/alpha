@@ -1,0 +1,12 @@
+[package]
+name = "scorer-roundrobin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected fitness criterion: every creature that has handled anything scores 1.0 (alive = fit). The non-discriminating reference, sibling to reputation-roundrobin and distributor-roundrobin. Never a production criterion — it promotes everyone."
+
+[dependencies]
+fitness-selector = { path = "../../../../creatures/fitness-selector" }

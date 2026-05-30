@@ -1,0 +1,14 @@
+[package]
+name = "policy-abode-allowlist"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected RestorePolicy for abode-migrator: admits an AbodeSnapshot only when its `abode_key` is in the operator's allowlist. NOT substrate — operators ship their own RestorePolicy implementations (`my-org-abode-allowlist`, realm-membership checkers, jurisdiction filters, etc.) and bind those instead."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+abode = { path = "../../../../abode" }
+abode-migrator = { path = "../../../../creatures/abode-migrator" }

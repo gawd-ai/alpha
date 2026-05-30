@@ -1,0 +1,16 @@
+[package]
+name = "realm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The GAWD trust domain (embryo). A Realm is a mesh of peer Sanctums that trust one another. The address grain lives in aether (where the router binds it); this crate is the authority layer that grain answers to. It ships the imprint — the concept named, the identity re-exported — so future realm-level authority lands in a home that already exists."
+
+[dependencies]
+aether = { path = "../aether" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

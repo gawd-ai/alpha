@@ -1,0 +1,16 @@
+[package]
+name = "immune-response"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The Loop-4 (Defend / immune) consumer. Senses faults on the kernel's PROPRIOCEPTION stream (hard budget breach, leaked-resources-on-unload) for watched creatures and quarantines the offending artifact on the registry — reversibly (T5). Honors inbound cross-Realm quarantine notices through an INJECTED QuarantineTrust gate (a peer can't quarantine your creatures unless you trust it). Substrate ships no trust model."
+
+[dependencies]
+aether = { path = "../../aether" }
+registry-mem = { path = "../registry-mem" }
+omega-federator = { path = "../omega-federator" }
+serde = { workspace = true }
+serde_json = { workspace = true }

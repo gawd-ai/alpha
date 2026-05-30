@@ -1,0 +1,17 @@
+[package]
+name = "realm-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected Realm-gateway creature — not substrate. Routes Address::Realm envelopes to the configured peer for the named Realm via Role::TRANSPORT. See the crate docs (lib.rs) for the full seam rationale."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+sigil = { path = "../../../../sigil" }
+# The `realm` concept crate owns the gateway seam — the bound Role, the structured
+# `realm.no_route` wire contract, and the `RealmRouting` trait this creature implements.
+realm = { path = "../../../../realm" }
+serde_json = { workspace = true }

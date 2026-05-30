@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  ci:
+    name: fmt · clippy · build · docs · test · package · demos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
+      # `rustup show` installs them on first use.
+      - name: Set up Rust (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --workspace
+
+      - name: Docs (rustdoc warnings are errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+
+      # The suite includes the composed end-to-end loops and the cargo-compile
+      # tests, so the first CI run is compile-heavy; subsequent runs hit the cache.
+      - name: Test
+        run: cargo test --locked --workspace -- --test-threads=1
+
+      # Only sigil is currently publishable; package it exactly as crates.io will see it.
+      - name: Package publishable crates
+        run: cargo package --locked -p sigil
+
+      # The α front door: a smoke test that the single entry point builds and dispatches.
+      # `alpha node` / `alpha mcp` / `alpha demo` are exercised by the workspace tests above;
+      # the standalone demo crates are gated below. `version` proves the front-door dispatch itself.
+      - name: Front door — alpha version (the α entry point dispatches)
+        run: cargo run --locked -p alpha -- version
+
+      # The onboarding demo is the first thing a newcomer runs; gate it in CI so it
+      # can never silently rot. It drives a real author→compile→sign→load→run→migrate
+      # loop (the authoring step shells out to cargo), so it is compile-heavy on a cold cache.
+      - name: Demo — walkthrough (the onboarding loop runs end to end)
+        run: cargo run --locked -p walkthrough
+
+      # The federation demo boots several Sanctums across 2–3 Realms over real loopback TCP and
+      # narrates the cross-node + cross-Realm fabric; gate the default 2×2 so the multi-node path
+      # can never silently rot. Fast (seconds) — no cargo authoring in this one.
+      - name: Demo — federation (the multi-Realm fabric runs end to end)
+        run: cargo run --locked -p federation
+
+  # Supply-chain + license gate (config in `deny.toml`). Runs in parallel with the build job:
+  # a new dependency carrying a security advisory, an out-of-policy license, or an unexpected
+  # source fails CI rather than landing silently.
+  deny:
+    name: cargo-deny (advisories · bans · licenses · sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

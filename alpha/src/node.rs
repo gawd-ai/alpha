@@ -1,0 +1,460 @@
+//! The node-daemon entry point ([`run`]) — the body `alpha node` invokes (the daemon
+//! is a subcommand of the α front door, not a standalone crate). Boots the kernel (three engines + an
+//! injected dev policy) and, by default,
+//! self-hosts its own organs ([`boot_organs_with_monitor`]) so a fresh daemon is a *live* substrate.
+//! It then drives that one live kernel through the shared command core ([`run_verb`]) over up to
+//! three front-ends:
+//! - the **stdin REPL** — the local human seat, never gated;
+//! - the **HTTP/WebSocket API** (`--listen`) — the loadable `surface-http` creature, a remote
+//!   surface a future web UI or the MCP control-hub drives, subject to the allow-AI gate;
+//! - **non-interactive** `--exec`/`--script` runs over the same verbs.
+//!
+//! `--minimal` boots the bare kernel; `--headless` runs the API with no REPL.
+//!
+//! **Dev posture (disclosed at boot):** the dev policy admits everything and the bus signer is a
+//! stub. This is a single-node developer surface, not a hardened deployment.
+
+use std::io::{BufRead, Write};
+use std::sync::Arc;
+
+use aether::{CreatureId, Deadline, StubSigner, StubVerifier};
+use anima::{NativeEngine, ScriptEngine, WasmEngine};
+use policy_dev::DevPolicy;
+use sanctum::Kernel;
+
+use omni::{
+    boot_control, boot_manifest, boot_organs_with_monitor, parse_verb, run_verb, AiControl,
+    VerbCtx, COMMANDS,
+};
+
+/// Parsed command-line options.
+struct Opts {
+    minimal: bool,
+    headless: bool,
+    allow_ai: bool,
+    json: bool,
+    listen: Option<String>,
+    api_key: Option<String>,
+    exec: Option<String>,
+    script: Option<String>,
+    // Clustering: present `cluster_listen` boots the transport organ + joins a mesh.
+    node_id: Option<String>,
+    cluster_listen: Option<String>,
+    seeds: Vec<String>,
+    cluster_key: Option<String>,
+}
+
+fn parse_opts(args: &[String]) -> Result<Opts, String> {
+    let mut o = Opts {
+        minimal: false,
+        headless: false,
+        allow_ai: false,
+        json: false,
+        listen: None,
+        api_key: None,
+        exec: None,
+        script: None,
+        node_id: None,
+        cluster_listen: None,
+        seeds: Vec::new(),
+        cluster_key: None,
+    };
+    let mut args = args.iter().cloned();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--minimal" => o.minimal = true,
+            "--headless" => o.headless = true,
+            "--allow-ai" => o.allow_ai = true,
+            "--json" => o.json = true,
+            "--listen" => {
+                o.listen = Some(args.next().ok_or("--listen needs <addr> (e.g. 127.0.0.1:7777)")?)
+            }
+            "--api-key" => o.api_key = Some(args.next().ok_or("--api-key needs <key>")?),
+            "--exec" => o.exec = Some(args.next().ok_or("--exec needs <verb>")?),
+            "--script" => o.script = Some(args.next().ok_or("--script needs <file>")?),
+            "--node-id" => o.node_id = Some(args.next().ok_or("--node-id needs <id>")?),
+            "--cluster-listen" => {
+                o.cluster_listen =
+                    Some(args.next().ok_or("--cluster-listen needs <addr> (e.g. 127.0.0.1:9001)")?)
+            }
+            "--seed" => {
+                o.seeds.push(args.next().ok_or("--seed needs <node-id@host:port#pubkey-hex>")?)
+            }
+            "--cluster-key" => {
+                o.cluster_key = Some(args.next().ok_or("--cluster-key needs <64-hex-char seed>")?)
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    Ok(o)
+}
+
+/// Run the node daemon to completion over the given CLI args (everything after the `node` subcommand).
+/// Invoked by `alpha node`.
+pub fn run(args: &[String]) -> std::io::Result<()> {
+    let opts = match parse_opts(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("alpha node: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let kernel = Arc::new(Kernel::new(
+        vec![Arc::new(NativeEngine), Arc::new(WasmEngine::new()), Arc::new(ScriptEngine)],
+        Arc::new(StubSigner::new("local-node")),
+        Arc::new(StubVerifier),
+        Arc::new(DevPolicy),
+        1024,
+    ));
+    let ai = Arc::new(AiControl::new(opts.allow_ai));
+
+    // Clean shutdown on SIGINT/SIGTERM (T14): the signal handler runs the kernel's reverse-order
+    // `shutdown_all` and exits, turning an abrupt kill into the orderly `quit` teardown.
+    {
+        let kernel = Arc::clone(&kernel);
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let install = ctrlc::set_handler(move || {
+            if shutting_down.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            eprintln!("\nalpha node: signal received — shutting down the substrate cleanly…");
+            kernel.shutdown_all(Deadline::default());
+            std::process::exit(0);
+        });
+        if let Err(e) = install {
+            eprintln!("alpha node: could not install the SIGINT/SIGTERM handler ({e}); Ctrl-C will hard-kill.");
+        }
+    }
+
+    // In non-interactive modes (`--exec`/`--script`) stdout must carry ONLY the verb output, so
+    // `--json` is machine-parseable; boot/banner chatter goes to stderr instead. `note!` routes it.
+    let quiet = opts.exec.is_some() || opts.script.is_some();
+    let (probe_id, probe_bus, probe_rx) = omni::open_probe(&kernel);
+    let mut out = std::io::stdout();
+    macro_rules! note {
+        ($($a:tt)*) => {
+            if quiet {
+                eprintln!($($a)*);
+            } else {
+                let _ = writeln!(out, $($a)*);
+            }
+        };
+    }
+
+    note!("alpha node — Alpha Sanctum daemon (v{})", env!("CARGO_PKG_VERSION"));
+    note!("posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.");
+
+    let mut critter_builder: Option<CreatureId> = None;
+    if opts.minimal {
+        note!("boot: --minimal — empty kernel, nothing bound (use `bind`/`load` to wire it).");
+    } else {
+        match boot_organs_with_monitor(&kernel, !quiet) {
+            Ok(bc_id) => {
+                critter_builder = Some(bc_id);
+                if quiet {
+                    note!("boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY; stdout monitor omitted for non-interactive output.");
+                } else {
+                    note!("boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.");
+                }
+            }
+            Err(e) => {
+                note!("boot: organ wiring incomplete ({e}); some organs may already be loaded/bound — run `list` / `status` to see what actually came up.");
+            }
+        }
+    }
+
+    // Optionally join/form a cluster: boot the `transport-tcp` organ bound to TRANSPORT,
+    // in gossip mode, dialing any `--seed`. The mesh self-completes; `cluster` reads the graph.
+    let mut cluster_transport: Option<CreatureId> = None;
+    if let Some(listen) = &opts.cluster_listen {
+        let Some(node_id) = opts.node_id.clone() else {
+            eprintln!("alpha node: --cluster-listen requires --node-id <id>");
+            std::process::exit(2);
+        };
+        match boot_cluster(&kernel, &node_id, listen, &opts.seeds, opts.cluster_key.as_deref()) {
+            Ok(b) => {
+                cluster_transport = Some(b.transport);
+                note!("cluster: node-id={node_id}  listen={listen}  seeds={}", opts.seeds.len());
+                note!("cluster: node pubkey = {}", b.pubkey_hex);
+                if b.generated {
+                    note!(
+                        "cluster: generated a node key — reuse this identity with `--cluster-key {}`",
+                        b.seed_hex
+                    );
+                }
+                note!(
+                    "cluster: peers join this node with  cluster join {node_id}@{listen}#{}",
+                    b.pubkey_hex
+                );
+            }
+            Err(e) => {
+                eprintln!("alpha node: cluster boot failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Optionally start the daemon HTTP/WS control plane. This is two
+    // creatures on the bus: the `ControlCore` translator on `Role::CONTROL`, and the loadable
+    // `surface-http` creature that drives it. The REPL (this file) keeps driving `run_verb` directly
+    // (the local human seat, never gated); the HTTP plane and any MCP hub are gated bus clients.
+    if let Some(addr) = &opts.listen {
+        let listen: std::net::SocketAddr = match addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("alpha node: bad --listen address `{addr}`: {e}");
+                std::process::exit(2);
+            }
+        };
+        let key = opts
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("SANCTUM_API_KEY").ok().filter(|s| !s.is_empty()))
+            .map(Ok)
+            .unwrap_or_else(surface_http::generate_api_key);
+        let key = match key {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("alpha node: could not generate API key: {e}");
+                std::process::exit(1);
+            }
+        };
+        // Bind the control plane so the surface has something to talk to. Bound on the
+        // `--listen` path specifically, so a `--minimal --exec` run still loads nothing (and a bare
+        // node that wants no remote control simply never opens a surface).
+        let control_id = match boot_control(&kernel, &ai, critter_builder, cluster_transport) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("alpha node: could not bind the control plane: {e}");
+                std::process::exit(1);
+            }
+        };
+        // Load the HTTP/WS surface creature. The listener is bound here (synchronously,
+        // so a port conflict is reported before load) and handed to the creature.
+        match boot_http_surface(&kernel, listen, key.clone()) {
+            Ok(surface_id) => {
+                note!("control: ControlCore on Role::CONTROL (id={}), surface-http (id={}) — control rides the bus.", control_id.0, surface_id.0);
+                note!("api: HTTP/WS control plane on http://{listen}  (Bearer key: {key})");
+                note!(
+                    "api: allow-ai is {} — a remote AI may{} author/load/mutate (flip with `allow-ai on|off` here).",
+                    if ai.allowed() { "ON" } else { "OFF" },
+                    if ai.allowed() { "" } else { " NOT" }
+                );
+            }
+            Err(e) => {
+                eprintln!("alpha node: could not start the API on {listen}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Non-interactive modes: run verbs and exit (reproducible demos / CI).
+    if let Some(verbs) = opts.exec.clone() {
+        let mut ctx =
+            VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, critter_builder, &ai, false);
+        ctx.transport = cluster_transport;
+        run_line(&verbs, &mut ctx, opts.json, &mut out)?;
+        kernel.shutdown_all(Deadline::default());
+        return Ok(());
+    }
+    if let Some(path) = opts.script.clone() {
+        let body = match std::fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("alpha node: --script {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut ctx =
+            VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, critter_builder, &ai, false);
+        ctx.transport = cluster_transport;
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if !run_line(trimmed, &mut ctx, opts.json, &mut out)? {
+                break;
+            }
+        }
+        kernel.shutdown_all(Deadline::default());
+        return Ok(());
+    }
+
+    // Headless: API only, no REPL — park until a signal tears the node down.
+    if opts.headless {
+        if opts.listen.is_none() {
+            eprintln!("alpha node: --headless needs --listen (nothing to do without the API).");
+            std::process::exit(2);
+        }
+        writeln!(out, "headless: REPL disabled; serving the API. Ctrl-C to shut down.")?;
+        out.flush()?;
+        loop {
+            std::thread::park();
+        }
+    }
+
+    writeln!(out, "probe endpoint id = {}", probe_id.0)?;
+    writeln!(out, "{COMMANDS}")?;
+    prompt(&mut out)?;
+
+    let mut ctx = VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, critter_builder, &ai, false);
+    ctx.transport = cluster_transport;
+    for line in std::io::stdin().lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if !run_line(&line, &mut ctx, opts.json, &mut out)? {
+            // `quit`/`exit` — shutdown already requested below.
+            kernel.shutdown_all(Deadline::default());
+            return Ok(());
+        }
+        prompt(&mut out)?;
+    }
+
+    // EOF on stdin — clean shutdown for piped use.
+    kernel.shutdown_all(Deadline::default());
+    Ok(())
+}
+
+/// Parse + run one line against `ctx`, render the result (human text or `--json`). Returns
+/// `keep_going` (false on `quit`/`exit`).
+fn run_line(
+    line: &str,
+    ctx: &mut VerbCtx,
+    json: bool,
+    out: &mut std::io::Stdout,
+) -> std::io::Result<bool> {
+    let verb = match parse_verb(line) {
+        Ok(None) => return Ok(true),
+        Ok(Some(v)) => v,
+        Err(usage) => {
+            writeln!(out, "{usage}")?;
+            return Ok(true);
+        }
+    };
+    // Progress lines use a fresh handle (so they don't borrow `out` across run_verb). In `--json`
+    // mode they go to stderr so stdout stays one JSON result per verb.
+    let mut progress = |s: &str| {
+        if json {
+            eprintln!("{s}");
+        } else {
+            let mut o = std::io::stdout();
+            let _ = writeln!(o, "{s}");
+            let _ = o.flush();
+        }
+    };
+    let res = run_verb(verb, ctx, &mut progress);
+    if json {
+        writeln!(out, "{}", serde_json::to_string(&res.json).unwrap_or_else(|_| "{}".into()))?;
+    } else {
+        writeln!(out, "{}", res.human)?;
+    }
+    Ok(res.keep_going)
+}
+
+fn prompt(out: &mut std::io::Stdout) -> std::io::Result<()> {
+    out.write_all(b"alpha> ")?;
+    out.flush()
+}
+
+/// Load the HTTP/WS surface creature and subscribe it to the sense topics so its
+/// WebSocket stream tails the node's nervous system. The listener is bound here so a port conflict
+/// surfaces synchronously (before the creature loads), then handed to the creature, which owns its
+/// Axum/tokio runtime and releases the port on unload. The surface targets the local
+/// `Role::CONTROL`, so its handlers drive this node's `ControlCore` over the bus.
+fn boot_http_surface(
+    kernel: &Arc<Kernel>,
+    listen: std::net::SocketAddr,
+    api_key: String,
+) -> Result<CreatureId, String> {
+    use aether::Topic;
+    use sigil::Capabilities;
+    let listener =
+        std::net::TcpListener::bind(listen).map_err(|e| format!("bind {listen}: {e}"))?;
+    // A dedicated, drain-less sense endpoint for the WS stream — subscribed to the node's nervous
+    // system. Kept off the surface creature's own inbox (which carries control replies) so a fitness
+    // burst can't shed a control reply, and so reading it never re-publishes fitness (no storm).
+    let (sense_id, _sense_bus, sense_rx) = kernel.open_endpoint(Capabilities::default());
+    kernel.subscribe(Topic::new(Topic::PROPRIOCEPTION), sense_id);
+    kernel.subscribe(Topic::new(Topic::FITNESS), sense_id);
+    kernel.subscribe(Topic::new("seer"), sense_id);
+    let surface = surface_http::SurfaceHttp::new(
+        listener,
+        api_key,
+        surface_http::ControlTarget::Local,
+        sense_rx,
+    )
+    .map_err(|e| format!("surface-http setup: {e}"))?;
+    let id = kernel
+        .load_instance(boot_manifest("surface-http"), Box::new(surface))
+        .map_err(|e| format!("surface-http admits: {e}"))?;
+    Ok(id)
+}
+
+/// Result of booting the cluster transport: its creature id + this node's identity (printed at boot).
+struct ClusterBoot {
+    transport: CreatureId,
+    pubkey_hex: String,
+    seed_hex: String,
+    generated: bool,
+}
+
+/// Boot the `transport-tcp` organ in gossip (cluster) mode and bind it to `Role::TRANSPORT`. Mints
+/// (or loads, via `cluster_key`) this node's ed25519 identity and dials each `--seed`.
+fn boot_cluster(
+    kernel: &Kernel,
+    node_id: &str,
+    listen: &str,
+    seeds: &[String],
+    cluster_key: Option<&str>,
+) -> Result<ClusterBoot, String> {
+    use sigil::{crypto, Ed25519KeyMaterial};
+
+    let (seed, generated): ([u8; 32], bool) = match cluster_key {
+        Some(hex) => {
+            let bytes = crypto::hex_decode(hex)
+                .filter(|b| b.len() == 32)
+                .ok_or("--cluster-key must be 64 hex chars (a 32-byte seed)")?;
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&bytes);
+            (s, false)
+        }
+        None => (crypto::fresh_seed()?, true),
+    };
+    let key = Ed25519KeyMaterial::from_seed(seed).map_err(|e| format!("node key: {e}"))?;
+    let pubkey_hex = key.public_hex().to_string();
+
+    let mut peers = Vec::new();
+    for s in seeds {
+        let bad = || format!("bad --seed {s:?} (want node-id@host:port#pubkey-hex)");
+        let (id, rest) = s.split_once('@').ok_or_else(bad)?;
+        let (addr, pk) = rest.split_once('#').ok_or_else(bad)?;
+        if id.is_empty() || addr.is_empty() || pk.is_empty() {
+            return Err(bad());
+        }
+        peers.push(transport_tcp::PeerConfig {
+            node_id: aether::NodeId(id.to_string()),
+            pubkey_hex: pk.to_string(),
+            dial_addr: Some(addr.to_string()),
+        });
+    }
+
+    let cfg = transport_tcp::TransportConfig {
+        self_key: key,
+        self_node: aether::NodeId(node_id.to_string()),
+        listen_addr: listen.to_string(),
+        peers,
+    };
+    let transport = kernel
+        .load_instance(
+            omni::boot_manifest("transport-tcp"),
+            Box::new(transport_tcp::TransportTcp::new(cfg).with_gossip(Some(listen.to_string()))),
+        )
+        .map_err(|e| format!("transport admits: {e}"))?;
+    kernel.bind_role(aether::Role::new(aether::Role::TRANSPORT), transport);
+
+    Ok(ClusterBoot { transport, pubkey_hex, seed_hex: crypto::hex_encode(&seed), generated })
+}

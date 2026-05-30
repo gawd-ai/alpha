@@ -1,0 +1,15 @@
+[package]
+name = "echo-daemon-v2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A reload-loop counter-specimen: identical to echo-daemon but appends a sentinel byte (0x02) to the reversed payload. Alternating between echo-daemon and echo-daemon-v2 across 1000 cycles proves the loader actually re-mmaps the new .so each time rather than silently caching the previous version."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge = { path = "../../../../forge" }

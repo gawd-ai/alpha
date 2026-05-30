@@ -1,0 +1,15 @@
+{
+  "about": "The demos `alpha demo` can launch. Alpha never links these — add or remove an entry here and Alpha needs no recompile. Each demo runs via its cargo `package` in a source checkout, or a prebuilt `bin` path for an installed alpha (bin wins over package if both are set; a relative bin resolves against this file's directory).",
+  "demos": [
+    {
+      "name": "walkthrough",
+      "summary": "Onboarding loop: author -> build -> sign -> load -> run -> migrate, narrated.",
+      "package": "walkthrough"
+    },
+    {
+      "name": "federation",
+      "summary": "Many Sanctums x Realms over ed25519 TCP (loopback).",
+      "package": "federation"
+    }
+  ]
+}

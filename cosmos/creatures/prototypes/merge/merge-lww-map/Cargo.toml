@@ -1,0 +1,14 @@
+[package]
+name = "merge-lww-map"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected CRDT MergeModel: a Last-Writer-Wins Element-Map over a JSON object `{key: {v, ts}}`. Merge = union of keys, per key the higher `ts` wins (ties broken deterministically). Commutative + associative + idempotent, so abode-reconciler converges on divergent forks regardless of order. Operators write their own lattice (OR-Set, RGA, domain-specific). Not substrate."
+
+[dependencies]
+abode-reconciler = { path = "../../../../creatures/abode-reconciler" }
+serde = { workspace = true }
+serde_json = { workspace = true }

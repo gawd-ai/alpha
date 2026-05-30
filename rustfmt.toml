@@ -1,0 +1,9 @@
+# GAWD formatting — tuned to the codebase's existing dense, hand-authored style so
+# `cargo fmt` produces a deterministic, CI-enforceable layout with minimal churn.
+#
+# `use_small_heuristics = "Max"` packs structs/calls/arrays onto a single line up to
+# `max_width` instead of stock rustfmt's narrower per-construct thresholds — this is
+# what matches the way the substrate was written. Both options are stable, so
+# `cargo fmt --check` works on the pinned stable toolchain (no nightly required).
+max_width = 100
+use_small_heuristics = "Max"

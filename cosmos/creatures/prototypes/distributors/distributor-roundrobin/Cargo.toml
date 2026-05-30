@@ -1,0 +1,12 @@
+[package]
+name = "distributor-roundrobin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected Distributor — *not* substrate. A round-robin distributor that takes an Intent envelope and re-addresses it to one of a fixed set of provider creatures, preserving reply_to/corr so the final reply finds the original requester directly. Proves the IoC socket + capability-addressing seam (lever 6 / R8). The minimal reference strategy and IoC-composability proof alongside the full Distributor (creatures/distributor-requirements) — two distributor creatures coexist, the operator picks one."
+
+[dependencies]
+aether = { path = "../../../../aether" }

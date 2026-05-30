@@ -1,0 +1,101 @@
+[package]
+name = "sanctum"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The GAWD kernel — a tiny, model-free core doing exactly three jobs: lifecycle (load/unload via tier engines), routing (own the bus router), admission (verify mechanism + injected policy). The fixed fabric an AI cannot re-author; everything woven on it is hot-swappable."
+
+[dependencies]
+aether = { path = "../aether" }
+anima = { path = "../anima" }
+sigil = { path = "../sigil" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Hashing the artifact bytes for the admission integrity gate.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# `tests/m0_integration.rs` exercises the walking skeleton end-to-end and needs the skeleton creatures
+# (echo-daemon as a built cdylib side-effect; the in-process ones for `load_instance`).
+aether = { path = "../aether" }
+# The SEER consult primitive + the Abode snapshot contract are top-level crates the
+# integration tests import directly.
+seer = { path = "../seer" }
+abode = { path = "../abode" }
+anima = { path = "../anima" }
+sigil = { path = "../sigil" }
+echo-daemon = { path = "../creatures/prototypes/fixtures/echo-daemon" }
+echo-daemon-v2 = { path = "../creatures/prototypes/fixtures/echo-daemon-v2" }
+loopback-gateway = { path = "../creatures/prototypes/fixtures/loopback-gateway" }
+panic-daemon = { path = "../creatures/prototypes/fixtures/panic-daemon" }
+runaway-thread-daemon = { path = "../creatures/prototypes/fixtures/runaway-thread-daemon" }
+welbehaved-thread-daemon = { path = "../creatures/prototypes/fixtures/welbehaved-thread-daemon" }
+distributor-roundrobin = { path = "../creatures/prototypes/distributors/distributor-roundrobin" }
+policy-dev = { path = "../creatures/prototypes/policies/policy-dev" }
+# Integrity tests + the two-node end-to-end test pull in real crypto, the signed policy, the
+# transport + registry creatures, and sha2 for the test fixtures.
+policy-signed = { path = "../creatures/prototypes/policies/policy-signed" }
+transport-tcp = { path = "../creatures/transport-tcp" }
+registry-mem = { path = "../creatures/registry-mem" }
+# The self-authoring loop: the build + authoring reference creatures live as dev-deps so
+# the loop's end-to-end tests can spin both up in-process and drive author→build→admit→load.
+build-cargo = { path = "../creatures/build-cargo" }
+# The critter (script) tier's no-cargo BUILD creature. Drives critter_tier.rs —
+# author (Rhai) → build-critter signs → Kernel::load through the real ScriptEngine → run. Also the
+# abi_tag drift guard between build-critter and anima.
+build-critter = { path = "../creatures/build-critter" }
+agent-templated = { path = "../creatures/agent-templated" }
+# agent-curious drives the conversation integration test — loaded on Role::AUTHORING, it proves the
+# full Request → Query → Answer → Reply roundtrip on the bus.
+agent-curious = { path = "../creatures/agent-curious" }
+# Capability/sandbox tests: the injected budget-apoptosis reference creature.
+policy-budget = { path = "../creatures/prototypes/policies/policy-budget" }
+# The real Distributor + its companion embodiment-advertiser. Pulled into the kernel's dev-deps so
+# the placement integration tests can spin both up in-process and prove the SEER placement consult
+# fires + the Intent routes to the picked target (local + cross-node).
+distributor-requirements = { path = "../creatures/distributor-requirements" }
+embodiment-advertiser = { path = "../creatures/embodiment-advertiser" }
+# Reference gateway creatures. realm-gateway is exercised by realm_local_route over a
+# two-Sanctum transport-tcp pair; omega-gateway is exercised by omega_stub_route in-process.
+# `realm` itself is a dev-dep too: a gateway is `realm::serve(<RealmRouting policy>)`.
+realm = { path = "../realm" }
+realm-gateway = { path = "../creatures/prototypes/gateways/realm-gateway" }
+omega-gateway = { path = "../creatures/prototypes/gateways/omega-gateway" }
+# The Abode migrator + the allowlist policy creature. Drives abode_migrate_local (single-Sanctum,
+# two migrators) and abode_migrate_cross_node (A → B via transport-tcp, policy admit + reject paths).
+abode-migrator = { path = "../creatures/abode-migrator" }
+policy-abode-allowlist = { path = "../creatures/prototypes/policies/policy-abode-allowlist" }
+# The Role::OMEGA_GATEWAY consumer — omega-federator + the example reputation weight model. Drives
+# omega_federation_cross_node (pull anti-entropy + signed reputation propagation + quarantine path,
+# A↔B over transport-tcp) and the in-process omega_admission_gate_holds (T2).
+omega-federator = { path = "../creatures/omega-federator" }
+reputation-roundrobin = { path = "../creatures/prototypes/reputation/reputation-roundrobin" }
+# The operating-model Loop-2 consumer — fitness-selector + the example success-rate scorer + the
+# prefer-promoted admission policy. Drives fitness_selection_local (in-process: a real kernel fitness
+# stream relayed → aggregated → signed promotion written to the registry) and the prefer-promoted
+# admission gate (selection pressure as a policy choice, T7).
+fitness-selector = { path = "../creatures/fitness-selector" }
+scorer-success-rate = { path = "../creatures/prototypes/scorers/scorer-success-rate" }
+policy-prefer-promoted = { path = "../creatures/prototypes/policies/policy-prefer-promoted" }
+# The operating-model Loop-4 consumer — immune-response + its trust + the quarantine-aware admission
+# policy. Drives immune_response_local (in-process: a real kernel PROPRIOCEPTION stream → a watched
+# creature's hard-budget breach → a quarantine written to the registry) and
+# defense_overrides_selection (quarantine-aware rejects a promoted+quarantined entry that
+# prefer-promoted admits — the headline selection-vs-defense interaction).
+immune-response = { path = "../creatures/immune-response" }
+policy-quarantine-trust-all = { path = "../creatures/prototypes/policies/policy-quarantine-trust-all" }
+policy-quarantine-aware = { path = "../creatures/prototypes/policies/policy-quarantine-aware" }
+# The consumer of the envelope `commitment` slot (verifiable randomness). Drives verifiable_die_local
+# — commit (commitment rides the slot across the bus) → reveal → any peer verifies the pick.
+verifiable-die = { path = "../creatures/verifiable-die" }
+# The Abode fork/merge reconciler + the LWW-Element-Map CRDT reference. Drives
+# abode_reconcile_local — two divergent signed forks of one self merge into a re-signed snapshot.
+abode-reconciler = { path = "../creatures/abode-reconciler" }
+merge-lww-map = { path = "../creatures/prototypes/merge/merge-lww-map" }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+wat = "1"

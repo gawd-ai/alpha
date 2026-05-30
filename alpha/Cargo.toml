@@ -1,0 +1,45 @@
+[package]
+name = "alpha"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "alpha — the α front door: the single, outermost entry point to an Alpha deployment, and the home of every operator surface's composition root. Dispatches in-process to `alpha node` (the sanctum daemon), `alpha mcp` (the MCP control-hub), and `alpha http` (the HTTP/WS control plane); `alpha demo <name>` is a managed runner that spawns external narrated demos from `demos/demos.json`."
+
+# The operator-surface composition roots (node / mcp / http) plus the external demo runner live in
+# the lib so the binary is a thin dispatcher and the front-door behavior can be tested in one place.
+[lib]
+name = "alpha"
+path = "src/lib.rs"
+
+[[bin]]
+name = "alpha"
+path = "src/main.rs"
+
+[dependencies]
+# The kernel + engines + the shared control core the surfaces compose.
+aether = { path = "../cosmos/aether" }
+anima = { path = "../cosmos/anima" }
+sigil = { path = "../cosmos/sigil" }
+sanctum = { path = "../cosmos/sanctum" }
+omni = { path = "../cosmos/omni" }
+# The injected dev admission policy each surface boots its kernel with.
+policy-dev = { path = "../cosmos/creatures/prototypes/policies/policy-dev" }
+# The loadable surface creatures + the authenticated peer transport.
+surface-http = { path = "../cosmos/creatures/surface-http" }
+surface-mcp = { path = "../cosmos/creatures/surface-mcp" }
+transport-tcp = { path = "../cosmos/creatures/transport-tcp" }
+# The narrated demos are NOT linked here: `alpha demo` reads the external
+# `demos/demos.json` registry and spawns the named demo, so adding/removing one needs no alpha
+# recompile. The demo crates live under `demos/` and run standalone via `cargo run -p <name>`.
+# Clean shutdown on SIGINT/SIGTERM (the node daemon + the MCP hub).
+ctrlc = { workspace = true }
+# `serde_json` parses the API/MCP wire + the demo registry; `serde` derives the registry types.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The daemon/HTTP/MCP integration tests parse JSON-RPC + API responses.
+serde_json = { workspace = true }
