@@ -1,10 +1,16 @@
-# Alpha
+<p align="center">
+  <img src="docs/assets/alpha-mark.png" alt="Alpha" width="132" height="132">
+</p>
 
-[![CI](https://github.com/gawd-ai/alpha/actions/workflows/ci.yml/badge.svg)](https://github.com/gawd-ai/alpha/actions/workflows/ci.yml)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
-![status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-orange.svg)
+<h1 align="center">Alpha</h1>
 
-> **ASI is the fabric, not the model.**
+<p align="center"><em>ASI is the fabric, not the model.</em></p>
+
+<p align="center">
+  <a href="https://github.com/gawd-ai/alpha/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/gawd-ai/alpha/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg"></a>
+  <img alt="status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-orange.svg">
+</p>
 
 **Alpha is an open-source substrate for autonomous, self-improving AI** — a decentralized fabric where
 *many* AIs write their own capabilities, cryptographically sign them, and hot-load them into live
