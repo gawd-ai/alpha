@@ -179,8 +179,8 @@ Clustering many real nodes (gossip mesh, cross-execution, attaching an AI to eac
 ## Build & install
 
 This first public release is **source-first** — clone and build the `alpha` front door from the
-workspace. (`sigil` is the only crate currently on crates.io, as the standalone at-rest contract; the
-rest stay unpublished while the node/MCP/control surfaces settle before 1.0.)
+workspace. Nothing is published to crates.io yet; the crates stay source-only while the node / MCP /
+control surfaces settle before 1.0.
 
 ```sh
 cargo build --locked --workspace                                       # build everything
