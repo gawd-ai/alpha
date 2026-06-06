@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+publish.workspace = true
 readme = "README.md"
 keywords = ["gawd", "manifest", "ed25519", "capabilities"]
 categories = ["data-structures", "cryptography"]

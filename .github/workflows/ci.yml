@@ -48,10 +48,6 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace -- --test-threads=1
 
-      # Only sigil is currently publishable; package it exactly as crates.io will see it.
-      - name: Package publishable crates
-        run: cargo package --locked -p sigil
-
       # The α front door: a smoke test that the single entry point builds and dispatches.
       # `alpha node` / `alpha mcp` / `alpha demo` are exercised by the workspace tests above;
       # the standalone demo crates are gated below. `version` proves the front-door dispatch itself.

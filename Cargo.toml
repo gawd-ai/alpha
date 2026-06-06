@@ -89,8 +89,9 @@ authors = ["Alex Grenier <alex@gawd.ai>"]
 license = "GPL-3.0-or-later"
 homepage = "https://gawd.ai"
 repository = "https://github.com/gawd-ai/alpha"
-# Workspace crates are source-release artifacts by default. `sigil` intentionally omits
-# `publish.workspace = true` so the contract crate can be packaged for crates.io first.
+# Source-only workspace: every member sets `publish.workspace = true`, so nothing is
+# published to crates.io. Distribution is clone-and-build; on Alpha the distributable
+# unit is the creature (a signed gawd_creature_v1 artifact), shared via the Bestiary.
 publish = false
 
 # WORKSPACE INVARIANT: no member may set a custom `#[global_allocator]`.

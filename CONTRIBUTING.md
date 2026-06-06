@@ -48,12 +48,11 @@ be exercised by the kernel test suite (a fault specimen or a walking-skeleton st
 
 ## Release packaging
 
-The public release is source-first. `sigil` is the only crates.io-publishable member
-today; every other workspace crate inherits `publish = false` from the root manifest and is built
-from this repository. Keep that split explicit when adding new crates: publish only a contract crate
-that stands alone without path dependencies, and leave daemon, MCP, prototype, and creature crates
-source-release-only until the release channel deliberately changes. The release checklist lives in
-[`RELEASE.md`](RELEASE.md).
+The public release is **source-first**: every workspace crate sets `publish.workspace = true` and so
+inherits `publish = false` from the root manifest — nothing goes to a package registry; you clone and
+build from this repository. Keep that invariant when adding a crate (set `publish.workspace = true`):
+on Alpha the distributable unit is the **creature** (a signed `gawd_creature_v1` artifact), shared via
+the Bestiary, not a Rust package. The release checklist lives in [`RELEASE.md`](RELEASE.md).
 
 ## Add a creature (native daemon)
 
