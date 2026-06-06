@@ -180,8 +180,10 @@ Clustering many real nodes (gossip mesh, cross-execution, attaching an AI to eac
 
 This first public release is **source-first**: clone the repo and build the `alpha` front door from
 the workspace — that's the whole install. The crates aren't published to a package registry; on Alpha
-the unit you distribute is the **creature** (a signed `gawd_creature_v1` artifact), shared through the
-Bestiary, not crates.io.
+the unit you distribute is the **creature** (a signed `gawd_creature_v1` artifact), published and
+fetched by **content address between nodes over the bus**, not through a package manager. (The registry
+that catalogues them — the *Bestiary* — ships today as an in-memory seed; a durable, federated one is
+on the [roadmap](docs/ROADMAP.md).)
 
 ```sh
 cargo build --locked --workspace                                       # build everything

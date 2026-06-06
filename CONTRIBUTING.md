@@ -51,8 +51,9 @@ be exercised by the kernel test suite (a fault specimen or a walking-skeleton st
 The public release is **source-first**: every workspace crate sets `publish.workspace = true` and so
 inherits `publish = false` from the root manifest — nothing goes to a package registry; you clone and
 build from this repository. Keep that invariant when adding a crate (set `publish.workspace = true`):
-on Alpha the distributable unit is the **creature** (a signed `gawd_creature_v1` artifact), shared via
-the Bestiary, not a Rust package. The release checklist lives in [`RELEASE.md`](RELEASE.md).
+on Alpha the distributable unit is the **creature** (a signed `gawd_creature_v1` artifact), published
+and fetched by content address over the bus, not a Rust package. The release checklist lives in
+[`RELEASE.md`](RELEASE.md).
 
 ## Add a creature (native daemon)
 
