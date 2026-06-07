@@ -119,9 +119,12 @@ The load-bearing decisions; full reasoning in the [design notes](docs/design/).
 
 We'd rather you knew exactly where the seams are:
 
-- The shipped reference author is a deterministic **template matcher** (`agent-templated`), not an
-  LLM. It proves the author → compile → sign → admit → load *seam*; an LLM-backed author binds the
-  same `AUTHORING` socket and is not yet wired in-tree.
+- The **default** reference author is a deterministic **template matcher** (`agent-templated`) —
+  hermetic, no network — which proves the author → compile → sign → admit → load *seam*. A real
+  **model-backed author** (`agent-mind`) now binds the same `AUTHORING` socket: build with `--features
+  openai`, select a model at the operator surface, and a live LLM writes the source. The model is
+  *injected* through a trait, so the fabric still ships only the socket — "ASI is the fabric, not the
+  model" made literal.
 - Native `daemon` creatures are **trusted-by-admission** (they run in-process). Run untrusted or
   mobile code in the sandboxed WASM `beast` tier or the metered script `critter` tier.
 - Alpha is **pre-1.0 with no external security audit**. "An AI ships native code to a peer node" is,
@@ -182,8 +185,10 @@ This first public release is **source-first**: clone the repo and build the `alp
 the workspace — that's the whole install. The crates aren't published to a package registry; on Alpha
 the unit you distribute is the **creature** (a signed `gawd_creature_v1` artifact), published and
 fetched by **content address between nodes over the bus**, not through a package manager. (The registry
-that catalogues them — the *Bestiary* — ships today as an in-memory seed; a durable, federated one is
-on the [roadmap](docs/ROADMAP.md).)
+that catalogues them — the *Bestiary* — ships in two forms: an in-memory seed (`registry-mem`, the stub
+reference) and a **durable, federated, AI-curated** one (`bestiary-daemon`) — a realm-hashed
+signed-log store with verifiable entry proofs and monotonic-lattice replication. Both fill
+`Role::REGISTRY`; pick either.)
 
 ```sh
 cargo build --locked --workspace                                       # build everything

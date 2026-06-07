@@ -26,13 +26,17 @@ and an AI drives any node it is allowed to.
   with richer partition tolerance.
 - **Placement** — cross-Realm placement: a creature's requirements matched against embodiment beyond
   the local Realm, not only within it.
-- **Federation** — Omega discovery and production realm/omega gateway creatures; a durable registry
-  beyond the in-memory Bestiary.
+- **Federation** — Omega discovery and production realm/omega gateway creatures. (A durable, federated
+  Bestiary beyond the in-memory seed now ships — `bestiary-daemon`; what remains is autonomous
+  cross-Realm anti-entropy scheduling and quorum.)
 - **Trust** — more of the proof-of-trust surface made live: weighted and consensus picks, additional
-  verifiable-randomness schemes, and standing SEER consumers for the policy, budget, fitness, and
-  consensus topics.
-- **Budgets** — the limit-as-gradient enforced on memory and wall-clock, not only fuel; a live store
-  limiter for the native tier's deployment seam.
+  verifiable-randomness schemes, and standing SEER consumers for the policy, budget, fitness,
+  consensus, and curation topics.
+- **Budgets** — extend the limit-as-gradient's live *lift* (`ExtendBudget`) beyond fuel to memory and
+  wall-clock (today only the fuel lift is honored; the mem/wall lifts are accepted by the wire but not
+  yet enforced); per-tier wall-clock for the critter and native tiers (the beast tier already traps a
+  `wall_ms` *cap* via wasmtime epoch interruption); a live store limiter for the native tier's
+  deployment seam.
 - **Scenarios** — declarative runbooks the control plane replays as verbs over the bus, so a demo or
   an operator can drive a live remote node instead of building its own topology in code.
 

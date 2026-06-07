@@ -93,16 +93,17 @@ pub enum SignalLevel {
 
 /// Which quantitative dimension a [`BudgetSignal`] is about.
 ///
-/// `Fuel` and `Memory` are engine-enforced kinds where a tier can measure them. `Wall` is
-/// **reserved** — per-envelope wall-time enforcement is not wired today, but the slot exists so a
-/// policy that wants to react to "this handle took 30s" can bind to the same shape as a fuel breach.
+/// `Fuel`, `Memory`, and `Wall` are engine-enforced kinds where a tier can measure them. The beast
+/// tier enforces all three; other tiers enforce the subset they can measure. A policy reacting to
+/// "this handle took 30s" binds to the same shape as a fuel breach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LimitKind {
     /// `cpu_ms` budget (wasmtime fuel for beasts).
     Fuel,
     /// `mem_bytes` budget (linear-memory grow refused by the limiter for beasts).
     Memory,
-    /// **Reserved** — per-envelope wall time. No engine enforces this today.
+    /// `wall_ms` budget (per-envelope wall time). Engine-enforced for the **beast** tier via wasmtime
+    /// epoch interruption (one engine-global ticker); other tiers leave it unenforced.
     Wall,
 }
 

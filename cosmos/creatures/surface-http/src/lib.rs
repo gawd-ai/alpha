@@ -41,7 +41,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use aether::{
     Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, InboxReceiver,
-    Outcome,
+    Outcome, RealmId,
 };
 pub use omni::ControlTarget;
 use omni::{Verb, VerbResult, CONTROL_PROGRESS_SCHEMA, CONTROL_RESULT_SCHEMA, CONTROL_SCHEMA};
@@ -324,6 +324,12 @@ fn router(state: Arc<SurfaceState>) -> Router {
         .route("/api/author", post(h_author))
         .route("/api/author/critter", post(h_author_critter))
         .route("/api/load", post(h_load))
+        // The catalogue verbs. Publish is a POST (mutating, allow-AI-gated by the control core);
+        // fetch/list/prove are GET reads (Bearer-guarded, never allow-AI-gated).
+        .route("/api/registry/publish", post(h_registry_publish))
+        .route("/api/registry/fetch", get(h_registry_fetch))
+        .route("/api/registry/list", get(h_registry_list))
+        .route("/api/bestiary/prove", get(h_bestiary_prove))
         .route("/api/send", post(h_send))
         .route("/api/intent", post(h_intent))
         .route("/api/bind", post(h_bind))
@@ -374,6 +380,29 @@ struct AuthorReq {
 struct LoadReq {
     manifest_path: String,
     artifact_path: String,
+}
+#[derive(Deserialize)]
+struct RegistryPublishReq {
+    manifest_path: String,
+    artifact_path: String,
+    #[serde(default)]
+    realm: Option<String>,
+}
+#[derive(Deserialize)]
+struct RegistryFetchQ {
+    artifact_hash: String,
+    #[serde(default)]
+    realm: Option<String>,
+}
+#[derive(Deserialize)]
+struct RegistryListQ {
+    #[serde(default)]
+    realm: Option<String>,
+}
+#[derive(Deserialize)]
+struct BestiaryProveQ {
+    artifact_hash: String,
+    realm: String,
 }
 #[derive(Deserialize)]
 struct SendReq {
@@ -454,6 +483,71 @@ async fn h_load(State(st): State<Arc<SurfaceState>>, Json(b): Json<LoadReq>) -> 
         request_control(
             &st,
             Verb::Load { manifest_path: b.manifest_path, artifact_path: b.artifact_path },
+            READ_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+/// An optional Realm argument: a present, non-empty string → `Some(RealmId)`; absent or empty → `None`
+/// (the local Realm). Mirrors `surface-mcp`'s `oarg_realm` so the two surfaces normalize identically —
+/// an explicit `""` must not become `RegistryOp::*InRealm { realm: RealmId("") }` (a distinct, hidden
+/// catalogue bucket) on one surface while collapsing to the local Realm on the other.
+fn opt_realm(realm: Option<String>) -> Option<RealmId> {
+    realm.filter(|s| !s.is_empty()).map(RealmId::new)
+}
+
+/// Publish a creature into the catalogue by NODE-LOCAL path (the same operator caveat as `/api/load`:
+/// the manifest + artifact must already be on the node's filesystem; this is not a client upload).
+async fn h_registry_publish(
+    State(st): State<Arc<SurfaceState>>,
+    Json(b): Json<RegistryPublishReq>,
+) -> Response {
+    into_response(
+        request_control(
+            &st,
+            Verb::RegistryPublish {
+                manifest_path: b.manifest_path,
+                artifact_path: b.artifact_path,
+                realm: opt_realm(b.realm),
+            },
+            READ_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+async fn h_registry_fetch(
+    State(st): State<Arc<SurfaceState>>,
+    Query(q): Query<RegistryFetchQ>,
+) -> Response {
+    into_response(
+        request_control(
+            &st,
+            Verb::RegistryFetch { artifact_hash: q.artifact_hash, realm: opt_realm(q.realm) },
+            READ_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+async fn h_registry_list(
+    State(st): State<Arc<SurfaceState>>,
+    Query(q): Query<RegistryListQ>,
+) -> Response {
+    into_response(
+        request_control(&st, Verb::RegistryList { realm: opt_realm(q.realm) }, READ_TIMEOUT).await,
+    )
+}
+
+async fn h_bestiary_prove(
+    State(st): State<Arc<SurfaceState>>,
+    Query(q): Query<BestiaryProveQ>,
+) -> Response {
+    into_response(
+        request_control(
+            &st,
+            Verb::BestiaryProve { artifact_hash: q.artifact_hash, realm: RealmId::new(q.realm) },
             READ_TIMEOUT,
         )
         .await,
@@ -563,7 +657,19 @@ async fn handle_socket(mut socket: WebSocket, st: Arc<SurfaceState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{constant_time_eq, opt_realm};
+
+    #[test]
+    fn opt_realm_normalizes_empty_to_none_matching_mcp() {
+        // An absent or explicit-empty realm collapses to the local Realm (None); a real name passes
+        // through. This is the cross-surface parity the review flagged (MCP's oarg_realm does the same).
+        assert!(opt_realm(None).is_none(), "absent realm → None");
+        assert!(
+            opt_realm(Some(String::new())).is_none(),
+            "explicit empty realm → None (not Some(\"\"))"
+        );
+        assert_eq!(opt_realm(Some("crew".into())).map(|r| r.0), Some("crew".to_string()));
+    }
 
     #[test]
     fn api_key_compare_accepts_exact_match_only() {

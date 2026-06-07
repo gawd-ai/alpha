@@ -1,0 +1,28 @@
+[package]
+name = "mind"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The injected-mind seam: a `Model` trait + request/reply types (`Prompt`/`Completion`), an OpenAI-compatible reference model (feature `openai`), and zero-dep Fake/Slow models for hermetic tests. A leaf crate (depends on no creature) so both the agent-mind author and the Bestiary curator can consume a model without a contract-crate → creature dependency edge. The fabric ships the socket; the model is injected here. 'ASI is the fabric, not the model.'"
+
+[lib]
+name = "mind"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The real HTTP path (OpenAI-compatible servers, incl. local Ollama / LM-Studio). Optional + the
+# workspace's FIRST optional dep: cargo-deny reads the resolved metadata graph regardless of feature
+# selection, so its TLS tree is allow-listed unconditionally in `deny.toml`. TLS is pinned to
+# ring-backed rustls (`default-features = false` + `tls`), keeping aws-lc-rs out of the tree.
+ureq = { version = "2", default-features = false, features = ["tls"], optional = true }
+
+[features]
+# Off by default: the default build links neither `ureq` nor any TLS stack and is byte-identical to
+# v0.4.0. The live model path needs `--features openai` at build AND a model configured at the
+# operator surface (the `--author-*` flags on `alpha node` / `alpha mcp`).
+openai = ["dep:ureq"]

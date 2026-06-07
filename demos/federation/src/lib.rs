@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,8 @@ use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use sanctum::Kernel;
 use sigil::{Backend, Capabilities, Ed25519KeyMaterial, Ed25519Verifier, Manifest};
 
+use bestiary::{BestiaryStore, DeterministicCurator, FsBestiaryStore};
+use bestiary_daemon::{BestiaryConfig, BestiaryDaemon};
 use omega_federator::{FederatorConfig, FederatorMsg, OmegaFederator};
 use policy_signed::SignedPolicy;
 use registry_mem::{RegistryMem, RegistryOp, RegistryReply, SyncEntry};
@@ -117,6 +120,9 @@ struct Node {
     rx: InboxReceiver,
     /// Peer node names this node shares a direct TCP link with (for the handshake wait).
     peers: Vec<String>,
+    /// The on-disk root of this node's durable Bestiary, when `ALPHA_DURABLE_BESTIARY` is set
+    /// (removed at teardown). `None` for the default in-memory registry.
+    bestiary_root: Option<PathBuf>,
 }
 
 /// Run the federation demo to completion over the given CLI args. Invoked by the `federation`
@@ -236,6 +242,11 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
     }
 
     banner("Booting the mesh");
+    if std::env::var("ALPHA_DURABLE_BESTIARY").is_ok() {
+        note("registry backend: durable bestiary-daemon (ALPHA_DURABLE_BESTIARY set) — on-disk, signed-log store");
+    } else {
+        note("registry backend: in-memory registry-mem (set ALPHA_DURABLE_BESTIARY=1 to run on the durable Bestiary)");
+    }
     let mut nodes: Vec<Node> = Vec::with_capacity(n);
     for idx in 0..n {
         let r = realm_of(idx);
@@ -257,18 +268,45 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
         let (probe_id, bus, rx) = kernel.open_endpoint(Capabilities::default());
         kernel.subscribe(Topic::new(Topic::PROPRIOCEPTION), probe_id);
 
-        // Registry — gateways seed their Realm's artifact (the federation target).
-        let registry = RegistryMem::new();
-        if is_gateway(idx) {
-            registry.publish_in(
-                RealmId::new(realm),
-                artifact_manifest(realm),
-                artifact_bytes(realm),
+        // Registry — gateways seed their Realm's artifact (the federation target). With
+        // ALPHA_DURABLE_BESTIARY set, bind the on-disk `bestiary-daemon` instead of the in-memory
+        // stub; it serves every RegistryOp byte-identically, so the whole scenario runs unchanged on
+        // a durable, signed-log store.
+        let mut bestiary_root: Option<PathBuf> = None;
+        let registry_id = if std::env::var("ALPHA_DURABLE_BESTIARY").is_ok() {
+            let root = std::env::temp_dir()
+                .join(format!("alpha-federation-bestiary-{}-{idx}", std::process::id()));
+            let store = Arc::new(
+                FsBestiaryStore::new(&root, abode_keys[idx].clone())
+                    .map_err(|e| format!("{name}: bestiary store: {e}"))?,
             );
-        }
-        let registry_id = kernel
-            .load_instance(signed_boot_manifest("registry-mem", &key), Box::new(registry))
-            .map_err(|e| format!("{name}: registry admits: {e}"))?;
+            if is_gateway(idx) {
+                store
+                    .put(&RealmId::new(realm), artifact_manifest(realm), artifact_bytes(realm))
+                    .map_err(|e| format!("{name}: bestiary seed: {e}"))?;
+            }
+            bestiary_root = Some(root);
+            let daemon = BestiaryDaemon::new(
+                store,
+                Arc::new(DeterministicCurator::default()),
+                BestiaryConfig::local(),
+            );
+            kernel
+                .load_instance(signed_boot_manifest("bestiary-daemon", &key), Box::new(daemon))
+                .map_err(|e| format!("{name}: bestiary-daemon admits: {e}"))?
+        } else {
+            let registry = RegistryMem::new();
+            if is_gateway(idx) {
+                registry.publish_in(
+                    RealmId::new(realm),
+                    artifact_manifest(realm),
+                    artifact_bytes(realm),
+                );
+            }
+            kernel
+                .load_instance(signed_boot_manifest("registry-mem", &key), Box::new(registry))
+                .map_err(|e| format!("{name}: registry admits: {e}"))?
+        };
         kernel.bind_role(Role::new(Role::REGISTRY), registry_id);
 
         // Federator (gateways only) — maps every *other* Realm to that Realm's gateway node.
@@ -333,6 +371,7 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
             bus,
             rx,
             peers: links[idx].iter().map(|&(peer, _)| node_name(peer)).collect(),
+            bestiary_root,
         });
     }
 
@@ -723,5 +762,8 @@ fn recv_corr(rx: &InboxReceiver, corr: u64, budget: Duration) -> Option<Vec<u8>>
 fn teardown(nodes: &[Node]) {
     for node in nodes {
         node.kernel.shutdown_all(Deadline::from_millis(1500));
+        if let Some(root) = &node.bestiary_root {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }

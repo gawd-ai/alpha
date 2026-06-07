@@ -205,5 +205,17 @@ fn step_breaching_critter_is_apoptosed_via_injected_policy() {
         unloaded,
         "critter op-budget breach → injected policy → kernel unload did not complete in 5s"
     );
+
+    // **Prove-stop (E1): "stop means stop."** The op-budget breach didn't merely *signal* the
+    // critter — apoptosis deregistered it from the router. A send to its address now returns a clean
+    // `RouteError::NoSuchModule`, proving the loop *terminates the creature*, not just flags it.
+    let err = probe_bus
+        .send(Dispatch::to(Address::Creature(greedy_id), b"after-apoptosis".to_vec()))
+        .expect_err("a send to the apoptosed critter must not route");
+    assert!(
+        matches!(err, aether::RouteError::NoSuchModule(_)),
+        "post-apoptosis send must be NoSuchModule (deregistered), got {err:?}"
+    );
+
     k.shutdown_all(Deadline::default());
 }

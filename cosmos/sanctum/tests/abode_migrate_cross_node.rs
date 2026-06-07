@@ -116,6 +116,9 @@ fn wait_for_peer_event(rx: &InboxReceiver, peer: &str, event: &str, budget: Dura
 struct NodeB {
     kernel: Arc<Kernel>,
     migrator_id: CreatureId,
+    /// B's own Abode pubkey (hex) — the key its migrator signs responder witnesses under. A pins this
+    /// as the `expected_responder_pubkey` anchor on the Migrate (M9-2).
+    abode_pubkey: String,
 }
 
 /// B boots first. Its migrator binds an `AbodeAllowlistPolicy` configured by the test —
@@ -155,6 +158,7 @@ fn boot_node_b(
     // ones it admits — so this key doesn't have to match A's). The allowlist gates which Abodes
     // B will accept as restores.
     let b_self_abode = Ed25519KeyMaterial::from_seed([0xC0; 32]).unwrap();
+    let b_abode_pubkey = b_self_abode.public_hex().to_string();
     let policy = match abode_for_b_allowlist {
         Some(k) => Box::new(AbodeAllowlistPolicy::allowing(k.public_hex().to_string())),
         None => Box::new(AbodeAllowlistPolicy::new(vec![])), // refuse every restore
@@ -165,7 +169,7 @@ fn boot_node_b(
         .expect("B migrator admits");
     k.bind_role(Role::new(Role::ABODE_MIGRATOR), migrator_id);
 
-    NodeB { kernel: k, migrator_id }
+    NodeB { kernel: k, migrator_id, abode_pubkey: b_abode_pubkey }
 }
 
 struct NodeA {
@@ -269,6 +273,9 @@ fn abode_migrate_cross_node_b_admits_via_allowlist() {
                 MigratorMsg::Migrate {
                     destination_node: NodeId(NODE_B.into()),
                     destination_migrator: b.migrator_id,
+                    // Pin B's Abode pubkey as the responder trust anchor (M9-2): only a witness signed
+                    // by this key, matching the anchor, can seal A's self to B.
+                    expected_responder_pubkey: Some(b.abode_pubkey.clone()),
                 }
                 .to_bytes(),
             )

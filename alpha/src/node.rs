@@ -1,7 +1,7 @@
 //! The node-daemon entry point ([`run`]) — the body `alpha node` invokes (the daemon
 //! is a subcommand of the α front door, not a standalone crate). Boots the kernel (three engines + an
 //! injected dev policy) and, by default,
-//! self-hosts its own organs ([`boot_organs_with_monitor`]) so a fresh daemon is a *live* substrate.
+//! self-hosts its own organs ([`boot_organs_with`]) so a fresh daemon is a *live* substrate.
 //! It then drives that one live kernel through the shared command core ([`run_verb`]) over up to
 //! three front-ends:
 //! - the **stdin REPL** — the local human seat, never gated;
@@ -9,7 +9,9 @@
 //!   surface a future web UI or the MCP control-hub drives, subject to the allow-AI gate;
 //! - **non-interactive** `--exec`/`--script` runs over the same verbs.
 //!
-//! `--minimal` boots the bare kernel; `--headless` runs the API with no REPL.
+//! `--minimal` boots the bare kernel; `--headless` runs the API with no REPL. With `--features openai`,
+//! `--author-model <id>` (+ optional `--author-base-url` / `--author-api-key-file` or `--author-api-key`
+//! / `--author-timeout-secs`) binds the model-backed author per node instance — see [`crate::AuthorFlags`].
 //!
 //! **Dev posture (disclosed at boot):** the dev policy admits everything and the bus signer is a
 //! stub. This is a single-node developer surface, not a hardened deployment.
@@ -23,8 +25,8 @@ use policy_dev::DevPolicy;
 use sanctum::Kernel;
 
 use omni::{
-    boot_control, boot_manifest, boot_organs_with_monitor, parse_verb, run_verb, AiControl,
-    VerbCtx, COMMANDS,
+    boot_control, boot_manifest, boot_organs_with, parse_verb, run_verb, AiControl, VerbCtx,
+    COMMANDS,
 };
 
 /// Parsed command-line options.
@@ -42,6 +44,8 @@ struct Opts {
     cluster_listen: Option<String>,
     seeds: Vec<String>,
     cluster_key: Option<String>,
+    // Model-backed author selection (per node instance; needs `--features openai` to take effect).
+    author: crate::AuthorFlags,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -58,6 +62,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         cluster_listen: None,
         seeds: Vec::new(),
         cluster_key: None,
+        author: crate::AuthorFlags::default(),
     };
     let mut args = args.iter().cloned();
     while let Some(a) = args.next() {
@@ -82,6 +87,24 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             }
             "--cluster-key" => {
                 o.cluster_key = Some(args.next().ok_or("--cluster-key needs <64-hex-char seed>")?)
+            }
+            "--author-model" => {
+                o.author.model = Some(args.next().ok_or("--author-model needs <model-id>")?)
+            }
+            "--author-base-url" => {
+                o.author.base_url = Some(args.next().ok_or("--author-base-url needs <url>")?)
+            }
+            "--author-api-key" => {
+                o.author.api_key = Some(args.next().ok_or("--author-api-key needs <key>")?)
+            }
+            "--author-api-key-file" => {
+                o.author.api_key_file =
+                    Some(args.next().ok_or("--author-api-key-file needs <path>")?)
+            }
+            "--author-timeout-secs" => {
+                let v = args.next().ok_or("--author-timeout-secs needs <seconds>")?;
+                o.author.timeout_secs =
+                    Some(v.parse::<u64>().map_err(|_| "--author-timeout-secs needs an integer")?);
             }
             other => return Err(format!("unknown flag `{other}`")),
         }
@@ -149,13 +172,15 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     if opts.minimal {
         note!("boot: --minimal — empty kernel, nothing bound (use `bind`/`load` to wire it).");
     } else {
-        match boot_organs_with_monitor(&kernel, !quiet) {
+        let authoring = crate::chosen_authoring(&opts.author);
+        let author_desc = authoring.describe();
+        match boot_organs_with(&kernel, !quiet, authoring) {
             Ok(bc_id) => {
                 critter_builder = Some(bc_id);
                 if quiet {
-                    note!("boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY; stdout monitor omitted for non-interactive output.");
+                    note!("boot: live substrate — {author_desc}→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY; stdout monitor omitted for non-interactive output.");
                 } else {
-                    note!("boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.");
+                    note!("boot: live substrate — {author_desc}→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.");
                 }
             }
             Err(e) => {

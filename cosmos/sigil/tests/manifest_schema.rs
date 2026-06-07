@@ -240,6 +240,7 @@ fn fully_populated() -> Manifest {
             mem_bytes: 1024,
             calls: vec!["creature:*".into()],
             budget_warn_at: Some(80),
+            wall_ms: Some(250),
         },
         requirements: Requirements {
             accelerators: vec!["nvidia-a100".into()],

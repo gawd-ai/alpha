@@ -95,7 +95,7 @@ fn handshake_tools_list_and_unknown_method() {
     mcp.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let list = mcp.recv();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 14, "the tool catalog has 14 entries");
+    assert_eq!(tools.len(), 18, "the tool catalog has 18 entries");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     for expected in [
         "alpha_status",
@@ -105,11 +105,28 @@ fn handshake_tools_list_and_unknown_method() {
         "alpha_ai_status",
         "alpha_cluster",
         "alpha_cluster_connect",
+        "alpha_registry_publish",
+        "alpha_registry_fetch",
+        "alpha_registry_list",
+        "alpha_bestiary_prove",
     ] {
         assert!(names.contains(&expected), "tool `{expected}` is in the catalog: {names:?}");
     }
     let status_tool = tools.iter().find(|t| t["name"] == json!("alpha_status")).unwrap();
     assert_eq!(status_tool["annotations"]["readOnlyHint"], json!(true), "read tool is annotated");
+    // The new registry/bestiary reads carry readOnlyHint; publish (a mutation) does not.
+    let prove_tool = tools.iter().find(|t| t["name"] == json!("alpha_bestiary_prove")).unwrap();
+    assert_eq!(
+        prove_tool["annotations"]["readOnlyHint"],
+        json!(true),
+        "bestiary prove is read-only"
+    );
+    let publish_tool = tools.iter().find(|t| t["name"] == json!("alpha_registry_publish")).unwrap();
+    assert_ne!(
+        publish_tool["annotations"]["readOnlyHint"],
+        json!(true),
+        "registry publish is a mutation, not read-only"
+    );
 
     mcp.send(json!({ "jsonrpc": "2.0", "id": 3, "method": "frobnicate" }));
     let err = mcp.recv();

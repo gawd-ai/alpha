@@ -13,6 +13,6 @@ and layout, [ARCHITECTURE](../ARCHITECTURE.md).
 - [Identity, transport, and clustering](identity-transport-clustering.md) — node identity, the
   authenticated transport, and the self-forming gossip mesh.
 - [Addressing, placement, and federation](addressing-placement-federation.md) — the address grain,
-  the registry, the Distributor, Realm and Omega, and verifiable randomness.
+  the registry and the durable Bestiary, the Distributor, Realm and Omega, and verifiable randomness.
 - [The distributed self and evolution](distributed-self-and-evolution.md) — the Abode, migration and
   fork/merge, the evolutionary loops, and limits as gradients.

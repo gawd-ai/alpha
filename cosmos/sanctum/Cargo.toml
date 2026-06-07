@@ -41,6 +41,10 @@ policy-dev = { path = "../creatures/prototypes/policies/policy-dev" }
 policy-signed = { path = "../creatures/prototypes/policies/policy-signed" }
 transport-tcp = { path = "../creatures/transport-tcp" }
 registry-mem = { path = "../creatures/registry-mem" }
+# The durable Bestiary: the contract/store crate + the daemon creature that fills Role::REGISTRY
+# with persistence + replication, exercised by bestiary_durable_local + bestiary_replication_cross_node.
+bestiary = { path = "../bestiary" }
+bestiary-daemon = { path = "../creatures/bestiary-daemon" }
 # The self-authoring loop: the build + authoring reference creatures live as dev-deps so
 # the loop's end-to-end tests can spin both up in-process and drive author→build→admit→load.
 build-cargo = { path = "../creatures/build-cargo" }
@@ -52,6 +56,11 @@ agent-templated = { path = "../creatures/agent-templated" }
 # agent-curious drives the conversation integration test — loaded on Role::AUTHORING, it proves the
 # full Request → Query → Answer → Reply roundtrip on the bus.
 agent-curious = { path = "../creatures/agent-curious" }
+# The model-backed author + the shared model seam. The authoring-loop test binds agent-mind on
+# Role::AUTHORING with the zero-dep Fake/Slow models and proves author → build → admit → load → run
+# end to end, plus the off-drain shutdown/join contract — all hermetic (no network).
+agent-mind = { path = "../creatures/agent-mind" }
+mind = { path = "../mind" }
 # Capability/sandbox tests: the injected budget-apoptosis reference creature.
 policy-budget = { path = "../creatures/prototypes/policies/policy-budget" }
 # The real Distributor + its companion embodiment-advertiser. Pulled into the kernel's dev-deps so

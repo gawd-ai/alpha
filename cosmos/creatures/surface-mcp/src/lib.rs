@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use aether::{
-    Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, Outcome,
+    Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, Outcome, RealmId,
 };
 use omni::{ControlTarget, Verb, VerbResult, CONTROL_RESULT_SCHEMA, CONTROL_SCHEMA};
 
@@ -204,11 +204,13 @@ fn initialize_result(params: &Value) -> Value {
              a Verb envelope routed to Role::CONTROL, and the result rides back. The MCP \
              server is itself a headless Sanctum (a control-hub node). DEV posture: the target node's dev policy \
              admits everything and the bus signer is a stub; not a hardened deployment. Mutating tools \
-             (alpha_author, alpha_author_critter, alpha_load, alpha_send, alpha_intent, alpha_bind, \
-             alpha_unload, alpha_cluster_connect) are gated by the target node's allow-AI switch, which a \
+             (alpha_author, alpha_author_critter, alpha_load, alpha_registry_publish, alpha_send, \
+             alpha_intent, alpha_bind, alpha_unload, alpha_cluster_connect) are gated by the target \
+             node's allow-AI switch, which a \
              human grants with `allow-ai on` at that node's REPL; while it is off they return an \
              `ai-not-allowed` error. Read-only tools (alpha_status, alpha_list, alpha_journal, alpha_watch, \
-             alpha_cluster) are not blocked by allow-AI. Call alpha_ai_status before mutating so the human \
+             alpha_registry_fetch, alpha_registry_list, alpha_bestiary_prove, alpha_cluster) are not \
+             blocked by allow-AI. Call alpha_ai_status before mutating so the human \
              watching the node can see your activity and revoke. Prefer alpha_author_critter (Rhai, \
              milliseconds) over alpha_author (a cold cargo build can take minutes and blocks the call)."
     })
@@ -295,6 +297,10 @@ fn tool_list() -> Value {
         tool("alpha_author", "Author a NEW daemon-tier (native .so) creature from a natural-language request. Triggers a real cargo build and CAN TAKE MINUTES (the call blocks). Prefer alpha_author_critter. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": { "type": "string", "description": "What the creature should do, in plain language." } }, "required": ["request"], "additionalProperties": false }), false),
         tool("alpha_author_critter", "Author a NEW critter-tier (Rhai script) creature from a natural-language request. No compiler — returns in milliseconds. The preferred authoring path. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": { "type": "string", "description": "What the critter should do, in plain language." } }, "required": ["request"], "additionalProperties": false }), false),
         tool("alpha_load", "Load a creature from a manifest + artifact already on the node's filesystem. Gated by allow-AI.", json!({ "type": "object", "properties": { "manifest_path": { "type": "string" }, "artifact_path": { "type": "string" } }, "required": ["manifest_path", "artifact_path"], "additionalProperties": false }), false),
+        tool("alpha_registry_publish", "Publish a creature into the catalogue (the Bestiary) from a manifest + artifact already on the NODE's filesystem (same node-local caveat as alpha_load — not a client upload). Optional `realm` scopes the catalogue. Gated by allow-AI.", json!({ "type": "object", "properties": { "manifest_path": { "type": "string" }, "artifact_path": { "type": "string" }, "realm": { "type": "string", "description": "Optional Realm name; omit for the local Realm." } }, "required": ["manifest_path", "artifact_path"], "additionalProperties": false }), false),
+        tool("alpha_registry_fetch", "Look up a catalogue entry by artifact hash and return its manifest metadata (name, version, content_address) plus the artifact length — NOT the raw bytes. Optional `realm`. Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string" }, "realm": { "type": "string", "description": "Optional Realm name; omit for the local Realm." } }, "required": ["artifact_hash"], "additionalProperties": false }), true),
+        tool("alpha_registry_list", "Snapshot the catalogue (the Bestiary): each entry's artifact hash, name, version, Realm, reputation, and quarantine flag. Optional `realm` scopes to one Realm; omit to list all. Read-only.", json!({ "type": "object", "properties": { "realm": { "type": "string", "description": "Optional Realm name; omit to list every Realm." } }, "additionalProperties": false }), true),
+        tool("alpha_bestiary_prove", "Ask the durable Bestiary for a standalone, signed EntryProof attestation over (realm, artifact_hash) — survives compaction and is independently verifiable. Only a durable bestiary-daemon answers (the in-memory stub returns an error). Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string" }, "realm": { "type": "string" } }, "required": ["artifact_hash", "realm"], "additionalProperties": false }), true),
         tool("alpha_send", "Send a text message to a creature by creature id and read its reply. Add `node` to route to a creature on a peer node over the cluster. Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" }, "text": { "type": "string" }, "node": { "type": "string", "description": "Optional peer node-id — routes the send across the cluster." } }, "required": ["id", "text"], "additionalProperties": false }), false),
         tool("alpha_intent", "Express an intent on a Role (outcome + text) and read the reply from whatever creature is bound there. Gated by allow-AI.", json!({ "type": "object", "properties": { "outcome": { "type": "string" }, "text": { "type": "string" } }, "required": ["outcome", "text"], "additionalProperties": false }), false),
         tool("alpha_bind", "Bind a loaded creature to a Role so intents addressed to that Role route to it. Gated by allow-AI.", json!({ "type": "object", "properties": { "role": { "type": "string" }, "id": { "type": "integer" } }, "required": ["role", "id"], "additionalProperties": false }), false),
@@ -354,6 +360,31 @@ fn dispatch(state: &SurfaceState, name: &str, args: &Value) -> (bool, Value) {
             Verb::Load {
                 manifest_path: sarg(args, "manifest_path"),
                 artifact_path: sarg(args, "artifact_path"),
+            },
+            READ_TIMEOUT,
+        ),
+        "alpha_registry_publish" => (
+            Verb::RegistryPublish {
+                manifest_path: sarg(args, "manifest_path"),
+                artifact_path: sarg(args, "artifact_path"),
+                realm: oarg_realm(args, "realm"),
+            },
+            READ_TIMEOUT,
+        ),
+        "alpha_registry_fetch" => (
+            Verb::RegistryFetch {
+                artifact_hash: sarg(args, "artifact_hash"),
+                realm: oarg_realm(args, "realm"),
+            },
+            READ_TIMEOUT,
+        ),
+        "alpha_registry_list" => {
+            (Verb::RegistryList { realm: oarg_realm(args, "realm") }, READ_TIMEOUT)
+        }
+        "alpha_bestiary_prove" => (
+            Verb::BestiaryProve {
+                artifact_hash: sarg(args, "artifact_hash"),
+                realm: RealmId::new(sarg(args, "realm")),
             },
             READ_TIMEOUT,
         ),
@@ -438,6 +469,10 @@ fn known_tool(name: &str) -> bool {
             | "alpha_author"
             | "alpha_author_critter"
             | "alpha_load"
+            | "alpha_registry_publish"
+            | "alpha_registry_fetch"
+            | "alpha_registry_list"
+            | "alpha_bestiary_prove"
             | "alpha_send"
             | "alpha_intent"
             | "alpha_bind"
@@ -457,6 +492,20 @@ fn arg_specs(name: &str) -> &'static [ArgSpec] {
         "alpha_load" => &[
             ArgSpec { name: "manifest_path", ty: ArgType::String, required: true },
             ArgSpec { name: "artifact_path", ty: ArgType::String, required: true },
+        ],
+        "alpha_registry_publish" => &[
+            ArgSpec { name: "manifest_path", ty: ArgType::String, required: true },
+            ArgSpec { name: "artifact_path", ty: ArgType::String, required: true },
+            ArgSpec { name: "realm", ty: ArgType::String, required: false },
+        ],
+        "alpha_registry_fetch" => &[
+            ArgSpec { name: "artifact_hash", ty: ArgType::String, required: true },
+            ArgSpec { name: "realm", ty: ArgType::String, required: false },
+        ],
+        "alpha_registry_list" => &[ArgSpec { name: "realm", ty: ArgType::String, required: false }],
+        "alpha_bestiary_prove" => &[
+            ArgSpec { name: "artifact_hash", ty: ArgType::String, required: true },
+            ArgSpec { name: "realm", ty: ArgType::String, required: true },
         ],
         "alpha_send" => &[
             ArgSpec { name: "id", ty: ArgType::U64, required: true },
@@ -523,4 +572,10 @@ fn sarg(args: &Value, key: &str) -> String {
 
 fn uarg(args: &Value, key: &str) -> u64 {
     args.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// An optional Realm argument: a present, non-empty string → `Some(RealmId)`; absent/empty → `None`
+/// (the local Realm). Keeps the implicit-Realm path off the wire, matching the `Verb` field default.
+fn oarg_realm(args: &Value, key: &str) -> Option<RealmId> {
+    args.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(RealmId::new)
 }

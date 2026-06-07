@@ -255,6 +255,9 @@ fn v03_end_to_end_loop_proves_m9_m10_m11_m12_compose() {
                 MigratorMsg::Migrate {
                     destination_node: NodeId(SELF_NODE.into()),
                     destination_migrator: dest_mig_id,
+                    // Local hand-off — the dest migrator signs a witness the source verifies; no
+                    // pinned anchor (the responder's pubkey isn't known ahead of time here).
+                    expected_responder_pubkey: None,
                 }
                 .to_bytes(),
             )

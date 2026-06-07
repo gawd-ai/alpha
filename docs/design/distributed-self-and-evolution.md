@@ -106,6 +106,23 @@ request knows it) **and** assert in-band that it is the destination node shipped
 means a misrouted or spoofed reply: the source refuses it, stays authoritative, and re-parks the
 pending so a genuine later reply can still complete — a self is never lost to a spoofed ack.
 
+The challenge echo proves *liveness* (someone received this request), but not that the responder
+actually **ran the admission gates**. So a responder that admits a self also returns a **cryptographic
+witness**: having passed all six gates, it signs `(source abode_key ‖ state_hash ‖ challenge ‖
+responder_node ‖ responder_pubkey)` with its *own* Abode key and attaches the signature plus that
+pubkey to the `RestoreResponse`. The source verifies the signature under the responder's pubkey, then
+binds that pubkey to a pre-shared **trust anchor** — an `expected_responder_pubkey` pinned on the
+`Migrate` op and parked alongside the pending migration. The witness is reconstructed from the source's
+*own* parked state, never from the response body, so a spoofer cannot supply both the claim and its
+proof. By default a signed witness is **required**: a missing witness, a signature that fails to
+verify, or a pubkey that differs from the pinned anchor each keeps the source authoritative and
+re-parks the pending (a builder, `with_unsigned_responder_allowed`, opts out for a legacy or lab peer).
+A determinism tripwire pins the witness byte layout, so no later edit can silently invalidate
+in-flight responder signatures. The honest residuals: the anchor is distributed out of band (the
+operator pins the destination's key when it issues the migration), and the witness binds *identity*,
+not *liveness or non-equivocation* — a destination cannot later disavow having admitted the self, but
+the path does not by itself prevent a trusted destination from misbehaving after admission.
+
 ## Fork and merge: a CRDT reconciler on an injected lattice
 
 Hand-off covers the safe case. The hard case is **two bodies of the same self that both kept running
@@ -264,7 +281,9 @@ The signal is `BudgetSignal { level, kind, vector }`:
 - **`level`** — `Warn` (advisory) or `Hard` (terminal). The wasm and script engines emit `Warn` after a
   *successful* handle that crosses the operator-declared `capabilities.budget_warn_at` percent; a budget
   trap emits `Hard`.
-- **`kind`** — the dimension: `Fuel` (cpu), `Memory`, `Wall` (reserved).
+- **`kind`** — the dimension: `Fuel` (cpu), `Memory`, `Wall` (per-envelope wall time —
+  engine-enforced on the **beast** tier via `wasmtime` epoch interruption, see the substrate note;
+  unenforced on the critter and native tiers).
 - **`vector`** — the raw scalars (`consumed`, `limit`, `dispatches_this_envelope`, `wall_ms_elapsed`,
   `envelopes_since_load`). The fabric ships **numerator and denominator**; any tolerance / velocity /
   curve / abuse-detection model lives entirely in an injected policy. A "last 1% hides 1000% of the work"
@@ -288,9 +307,11 @@ can't loop-beg unbounded budget) and observes the rest; a `Hard` signal still be
 
 This is **tier-honest**. The metering tiers expose budget control; the native tier — trusted by
 admission, with no fuel or operation metering — exposes none, so a grant to a native creature returns
-`false`: an explicit no-op, not a silent lie. `mem_bytes` and `wall_ms` lifts are accepted by the wire
-but not yet honored on any tier (the wasm limiter isn't live-mutable and script memory is a structural
-cap) — a documented limit, not a silent drop. The **wire is the commitment**: the framework admits
+`false`: an explicit no-op, not a silent lie. A live *lift* of `mem_bytes` or `wall_ms` via
+`ExtendBudget` is accepted by the wire but not yet honored on any tier (the wasm limiter isn't
+live-mutable and script memory is a structural cap) — a documented limit, not a silent drop. (This is
+the live grant; the `wall_ms` *cap* itself does trap a beast today — enforcement and live-lift are
+separate, and only fuel is live-liftable so far.) The **wire is the commitment**: the framework admits
 gradient strategies without baking any, and richer engine behavior lands against the unchanged shape.
 
 Anti-IoC discipline closes it: `Warn` is fire-and-forget and **never blocks on a policy reply**. A slow

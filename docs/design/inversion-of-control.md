@@ -108,7 +108,16 @@ intent ──▶ AUTHORING ──▶ source + manifest stub ──▶ BUILD ─�
   none. The reference `agent-templated` is a pattern matcher with zero authoring intelligence; its
   job is to make the *seam* testable end-to-end without coupling the substrate to any model. A
   Claude/GPT/local agent is the **same creature answering the same request** — a swap, not a
-  redesign.
+  redesign. That swap ships: `agent-mind` binds this same socket and asks a real model — an injected
+  `Model` from the `mind` leaf crate — for the source + manifest stub, returned as two fenced
+  blocks (a `rust` source block + a `json` manifest stub) and parsed **fail-closed** (a missing or
+  malformed stub is a structured `Failed`, never a silently-defaulted permissive manifest). It is
+  opt-in (`--features openai` + an `--author-model` flag selecting the model per node instance — the
+  model is configured at the operator surface, never from the environment) and **in-process only** —
+  never a `.so` — because its construction takes the model explicitly (no `Default`-constructed fake
+  can be substituted) and its slow model call runs off the kernel drain thread on a self-owned worker.
+  The model is injected through a trait; the fabric still ships only the socket. `agent-curious` is
+  the third reference — the conversational end, consulting over SEER when no template fits.
 
 - **`Role::BUILD`** receives a `BuildOp::Build { crate_name, crate_version, source, manifest_stub,
   deps }` and replies with `BuildReply::Built { manifest, artifact }` — signed, hashed,

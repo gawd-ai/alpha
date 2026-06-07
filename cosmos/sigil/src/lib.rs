@@ -164,6 +164,17 @@ pub struct Capabilities {
     /// and not forcing every existing creature to re-sign.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_warn_at: Option<u8>,
+    /// **Opt-in per-envelope wall-clock cap (ms).** `Some(n)` traps a beast that exceeds `n` ms of
+    /// wall time in a single `handle`, surfacing a `Hard` `BudgetSignal { kind: Wall }` — the same
+    /// gradient shape as a fuel or memory breach. Enforced for the **beast** tier via wasmtime epoch
+    /// interruption (one engine-global ticker); the critter and daemon tiers do not enforce it
+    /// (critter wall-clock is deferred; native is trusted-by-admission). `None` (the default) = unset
+    /// = unlimited, mirroring the `cpu_ms == 0` convention.
+    ///
+    /// **`skip_serializing_if`** keeps the wire compact and the signing-payload determinism tripwire
+    /// valid: a manifest that omits this key serializes it away, so no existing creature must re-sign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_ms: Option<u64>,
 }
 
 /// What a host must offer for this creature to run. The Distributor matches these against a
@@ -634,6 +645,7 @@ mod tests {
                 mem_bytes: 1024,
                 calls: vec!["creature:*".into()],
                 budget_warn_at: None,
+                wall_ms: None,
             },
             requirements: Requirements::default(),
             provenance: Provenance {
@@ -701,6 +713,7 @@ mod tests {
                 mem_bytes: 1024,
                 calls: vec!["creature:*".into()],
                 budget_warn_at: None,
+                wall_ms: None,
             },
             requirements: Requirements {
                 accelerators: vec![],

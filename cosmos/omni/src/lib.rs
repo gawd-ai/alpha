@@ -28,13 +28,19 @@ use std::time::Duration;
 
 use aether::{
     Address, BusHandle, CreatureId, Deadline, Dispatch, Envelope, InboxReceiver, Intent, NodeId,
-    Role, RouteError, Topic,
+    RealmId, Role, RouteError, Topic,
 };
 use anima::Artifact;
 use sanctum::Kernel;
 use sigil::{Backend, Capabilities, Ed25519KeyMaterial, Manifest};
 
 use agent_templated::{AgentTemplated, AuthoringReply, AuthoringRequest};
+// The registry wire (RegistryOp/RegistryReply) the registry verbs build, and the additive
+// `bestiary.op` (BestiaryOp/BestiaryReply) the `bestiary_prove` verb speaks — both from the Bestiary
+// contract crate, so `run_verb` names the wire without reaching into a registry creature.
+use bestiary::{
+    BestiaryOp, BestiaryReply, RegistryOp, RegistryReply, BESTIARY_OP_SCHEMA, REGISTRY_OP_SCHEMA,
+};
 use build_cargo::{BuildCargo, BuildConfig, BuildOp, BuildReply, Sandbox};
 use build_critter::{BuildCritter, BuildCritterOp};
 use monitor::Monitor;
@@ -49,7 +55,7 @@ pub use control::{
 };
 
 /// The one-line command summary printed by the REPL banner and the `help` verb.
-pub const COMMANDS: &str = "commands: author [--critter] <request> | load <manifest> <artifact> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit";
+pub const COMMANDS: &str = "commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | bestiary prove <artifact-hash> <realm> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit";
 
 // ---------------------------------------------------------------------------------------------
 // Human/AI shared control (modeled on sctl session_allow_ai / session_ai_status)
@@ -144,6 +150,37 @@ pub enum Verb {
         manifest_path: String,
         artifact_path: String,
     },
+    /// Publish a creature into the catalogue **by node-local path** — reads the manifest + artifact
+    /// off *this node's* filesystem (the same operator caveat as [`Verb::Load`]; not a client upload),
+    /// then ships a `RegistryOp::Publish`/`PublishInRealm` to `Role::REGISTRY`. Mutating → gated.
+    RegistryPublish {
+        manifest_path: String,
+        artifact_path: String,
+        /// `None` publishes into `RealmId::local()`; `Some(r)` into the named Realm. `serde(default)`
+        /// so a surface may omit it on the wire.
+        #[serde(default)]
+        realm: Option<RealmId>,
+    },
+    /// Look up a catalogue entry by `artifact_hash` and return its manifest **metadata** + artifact
+    /// length (never the raw bytes inline — a control reply must not carry a multi-megabyte artifact).
+    /// Read-only → ungated.
+    RegistryFetch {
+        artifact_hash: String,
+        #[serde(default)]
+        realm: Option<RealmId>,
+    },
+    /// Snapshot the catalogue (`None` = every Realm, `Some(r)` = one). Read-only → ungated.
+    RegistryList {
+        #[serde(default)]
+        realm: Option<RealmId>,
+    },
+    /// Ask the durable Bestiary for a standalone, signed [`EntryProof`](bestiary::EntryProof) over
+    /// `(realm, artifact_hash)` — rides the additive `bestiary.op` schema (a `registry-mem` stub
+    /// answers a structured error; only a `bestiary-daemon` proves). Read-only → ungated.
+    BestiaryProve {
+        artifact_hash: String,
+        realm: RealmId,
+    },
     Send {
         id: u64,
         text: String,
@@ -184,6 +221,7 @@ impl Verb {
             Verb::Author { .. }
                 | Verb::AuthorCritter { .. }
                 | Verb::Load { .. }
+                | Verb::RegistryPublish { .. }
                 | Verb::Send { .. }
                 | Verb::Intent { .. }
                 | Verb::Bind { .. }
@@ -331,6 +369,33 @@ pub fn parse_verb(line: &str) -> Result<Option<Verb>, String> {
             artifact_path: (*artifact_path).to_string(),
         },
         ["load", ..] => return Err("usage: load <manifest> <artifact>".into()),
+        ["registry", "publish", manifest_path, artifact_path] => Verb::RegistryPublish {
+            manifest_path: (*manifest_path).to_string(),
+            artifact_path: (*artifact_path).to_string(),
+            realm: None,
+        },
+        ["registry", "publish", manifest_path, artifact_path, realm] => Verb::RegistryPublish {
+            manifest_path: (*manifest_path).to_string(),
+            artifact_path: (*artifact_path).to_string(),
+            realm: Some(RealmId::new(*realm)),
+        },
+        ["registry", "fetch", artifact_hash] => {
+            Verb::RegistryFetch { artifact_hash: (*artifact_hash).to_string(), realm: None }
+        }
+        ["registry", "fetch", artifact_hash, realm] => Verb::RegistryFetch {
+            artifact_hash: (*artifact_hash).to_string(),
+            realm: Some(RealmId::new(*realm)),
+        },
+        ["registry", "list"] => Verb::RegistryList { realm: None },
+        ["registry", "list", realm] => Verb::RegistryList { realm: Some(RealmId::new(*realm)) },
+        ["registry", ..] => {
+            return Err("usage: registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm]".into())
+        }
+        ["bestiary", "prove", artifact_hash, realm] => Verb::BestiaryProve {
+            artifact_hash: (*artifact_hash).to_string(),
+            realm: RealmId::new(*realm),
+        },
+        ["bestiary", ..] => return Err("usage: bestiary prove <artifact-hash> <realm>".into()),
         ["unload", id_str] => {
             let id = id_str.parse::<u64>().map_err(|_| "usage: unload <id>".to_string())?;
             Verb::Unload { id }
@@ -444,6 +509,16 @@ pub fn run_verb(verb: Verb, ctx: &mut VerbCtx, progress: &mut dyn FnMut(&str)) -
         Verb::Load { manifest_path, artifact_path } => {
             verb_load(ctx, &manifest_path, &artifact_path)
         }
+        Verb::RegistryPublish { manifest_path, artifact_path, realm } => {
+            verb_registry_publish(ctx, &manifest_path, &artifact_path, realm)
+        }
+        Verb::RegistryFetch { artifact_hash, realm } => {
+            verb_registry_fetch(ctx, &artifact_hash, realm)
+        }
+        Verb::RegistryList { realm } => verb_registry_list(ctx, realm),
+        Verb::BestiaryProve { artifact_hash, realm } => {
+            verb_bestiary_prove(ctx, &artifact_hash, realm)
+        }
         Verb::Send { id, text, node } => verb_send(ctx, id, &text, node.as_deref()),
         Verb::Intent { outcome, text } => verb_intent(ctx, &outcome, &text),
         Verb::Author { request } => verb_author(ctx, &request, progress),
@@ -483,6 +558,257 @@ fn verb_load(ctx: &mut VerbCtx, manifest_path: &str, artifact_path: &str) -> Ver
             json!({ "ok": false, "error": e.to_string() }),
             format!("load failed: {e}"),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Registry / Bestiary verbs — operator/AI-driven catalogue ops over the bus to Role::REGISTRY.
+// Unlike `load` (inline kernel call), these do a request/reply round-trip, so they need a probe.
+// ---------------------------------------------------------------------------------------------
+
+/// Bound for a registry/bestiary op round-trip. The registry creature replies promptly (in-memory in
+/// ms; the durable daemon does a small fs write); this only bites if nothing is bound to REGISTRY.
+const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ship a `RegistryOp` to `Role::REGISTRY` and decode the `RegistryReply`. The `Err` arm is a
+/// ready-to-return [`VerbResult`] (no probe / route failure / timeout / parse error), so callers
+/// `match` on the reply variant and bubble `Err(res)` through.
+fn registry_request(ctx: &mut VerbCtx, op: RegistryOp) -> Result<RegistryReply, VerbResult> {
+    let Some((bus, rx)) = ctx.probe else { return Err(no_probe_err()) };
+    let payload = match serde_json::to_vec(&op) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("registry op encode failed: {e}"),
+            ))
+        }
+    };
+    let c = ctx.next_corr();
+    let d = Dispatch::to(Address::Role(Role::new(Role::REGISTRY)), payload)
+        .with_schema(REGISTRY_OP_SCHEMA)
+        .with_reply_to(Address::Creature(bus.id()))
+        .with_corr(c);
+    match request_reply(bus, rx, d, c, REGISTRY_TIMEOUT) {
+        Ok(Some(env)) => serde_json::from_slice::<RegistryReply>(&env.payload).map_err(|e| {
+            VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("registry reply parse failed: {e}"),
+            )
+        }),
+        Ok(None) => Err(VerbResult::err(
+            json!({ "ok": false, "error": "nothing bound to REGISTRY" }),
+            "registry op failed: nothing bound to REGISTRY (running --minimal?)",
+        )),
+        Err(e) => Err(VerbResult::err(
+            json!({ "ok": false, "unrouted": true, "error": e.to_string() }),
+            format!("registry op failed: {e}"),
+        )),
+    }
+}
+
+/// Like [`registry_request`] but over the additive `bestiary.op` schema, decoding a [`BestiaryReply`].
+fn bestiary_request(ctx: &mut VerbCtx, op: BestiaryOp) -> Result<BestiaryReply, VerbResult> {
+    let Some((bus, rx)) = ctx.probe else { return Err(no_probe_err()) };
+    let c = ctx.next_corr();
+    let d = Dispatch::to(Address::Role(Role::new(Role::REGISTRY)), op.to_bytes())
+        .with_schema(BESTIARY_OP_SCHEMA)
+        .with_reply_to(Address::Creature(bus.id()))
+        .with_corr(c);
+    match request_reply(bus, rx, d, c, REGISTRY_TIMEOUT) {
+        Ok(Some(env)) => serde_json::from_slice::<BestiaryReply>(&env.payload).map_err(|e| {
+            VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("bestiary reply parse failed: {e}"),
+            )
+        }),
+        Ok(None) => Err(VerbResult::err(
+            json!({ "ok": false, "error": "nothing bound to REGISTRY" }),
+            "bestiary op failed: nothing bound to REGISTRY (running --minimal?)",
+        )),
+        Err(e) => Err(VerbResult::err(
+            json!({ "ok": false, "unrouted": true, "error": e.to_string() }),
+            format!("bestiary op failed: {e}"),
+        )),
+    }
+}
+
+fn registry_unexpected(reply: RegistryReply) -> VerbResult {
+    VerbResult::err(
+        json!({ "ok": false, "error": format!("unexpected registry reply: {reply:?}") }),
+        format!("registry op: unexpected reply: {reply:?}"),
+    )
+}
+
+fn verb_registry_publish(
+    ctx: &mut VerbCtx,
+    manifest_path: &str,
+    artifact_path: &str,
+    realm: Option<RealmId>,
+) -> VerbResult {
+    // NODE-LOCAL paths — the same operator caveat as `load`: these name files on the node's own
+    // filesystem, not client uploads. A surface caller hands the node a path it can already read.
+    let m_bytes = match std::fs::read(manifest_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": format!("read manifest {manifest_path}: {e}") }),
+                format!("registry publish failed: read manifest {manifest_path}: {e}"),
+            )
+        }
+    };
+    let manifest = match Manifest::parse(&m_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("registry publish failed: {e}"),
+            )
+        }
+    };
+    let artifact = match std::fs::read(artifact_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": format!("read artifact {artifact_path}: {e}") }),
+                format!("registry publish failed: read artifact {artifact_path}: {e}"),
+            )
+        }
+    };
+    let op = match &realm {
+        None => RegistryOp::Publish { manifest, artifact },
+        Some(r) => RegistryOp::PublishInRealm { manifest, artifact, realm: r.clone() },
+    };
+    match registry_request(ctx, op) {
+        Ok(RegistryReply::Published { artifact_hash }) => VerbResult::ok(
+            json!({ "ok": true, "artifact_hash": artifact_hash, "realm": "local" }),
+            format!("published artifact {artifact_hash} into realm `local`"),
+        ),
+        Ok(RegistryReply::PublishedInRealm { artifact_hash, realm }) => VerbResult::ok(
+            json!({ "ok": true, "artifact_hash": artifact_hash, "realm": realm.0 }),
+            format!("published artifact {artifact_hash} into realm `{}`", realm.0),
+        ),
+        Ok(other) => registry_unexpected(other),
+        Err(res) => res,
+    }
+}
+
+/// Render a fetched entry as **metadata** (name/version/content_address) + artifact length — never the
+/// raw bytes inline. `realm` is `Some` for a Realm-explicit fetch (echoed back), `None` for `local`.
+fn fetched_ok(manifest: &Manifest, artifact_len: usize, realm: Option<&RealmId>) -> VerbResult {
+    let realm_str = realm.map(|r| r.0.clone()).unwrap_or_else(|| "local".to_string());
+    let mut j = json!({
+        "ok": true,
+        "name": manifest.name,
+        "version": manifest.version,
+        "content_address": manifest.content_address,
+        "artifact_len": artifact_len,
+        "realm": realm_str,
+    });
+    if realm.is_none() {
+        // Make the implicit-Realm case explicit for a machine reader without claiming a named Realm.
+        j["realm"] = json!("local");
+    }
+    VerbResult::ok(
+        j,
+        format!(
+            "entry `{}` v{} ({} bytes) in realm `{}`",
+            manifest.name, manifest.version, artifact_len, realm_str
+        ),
+    )
+}
+
+fn verb_registry_fetch(
+    ctx: &mut VerbCtx,
+    artifact_hash: &str,
+    realm: Option<RealmId>,
+) -> VerbResult {
+    let op = match &realm {
+        None => RegistryOp::Fetch { artifact_hash: artifact_hash.to_string() },
+        Some(r) => {
+            RegistryOp::FetchInRealm { artifact_hash: artifact_hash.to_string(), realm: r.clone() }
+        }
+    };
+    match registry_request(ctx, op) {
+        Ok(RegistryReply::Fetched { manifest, artifact }) => {
+            fetched_ok(&manifest, artifact.len(), None)
+        }
+        Ok(RegistryReply::FetchedInRealm { manifest, artifact, realm }) => {
+            fetched_ok(&manifest, artifact.len(), Some(&realm))
+        }
+        Ok(RegistryReply::NotFound) => VerbResult::err(
+            json!({ "ok": false, "not_found": true, "artifact_hash": artifact_hash }),
+            format!("registry fetch: no entry for {artifact_hash}"),
+        ),
+        Ok(other) => registry_unexpected(other),
+        Err(res) => res,
+    }
+}
+
+fn verb_registry_list(ctx: &mut VerbCtx, realm: Option<RealmId>) -> VerbResult {
+    let scope = realm.as_ref().map(|r| r.0.clone()).unwrap_or_else(|| "(all realms)".to_string());
+    match registry_request(ctx, RegistryOp::ListEntries { realm }) {
+        Ok(RegistryReply::Entries { entries }) => {
+            let arr: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "artifact_hash": e.artifact_hash,
+                        "realm": e.realm.0,
+                        "name": e.manifest.name,
+                        "version": e.manifest.version,
+                        "reputation": e.reputation.as_ref().map(|r| r.score),
+                        "quarantined": e.quarantine.is_some(),
+                    })
+                })
+                .collect();
+            let mut human = format!(
+                "catalogue {scope}: {} entr{}",
+                arr.len(),
+                if arr.len() == 1 { "y" } else { "ies" }
+            );
+            for e in &entries {
+                human.push_str(&format!(
+                    "\n  {} {:<24} v{:<8} realm={}{}",
+                    &e.artifact_hash[..e.artifact_hash.len().min(12)],
+                    e.manifest.name,
+                    e.manifest.version,
+                    e.realm.0,
+                    if e.quarantine.is_some() { " [quarantined]" } else { "" }
+                ));
+            }
+            VerbResult::ok(json!({ "ok": true, "count": arr.len(), "entries": arr }), human)
+        }
+        Ok(other) => registry_unexpected(other),
+        Err(res) => res,
+    }
+}
+
+fn verb_bestiary_prove(ctx: &mut VerbCtx, artifact_hash: &str, realm: RealmId) -> VerbResult {
+    let realm_name = realm.0.clone();
+    let op = BestiaryOp::ProveEntry { artifact_hash: artifact_hash.to_string(), realm };
+    match bestiary_request(ctx, op) {
+        Ok(BestiaryReply::EntryProof { proof }) => {
+            let human = format!(
+                "entry proof for {} in realm `{}` (first_seen={}, attester={})",
+                proof.artifact_hash, proof.realm.0, proof.first_seen, proof.attester
+            );
+            let proof_json = serde_json::to_value(&proof).unwrap_or_else(|_| json!({}));
+            VerbResult::ok(json!({ "ok": true, "proof": proof_json }), human)
+        }
+        Ok(BestiaryReply::NotFound) => VerbResult::err(
+            json!({ "ok": false, "not_found": true, "artifact_hash": artifact_hash }),
+            format!("bestiary prove: no entry for {artifact_hash} in realm `{realm_name}`"),
+        ),
+        Ok(BestiaryReply::Error { message }) => VerbResult::err(
+            json!({ "ok": false, "error": message }),
+            format!("bestiary prove failed: {message}"),
+        ),
+        Ok(other) => VerbResult::err(
+            json!({ "ok": false, "error": format!("unexpected bestiary reply: {other:?}") }),
+            format!("bestiary prove: unexpected reply: {other:?}"),
+        ),
+        Err(res) => res,
     }
 }
 
@@ -545,6 +871,20 @@ fn verb_intent(ctx: &mut VerbCtx, outcome: &str, text: &str) -> VerbResult {
     }
 }
 
+/// How long the control plane waits for an AUTHORING reply. The templated author replies
+/// synchronously (ms); a model-backed author (`agent-mind`) runs the call **off the drain thread**
+/// and can take many seconds, so the boot recipe sizes this from the bound model's own timeout (plus
+/// margin) when it binds one — see [`boot_organs_with`]. Without that, the live single-shot author
+/// would hit a 5 s wall and report a misleading "nothing bound to AUTHORING" while the worker runs.
+///
+/// Process-scoped (a `OnceLock`, set once at boot from the chosen model config — NOT read from the
+/// environment). v0.4.1 binds one author per node; per-realm model routing would key this by context.
+static AUTHORING_BUDGET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+fn authoring_reply_budget() -> Duration {
+    AUTHORING_BUDGET.get().copied().unwrap_or(Duration::from_secs(5))
+}
+
 fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str)) -> VerbResult {
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
     let c1 = ctx.next_corr();
@@ -562,7 +902,7 @@ fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str))
             .with_reply_to(Address::Creature(bus.id()))
             .with_corr(c1),
         c1,
-        Duration::from_secs(5),
+        authoring_reply_budget(),
     ) {
         Ok(Some(e)) => e,
         Ok(None) | Err(_) => {
@@ -665,7 +1005,7 @@ fn verb_author_critter(
             .with_reply_to(Address::Creature(bus.id()))
             .with_corr(c1),
         c1,
-        Duration::from_secs(5),
+        authoring_reply_budget(),
     ) {
         Ok(Some(e)) => e,
         Ok(None) | Err(_) => {
@@ -974,25 +1314,58 @@ pub fn recv_corr(rx: &InboxReceiver, corr: u64, budget: Duration) -> Option<Enve
 // Boot recipe (self-hosting the substrate's own organs) — shared by main.rs and the API host
 // ---------------------------------------------------------------------------------------------
 
-/// Self-host the substrate's own organs onto their Roles. Returns the `build-critter` organ's id:
-/// `Role::BUILD` is single-binding (held by build-cargo for daemons), so `author --critter`
-/// addresses the no-cargo critter builder directly by id.
+/// Which creature binds `Role::AUTHORING`, chosen by the composition root (the operator surface) and
+/// passed into [`boot_organs_with`] as **data** — the core never reads the environment to decide.
+/// This is the literal "ASI is the fabric, not the model": the model is injected here.
+pub enum Authoring {
+    /// The deterministic `agent-templated` reference (the default; byte-identical to v0.4.0).
+    Templated,
+    /// A real model-backed author (`agent-mind`) on the given model config. Requires building with
+    /// `--features openai`; without that feature, binding this returns an error.
+    Model(mind::ModelConfig),
+}
+
+impl Authoring {
+    /// A short human label for boot banners ("agent-templated" / "agent-mind (model …)").
+    pub fn describe(&self) -> String {
+        match self {
+            Authoring::Templated => "agent-templated".to_string(),
+            Authoring::Model(cfg) => format!("agent-mind (model {})", cfg.model),
+        }
+    }
+}
+
+/// Self-host the substrate's own organs onto their Roles, binding the deterministic `agent-templated`
+/// author. Returns the `build-critter` organ's id: `Role::BUILD` is single-binding (held by
+/// build-cargo for daemons), so `author --critter` addresses the no-cargo critter builder by id.
 pub fn boot_organs(kernel: &Kernel) -> Result<CreatureId, String> {
     boot_organs_with_monitor(kernel, true)
 }
 
-/// Variant used by non-interactive CLI modes: the monitor creature prints directly to stdout, so it
-/// is omitted when stdout must remain machine-readable (`--json --exec` / `--json --script`).
+/// Like [`boot_organs`] but with control over the stdout monitor (omitted when stdout must stay
+/// machine-readable, e.g. `--json --exec`). Binds the deterministic `agent-templated` author.
 pub fn boot_organs_with_monitor(
     kernel: &Kernel,
     attach_stdout_monitor: bool,
 ) -> Result<CreatureId, String> {
+    boot_organs_with(kernel, attach_stdout_monitor, Authoring::Templated)
+}
+
+/// The full boot recipe: self-host the substrate's own organs onto their Roles, binding the
+/// `authoring` author the composition root chose (see [`Authoring`]). The default
+/// [`Authoring::Templated`] keeps the boot byte-identical to v0.4.0; [`Authoring::Model`] binds the
+/// real model-backed `agent-mind` (in-process only — never a `.so`) onto the same `Role::AUTHORING`
+/// socket — the literal "ASI is the fabric, not the model." swap.
+pub fn boot_organs_with(
+    kernel: &Kernel,
+    attach_stdout_monitor: bool,
+    authoring: Authoring,
+) -> Result<CreatureId, String> {
     let abode = Ed25519KeyMaterial::from_seed([7u8; 32]).map_err(|e| e.to_string())?;
     let author = abode.public_hex().to_string();
 
-    let agent_id = kernel
-        .load_instance(boot_manifest("agent-templated"), Box::new(AgentTemplated::new()))
-        .map_err(|e| format!("agent: {e}"))?;
+    // Bind the AUTHORING organ chosen by the composition root (data, not ambient state).
+    let agent_id = bind_authoring_organ(kernel, &authoring)?;
     kernel.bind_role(Role::new(Role::AUTHORING), agent_id);
 
     let critter_build_id = kernel
@@ -1031,6 +1404,37 @@ pub fn boot_organs_with_monitor(
 
 pub fn boot_manifest(name: &str) -> Manifest {
     Manifest::new(name, "0.1.0", Backend::Daemon, "gawd_creature_v1")
+}
+
+/// Load the AUTHORING organ chosen by the composition root and return its id.
+/// [`Authoring::Templated`] binds the deterministic reference; [`Authoring::Model`] binds the real
+/// model-backed `agent-mind` (in-process only — never a `.so`) and requires `--features openai`.
+fn bind_authoring_organ(kernel: &Kernel, authoring: &Authoring) -> Result<CreatureId, String> {
+    match authoring {
+        Authoring::Templated => kernel
+            .load_instance(boot_manifest("agent-templated"), Box::new(AgentTemplated::new()))
+            .map_err(|e| format!("agent: {e}")),
+        Authoring::Model(cfg) => bind_model_author(kernel, cfg),
+    }
+}
+
+/// Bind the model-backed `agent-mind` author on the given model config (feature `openai`). Sizes the
+/// control plane's AUTHORING reply budget from the model's own timeout (+margin) so the live
+/// single-shot author doesn't hit a short wall while the off-drain worker is still running.
+#[cfg(feature = "openai")]
+fn bind_model_author(kernel: &Kernel, cfg: &mind::ModelConfig) -> Result<CreatureId, String> {
+    let _ = AUTHORING_BUDGET.set(cfg.timeout.saturating_add(Duration::from_secs(10)));
+    let model = std::sync::Arc::new(mind::OpenAiModel::new(cfg.clone()));
+    kernel
+        .load_instance(boot_manifest("agent-mind"), Box::new(agent_mind::AgentMind::new(model)))
+        .map_err(|e| format!("agent-mind: {e}"))
+}
+
+/// Without `--features openai` there is no model HTTP path linked, so a model-backed author cannot be
+/// bound — refuse rather than silently fall back, so a misconfigured deployment is visible.
+#[cfg(not(feature = "openai"))]
+fn bind_model_author(_kernel: &Kernel, _cfg: &mind::ModelConfig) -> Result<CreatureId, String> {
+    Err("a model-backed author requires building Alpha with `--features openai`".to_string())
 }
 
 /// Load the [`ControlCore`] translator and bind it to [`Role::CONTROL`], so the node

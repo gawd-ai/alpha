@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abode"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "serde",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "abode-migrator"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "abode",
  "aether",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "abode-reconciler"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "abode",
  "abode-migrator",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ring",
  "serde",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agent-curious"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "agent-templated",
@@ -72,8 +72,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-mind"
+version = "0.4.1"
+dependencies = [
+ "aether",
+ "agent-templated",
+ "build-cargo",
+ "mind",
+ "seer",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sigil",
+]
+
+[[package]]
 name = "agent-templated"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "build-cargo",
@@ -104,11 +119,12 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "alpha"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "anima",
  "ctrlc",
+ "mind",
  "omni",
  "policy-dev",
  "sanctum",
@@ -122,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "anima"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "libloading",
@@ -235,6 +251,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bestiary"
+version = "0.4.1"
+dependencies = [
+ "aether",
+ "mind",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sigil",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bestiary-daemon"
+version = "0.4.1"
+dependencies = [
+ "aether",
+ "bestiary",
+ "mind",
+ "serde",
+ "serde_json",
+ "sigil",
+]
+
+[[package]]
+name = "bestiary-live"
+version = "0.4.1"
+dependencies = [
+ "aether",
+ "agent-mind",
+ "agent-templated",
+ "anima",
+ "bestiary",
+ "bestiary-daemon",
+ "build-cargo",
+ "build-critter",
+ "mind",
+ "policy-signed",
+ "sanctum",
+ "serde_json",
+ "sigil",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -260,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "build-cargo"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "serde",
@@ -272,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "build-critter"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "build-cargo",
@@ -580,8 +640,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "displaydoc"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "distributor-requirements"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "seer",
@@ -591,21 +662,21 @@ dependencies = [
 
 [[package]]
 name = "distributor-roundrobin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
 ]
 
 [[package]]
 name = "echo-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "forge",
 ]
 
 [[package]]
 name = "echo-daemon-v2"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "forge",
 ]
@@ -630,7 +701,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "embodiment-advertiser"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "seer",
@@ -656,10 +727,12 @@ dependencies = [
 
 [[package]]
 name = "federation"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "anima",
+ "bestiary",
+ "bestiary-daemon",
  "omega-federator",
  "policy-signed",
  "registry-mem",
@@ -679,7 +752,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fitness-selector"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "registry-mem",
@@ -702,7 +775,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "seer",
@@ -909,8 +982,111 @@ dependencies = [
 ]
 
 [[package]]
+name = "icu_collections"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2984d1cd16c883d7935b9e07e44071dca8d917fd52ecc02c04d5fa0b5a3f191c"
+dependencies = [
+ "displaydoc",
+ "potential_utf",
+ "utf8_iter",
+ "yoke",
+ "zerofrom",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_locale_core"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92219b62b3e2b4d88ac5119f8904c10f8f61bf7e95b640d25ba3075e6cac2c29"
+dependencies = [
+ "displaydoc",
+ "litemap",
+ "tinystr",
+ "writeable",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_normalizer"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c56e5ee99d6e3d33bd91c5d85458b6005a22140021cc324cea84dd0e72cff3b4"
+dependencies = [
+ "icu_collections",
+ "icu_normalizer_data",
+ "icu_properties",
+ "icu_provider",
+ "smallvec",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_normalizer_data"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da3be0ae77ea334f4da67c12f149704f19f81d1adf7c51cf482943e84a2bad38"
+
+[[package]]
+name = "icu_properties"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bee3b67d0ea5c2cca5003417989af8996f8604e34fb9ddf96208a033901e70de"
+dependencies = [
+ "icu_collections",
+ "icu_locale_core",
+ "icu_properties_data",
+ "icu_provider",
+ "zerotrie",
+ "zerovec",
+]
+
+[[package]]
+name = "icu_properties_data"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e2bbb201e0c04f7b4b3e14382af113e17ba4f63e2c9d2ee626b720cbce54a14"
+
+[[package]]
+name = "icu_provider"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421"
+dependencies = [
+ "displaydoc",
+ "icu_locale_core",
+ "writeable",
+ "yoke",
+ "zerofrom",
+ "zerotrie",
+ "zerovec",
+]
+
+[[package]]
+name = "idna"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
+dependencies = [
+ "idna_adapter",
+ "smallvec",
+ "utf8_iter",
+]
+
+[[package]]
+name = "idna_adapter"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
+dependencies = [
+ "icu_normalizer",
+ "icu_properties",
+]
+
+[[package]]
 name = "immune-response"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "omega-federator",
@@ -993,6 +1169,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "litemap"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+
+[[package]]
 name = "log"
 version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1000,7 +1182,7 @@ checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 
 [[package]]
 name = "loopback-gateway"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
 ]
@@ -1037,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "merge-lww-map"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "abode-reconciler",
  "serde",
@@ -1049,6 +1231,15 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mind"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "ureq",
+]
 
 [[package]]
 name = "mio"
@@ -1063,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "monitor"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "serde_json",
@@ -1129,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "omega"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "realm",
@@ -1139,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "omega-federator"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "omega",
@@ -1152,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "omega-gateway"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "omega",
@@ -1162,15 +1353,20 @@ dependencies = [
 
 [[package]]
 name = "omni"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
+ "agent-mind",
  "agent-templated",
  "anima",
+ "bestiary",
+ "bestiary-daemon",
  "build-cargo",
  "build-critter",
+ "mind",
  "monitor",
  "policy-dev",
+ "policy-signed",
  "registry-mem",
  "sanctum",
  "serde",
@@ -1190,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "panic-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "forge",
 ]
@@ -1209,7 +1405,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "policy-abode-allowlist"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "abode",
  "abode-migrator",
@@ -1218,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "policy-budget"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "sanctum",
@@ -1228,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "policy-dev"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "sanctum",
  "sigil",
@@ -1236,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "policy-prefer-promoted"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "registry-mem",
  "sanctum",
@@ -1245,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "policy-quarantine-aware"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "registry-mem",
  "sanctum",
@@ -1254,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "policy-quarantine-trust-all"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "immune-response",
@@ -1262,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "policy-quarantine-trust-realm"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "immune-response",
@@ -1270,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "policy-signed"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "sanctum",
  "sigil",
@@ -1292,6 +1488,15 @@ dependencies = [
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
  "serde",
+]
+
+[[package]]
+name = "potential_utf"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
+dependencies = [
+ "zerovec",
 ]
 
 [[package]]
@@ -1382,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "realm"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "serde",
@@ -1391,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "realm-gateway"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "realm",
@@ -1415,9 +1620,10 @@ dependencies = [
 
 [[package]]
 name = "registry-mem"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
+ "bestiary",
  "serde",
  "serde_json",
  "sha2",
@@ -1426,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "reputation-roundrobin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "omega-federator",
@@ -1477,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "runaway-thread-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "forge",
 ]
@@ -1508,6 +1714,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls"
+version = "0.23.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+dependencies = [
+ "log",
+ "once_cell",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls-pki-types"
+version = "1.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1521,15 +1762,18 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 
 [[package]]
 name = "sanctum"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "abode",
  "abode-migrator",
  "abode-reconciler",
  "aether",
  "agent-curious",
+ "agent-mind",
  "agent-templated",
  "anima",
+ "bestiary",
+ "bestiary-daemon",
  "build-cargo",
  "build-critter",
  "distributor-requirements",
@@ -1541,6 +1785,7 @@ dependencies = [
  "immune-response",
  "loopback-gateway",
  "merge-lww-map",
+ "mind",
  "omega-federator",
  "omega-gateway",
  "panic-daemon",
@@ -1571,28 +1816,28 @@ dependencies = [
 
 [[package]]
 name = "scorer-latency"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "fitness-selector",
 ]
 
 [[package]]
 name = "scorer-roundrobin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "fitness-selector",
 ]
 
 [[package]]
 name = "scorer-success-rate"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "fitness-selector",
 ]
 
 [[package]]
 name = "seer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "serde",
@@ -1700,7 +1945,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sigil"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ring",
  "serde",
@@ -1764,8 +2009,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
 name = "surface-http"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "anima",
@@ -1781,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "surface-mcp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "omni",
@@ -1804,6 +2055,17 @@ name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
+
+[[package]]
+name = "synstructure"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "target-lexicon"
@@ -1873,6 +2135,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
 dependencies = [
  "crunchy",
+]
+
+[[package]]
+name = "tinystr"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
+dependencies = [
+ "displaydoc",
+ "zerovec",
 ]
 
 [[package]]
@@ -1963,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "transport-tcp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "ring",
@@ -2015,14 +2287,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "url"
+version = "2.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+dependencies = [
+ "form_urlencoded",
+ "idna",
+ "percent-encoding",
+ "serde",
+]
+
+[[package]]
 name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
+name = "utf8_iter"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
 name = "verifiable-die"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aether",
  "serde",
@@ -2039,7 +2344,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 
 [[package]]
 name = "walkthrough"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "abode-migrator",
  "aether",
@@ -2367,8 +2672,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "welbehaved-thread-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "forge",
 ]
@@ -2477,6 +2800,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "writeable"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "yoke"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
+dependencies = [
+ "stable_deref_trait",
+ "yoke-derive",
+ "zerofrom",
+]
+
+[[package]]
+name = "yoke-derive"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2490,6 +2842,66 @@ name = "zerocopy-derive"
 version = "0.8.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b631b19d36a892ab55420c92dbc83ccd79274f25be714855d3074aa71cab639"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "zerofrom"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272"
+dependencies = [
+ "zerofrom-derive",
+]
+
+[[package]]
+name = "zerofrom-derive"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
+]
+
+[[package]]
+name = "zeroize"
+version = "1.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+
+[[package]]
+name = "zerotrie"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f9152d31db0792fa83f70fb2f83148effb5c1f5b8c7686c3459e361d9bc20bf"
+dependencies = [
+ "displaydoc",
+ "yoke",
+ "zerofrom",
+]
+
+[[package]]
+name = "zerovec"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90f911cbc359ab6af17377d242225f4d75119aec87ea711a880987b18cd7b239"
+dependencies = [
+ "yoke",
+ "zerofrom",
+ "zerovec-derive",
+]
+
+[[package]]
+name = "zerovec-derive"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "625dc425cab0dca6dc3c3319506e6593dcb08a9f387ea3b284dbd52a92c40555"
 dependencies = [
  "proc-macro2",
  "quote",

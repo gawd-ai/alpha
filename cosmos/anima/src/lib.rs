@@ -800,4 +800,62 @@ mod tests {
         assert!(signal.vector.consumed <= signal.vector.limit);
         e.unload(loaded, Deadline::default()).expect("beast unloads cleanly after trap");
     }
+
+    /// **E2 — initial-memory cap (failing-first regression).** The limiter is installed BEFORE
+    /// `Instance::new`, so wasmtime routes the module's declared *initial* (minimum) linear memory
+    /// through `memory_growing` at instantiation. A beast whose initial allocation exceeds its
+    /// `mem_bytes` cap therefore fails the *load* — not only a later `memory.grow`. This guards the
+    /// load-ordering invariant (`store.limiter(...)` before `Instance::new`) against a future refactor
+    /// that moved the limiter and silently regressed initial-allocation enforcement.
+    #[test]
+    fn wasm_initial_memory_over_cap_fails_the_load() {
+        // IDENTITY_WAT declares `(memory 1)` = one 64 KiB page as its initial allocation.
+        let wasm = wat::parse_str(IDENTITY_WAT).expect("valid wat");
+        let e = WasmEngine::new();
+        let mut m = manifest(Backend::Beast, "gawd_creature_v1");
+        m.capabilities.mem_bytes = 1024; // far below 64 KiB → the initial allocation is refused
+        assert!(
+            matches!(e.load(&Artifact::Bytes(wasm), &m), Err(EngineError::Load(_))),
+            "an initial linear-memory allocation over the mem_bytes cap must fail the load"
+        );
+    }
+
+    /// **E3 — beast wall-clock.** A spinning beast with *unlimited fuel* (`cpu_ms == 0`) but a tight
+    /// `wall_ms` cap trips the engine-global epoch deadline (`Trap::Interrupt`) → a `Hard` `Wall`
+    /// budget signal, riding the same gradient shape as a fuel breach. A fine tick makes it prompt.
+    #[test]
+    fn wasm_wall_ms_budget_traps_with_wall_signal_when_fuel_is_unlimited() {
+        let _spin = budget_spin_lock().lock().unwrap_or_else(|p| p.into_inner());
+        use aether::{LimitKind, SignalLevel};
+        let wasm = wat::parse_str(SPIN_FOREVER_WAT).expect("valid wat");
+        let e = WasmEngine::with_tick_ms(2); // 2 ms cadence
+        let mut m = manifest(Backend::Beast, "gawd_creature_v1");
+        m.capabilities.cpu_ms = 0; // unlimited fuel — so WALL, not fuel, is what trips
+        m.capabilities.wall_ms = Some(20); // ~10 ticks at a 2 ms cadence
+        let mut loaded = e.load(&Artifact::Bytes(wasm), &m).expect("beast loads");
+        let out = loaded.instance.handle(test_envelope(b""));
+        assert!(out.dispatches.is_empty(), "a wall-clock trap produces no reply");
+        let signal = out.budget_signal.expect("engine must emit a BudgetSignal on the wall trap");
+        assert_eq!(signal.level, SignalLevel::Hard, "wall traps are terminal Hard signals");
+        assert_eq!(signal.kind, LimitKind::Wall, "an epoch-deadline trap classifies as Wall");
+        assert_eq!(signal.vector.limit, 20, "limit reflects the declared wall_ms cap");
+        assert!(signal.vector.consumed > 0, "the Wall vector reports ms elapsed");
+        assert_eq!(signal.vector.envelopes_since_load, 1, "first envelope handled");
+        e.unload(loaded, Deadline::default()).expect("beast unloads cleanly after the wall trap");
+    }
+
+    /// **E3 negative** — a quick, bounded beast with no `wall_ms` cap completes normally; the epoch
+    /// deadline never trips. Locks the "wall_ms == None ⇒ unlimited" convention (mirroring cpu_ms==0).
+    #[test]
+    fn wasm_wall_ms_none_means_no_wall_trap() {
+        let wasm = wat::parse_str(BOUNDED_LOOP_WAT).expect("valid wat");
+        let e = WasmEngine::with_tick_ms(2);
+        let m = manifest(Backend::Beast, "gawd_creature_v1"); // cpu_ms=0, wall_ms=None
+        let mut loaded = e.load(&Artifact::Bytes(wasm), &m).expect("beast loads");
+        let out = loaded.instance.handle(test_envelope(b"hi"));
+        assert_eq!(out.dispatches.len(), 1, "no wall cap ⇒ the bounded loop completes and replies");
+        assert_eq!(out.dispatches[0].payload, b"hi");
+        assert!(out.budget_signal.is_none(), "wall_ms=None never trips a wall signal");
+        e.unload(loaded, Deadline::default()).expect("beast unloads");
+    }
 }

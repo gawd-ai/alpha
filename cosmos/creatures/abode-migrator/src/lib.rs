@@ -239,6 +239,14 @@ struct PendingMigration {
     challenge: String,
     operator_reply_to: Address,
     operator_corr: Option<u64>,
+    /// The pre-shared trust anchor: the pubkey the operator expects the destination to sign its
+    /// witness under, pinned on the `Migrate` op. `None` falls back to the legacy challenge/node guard
+    /// (weaker, but never weaker than v0.4.0). The load-bearing addition that turns a self-consistent
+    /// responder signature into a *trusted* one (M9-2).
+    expected_responder_pubkey: Option<String>,
+    /// The source snapshot's `state_hash`, parked at migrate time so the requester reconstructs the
+    /// responder witness from its own knowledge — not from the now-mutable `Authoritative` state.
+    snapshot_state_hash: String,
 }
 
 /// Every wire message the migrator speaks. Single tagged enum on schema [`SCHEMA`].
@@ -265,6 +273,13 @@ pub enum MigratorMsg {
     Migrate {
         destination_node: NodeId,
         destination_migrator: CreatureId,
+        /// The pre-shared trust anchor (M9-2): the Abode pubkey (hex) the operator expects the
+        /// destination migrator to sign its responder witness under. `#[serde(default)]` so an
+        /// operator who omits it falls back to the legacy challenge/node-only guard (additive,
+        /// non-breaking). With it pinned, a forged responder keypair is refused even though its
+        /// signature verifies under itself.
+        #[serde(default)]
+        expected_responder_pubkey: Option<String>,
     },
     /// Read-only query of the migrator's current state. Always allowed. Reply: `StatusReply`.
     StatusQuery,
@@ -317,6 +332,17 @@ pub enum MigratorMsg {
         /// falsely rejected.
         #[serde(default)]
         responder_node: NodeId,
+        /// **Responder witness** (M9-2) — a hex ed25519 signature, by the responder's Abode key, over
+        /// `(source abode_key ‖ state_hash ‖ challenge ‖ responder_node ‖ responder_pubkey)`. Present
+        /// only on an `admitted: true` reply (a refusal ran no admission, so carries no witness).
+        /// `#[serde(default)]` so an old/unsigned responder deserializes to `None`.
+        #[serde(default)]
+        responder_signature: Option<String>,
+        /// The Abode pubkey (hex) the witness verifies under — the responder's own identity, *not* the
+        /// source key. The requester verifies the signature under this AND binds it to the pre-shared
+        /// anchor (`expected_responder_pubkey`). `#[serde(default)]` → `None` for an old responder.
+        #[serde(default)]
+        responder_pubkey: Option<String>,
     },
 }
 
@@ -361,6 +387,11 @@ pub struct AbodeMigrator {
     /// Whether to require a signature on every inbound `RestoreRequest.snapshot`. Default
     /// `true`; operator flips for a sealed test harness or a single-tenant lab.
     require_signed_snapshots: bool,
+    /// Whether to require a cryptographic **responder witness** on every admitting `RestoreResponse`
+    /// before sealing the source (M9-2). Default `true`: an old/unsigned responder cannot seal a
+    /// migration that demands proof. Operator flips for a sealed lab via
+    /// [`with_unsigned_responder_allowed`](AbodeMigrator::with_unsigned_responder_allowed).
+    require_signed_responders: bool,
     /// Verifier used by the substrate's `verify_signature` gate. Default `Ed25519Verifier`;
     /// operator swaps for tests that want a deterministic stub.
     verifier: Arc<dyn Verifier>,
@@ -391,6 +422,7 @@ impl AbodeMigrator {
             restore_policy,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             require_signed_snapshots: true,
+            require_signed_responders: true,
             verifier: Arc::new(Ed25519Verifier),
             pending: None,
             next_consult_corr: 1_000_000,
@@ -408,6 +440,15 @@ impl AbodeMigrator {
     /// `require_signed_snapshots = true` (the default) and never calls this.
     pub fn with_unsigned_snapshots_allowed(mut self) -> Self {
         self.require_signed_snapshots = false;
+        self
+    }
+
+    /// Allow an unsigned/legacy responder to seal a migration — skips the M9-2 responder-witness
+    /// check and falls back to the challenge/node guard alone. A sealed-lab posture; production binds
+    /// `require_signed_responders = true` (the default) and never calls this. Mirrors
+    /// [`with_unsigned_snapshots_allowed`](AbodeMigrator::with_unsigned_snapshots_allowed).
+    pub fn with_unsigned_responder_allowed(mut self) -> Self {
+        self.require_signed_responders = false;
         self
     }
 
@@ -453,16 +494,36 @@ impl Creature for AbodeMigrator {
         match msg {
             MigratorMsg::SetState { payload } => self.on_set_state(&env, payload),
             MigratorMsg::SnapshotRequest => self.on_snapshot_request(&env),
-            MigratorMsg::Migrate { destination_node, destination_migrator } => {
-                self.on_migrate(&env, destination_node, destination_migrator)
-            }
+            MigratorMsg::Migrate {
+                destination_node,
+                destination_migrator,
+                expected_responder_pubkey,
+            } => self.on_migrate(
+                &env,
+                destination_node,
+                destination_migrator,
+                expected_responder_pubkey,
+            ),
             MigratorMsg::StatusQuery => self.on_status_query(&env),
             MigratorMsg::RestoreRequest { snapshot, note, challenge } => {
                 self.on_restore_request(&env, snapshot, note, challenge)
             }
-            MigratorMsg::RestoreResponse { admitted, reason, challenge, responder_node } => {
-                self.on_restore_response(&env, admitted, reason, challenge, responder_node)
-            }
+            MigratorMsg::RestoreResponse {
+                admitted,
+                reason,
+                challenge,
+                responder_node,
+                responder_signature,
+                responder_pubkey,
+            } => self.on_restore_response(
+                &env,
+                admitted,
+                reason,
+                challenge,
+                responder_node,
+                responder_signature,
+                responder_pubkey,
+            ),
             // Replies arriving as inbound (echo, replay, or a misdirected envelope) — drop.
             // The migrator is the *issuer* of these variants, never the consumer.
             MigratorMsg::StateSet
@@ -516,6 +577,7 @@ impl AbodeMigrator {
         env: &Envelope,
         destination_node: NodeId,
         destination_migrator: CreatureId,
+        expected_responder_pubkey: Option<String>,
     ) -> Outcome {
         if self.pending.is_some() {
             return reply(
@@ -585,6 +647,10 @@ impl AbodeMigrator {
             challenge: challenge.clone(),
             operator_reply_to,
             operator_corr,
+            expected_responder_pubkey,
+            // Park our own snapshot's state_hash so we can reconstruct the responder witness without
+            // re-deriving it from the (soon-to-be-sealed) Authoritative state.
+            snapshot_state_hash: snapshot.state_hash.clone(),
         });
 
         // Build the RestoreRequest. reply_to points at this migrator so the peer's
@@ -654,6 +720,10 @@ impl AbodeMigrator {
                     reason,
                     challenge: challenge.clone(),
                     responder_node: self_node.clone(),
+                    // A refusal ran no admission, so it carries no witness (M9-2). Only the
+                    // `admitted: true` exit below attaches one.
+                    responder_signature: None,
+                    responder_pubkey: None,
                 },
             )
         };
@@ -713,11 +783,36 @@ impl AbodeMigrator {
             return respond(false, Some(format!("restore-policy: {reason}")));
         }
 
-        // All gates passed. Activate.
+        // All gates passed. Activate, then sign a responder witness (M9-2) so the source can prove
+        // this body actually ran the gates and is the anchored destination. The witness binds the
+        // proof to THIS snapshot (`abode_key` + `state_hash`), THIS migration (`challenge`), and THIS
+        // responder identity (`responder_node` + our own `responder_pubkey`) — so it can't be replayed
+        // onto another snapshot/migration or claimed by another node. We sign over the *source's*
+        // `snapshot.abode_key` (the body, known to both) but our *own* pubkey is the identity.
         self.state = AbodeState::Authoritative { payload: inner };
-        respond(true, None)
+        let responder_pubkey = self.abode_key_public_hex.clone();
+        let witness = responder_witness_payload(
+            &snapshot.abode_key,
+            &snapshot.state_hash,
+            &challenge,
+            &self_node.0,
+            &responder_pubkey,
+        );
+        let responder_signature = self.abode_key.sign(&witness);
+        reply(
+            env,
+            MigratorMsg::RestoreResponse {
+                admitted: true,
+                reason: None,
+                challenge,
+                responder_node: self_node,
+                responder_signature: Some(responder_signature),
+                responder_pubkey: Some(responder_pubkey),
+            },
+        )
     }
 
+    #[allow(clippy::too_many_arguments)] // mirrors the RestoreResponse wire shape one-to-one
     fn on_restore_response(
         &mut self,
         env: &Envelope,
@@ -725,6 +820,8 @@ impl AbodeMigrator {
         reason: Option<String>,
         challenge: String,
         responder_node: NodeId,
+        responder_signature: Option<String>,
+        responder_pubkey: Option<String>,
     ) -> Outcome {
         // Match against pending by corr. A response without a matching pending is a late /
         // duplicate / spurious reply; drop silently.
@@ -762,6 +859,61 @@ impl AbodeMigrator {
         }
 
         if admitted {
+            // **Responder witness** (M9-2). The challenge/node guard above proves the reply came back
+            // on the right correlation from a party claiming the right node — but not that it actually
+            // ran the six admission gates and is the *anchored* destination. Require a cryptographic
+            // witness before sealing. Each failure is a hard refuse that KEEPS the self authoritative
+            // and re-parks the pending (a genuine later reply can still complete the migration).
+            if self.require_signed_responders {
+                // (1) Witness present. An old/unsigned responder cannot seal a migration that
+                //     demands proof (the sealed-lab posture opts out via with_unsigned_responder_allowed).
+                let (sig, pubkey) = match (&responder_signature, &responder_pubkey) {
+                    (Some(s), Some(p)) => (s, p),
+                    _ => {
+                        eprintln!(
+                            "abode-migrator: REFUSED RestoreResponse on corr {} — a signed responder \
+                             is required but the response carried no witness; staying Authoritative",
+                            pending.consult_corr
+                        );
+                        self.pending = Some(pending);
+                        return Outcome::none();
+                    }
+                };
+                // (2) Signature verifies. Reconstruct the witness from our OWN knowledge (never the
+                //     response body): our snapshot's abode_key + state_hash, our challenge, the
+                //     destination we shipped to, and the responder's claimed pubkey.
+                let witness = responder_witness_payload(
+                    &self.abode_key_public_hex,
+                    &pending.snapshot_state_hash,
+                    &pending.challenge,
+                    &pending.destination_node.0,
+                    pubkey,
+                );
+                if !self.verifier.verify(pubkey, &witness, sig) {
+                    eprintln!(
+                        "abode-migrator: REFUSED RestoreResponse on corr {} — the responder witness \
+                         signature did not verify; staying Authoritative",
+                        pending.consult_corr
+                    );
+                    self.pending = Some(pending);
+                    return Outcome::none();
+                }
+                // (3) Anchor binding. A self-consistent signature is not enough: bind the responder
+                //     pubkey to the pre-shared anchor pinned at migrate time. A forged keypair verifies
+                //     under itself (step 2) but fails here. With no anchor pinned, the protection
+                //     degrades to the legacy challenge/node guard (documented weaker posture).
+                if let Some(anchor) = &pending.expected_responder_pubkey {
+                    if anchor != pubkey {
+                        eprintln!(
+                            "abode-migrator: REFUSED RestoreResponse on corr {} — responder pubkey \
+                             does not match the pinned anchor; staying Authoritative",
+                            pending.consult_corr
+                        );
+                        self.pending = Some(pending);
+                        return Outcome::none();
+                    }
+                }
+            }
             // Hand-off complete: source becomes sealed; tell operator.
             self.state = AbodeState::Migrated { to: pending.destination_node.clone() };
             Outcome::send(operator_reply(
@@ -793,6 +945,29 @@ impl AbodeMigrator {
 }
 
 // ----- helpers --------------------------------------------------------------------------------
+
+/// The canonical, byte-stable bytes a **responder witness** commits to (M9-2): the source snapshot's
+/// `abode_key` + `state_hash` (binds the proof to THIS snapshot/body), the per-migration `challenge`
+/// (THIS migration), and the responder's `node` + `pubkey` (THIS responder identity). Both the signer
+/// (`on_restore_request`, admitting exit) and the verifier (`on_restore_response`) call this, so the
+/// bytes are identical on each side. Deterministic via `aether::wire::to_bytes` — the same byte-stable
+/// encoder the snapshot signing payload uses; the `responder_witness_payload_is_locked_to_a_known_fixture`
+/// tripwire pins the exact bytes so a field re-order can't silently invalidate witnesses in flight.
+fn responder_witness_payload(
+    source_abode_key: &str,
+    source_state_hash: &str,
+    challenge: &str,
+    responder_node: &str,
+    responder_pubkey: &str,
+) -> Vec<u8> {
+    aether::wire::to_bytes(&(
+        source_abode_key,
+        source_state_hash,
+        challenge,
+        responder_node,
+        responder_pubkey,
+    ))
+}
 
 /// Reply to the envelope's `reply_to` (or `from`) with a migrator message + SCHEMA + the
 /// envelope's corr. Same as `Outcome::reply` but uses MigratorMsg's wire form.
@@ -962,6 +1137,7 @@ mod tests {
             MigratorMsg::Migrate {
                 destination_node: NodeId("peer-B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             2,
         ));
@@ -993,6 +1169,7 @@ mod tests {
             MigratorMsg::Migrate {
                 destination_node: NodeId("B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             1,
         ));
@@ -1012,6 +1189,7 @@ mod tests {
             MigratorMsg::Migrate {
                 destination_node: NodeId("B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             2,
         ));
@@ -1031,6 +1209,7 @@ mod tests {
             MigratorMsg::Migrate {
                 destination_node: NodeId("B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             2,
         ));
@@ -1038,6 +1217,7 @@ mod tests {
             MigratorMsg::Migrate {
                 destination_node: NodeId("C".into()),
                 destination_migrator: CreatureId(98),
+                expected_responder_pubkey: None,
             },
             3,
         ));
@@ -1090,14 +1270,39 @@ mod tests {
         }
     }
 
+    /// Extract the signed snapshot from the `RestoreRequest` a migrator emits on `Migrate`, so a test
+    /// can read its `state_hash` to reconstruct the responder witness the way a real destination does.
+    fn snapshot_of(out: &Outcome) -> AbodeSnapshot {
+        match MigratorMsg::parse(&out.dispatches[0].payload).unwrap() {
+            MigratorMsg::RestoreRequest { snapshot, .. } => snapshot,
+            other => panic!("expected RestoreRequest, got {other:?}"),
+        }
+    }
+
     /// Build a `RestoreResponse` envelope as a peer migrator would, with an explicit `challenge`
-    /// and `responder_node`, so a test can exercise the responder-authentication gate.
+    /// and `responder_node` but **no witness** — for the legacy challenge/node guard (paired with a
+    /// migrator built `.with_unsigned_responder_allowed()`). The witness path has its own builder.
     fn restore_response_env(
         corr: u64,
         admitted: bool,
         reason: Option<String>,
         challenge: String,
         responder_node: NodeId,
+    ) -> Envelope {
+        restore_response_env_signed(corr, admitted, reason, challenge, responder_node, None, None)
+    }
+
+    /// As [`restore_response_env`] but with the optional M9-2 responder witness
+    /// (`responder_signature` + `responder_pubkey`) so a test can drive the cryptographic gate.
+    #[allow(clippy::too_many_arguments)] // a test builder mirroring the full RestoreResponse wire shape
+    fn restore_response_env_signed(
+        corr: u64,
+        admitted: bool,
+        reason: Option<String>,
+        challenge: String,
+        responder_node: NodeId,
+        responder_signature: Option<String>,
+        responder_pubkey: Option<String>,
     ) -> Envelope {
         Envelope {
             header: Header {
@@ -1112,8 +1317,15 @@ mod tests {
                 commitment: None,
                 schema: SCHEMA.into(),
             },
-            payload: MigratorMsg::RestoreResponse { admitted, reason, challenge, responder_node }
-                .to_bytes(),
+            payload: MigratorMsg::RestoreResponse {
+                admitted,
+                reason,
+                challenge,
+                responder_node,
+                responder_signature,
+                responder_pubkey,
+            }
+            .to_bytes(),
         }
     }
 
@@ -1275,12 +1487,16 @@ mod tests {
         // Direct unit test: emulate the response envelope arriving from the peer back to A's
         // migrator after on_migrate parked a pending. A's migrator transitions to Migrated and
         // replies MigrateAck to the operator at the original corr.
-        let mut m = build_migrator(key(0xD1)).with_consult_corr_seed(2000);
+        // Legacy challenge/node guard only (no witness): opt out of the M9-2 signed-responder gate.
+        let mut m = build_migrator(key(0xD1))
+            .with_consult_corr_seed(2000)
+            .with_unsigned_responder_allowed();
         m.handle(op_env(MigratorMsg::SetState { payload: b"S".to_vec() }, 1));
         let mig = m.handle(op_env(
             MigratorMsg::Migrate {
                 destination_node: NodeId("peer-B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             555, // operator's original corr
         ));
@@ -1313,6 +1529,7 @@ mod tests {
             MigratorMsg::Migrate {
                 destination_node: NodeId("peer-B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             777,
         ));
@@ -1341,6 +1558,7 @@ mod tests {
             MigratorMsg::Migrate {
                 destination_node: NodeId("peer-B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             1,
         ));
@@ -1359,12 +1577,17 @@ mod tests {
         // A RestoreResponse on the CORRECT corr but from the wrong origin — or echoing the
         // wrong challenge — must NOT seal the source. Only the genuine reply (right corr + right
         // challenge + the destination node we shipped to) completes the migration.
-        let mut m = build_migrator(key(0xE9)).with_consult_corr_seed(5000);
+        // This test exercises the legacy challenge/node guard; opt out of the M9-2 witness gate so
+        // the genuine (right corr + challenge + node) reply at the end completes the migration.
+        let mut m = build_migrator(key(0xE9))
+            .with_consult_corr_seed(5000)
+            .with_unsigned_responder_allowed();
         m.handle(op_env(MigratorMsg::SetState { payload: b"S".to_vec() }, 1));
         let mig = m.handle(op_env(
             MigratorMsg::Migrate {
                 destination_node: NodeId("peer-B".into()),
                 destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
             },
             42,
         ));
@@ -1408,6 +1631,190 @@ mod tests {
             MigratorMsg::parse(&out.dispatches[0].payload).unwrap(),
             MigratorMsg::MigrateAck { .. }
         ));
+    }
+
+    // ----- M9-2: responder witness authentication ----
+
+    #[test]
+    fn on_restore_response_without_responder_signature_proof_is_refused() {
+        // With require_signed_responders = true (the default), an admitting RestoreResponse must carry
+        // a witness that (2) verifies AND (3) matches the pinned anchor. A missing witness, a bad
+        // signature, or a forged keypair unbound to the anchor is refused (self stays Authoritative,
+        // pending re-parked); only the genuine, anchor-matching, correctly-signed reply completes it.
+        let src = key(0xF1);
+        let src_pub = src.public_hex().to_string();
+        let responder = key(0xF2);
+        let responder_pub = responder.public_hex().to_string();
+        let dest = NodeId("peer-B".into());
+
+        // Build the source, pinning the responder's pubkey as the trust anchor on the Migrate op.
+        let mut m = build_migrator(src).with_consult_corr_seed(6000);
+        m.handle(op_env(MigratorMsg::SetState { payload: b"S".to_vec() }, 1));
+        let mig = m.handle(op_env(
+            MigratorMsg::Migrate {
+                destination_node: dest.clone(),
+                destination_migrator: CreatureId(99),
+                expected_responder_pubkey: Some(responder_pub.clone()),
+            },
+            42,
+        ));
+        let challenge = challenge_of(&mig);
+        let state_hash = snapshot_of(&mig).state_hash;
+        // Build the witness signature a given signer would produce for a given claimed pubkey.
+        let witness_sig = |signer: &Ed25519KeyMaterial, pubkey: &str| -> String {
+            signer.sign(&responder_witness_payload(
+                &src_pub,
+                &state_hash,
+                &challenge,
+                &dest.0,
+                pubkey,
+            ))
+        };
+
+        // (a) Right corr + challenge + node, but NO witness → refused (a signed responder is required).
+        let out = m.handle(restore_response_env(6000, true, None, challenge.clone(), dest.clone()));
+        assert!(out.dispatches.is_empty(), "a witness-less response must not seal the source");
+        assert!(matches!(m.state(), AbodeState::Authoritative { .. }));
+        assert!(m.has_pending_migration(), "pending re-parked for a genuine later reply");
+
+        // (b) Anchor-matching pubkey but a BOGUS signature → refused at the verify step.
+        let out = m.handle(restore_response_env_signed(
+            6000,
+            true,
+            None,
+            challenge.clone(),
+            dest.clone(),
+            Some("0".repeat(128)),
+            Some(responder_pub.clone()),
+        ));
+        assert!(out.dispatches.is_empty(), "an unverifiable witness must be refused");
+        assert!(matches!(m.state(), AbodeState::Authoritative { .. }));
+        assert!(m.has_pending_migration());
+
+        // (c) A FORGED keypair: its signature verifies under itself (step 2) but the pubkey is not the
+        //     pinned anchor (step 3) → refused. This is the load-bearing case the anchor exists for.
+        let forger = key(0xFF);
+        let forger_pub = forger.public_hex().to_string();
+        let out = m.handle(restore_response_env_signed(
+            6000,
+            true,
+            None,
+            challenge.clone(),
+            dest.clone(),
+            Some(witness_sig(&forger, &forger_pub)),
+            Some(forger_pub),
+        ));
+        assert!(out.dispatches.is_empty(), "a forged, unbound responder is refused at the anchor");
+        assert!(matches!(m.state(), AbodeState::Authoritative { .. }));
+        assert!(m.has_pending_migration());
+
+        // (d) The genuine, anchor-matching, correctly-signed response → completes to Migrated.
+        let genuine_sig = witness_sig(&responder, &responder_pub);
+        let out = m.handle(restore_response_env_signed(
+            6000,
+            true,
+            None,
+            challenge.clone(),
+            dest.clone(),
+            Some(genuine_sig),
+            Some(responder_pub),
+        ));
+        assert_eq!(m.state(), &AbodeState::Migrated { to: dest });
+        assert!(!m.has_pending_migration());
+        assert!(matches!(
+            MigratorMsg::parse(&out.dispatches[0].payload).unwrap(),
+            MigratorMsg::MigrateAck { .. }
+        ));
+    }
+
+    #[test]
+    fn responder_round_trip_signs_a_witness_the_requester_verifies() {
+        // End-to-end at the unit level: the responder's on_restore_request signs a witness on the
+        // admitting exit, and the requester's on_restore_response verifies it (no anchor pinned →
+        // the witness is still required and must verify, only the anchor-binding step is skipped).
+        let responder_key = key(0x5A);
+        let responder_pub = responder_key.public_hex().to_string();
+        let mut responder = build_migrator(responder_key);
+        // Source builds a real snapshot so the responder signs over genuine (abode_key, state_hash).
+        let mut source = build_migrator(key(0x5B)).with_consult_corr_seed(7000);
+        source.handle(op_env(MigratorMsg::SetState { payload: b"the-self".to_vec() }, 1));
+        let mig = source.handle(op_env(
+            MigratorMsg::Migrate {
+                destination_node: NodeId("test-node".into()), // responder's self_node
+                destination_migrator: CreatureId(7),
+                expected_responder_pubkey: None,
+            },
+            9,
+        ));
+        let snapshot = snapshot_of(&mig);
+        let challenge = challenge_of(&mig);
+
+        // Drive the responder with the source's RestoreRequest.
+        let req = Envelope {
+            header: Header {
+                from: Address::Node(NodeId("src".into()), CreatureId(1)),
+                to: Address::Creature(CreatureId(7)),
+                reply_to: Some(Address::Node(NodeId("src".into()), CreatureId(1))),
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(7000),
+                commitment: None,
+                schema: SCHEMA.into(),
+            },
+            payload: MigratorMsg::RestoreRequest { snapshot, note: None, challenge }.to_bytes(),
+        };
+        let resp_out = responder.handle(req);
+        let resp = MigratorMsg::parse(&resp_out.dispatches[0].payload).unwrap();
+        let (admitted, responder_signature, responder_pubkey) = match resp {
+            MigratorMsg::RestoreResponse {
+                admitted,
+                responder_signature,
+                responder_pubkey,
+                ..
+            } => (admitted, responder_signature, responder_pubkey),
+            other => panic!("expected RestoreResponse, got {other:?}"),
+        };
+        assert!(admitted, "permissive policy admits");
+        assert!(responder_signature.is_some(), "an admitting reply carries a witness");
+        assert_eq!(responder_pubkey.as_deref(), Some(responder_pub.as_str()));
+
+        // Feed it back to the source — the witness verifies and the migration completes.
+        let response_env = restore_response_env_signed(
+            7000,
+            true,
+            None,
+            challenge_of(&mig),
+            NodeId("test-node".into()),
+            responder_signature,
+            responder_pubkey,
+        );
+        let out = source.handle(response_env);
+        assert_eq!(source.state(), &AbodeState::Migrated { to: NodeId("test-node".into()) });
+        assert!(matches!(
+            MigratorMsg::parse(&out.dispatches[0].payload).unwrap(),
+            MigratorMsg::MigrateAck { .. }
+        ));
+    }
+
+    #[test]
+    fn responder_witness_payload_is_locked_to_a_known_fixture() {
+        // Pin the exact witness bytes for a fixed input. A field re-order or a non-byte-stable
+        // encoding would change these bytes and silently invalidate every responder signature in
+        // flight; this tripwire fires first. (Mirrors AbodeSnapshot::signing_payload_hash_is_locked.)
+        let payload = responder_witness_payload(
+            "source-abode-key",
+            "state-hash-abc",
+            "challenge-xyz",
+            "responder-node",
+            "responder-pubkey",
+        );
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            r#"["source-abode-key","state-hash-abc","challenge-xyz","responder-node","responder-pubkey"]"#,
+            "the responder witness payload shape/encoding changed — in-flight responder signatures would break"
+        );
     }
 
     // ----- malformed input + wrong schema ----

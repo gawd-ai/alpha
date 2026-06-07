@@ -21,15 +21,37 @@ sanctum = { path = "../sanctum" }
 # message types (AuthoringRequest, BuildOp, BuildReply, BuildCritterOp, TransportCtl) are also the
 # payloads `run_verb` builds, so the core links them as the one source of the control vocabulary.
 agent-templated = { path = "../creatures/agent-templated" }
+# The injected-model seam (leaf crate). Non-optional: the boot recipe names `mind::ModelConfig` in
+# its `Authoring` choice as plain data, so the config type is always present. Without `openai` it
+# links no `ureq`/TLS — just the trait + config + Fake/Slow models.
+mind = { path = "../mind" }
+# The model-backed author. Optional: only the `openai` feature links it (and `ureq`); the default
+# build binds the deterministic `agent-templated` author and is byte-identical to v0.4.0.
+agent-mind = { path = "../creatures/agent-mind", optional = true }
 build-cargo = { path = "../creatures/build-cargo" }
 build-critter = { path = "../creatures/build-critter" }
 registry-mem = { path = "../creatures/registry-mem" }
+# The Bestiary contract crate: the registry wire enums (RegistryOp/RegistryReply) the registry verbs
+# build, plus the additive `bestiary.op` (BestiaryOp/BestiaryReply) the `bestiary_prove` verb speaks.
+# A leaf/contract crate (no creature edge), so the control core can name the wire without pulling a
+# registry creature.
+bestiary = { path = "../bestiary" }
 transport-tcp = { path = "../creatures/transport-tcp" }
 monitor = { path = "../creatures/prototypes/monitor" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+# The real model-backed author. Enables the optional `agent-mind` dep (with its OpenAI-compatible
+# model) and lets the boot recipe bind it onto Role::AUTHORING when the composition root passes a
+# `mind::ModelConfig` (sourced from the operator's `--author-*` flags — never the environment).
+openai = ["dep:agent-mind", "agent-mind/openai", "mind/openai"]
+
 [dev-dependencies]
 # The control-on-the-bus integration test boots a real kernel (three engines + the dev policy) and
 # drives `Role::CONTROL` with `Verb` envelopes, asserting `VerbResult` envelopes come back.
 policy-dev = { path = "../creatures/prototypes/policies/policy-dev" }
+# The registry-verbs test also binds a real durable `bestiary-daemon` (signed boot) to Role::REGISTRY
+# to prove the `bestiary_prove` verb round-trips an `EntryProof` — needs the daemon + a signing policy.
+bestiary-daemon = { path = "../creatures/bestiary-daemon" }
+policy-signed = { path = "../creatures/prototypes/policies/policy-signed" }

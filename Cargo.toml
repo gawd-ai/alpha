@@ -10,6 +10,7 @@ members = [
     # ---- narrated, runnable demos (stay at the root, alongside the door they exercise) ----
     "demos/walkthrough",
     "demos/federation",
+    "demos/bestiary-live",
 
     # ---- everything between α and Ω lives under cosmos/ ----
 
@@ -21,12 +22,18 @@ members = [
     "cosmos/forge",
 
     # ---- first-class concept crates: promoted out of aether so future authority lands in a home that
-    #      already exists. abode/seer carry live contracts; realm/omega (= Ω) are embryos that imprint
-    #      the cosmology now. Layering: aether → {seer, abode, realm} → omega ----
+    #      already exists. abode/seer/bestiary carry live contracts; realm/omega (= Ω) are embryos that
+    #      imprint the cosmology now. Layering: aether → {seer, abode, realm, bestiary} → omega ----
     "cosmos/abode",
     "cosmos/seer",
     "cosmos/realm",
+    "cosmos/bestiary",
     "cosmos/omega",
+
+    # ---- the injected model seam: a leaf crate (depends on no creature) carrying the `Model`
+    #      contract so BOTH the model-backed author (agent-mind) and the Bestiary curator can consume
+    #      a model with no contract-crate → creature edge. "ASI is the fabric, not the model." ----
+    "cosmos/mind",
 
     # ---- control plane: the shared command core (omni) + the loadable surfaces
     #      (the node daemon + MCP hub composition roots live in the `alpha` crate) ----
@@ -37,10 +44,12 @@ members = [
     # ---- creatures: production-capable reference organs (the real substrate creatures) ----
     "cosmos/creatures/transport-tcp",
     "cosmos/creatures/registry-mem",
+    "cosmos/creatures/bestiary-daemon",
     "cosmos/creatures/build-cargo",
     "cosmos/creatures/build-critter",
     "cosmos/creatures/agent-templated",
     "cosmos/creatures/agent-curious",
+    "cosmos/creatures/agent-mind",
     "cosmos/creatures/distributor-requirements",
     "cosmos/creatures/embodiment-advertiser",
     "cosmos/creatures/omega-federator",
@@ -83,7 +92,7 @@ members = [
     "cosmos/creatures/prototypes/fixtures/welbehaved-thread-daemon",
 ]
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Alex Grenier <alex@gawd.ai>"]
 license = "GPL-3.0-or-later"

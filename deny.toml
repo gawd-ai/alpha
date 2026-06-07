@@ -34,7 +34,7 @@ allow = [
     # Arrived with the daemon control plane's HTTP/WebSocket stack. OSI/FSF-recognized permissive
     # license, one-way GPL-3-compatible. (The `MIT AND BSD-3-Clause` expression on some crates is
     # satisfied once both halves are allowed.)
-    "BSD-3-Clause",        # common permissive license in the rustls chain (e.g. `subtle`)
+    "BSD-3-Clause",        # permissive; arrived with the daemon HTTP/WS stack (one-way GPL-3-compatible)
     # Public-domain dedication (FSF Free/Libre, GPL-3-compatible). Arrived with the critter tier:
     # rhai → ahash (compile-time-rng) → const-random → tiny-keccak is CC0-1.0. ahash's feature is
     # enabled transitively by rhai and cannot be subtracted (Cargo features only union), so the
@@ -45,6 +45,19 @@ allow = [
     # MPL-licensed files themselves; we consume the crate unmodified, so it imposes nothing on GAWD's
     # own GPL-3 code. A non-optional rhai dep — unavoidable without forking rhai.
     "MPL-2.0",
+    # OSI/FSF-recognized permissive license (Unicode License v3), GPL-3-compatible. Arrived ONLY
+    # under the `--features openai` tree: ureq → url → idna → the ICU4X stack (icu_normalizer /
+    # icu_properties / icu_collections / icu_locale_core / icu_provider + zerovec / tinystr / …) is
+    # Unicode-3.0. The modern cargo resolver PRUNES an unused optional dep from `cargo metadata`, so
+    # the feature-blind default `cargo deny check` never sees this tree; this entry guards the
+    # `cargo deny --all-features check` CI step (which does). Harmless to the default job (the license
+    # is simply absent there).
+    "Unicode-3.0",
+    # Community Data License Agreement – Permissive 2.0. A permissive *data* license (no copyleft,
+    # GPL-3-compatible). Also `--features openai`-only: it covers `webpki-roots` (the bundled Mozilla
+    # root-CA trust anchors ureq's rustls TLS uses to verify api.openai.com). Same with-feature deny
+    # step as Unicode-3.0 above.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

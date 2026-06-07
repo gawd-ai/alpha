@@ -64,9 +64,13 @@ A creature becomes useful beyond its origin node when it can be **published, dis
 fetched**. That is the registry — and, viewed across the Ω, the **Bestiary**: the catalogue of
 creatures, which doubles as the evolutionary gene pool.
 
-The substrate ships a socket, `Role::REGISTRY`, and `creatures/registry-mem` fills it as the
-reference in-memory store. Operators who want persistence or replication write their own creature
-with the same op vocabulary; the kernel does not care.
+The substrate ships a socket, `Role::REGISTRY`, and two creatures fill it: `creatures/registry-mem`,
+the reference **in-memory** store (the stub — no persistence, no replication), and
+`creatures/bestiary-daemon`, a **durable, distributed, AI-curated** store. Both speak the *same* op
+vocabulary, so a test or a demo picks one by which `Box<dyn Creature>` it loads; an operator who wants
+something else writes a third on the same socket and the kernel is none the wiser. The wire types
+themselves live in the `bestiary` contract crate (`registry-mem` re-exports them), so the catalogue
+contract and its durable implementation never drift.
 
 - **Keyed by `(RealmId, artifact_hash)`.** `artifact_hash` is `sha256(artifact_bytes)`. Two
   creatures with identical bytes in different Realms are distinct entries by construction — Realm
@@ -91,6 +95,50 @@ and stamps `signed_by` + `signature`, so an admission policy can verify it. A **
 reputation is *unsigned* in the slot — its provenance is the `attesting_realm` tag, because the
 observer signed the SEER *delta* (a different payload), verified by the federator at ingest. Both
 live in the one slot without retrofit, distinguishable by provenance.
+
+### The durable Bestiary
+
+`bestiary-daemon` is the registry made **durable, replicated, and curated**, while serving every
+existing `RegistryOp` byte-for-byte — so any creature that consults `Role::REGISTRY` over the bus
+works against it unchanged. Its new capability rides an additive `bestiary.op` schema
+(`ProveEntry` / `Compact` / `PushEntries`), so the legacy wire is untouched.
+
+- **On-disk, integrity-first.** The reference `FsBestiaryStore` lays an artifact out as a
+  content-addressed, deduplicated blob (`<root>/blobs/<artifact_hash>`, atomic temp-then-rename) and a
+  per-Realm **tamper-evident signed log** (`<root>/log/<realm_hash>.jsonl`). Each `LogRecord` chains to
+  the prior record's hash and is signed by the daemon's Abode key, so a flipped byte or a spliced entry
+  is caught on replay. The Realm name is **only ever hashed**, never path-joined — a `RealmId` from the
+  wire may contain `/` or `..`, so joining it into a path would be a remote arbitrary-file-write
+  primitive; hashing closes it.
+- **A self-owned journal.** `recover()` replays the log at bind and **rejects any record not authored by
+  the daemon's own key** (`ForeignAuthor`). The on-disk log is a self-owned journal, not a federation
+  inbox: peer entries never arrive as foreign records replayed at bind — they arrive only through
+  `PushEntries`, verified and **re-signed under the local identity** on ingest.
+- **Verifiable entry proofs.** `ProveEntry` returns a standalone `EntryProof` — the daemon signs
+  `(realm, artifact_hash, manifest_hash, first_seen, attester)` with its Abode key. Anyone verifies it
+  with the attester's pubkey, and because it commits to the compaction-stable `first_seen` rather than a
+  chain position, it **survives compaction** (which rewrites a fresh genesis chain). `Compact`
+  garbage-collects orphaned blobs across *all* Realms at once (a blob deduped by hash but referenced
+  per-Realm), preserving each survivor's `first_seen` verbatim.
+- **Replication is a monotonic lattice, not last-write-wins.** A `PushEntries` merge unions membership,
+  takes the **verified-greater** signed reputation (a bare push can't clobber a locally-higher signed
+  score), and treats quarantine as **sticky** — a re-put never clears it; only an explicit signed
+  `Unquarantine` does (preserving reversibility while killing the silent safety-signal drop). A
+  `Tombstone` federates as a *permanent* eviction for a regretted artifact, complementing reversible
+  quarantine. Membership converges to the union idempotently; mutable signals converge by the lattice —
+  no wall-clock arrival-order assumption, because the substrate ships no clock.
+- **AI-curated.** An injected `Curator` decides `Keep` / `Promote` / `Demote` / `Quarantine` / `Gc`
+  per entry. The reference `DeterministicCurator` is **safe-by-default** — it never collects an entry it
+  hasn't ruled on, and disables GC entirely until configured. An `AICurator` consults an injected
+  `mind::Model` over each entry's *manifest + artifact bytes* for content-aware near-duplicate and
+  anomaly judgments the deterministic one cannot make; the model call runs on the daemon's own
+  anti-entropy thread, off the synchronous catalogue path, so it never blocks a fetch. (`SeerTopic::
+  Curation` reserves the seam for an *external* curator creature consulted over the bus.)
+
+**Publish still grants no trust** here either: the durable store makes a creature *available and
+provable*, never *authorized*. Every fetched byte runs the receiver's full admission gate on load, so a
+forged `Put` smuggled past at-rest integrity is still refused at the creature-load signature/calls
+gate. Durability is at-rest hardening; admission stays the choke point.
 
 ## Embodiment and placement: the Distributor
 

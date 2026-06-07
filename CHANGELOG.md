@@ -8,6 +8,70 @@ Semantic-versioning guarantees begin at 1.0.
 For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the design notes under [`docs/design/`](docs/design/).
 
+## 0.4.1 - unreleased
+
+Turns two seam-proven claims into shipped reality — a *real model* authors creatures, and the Bestiary
+is a *durable, federated* registry — and hardens migration and budgets. Every contract change is
+strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-identical existing
+`RegistryOp`s); no existing wire breaks.
+
+### Authoring — a real model on the AUTHORING socket
+- `mind`, a leaf crate carrying the injected **model seam**: the `Model` trait plus an `OpenAiModel`
+  (feature `openai`, any OpenAI-compatible server — api.openai.com or a local Ollama/LM-Studio) and a
+  zero-dep `FakeModel` that proves the loop (including the compile-error retry) hermetically. The crate
+  never reads the environment; a `ModelConfig` is supplied by the operator surface, so a node binds a
+  model per instance.
+- `agent-mind`, a model-backed author binding the same `Role::AUTHORING` socket as `agent-templated`. It
+  is **in-process only** (never a `.so`: construction takes the model explicitly, so no
+  `Default`-built fake can be substituted), runs its slow model call **off the kernel drain thread** on
+  a self-owned worker that joins within the unload deadline, and parses the model's two-fenced-block
+  response **fail-closed** (a missing or malformed manifest stub is a structured failure, never a
+  silently-permissive default). The author is contained at the **route + admission layer**, not the
+  prompt — the live path defaults to the sandboxed tier — and emits a structured audit line per
+  completion.
+
+### Bestiary — durable, distributed, AI-curated
+- `bestiary`, a contract crate that now owns the registry wire types (`registry-mem` re-exports them),
+  plus the `BestiaryStore` trait and the `FsBestiaryStore` reference: content-addressed deduplicated
+  blobs and a per-Realm **tamper-evident signed log**. Realm names are only ever hashed, never
+  path-joined (a wire-sourced `RealmId` can carry `/` or `..`); `recover()` rejects any foreign-authored
+  record — the log is a self-owned journal, not a federation inbox.
+- `EntryProof` — a standalone signed attestation over `(realm, artifact_hash, manifest_hash,
+  first_seen, attester)` that anyone verifies and that **survives compaction**. `Compact`
+  garbage-collects orphan blobs across all Realms, preserving each survivor's `first_seen`.
+- `bestiary-daemon`, a creature filling `Role::REGISTRY` that serves every existing `RegistryOp`
+  byte-for-byte plus an additive `bestiary.op` schema (`ProveEntry` / `Compact` / `PushEntries`).
+  Replication is a **monotonic lattice**, not last-write-wins: membership unions, signed reputation
+  takes the verified-greater, quarantine is sticky (cleared only by a signed `Unquarantine`), and a
+  `Tombstone` federates as a permanent eviction. An injected `Curator` decides keep/promote/demote/
+  quarantine/GC — `DeterministicCurator` is safe-by-default, and `AICurator` consults an injected
+  `mind::Model` over an entry's bytes off the synchronous catalogue path. `SeerTopic::Curation` reserves
+  the external-curator seam. `registry-mem` stays the in-memory stub reference.
+
+### Control plane — registry & Bestiary verbs
+- Four verbs across `omni` + the HTTP and MCP surfaces: `registry publish` (by node-local path,
+  mutating/gated), `registry fetch` (metadata, not raw bytes), `registry list`, and `bestiary prove`
+  (a verifiable `EntryProof`; only a `bestiary-daemon` answers, the stub returns a structured error).
+  Each round-trips a `RegistryOp` / `BestiaryOp` on the orchestration lane; the three reads are ungated.
+
+### Abode — authenticated migration (M9-2)
+- A migration responder now returns a **cryptographic witness**: having passed all six admission gates,
+  it signs `(source abode_key ‖ state_hash ‖ challenge ‖ responder_node ‖ responder_pubkey)` with its
+  own Abode key. The source verifies it and binds the responder's pubkey to a pre-shared
+  `expected_responder_pubkey` anchor pinned on the `Migrate` op, reconstructing the witness from its own
+  parked state. Signed responders are required by default (an opt-out builder exists for legacy peers);
+  any failure keeps the source authoritative and re-parks the pending. Closes the gap where the source
+  verified only an echoed challenge.
+
+### Budgets — real enforcement
+- The **beast** tier now enforces a per-envelope `wall_ms` wall-clock cap via `wasmtime` epoch
+  interruption (one engine-global ticker; a per-handle `ceil(wall_ms / tick)` deadline), surfacing an
+  exceeded deadline as a `Hard` `BudgetSignal { kind: Wall }`. The cap is **fail-closed**: if the
+  ticker can't spawn, the engine refuses to load a beast that declares `wall_ms` rather than ignore it.
+  `Capabilities.wall_ms` is a new serde-optional manifest field (`LimitKind::Wall` is no longer
+  reserved). A failing-first regression pins beast initial-memory-over-cap rejection, and post-apoptosis
+  `NoSuchModule` assertions prove the kill actually stops the creature on the beast and critter tiers.
+
 ## 0.4.0 - 2026-06-04
 
 Alpha's first public release. The five governing loops are alive end to end, and the substrate's

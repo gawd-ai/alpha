@@ -33,7 +33,7 @@ use aether::{CreatureId, Deadline, NodeId, Role, StubSigner, StubVerifier};
 use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use sanctum::Kernel;
 
-use omni::{boot_control, boot_manifest, boot_organs_with_monitor, AiControl, ControlTarget};
+use omni::{boot_control, boot_manifest, boot_organs_with, AiControl, ControlTarget};
 use surface_mcp::SurfaceMcp;
 
 struct Opts {
@@ -45,6 +45,8 @@ struct Opts {
     listen: Option<String>,
     seeds: Vec<String>,
     cluster_key: Option<String>,
+    // Model-backed author selection (per hub instance; needs `--features openai` to take effect).
+    author: crate::AuthorFlags,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -56,6 +58,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         listen: None,
         seeds: Vec::new(),
         cluster_key: None,
+        author: crate::AuthorFlags::default(),
     };
     let mut args = args.iter().cloned();
     while let Some(a) = args.next() {
@@ -82,6 +85,24 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--seed" => o.seeds.push(args.next().ok_or("--seed needs <id@host:port#pubkey-hex>")?),
             "--cluster-key" => {
                 o.cluster_key = Some(args.next().ok_or("--cluster-key needs <64-hex seed>")?)
+            }
+            "--author-model" => {
+                o.author.model = Some(args.next().ok_or("--author-model needs <model-id>")?)
+            }
+            "--author-base-url" => {
+                o.author.base_url = Some(args.next().ok_or("--author-base-url needs <url>")?)
+            }
+            "--author-api-key" => {
+                o.author.api_key = Some(args.next().ok_or("--author-api-key needs <key>")?)
+            }
+            "--author-api-key-file" => {
+                o.author.api_key_file =
+                    Some(args.next().ok_or("--author-api-key-file needs <path>")?)
+            }
+            "--author-timeout-secs" => {
+                let v = args.next().ok_or("--author-timeout-secs needs <seconds>")?;
+                o.author.timeout_secs =
+                    Some(v.parse::<u64>().map_err(|_| "--author-timeout-secs needs an integer")?);
             }
             other => return Err(format!("unknown flag `{other}`")),
         }
@@ -140,7 +161,7 @@ pub fn run(args: &[String]) {
                 eprintln!("alpha mcp: local mode (--minimal) — bare control plane, no AUTHORING/BUILD organs.");
                 None
             } else {
-                match boot_organs_with_monitor(&kernel, false) {
+                match boot_organs_with(&kernel, false, crate::chosen_authoring(&opts.author)) {
                     Ok(bc) => Some(bc),
                     Err(e) => {
                         eprintln!("alpha mcp: organ boot incomplete: {e}");

@@ -447,8 +447,14 @@ fn phase_migration() -> Result<(), String> {
         &probe_rx,
         Dispatch::to(
             Address::Creature(src_id),
-            MigratorMsg::Migrate { destination_node: node.clone(), destination_migrator: dest_id }
-                .to_bytes(),
+            MigratorMsg::Migrate {
+                destination_node: node.clone(),
+                destination_migrator: dest_id,
+                // Local hand-off in the demo — the dest migrator signs a witness the source verifies;
+                // no pre-shared anchor pinned (M9-2 falls back to the challenge/node guard for binding).
+                expected_responder_pubkey: None,
+            }
+            .to_bytes(),
         )
         .with_schema(MIGRATOR_SCHEMA)
         .with_corr(2)

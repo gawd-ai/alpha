@@ -157,6 +157,22 @@ abandons the drain detached and returns `UnloadTimeout`. The substrate never han
 creature — the thread-count guard's bounded leak is the safety net for the abandoned drain. Creatures
 unload in reverse-chronological order so a still-running neighbor's threads aren't misread as leaked.
 
+**Off-drain workers honor the same floor.** A creature whose `handle` must do something slow — a
+model call in `agent-mind`, say — runs that work on a self-owned worker thread and emits the reply
+through its captured bus, so the drain thread is never blocked. Its `shutdown` sets a stop flag (which
+suppresses a stopped worker's reply) and joins, **deadline-bounded by polling** so it returns inside
+the kernel's unload budget; a worker still blocked in its call at the deadline is detached. This is
+sound only for an **in-process** creature — the one place an emitting worker is safe, since there is
+no `.so` FFI bus shim on that path — where a detached worker returns into no unmapped code: it
+finishes its now-stopped call, drops its reply, and exits. The residual is a bounded, in-process
+thread that lingers for the call's duration — never a use-after-free, the same floor a `.so` leak
+converges on. (Clamping the call's *own* timeout low enough to fit a 1 s deadline would make a real
+model call impossible, so the call timeout stays generous and the **join** is what's bounded.) When
+a worker is still blocked at the deadline, the thread-count guard logs its generic "leaking
+resources" line for the detached tid — but for an in-process creature the resources it would leak are
+empty, so that diagnostic is conservative (no library is actually leaked); detach is the *expected*
+in-flight-unload path under this no-clamp choice, not a fault.
+
 **Beast and critter unload trivially.** A beast's unload drops the `wasmtime` store; linear memory,
 tables, and instances all vanish atomically — there is no native UB class. A critter's teardown drops
 the Rhai engine, AST, scope, and outbox together. The same kernel drop ordering applies, but the
@@ -179,6 +195,7 @@ Enforcement is per tier:
 |---|---|---|---|
 | `fs`, `net` | Closed by construction — no host imports, no FS or net to reach. | Closed by construction — the bare engine reaches nothing; `import` and `eval` are removed. | Trusted-by-admission. The declarations are evidence an injected policy reads at admit; OS-level confinement is the operator's deployment seam. |
 | `cpu_ms` | `wasmtime` fuel, refilled per envelope. | A Rhai **operation budget** (`set_max_operations`), refilled per envelope. | Read at admit; not metered at runtime. |
+| `wall_ms` | An opt-in per-envelope **wall-clock** cap, enforced by one engine-global `wasmtime` epoch ticker; an exceeded deadline traps as a `Hard` `Wall` signal. | Not enforced (the script tier has no external interrupt thread). | Read at admit; not metered at runtime. |
 | `mem_bytes` | A custom `ResourceLimiter` refuses growth past the cap — byte-exact. | Rhai's structural caps (string/array/map size) — **best-effort counts, not bytes**, with an always-on backstop. | Read at admit; the operator's OS-level seam. |
 | `calls` | Router-side allowlist at the one bus choke point; a disallowed envelope is never delivered. Empty = unrestricted. | Same router gate. | Same router gate. |
 
@@ -190,12 +207,41 @@ authority itself, and `no_module` plus a disabled `eval` make it exactly its sig
 Its `cpu_ms` is a real operation budget; its `mem_bytes` is honestly best-effort (structural counts,
 with a bounded default backstop so one bulk-allocating builtin can't OOM the host).
 
+**The beast tier also bounds wall time.** `capabilities.wall_ms` is an opt-in per-envelope ceiling on
+*elapsed* time — the backstop for work that consumes little fuel but still blocks or spins. It is
+enforced through `wasmtime`'s **epoch interruption**: the engine enables epoch interruption once, a
+single engine-global ticker thread advances the epoch on a fixed cadence (a weak engine handle, so the
+ticker never keeps the engine alive), and each `handle` arms a per-store deadline of `ceil(wall_ms /
+tick)` epochs; an exceeded deadline surfaces as a trap and becomes a `Hard` `BudgetSignal { kind:
+Wall }` — the same apoptosis path a fuel breach takes. Two honesty notes: like fuel, the deadline is
+checked at instrumentation points the compiler weaves into the wasm code, so it bounds time spent *in*
+the beast (a beast has no host imports, so there is nothing external to block inside); and the cap is
+**fail-closed** — if the ticker thread ever fails to spawn, the engine logs the degradation and
+*refuses to load* any beast that declares `wall_ms`, rather than silently ignore the cap. A beast with
+no `wall_ms` runs under an effectively unlimited deadline, exactly as `cpu_ms == 0` means unlimited
+fuel. The critter and native tiers leave `wall_ms` unenforced (the script tier would need an external
+interrupt thread; the native tier is trusted-by-admission), so only the **beast** tier reads it as a
+live cap today.
+
 **The daemon stays honest about its limits.** The substrate does not pretend to confine in-process
 native code mid-flight. The capability declarations are evidence an injected admission policy reads —
 a policy can demand `net:none` and refuse any daemon that declares otherwise, or compose
 signed-provenance + net-restriction + author-allowlist + any custom rule. OS-level confinement
 (bwrap, firejail, seccomp, cgroups) is the operator's deployment decision, applied to the sanctum
 process, not a per-creature cage the kernel fakes.
+
+**A model-backed author is contained by the route, not the prompt.** `agent-mind` is the first place a
+real model decides what native code gets compiled and admitted — and it is prompt-injectable (both the
+request and the compiler `prev_error` fed back on retry are influenceable). The reference `build-cargo`
+emits a native `Backend::Daemon` by default — a *trusted-by-admission* creature signed with the
+operator's own Abode key — and under the dev posture (an allow-all verifier) that signature is not
+load-bearing. So containment lives where it can be enforced, the **route + admission layer, not the
+prompt**: default a model-author path to the sandboxed `critter` tier (concentric confinement:
+daemon ⊃ beast ⊃ critter), or gate model-authored native artifacts behind a model-author-specific
+admission policy. The system prompt's tier preference is advisory. For audit, the author emits one
+structured line per completion (authored-source `sha256`, model label, token usage). The honest
+containment boundary is the operator's tier choice + admission policy — the daemon's
+trusted-by-admission limit above, now with an untrusted author on the other side of it.
 
 **Budgets are observed, never judged, by the substrate.** When an engine detects pressure — fuel or
 operation exhaustion, a refused grow, a crossed warning threshold — it surfaces a `BudgetSignal`

@@ -66,14 +66,27 @@ jobs:
       - name: Demo — federation (the multi-Realm fabric runs end to end)
         run: cargo run --locked -p federation
 
+      # The opt-in real-model author (`agent-mind`) lives behind `--features openai`, which links
+      # `ureq` + a ring-backed rustls TLS stack the default build never touches. Gate the feature so
+      # the cfg'd composition root (omni) and the creature can't silently rot. No live model call is
+      # made in CI (no network, no key) — this only compiles + clippies + unit-tests the feature.
+      - name: Clippy + test (the opt-in `openai` author feature)
+        run: |
+          cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
+          cargo clippy --locked -p alpha --features openai -- -D warnings
+          cargo test --locked -p agent-mind --features openai
+
   # Supply-chain + license gate (config in `deny.toml`). Runs in parallel with the build job:
   # a new dependency carrying a security advisory, an out-of-policy license, or an unexpected
-  # source fails CI rather than landing silently.
+  # source fails CI rather than landing silently. `--features openai` is REQUIRED here: the modern
+  # cargo resolver prunes unused optional deps from `cargo metadata`, so without it the `ureq`/TLS/
+  # ICU tree (Unicode-3.0, CDLA-Permissive-2.0) is invisible to the gate.
   deny:
-    name: cargo-deny (advisories · bans · licenses · sources)
+    name: cargo-deny (advisories · bans · licenses · sources — incl. the openai tree)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
+          arguments: --all-features
           command: check

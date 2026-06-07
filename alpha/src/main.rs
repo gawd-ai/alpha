@@ -34,6 +34,9 @@ USAGE:
 COMMANDS:
     node [flags]     Boot a sanctum node daemon (REPL + optional HTTP/WS + cluster).
                      All node flags pass through: --listen --cluster-listen --exec …
+                     Model author (needs `--features openai`): --author-model <id>
+                     [--author-base-url <url>] [--author-api-key-file <path> | --author-api-key <key>]
+                     [--author-timeout-secs <n>]. Selected per node instance — never from the env.
     mcp [flags]      Boot the MCP control-hub (a headless sanctum speaking JSON-RPC on stdio).
     http --listen <addr>
                      Serve the HTTP/WS control plane (a headless node + the surface-http creature).

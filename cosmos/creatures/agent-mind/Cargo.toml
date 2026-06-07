@@ -1,0 +1,35 @@
+[package]
+name = "agent-mind"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A real, model-backed AUTHORING creature. Bound to Role::AUTHORING (in-process only — never shipped as a .so), it takes an AuthoringRequest, asks an injected mind::Model for source + a manifest stub (two fenced blocks), and replies with the same AuthoringReply the templated reference uses. The literal 'ASI is the fabric, not the model': the model is injected via the mind leaf-crate trait; the fabric ships only the socket. The slow model call runs off the kernel drain thread (transport-tcp threading discipline)."
+
+[lib]
+name = "agent_mind"
+path = "src/lib.rs"
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+seer = { path = "../../seer" }
+mind = { path = "../../mind" }
+# Reuse the AUTHORING wire contract (AuthoringRequest / AuthoringReply / AuthoringResponse /
+# AuthoringError) — byte-identical to what agent-templated speaks.
+agent-templated = { path = "../agent-templated" }
+# `ManifestStub` / `CargoDep` are defined in build-cargo and not re-exported by agent-templated.
+# agent-curious already pays this exact edge — accepted precedent, not a new cost.
+build-cargo = { path = "../build-cargo" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Hashing authored source for the per-completion observability log line. Already ubiquitous in the
+# workspace tree — adds no new crate to the dependency graph.
+sha2 = { workspace = true }
+
+[features]
+# Threads the real OpenAI-compatible model through to the `mind` leaf crate. `omni`'s `openai`
+# feature enables this; the default build links neither this creature nor `ureq`.
+openai = ["mind/openai"]

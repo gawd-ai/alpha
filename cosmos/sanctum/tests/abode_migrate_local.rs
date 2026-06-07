@@ -173,6 +173,9 @@ fn abode_migrate_local_two_migrators_on_one_sanctum_hand_off_state() {
                 MigratorMsg::Migrate {
                     destination_node: NodeId(SELF_NODE.into()),
                     destination_migrator: dest_id,
+                    // Local hand-off — the dest migrator signs a witness the source verifies; no
+                    // pinned anchor (the responder's pubkey isn't known ahead of time here).
+                    expected_responder_pubkey: None,
                 }
                 .to_bytes(),
             )

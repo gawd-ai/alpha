@@ -86,6 +86,11 @@
           "minimum": 0,
           "maximum": 255,
           "description": "Opt-in advisory threshold: emit a budget Warn after a successful handle once the consumed fraction of cpu_ms/mem_bytes crosses this percent. Intended range 0..=100; values >100 are clamped at engine load. Absent = no Warn ever fires."
+        },
+        "wall_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Opt-in per-envelope wall-clock cap (ms). A beast that exceeds this in one handle traps with a Hard Wall budget signal (enforced via wasmtime epoch interruption). Critter/daemon tiers do not enforce it. Absent = unlimited."
         }
       }
     },

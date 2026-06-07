@@ -25,6 +25,9 @@ anima = { path = "../cosmos/anima" }
 sigil = { path = "../cosmos/sigil" }
 sanctum = { path = "../cosmos/sanctum" }
 omni = { path = "../cosmos/omni" }
+# The injected-model config type. Optional: only the `openai` feature names `mind::ModelConfig` (to
+# build it from the operator's `--author-*` flags); the default build links neither it nor `ureq`.
+mind = { path = "../cosmos/mind", optional = true }
 # The injected dev admission policy each surface boots its kernel with.
 policy-dev = { path = "../cosmos/creatures/prototypes/policies/policy-dev" }
 # The loadable surface creatures + the authenticated peer transport.
@@ -39,6 +42,13 @@ ctrlc = { workspace = true }
 # `serde_json` parses the API/MCP wire + the demo registry; `serde` derives the registry types.
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# The real model-backed author, threaded through to omni → agent-mind → the mind leaf crate's
+# OpenAI-compatible model. Build with `--features openai` and select a model per node with the
+# `--author-*` flags on `alpha node` / `alpha mcp` to bind a live model onto Role::AUTHORING; without
+# the feature, `alpha` is byte-identical to v0.4.0.
+openai = ["omni/openai", "dep:mind"]
 
 [dev-dependencies]
 # The daemon/HTTP/MCP integration tests parse JSON-RPC + API responses.

@@ -70,8 +70,9 @@ pub const SCHEMA: &str = "seer";
 /// - `Authoring` — consumed by `agent-curious`.
 /// - `Placement` — consumed by `distributor-requirements` + `embodiment-advertiser`.
 /// - `Consensus` — consumed by `creatures/omega-federator` (signed reputation deltas).
-/// - `Policy`, `Budget`, `Fitness` — reserved/draft typed bodies; consumers may use the
-///   generic SEER envelope without changing the wire.
+/// - `Policy`, `Budget`, `Fitness`, `Curation` — reserved/draft typed bodies; consumers may use the
+///   generic SEER envelope without changing the wire. `Curation` is the durable Bestiary's
+///   external-curator consult seam (the in-process `bestiary::AICurator` curates directly today).
 ///
 /// `snake_case` serde rename matches the on-wire convention used by every other enum in `aether`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -98,6 +99,12 @@ pub enum SeerTopic {
     /// for signed reputation deltas; additional consensus mechanisms can land as consumers without
     /// changing the bus shape.
     Consensus,
+    /// The durable Bestiary's curation consult — a daemon's anti-entropy/compaction thread asks an
+    /// injected curator creature whether to keep / GC / quarantine an entry. **Reserved/draft typed
+    /// body** (`bestiary::AICurator` curates in-process today over the injected `mind::Model`; this
+    /// topic is the seam for an *external* curator creature, consulted off the synchronous decide
+    /// path so the model call never blocks the catalog).
+    Curation,
 }
 
 impl SeerTopic {
@@ -110,6 +117,7 @@ impl SeerTopic {
             SeerTopic::Budget => "budget",
             SeerTopic::Fitness => "fitness",
             SeerTopic::Consensus => "consensus",
+            SeerTopic::Curation => "curation",
         }
     }
 }
@@ -860,6 +868,32 @@ pub mod topics {
             pub weight: f32,
         }
     }
+
+    /// Curation topic — reserved/draft (the durable Bestiary's external-curator consult).
+    ///
+    /// **Draft shape — may be revised before any external curator creature ships.** The in-process
+    /// `bestiary::AICurator` curates directly over the injected `mind::Model` today; this topic is the
+    /// seam for an *external* curator creature, consulted by a daemon's compaction thread off the
+    /// synchronous decide path. The verb the answer carries mirrors `bestiary::CurationDecision`.
+    pub mod curation {
+        use super::*;
+
+        /// **Reserved/draft.** A daemon asks "what should I do with this entry?" — carrying the key
+        /// and the manifest identity so an external curator can reason without a follow-up fetch.
+        #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+        pub struct QueryBody {
+            pub realm: String,
+            pub artifact_hash: String,
+            pub manifest_hash: String,
+        }
+        /// **Reserved/draft.** The curator's verdict: one of `keep` / `gc` / `quarantine` (mirrors
+        /// `bestiary::CurationDecision`) plus an audit-trail reason.
+        #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+        pub struct AnswerBody {
+            pub decision: String,
+            pub reason: String,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -873,7 +907,7 @@ mod tests {
     // a type definition.
     // -----------------------------------------------------------------------------------------
 
-    fn all_topics() -> [SeerTopic; 6] {
+    fn all_topics() -> [SeerTopic; 7] {
         [
             SeerTopic::Authoring,
             SeerTopic::Placement,
@@ -881,6 +915,7 @@ mod tests {
             SeerTopic::Budget,
             SeerTopic::Fitness,
             SeerTopic::Consensus,
+            SeerTopic::Curation,
         ]
     }
 

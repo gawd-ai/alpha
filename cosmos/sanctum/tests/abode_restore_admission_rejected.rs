@@ -245,6 +245,8 @@ fn abode_restore_admission_rejected_leaves_source_authoritative() {
                 MigratorMsg::Migrate {
                     destination_node: NodeId(NODE_B.into()),
                     destination_migrator: b.migrator_id,
+                    // Refusal path — admitted:false carries no witness, so no anchor is needed.
+                    expected_responder_pubkey: None,
                 }
                 .to_bytes(),
             )

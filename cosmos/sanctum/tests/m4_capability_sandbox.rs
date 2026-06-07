@@ -247,6 +247,7 @@ fn tier_as_containment_same_caps_run_as_daemon_or_beast() {
         mem_bytes: 4 * 1024 * 1024, // 4 MiB — plenty for the reverse beast
         calls: vec![],
         budget_warn_at: None,
+        wall_ms: None,
     };
 
     // Daemon variant — same caps, native tier. The .so was built at workspace `cargo build` time.

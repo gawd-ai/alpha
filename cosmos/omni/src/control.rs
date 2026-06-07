@@ -125,6 +125,12 @@ fn needs_probe(verb: &Verb) -> bool {
         verb,
         Verb::Author { .. }
             | Verb::AuthorCritter { .. }
+            // The registry/bestiary verbs do a request/reply round-trip to Role::REGISTRY (unlike the
+            // inline `Load`), so they need the worker's probe endpoint.
+            | Verb::RegistryPublish { .. }
+            | Verb::RegistryFetch { .. }
+            | Verb::RegistryList { .. }
+            | Verb::BestiaryProve { .. }
             | Verb::Send { .. }
             | Verb::Intent { .. }
             | Verb::Cluster

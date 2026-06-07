@@ -32,12 +32,14 @@ use aether::{
 };
 use sigil::{Backend, Manifest};
 use wasmtime::{
-    Config as WtConfig, Engine as WtEngine, Instance, Memory, Module, ResourceLimiter, Store, Trap,
-    TypedFunc,
+    Config as WtConfig, Engine as WtEngine, EngineWeak, Instance, Memory, Module, ResourceLimiter,
+    Store, Trap, TypedFunc,
 };
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::{Artifact, BudgetControl, Engine, EngineError, LoadedModule};
 
@@ -63,29 +65,104 @@ impl std::error::Error for BudgetMemoryRefused {}
 /// who profile their workloads tune this for their fleet.
 pub const DEFAULT_FUEL_PER_MS: u64 = 1_000_000;
 
+/// Wall-clock granularity for beast epoch interruption: the engine-global ticker advances the shared
+/// epoch counter once per this interval, so a per-creature `wall_ms` cap is enforced to within one
+/// tick. Fine enough to bound a runaway beast promptly; coarse enough that one thread per engine is
+/// cheap. Operator-tunable per engine via [`WasmEngine::with_tick_ms`].
+pub const DEFAULT_EPOCH_TICK_MS: u64 = 10;
+
+/// Epoch deadline armed when a beast declares no `wall_ms` cap. Large enough never to trip in any
+/// realistic run, small enough that `current_epoch + this` never overflows `u64`.
+const UNLIMITED_EPOCH_DEADLINE: u64 = u64::MAX / 2;
+
 pub struct WasmEngine {
     engine: WtEngine,
     fuel_per_ms: u64,
+    /// The epoch ticker's cadence (ms) — also the wall-clock granularity (one tick = one interval).
+    epoch_tick_ms: u64,
+    /// Set on `Drop` so the engine-global epoch ticker exits its loop and is joined (no leaked thread).
+    ticker_stop: Arc<AtomicBool>,
+    ticker: Option<JoinHandle<()>>,
 }
 
 impl WasmEngine {
-    /// Constructs with `DEFAULT_FUEL_PER_MS` and `consume_fuel(true)` on the wasmtime config.
-    /// `consume_fuel` must be set at engine build time (not per-store), so we enable it whether or
-    /// not any given creature declares `cpu_ms`. A creature with `cpu_ms == 0` simply gets `u64::MAX`
-    /// fuel on its store — effectively unlimited.
+    /// Constructs with `DEFAULT_FUEL_PER_MS`, `consume_fuel(true)`, and `epoch_interruption(true)` on
+    /// the wasmtime config, plus the engine-global epoch ticker at `DEFAULT_EPOCH_TICK_MS`.
+    /// `consume_fuel`/`epoch_interruption` must be set at engine build time (not per-store), so they
+    /// are always on. A creature with `cpu_ms == 0` gets `u64::MAX` fuel; one with `wall_ms == None`
+    /// gets an effectively-unlimited epoch deadline — both effectively unlimited.
     pub fn new() -> Self {
+        Self::with_tick_ms(DEFAULT_EPOCH_TICK_MS)
+    }
+
+    /// Like [`new`](WasmEngine::new) but with a custom epoch-tick granularity. A finer tick enforces
+    /// `wall_ms` more precisely (and lets a test trip a wall cap fast); `tick_ms` is clamped to ≥1.
+    pub fn with_tick_ms(tick_ms: u64) -> Self {
         let mut cfg = WtConfig::new();
         cfg.consume_fuel(true);
+        // Wall-clock enforcement for the beast tier rides wasmtime epoch interruption — an
+        // engine-build-time tunable on the shared engine. Once on, EVERY store must get an epoch
+        // deadline set before a guest call (the default deadline of 0 traps immediately); we arm one
+        // at load (so a wasm `start` fn doesn't trip) and refresh it per handle.
+        cfg.epoch_interruption(true);
         let engine = WtEngine::new(&cfg).expect(
             "wasmtime config is fixed and valid; failure here is a bug in this constructor",
         );
-        WasmEngine { engine, fuel_per_ms: DEFAULT_FUEL_PER_MS }
+        let epoch_tick_ms = tick_ms.max(1);
+
+        // Exactly ONE engine-global ticker advances the shared epoch counter. It holds a WEAK engine
+        // handle so it never keeps the engine alive (a strong clone would leak both the engine and
+        // this thread); a stop flag set on `Drop` makes teardown prompt even while beasts — which
+        // hold strong engine refs internally — are still loaded. N tickers would race the single
+        // counter to N× the cadence, so the count is load-bearing: one, for the whole engine.
+        let ticker_stop = Arc::new(AtomicBool::new(false));
+        let weak: EngineWeak = engine.weak();
+        let stop = ticker_stop.clone();
+        let ticker = match std::thread::Builder::new().name("anima-wasm-epoch".into()).spawn(
+            move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match weak.upgrade() {
+                    Some(e) => e.increment_epoch(),
+                    None => break, // engine fully dropped — nothing left to tick
+                }
+                std::thread::sleep(Duration::from_millis(epoch_tick_ms));
+            },
+        ) {
+            Ok(h) => Some(h),
+            // **Fail loud, never silently fail open.** Without the ticker the epoch never advances, so
+            // no `wall_ms` deadline can ever trip. We do NOT panic the whole engine on a transient
+            // resource blip; instead we log the degradation here and `load()` refuses any beast that
+            // *declares* a `wall_ms` cap (so the cap is never silently ignored). A beast with no wall
+            // cap is unaffected.
+            Err(e) => {
+                eprintln!(
+                    "anima(wasm): FAILED to spawn the engine-global epoch ticker ({e}); beast \
+                     wall-clock (wall_ms) enforcement is DISABLED on this engine — load() will refuse \
+                     any beast that declares a wall_ms cap rather than silently ignore it"
+                );
+                None
+            }
+        };
+
+        WasmEngine { engine, fuel_per_ms: DEFAULT_FUEL_PER_MS, epoch_tick_ms, ticker_stop, ticker }
     }
 
     /// Override the fuel-per-ms factor (see `DEFAULT_FUEL_PER_MS`). Operator-tunable.
     pub fn with_fuel_per_ms(mut self, fuel_per_ms: u64) -> Self {
         self.fuel_per_ms = fuel_per_ms.max(1);
         self
+    }
+}
+
+impl Drop for WasmEngine {
+    fn drop(&mut self) {
+        // Stop + join the engine-global epoch ticker so no thread outlives the engine.
+        self.ticker_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.ticker.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -160,6 +237,16 @@ impl Engine for WasmEngine {
                 got: manifest.abi.abi_tag.clone(),
             });
         }
+        // **Fail-closed wall-clock:** if the engine's epoch ticker isn't running (its spawn failed at
+        // construction — already logged), a declared `wall_ms` cap cannot be enforced. Refuse the load
+        // rather than silently ignore the cap. A beast that declares no `wall_ms` loads normally.
+        if manifest.capabilities.wall_ms.is_some() && self.ticker.is_none() {
+            return Err(EngineError::Load(
+                "beast declares a wall_ms cap but this engine's wall-clock epoch ticker is not \
+                 running (its spawn failed); refusing to load rather than ignore the cap"
+                    .to_string(),
+            ));
+        }
         let bytes = artifact.read_bytes()?;
         let module = Module::new(&self.engine, &bytes)
             .map_err(|e| EngineError::Load(format!("wasm compile: {e}")))?;
@@ -178,6 +265,11 @@ impl Engine for WasmEngine {
         let fuel = budget_to_fuel(manifest.capabilities.cpu_ms, self.fuel_per_ms);
         store.set_fuel(fuel).map_err(|e| EngineError::Load(format!("wasm set_fuel: {e}")))?;
 
+        // Epoch interruption is enabled engine-wide, so the store needs a non-tripping deadline for
+        // instantiation (a wasm `start` function runs inside `Instance::new`). The real per-handle
+        // wall deadline is armed fresh in `handle` from the creature's `wall_ms` cap.
+        store.set_epoch_deadline(UNLIMITED_EPOCH_DEADLINE);
+
         let instance = Instance::new(&mut store, &module, &[])
             .map_err(|e| EngineError::Load(format!("wasm instantiate: {e}")))?;
         let memory = instance
@@ -191,6 +283,8 @@ impl Engine for WasmEngine {
             .map_err(|e| EngineError::Load(format!("wasm export `handle`: {e}")))?;
         let cpu_ms = manifest.capabilities.cpu_ms;
         let mem_bytes_cap = manifest.capabilities.mem_bytes;
+        // Per-envelope wall-clock cap (ms), enforced via the engine-global epoch in `handle`.
+        let wall_ms = manifest.capabilities.wall_ms;
         // Clamp the operator-declared warn threshold to [0, 100]; values >100 (a malformed
         // manifest) collapse to "always warn" rather than refusing the load. Admission could
         // also reject them, but engine-side clamp is the floor — never trust the input.
@@ -209,6 +303,8 @@ impl Engine for WasmEngine {
             envelopes_handled: 0,
             budget_warn_at,
             live_fuel_cap: budget.cell(),
+            wall_ms,
+            epoch_tick_ms: self.epoch_tick_ms,
         };
         Ok(LoadedModule::new(Box::new(inst), Box::new(())).with_budget(budget))
     }
@@ -253,6 +349,9 @@ fn diagnose_trap(err: &wasmtime::Error) -> Option<LimitKind> {
     match err.downcast_ref::<Trap>()? {
         Trap::OutOfFuel => Some(LimitKind::Fuel),
         Trap::AllocationTooLarge => Some(LimitKind::Memory),
+        // An exceeded epoch deadline (the engine-global wall-clock ticker passed this store's
+        // deadline) surfaces as `Trap::Interrupt` — the beast wall-clock breach (E3).
+        Trap::Interrupt => Some(LimitKind::Wall),
         _ => None,
     }
 }
@@ -289,6 +388,13 @@ struct WasmInstance {
     /// creature's *next* handle without touching the instance on its drain thread. Seeded at load to
     /// the declared budget, so an ungranted creature behaves exactly as before.
     live_fuel_cap: Arc<AtomicU64>,
+    /// **Per-envelope wall-clock cap (ms).** `Some(n)` arms an epoch deadline of `ceil(n / tick)`
+    /// ticks before each `handle`, so a beast that exceeds `n` ms of wall time traps with
+    /// `Trap::Interrupt` → a `Hard` `Wall` budget signal. `None` (the default) → an
+    /// effectively-unlimited deadline (never trips), mirroring the `cpu_ms == 0` fuel convention.
+    wall_ms: Option<u64>,
+    /// The engine-global ticker cadence (ms), cached to convert `wall_ms` to a number of epoch ticks.
+    epoch_tick_ms: u64,
 }
 
 impl Creature for WasmInstance {
@@ -310,6 +416,15 @@ impl Creature for WasmInstance {
             eprintln!("anima(wasm): set_fuel({fuel}) failed: {e}; returning no reply");
             return Outcome::none();
         }
+        // Arm the per-envelope wall-clock ceiling via the engine-global epoch (E3). Convert the
+        // declared `wall_ms` cap to a number of ticks; `None`/`0` → an effectively-unlimited deadline
+        // that never trips (mirrors the fuel `cpu_ms == 0` convention). Set fresh each handle so the
+        // budget is genuinely per-envelope.
+        let deadline_ticks = match self.wall_ms {
+            Some(ms) if ms > 0 => ms.div_ceil(self.epoch_tick_ms).max(1),
+            _ => UNLIMITED_EPOCH_DEADLINE,
+        };
+        self.store.set_epoch_deadline(deadline_ticks);
         self.envelopes_handled = self.envelopes_handled.saturating_add(1);
         let started = std::time::Instant::now();
         let result = self.run(&env.payload);
@@ -367,10 +482,10 @@ impl WasmInstance {
     /// Checks fuel first (the universal dimension), then memory; emits one signal for the first
     /// crossing. Bus volume is bounded — one Warn per handle at most.
     ///
-    /// **Why no Wall here**: per-envelope wall-time isn't a substrate-enforced limit
-    /// (`LimitKind::Wall` is reserved in [`aether`]). The `wall_ms_elapsed` scalar is still
-    /// shipped in the vector for an injected policy that wants to read it, but the engine
-    /// doesn't itself trigger Wall Warns.
+    /// **Why no Wall here**: wall-clock is enforced as a *Hard* trap (an exceeded epoch deadline →
+    /// `Trap::Interrupt` → `LimitKind::Wall`), not as a Warn. There is no cheap "fraction of the wall
+    /// budget consumed" reading to threshold mid-handle the way fuel/memory have, so the engine emits
+    /// no Wall Warn; the `wall_ms_elapsed` scalar is still shipped in every vector for a policy to read.
     fn maybe_warn(&mut self, fuel_initial: u64, wall_ms_elapsed: u64) -> Option<BudgetSignal> {
         let threshold = self.budget_warn_at?; // `?` returns None if the operator opted out.
                                               // Fuel — only when the operator declared a CPU cap (cpu_ms > 0).
@@ -427,7 +542,9 @@ impl WasmInstance {
                 let current = self.memory.data_size(&self.store) as u64;
                 (current, self.mem_bytes_cap)
             }
-            LimitKind::Wall => (wall_ms_elapsed, 0),
+            // Wall: consumed is the ms elapsed; limit is the declared per-envelope `wall_ms` cap
+            // (0 if somehow unset — a Wall trap shouldn't arise without a cap).
+            LimitKind::Wall => (wall_ms_elapsed, self.wall_ms.unwrap_or(0)),
         };
         BudgetVector {
             consumed,

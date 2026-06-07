@@ -217,6 +217,19 @@ fn graceful_hard_signal_drives_apoptosis_through_real_kernel() {
     let unloaded = wait_until(Duration::from_secs(5), || !k.is_loaded(beast));
     assert!(unloaded, "BudgetGraceful Hard→Unload→kernel chain did not complete within 5s");
 
+    // **Prove-stop (E1): "stop means stop."** Apoptosis didn't merely *signal* the beast — it
+    // deregistered it from the router. A send to its address now returns a clean
+    // `RouteError::NoSuchModule` (the deregistered-target result), never a use-after-free. This closes
+    // the gap between "a Hard signal fired" and "the creature is gone."
+    let (_probe, bus, _rx) = k.open_endpoint(Capabilities::default());
+    let err = bus
+        .send(Dispatch::to(Address::Creature(beast), b"after-apoptosis".to_vec()))
+        .expect_err("a send to the apoptosed beast must not route");
+    assert!(
+        matches!(err, aether::RouteError::NoSuchModule(_)),
+        "post-apoptosis send must be NoSuchModule (deregistered), got {err:?}"
+    );
+
     k.shutdown_all(Deadline::default());
 }
 

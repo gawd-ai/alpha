@@ -8,8 +8,13 @@
     },
     {
       "name": "federation",
-      "summary": "Many Sanctums x Realms over ed25519 TCP (loopback).",
+      "summary": "Many Sanctums x Realms over ed25519 TCP (loopback). ALPHA_DURABLE_BESTIARY=1 runs it on the durable Bestiary.",
       "package": "federation"
+    },
+    {
+      "name": "bestiary-live",
+      "summary": "A REAL model authors a creature into a durable, replicated, AI-curated Bestiary (opt-in: needs ALPHA_LLM_MODEL + --features openai).",
+      "package": "bestiary-live"
     }
   ]
 }

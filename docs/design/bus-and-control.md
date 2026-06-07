@@ -142,7 +142,7 @@ the JSON payload of an ordinary `Envelope` whose `header.schema` is `"seer"`. It
 discriminates by **typed topic**, never by per-role schema string:
 
 ```rust
-pub enum SeerTopic { Authoring, Placement, Policy, Budget, Fitness, Consensus }
+pub enum SeerTopic { Authoring, Placement, Policy, Budget, Fitness, Consensus, Curation }
 
 pub enum SeerKind {
     Query    { query_id, body },   // the initiator asks
@@ -161,10 +161,13 @@ right one.
 
 **Reserved topics.** `Authoring` (the curiosity seam) and `Placement` (the
 distributor consult) have live consumers; `Consensus` carries signed reputation
-deltas for cross-Realm federation. `Policy`, `Budget`, and `Fitness` are
-reserved topics with draft typed bodies — their sockets exist, awaiting a
-concrete consumer to pin the exact payload. Reserving them means a new mechanism
-lands as a topic *consumer*, never as a widening of the wire.
+deltas for cross-Realm federation. `Policy`, `Budget`, `Fitness`, and `Curation`
+are reserved topics with draft typed bodies — their sockets exist, awaiting a
+concrete consumer to pin the exact payload. `Curation` is the durable Bestiary's
+seam for an *external* curator creature (an in-process curator already runs over
+the injected `mind::Model`; the topic reserves the off-process form). Reserving
+them means a new mechanism lands as a topic *consumer*, never as a widening of
+the wire.
 
 **Topic isolation is a consumer concern, by design.** The substrate has no
 router-level topic concept; SEER envelopes route by address like any envelope. A
@@ -238,14 +241,31 @@ control core runs on two lanes:
 - **Fast, probe-free verbs** (`status`, `list`, `journal`, `bind`, `unload`,
   `load`, `allow-ai`, `ai-status`, `watch`) run **inline on the kernel's drain
   thread** — microseconds — and reply directly.
-- **Request/reply orchestration** (`author`, `author --critter`, `send`,
+- **Request/reply orchestration** (`author`, `author --critter`, `registry
+  publish`, `registry fetch`, `registry list`, `bestiary prove`, `send`,
   `intent`, `cluster`, `cluster join`) is forwarded to a **single worker
   thread** that owns its own probe endpoint and `corr` space and emits the reply
-  itself. A build in the worker never stalls an inline `status`.
+  itself — these verbs round-trip a `RegistryOp` / `BestiaryOp` to the bound
+  `Role::REGISTRY` and need a probe to await the reply. A build in the worker
+  never stalls an inline `status`.
 
 Long-running progress (an `author`'s "compiling…") rides a SEER topic, a
 `control_progress` frame correlated by the command `corr`, so any surface that
 wants to stream it subscribes — fan-out, not request/reply.
+
+### Registry and Bestiary verbs
+
+Four verbs let a surface drive the bound registry without holding it. `registry
+publish` reads a manifest and an artifact **from node-local paths** (the same
+operator caveat as `load`: these are files on the node, not a client upload),
+parses and ships them as a `RegistryOp::Publish`; `registry fetch` returns the
+entry's *metadata* (name, version, content address, artifact length) rather than
+inlining the bytes; `registry list` enumerates a Realm's catalogue. Each carries
+an optional `realm` (omitted → the local Realm). `bestiary prove` rides the
+additive `bestiary.op` schema and asks for a verifiable `EntryProof` — only a
+durable `bestiary-daemon` answers it; the in-memory stub returns a structured
+error. `registry publish` is the only mutating one of the four and is gated like
+every other mutation; the three reads are not.
 
 ### Remote control is free
 
@@ -286,9 +306,11 @@ config, never a restricted remote caller.
 runtime racing the server against a shutdown signal; `shutdown` fires the signal,
 joins the runtime thread, and drops the listener so the port is freed and a
 re-load on the same port succeeds. REST endpoints map one-to-one to verbs —
-`/api/status|creatures|journal` read, `/api/author|author/critter|load|send|
-intent|bind|unload|cluster|cluster/connect` mutating, `/api/ai/status`. Every
-endpoint except `GET /api/health` is auth-guarded by a **Bearer key** compared in
+`/api/status|creatures|journal` and `GET /api/registry/fetch|list` +
+`/api/bestiary/prove` read, `/api/author|author/critter|load|send|intent|bind|
+unload|cluster|cluster/connect` + `POST /api/registry/publish` mutating,
+`/api/ai/status`. Every endpoint except `GET /api/health` is auth-guarded by a
+**Bearer key** compared in
 constant time; `GET /api/ws` is authenticated by `?token=` because a browser
 WebSocket upgrade cannot set an `Authorization` header. The WebSocket streams the
 high-volume sense topics — PROPRIOCEPTION, FITNESS, SEER — through a **separate,
@@ -308,10 +330,12 @@ server *is* a bus citizen, not an HTTP client.
 
 The server id is `alpha-mcp` and the tool verbs are `alpha_*` —
 `alpha_status` / `alpha_list` / `alpha_journal` / `alpha_watch` /
-`alpha_cluster` read-only (carrying `readOnlyHint`), and `alpha_author` /
-`alpha_author_critter` / `alpha_load` / `alpha_send` / `alpha_intent` /
-`alpha_bind` / `alpha_unload` / `alpha_cluster_connect` mutating, plus the
-`alpha_ai_status` announcement. One binary, two profiles, one `ControlTarget`:
+`alpha_cluster` / `alpha_registry_fetch` / `alpha_registry_list` /
+`alpha_bestiary_prove` read-only (carrying `readOnlyHint`), and `alpha_author` /
+`alpha_author_critter` / `alpha_load` / `alpha_registry_publish` / `alpha_send` /
+`alpha_intent` / `alpha_bind` / `alpha_unload` / `alpha_cluster_connect`
+mutating, plus the `alpha_ai_status` announcement. One binary, two profiles, one
+`ControlTarget`:
 
 - **Local (default)** — the hub boots its own `authoring` / `build` /
   critter-builder organs and a `ControlCore`, and the surface targets
@@ -348,8 +372,9 @@ status. The gate defaults **off**:
   surface, but it only acts under grant.
 
 `ControlCore` runs gated, because control over the bus is a remote front-end; the
-mutating verbs (`author`, `author --critter`, `load`, `send`, `intent`, `bind`,
-`unload`, `cluster join`) are exactly the ones the gate guards. `allow-ai` itself
+mutating verbs (`author`, `author --critter`, `load`, `registry publish`, `send`,
+`intent`, `bind`, `unload`, `cluster join`) are exactly the ones the gate guards.
+`allow-ai` itself
 is REPL-only — a gated caller cannot flip its own gate. The AI announces what it
 is doing through `alpha_ai_status`, surfaced live on the operator's tape and the
 WebSocket stream, so a human can watch the AI work and revoke mid-flight.
