@@ -15,6 +15,11 @@
 //!   destroys durable state on a cache miss. The (blocking) model call runs in
 //!   [`observe`](Curator::observe), off the synchronous decide path — the daemon's compaction worker
 //!   calls `observe` before `compact`, never under the store lock.
+//!
+//! The AI curator's prompt and completion parser bound untrusted text crossing the model seam:
+//! catalog metadata is previewed before it enters the prompt, and the returned completion/reason is
+//! capped before parsing so an injected or remote-backed model cannot force unbounded parser
+//! allocation.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -22,6 +27,13 @@ use std::sync::{Arc, Mutex};
 use sigil::RealmId;
 
 use crate::wire::Entry;
+
+/// Maximum bytes of one catalog metadata field included in an AI-curator prompt.
+pub const MAX_AI_CURATOR_FIELD_BYTES: usize = 4 * 1024;
+/// Maximum completion bytes the AI-curator parser inspects.
+pub const MAX_AI_CURATOR_COMPLETION_BYTES: usize = 16 * 1024;
+/// Maximum audit-reason bytes retained from a model curation verdict.
+pub const MAX_AI_CURATOR_REASON_BYTES: usize = 1024;
 
 /// What a [`Curator`] decides about one catalog entry.
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +165,11 @@ impl AICurator {
         const ARTIFACT_PREVIEW: usize = 2048;
         let preview_len = ctx.entry.artifact.len().min(ARTIFACT_PREVIEW);
         let artifact_preview = String::from_utf8_lossy(&ctx.entry.artifact[..preview_len]);
+        let realm = bounded_text(&ctx.realm.0, MAX_AI_CURATOR_FIELD_BYTES);
+        let artifact_hash = bounded_text(ctx.artifact_hash, MAX_AI_CURATOR_FIELD_BYTES);
+        let manifest_name = bounded_text(&ctx.entry.manifest.name, MAX_AI_CURATOR_FIELD_BYTES);
+        let manifest_version =
+            bounded_text(&ctx.entry.manifest.version, MAX_AI_CURATOR_FIELD_BYTES);
         let system_prompt = "You are a Bestiary curator. Given a creature's manifest and a prefix of \
              its artifact bytes, decide whether to KEEP it, GC it (a near-duplicate or dead weight), \
              or QUARANTINE it (anomalous or suspicious). Answer with exactly one line: the verb \
@@ -160,10 +177,10 @@ impl AICurator {
             .to_string();
         let user_prompt = format!(
             "Realm: {}\nArtifact hash: {}\nManifest name: {} v{}\nArtifact bytes (first {} of {}):\n{}",
-            ctx.realm.0,
-            ctx.artifact_hash,
-            ctx.entry.manifest.name,
-            ctx.entry.manifest.version,
+            realm,
+            artifact_hash,
+            manifest_name,
+            manifest_version,
             preview_len,
             ctx.entry.artifact.len(),
             artifact_preview,
@@ -175,20 +192,45 @@ impl AICurator {
     /// recognize as an explicit `GC`/`QUARANTINE` verb maps to [`CurationDecision::Keep`], so a
     /// garbled or hostile completion never destroys durable state.
     fn parse_decision(content: &str) -> CurationDecision {
+        let content = prefix_on_char_boundary(content, MAX_AI_CURATOR_COMPLETION_BYTES);
         let line = content.trim().lines().next().unwrap_or("").trim();
-        let upper = line.to_ascii_uppercase();
-        // Reason = everything after the verb word (best-effort, audit material).
-        let reason = line.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+        let raw_verb = line.split_whitespace().next().unwrap_or("");
+        let verb = raw_verb.trim_end_matches(':');
+        let reason = bounded_reason(line.strip_prefix(raw_verb).unwrap_or("").trim_start());
         let reason = if reason.is_empty() { "curator".to_string() } else { reason };
-        if upper.starts_with("GC") {
+        if verb.eq_ignore_ascii_case("GC") {
             CurationDecision::Gc { reason }
-        } else if upper.starts_with("QUARANTINE") {
+        } else if verb.eq_ignore_ascii_case("QUARANTINE") {
             CurationDecision::Quarantine { reason }
         } else {
             // KEEP, an unknown verb, an error, or empty — all keep (safe-by-default).
             CurationDecision::Keep
         }
     }
+}
+
+fn prefix_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+fn bounded_text(s: &str, max: usize) -> String {
+    let prefix = prefix_on_char_boundary(s, max);
+    if prefix.len() == s.len() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}\n... (truncated; {} bytes total)", s.len())
+    }
+}
+
+fn bounded_reason(s: &str) -> String {
+    prefix_on_char_boundary(s, MAX_AI_CURATOR_REASON_BYTES).trim().to_string()
 }
 
 impl Curator for AICurator {
@@ -297,7 +339,15 @@ mod tests {
             CurationDecision::Gc { .. }
         ));
         assert!(matches!(
+            AICurator::parse_decision("GC: near-duplicate of x"),
+            CurationDecision::Gc { .. }
+        ));
+        assert!(matches!(
             AICurator::parse_decision("QUARANTINE looks like a fork bomb"),
+            CurationDecision::Quarantine { .. }
+        ));
+        assert!(matches!(
+            AICurator::parse_decision("QUARANTINE: looks like a fork bomb"),
             CurationDecision::Quarantine { .. }
         ));
         assert_eq!(AICurator::parse_decision("KEEP it's fine"), CurationDecision::Keep);
@@ -308,6 +358,50 @@ mod tests {
             CurationDecision::Gc { reason } => assert_eq!(reason, "curator"),
             other => panic!("expected Gc, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ai_curator_prompt_bounds_untrusted_metadata_fields() {
+        let mut e = entry(None);
+        e.manifest.name = "n".repeat(MAX_AI_CURATOR_FIELD_BYTES + 256);
+        e.manifest.version = "v".repeat(MAX_AI_CURATOR_FIELD_BYTES + 256);
+        let realm = RealmId("r".repeat(MAX_AI_CURATOR_FIELD_BYTES + 256));
+        let artifact_hash = "h".repeat(MAX_AI_CURATOR_FIELD_BYTES + 256);
+
+        let prompt = AICurator::prompt_for(&CurationContext {
+            realm: &realm,
+            artifact_hash: &artifact_hash,
+            entry: &e,
+            first_seen: 0,
+            head_first_seen: 0,
+        });
+
+        assert!(prompt.user_prompt.contains("truncated"), "prompt should mark bounded previews");
+        assert!(
+            prompt.user_prompt.len() < (MAX_AI_CURATOR_FIELD_BYTES * 4) + 4096,
+            "prompt metadata previews should stay bounded; len={}",
+            prompt.user_prompt.len()
+        );
+    }
+
+    #[test]
+    fn ai_curator_completion_and_reason_are_bounded_before_parsing() {
+        let oversized_reason = "x".repeat(MAX_AI_CURATOR_REASON_BYTES + 4096);
+        match AICurator::parse_decision(&format!("QUARANTINE: {oversized_reason}")) {
+            CurationDecision::Quarantine { reason } => {
+                assert_eq!(reason.len(), MAX_AI_CURATOR_REASON_BYTES);
+                assert!(reason.bytes().all(|b| b == b'x'));
+            }
+            other => panic!("expected Quarantine, got {other:?}"),
+        }
+
+        let late_verdict =
+            format!("{}GC duplicate", " ".repeat(MAX_AI_CURATOR_COMPLETION_BYTES + 1));
+        assert_eq!(
+            AICurator::parse_decision(&late_verdict),
+            CurationDecision::Keep,
+            "a verdict beyond the completion cap fails closed"
+        );
     }
 
     // A model that returns a chosen verb, to exercise observe→decide caching end to end.

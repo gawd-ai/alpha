@@ -1333,6 +1333,7 @@ name = "omega-federator"
 version = "0.4.1"
 dependencies = [
  "aether",
+ "bestiary",
  "omega",
  "registry-mem",
  "seer",

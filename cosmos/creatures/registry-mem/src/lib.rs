@@ -12,6 +12,8 @@
 //!
 //! - `RegistryOp::Publish { manifest, artifact, realm? }` → reply `RegistryReply::Published { artifact_hash, realm }`
 //! - `RegistryOp::Fetch { artifact_hash, realm? }` → reply `RegistryReply::Fetched { manifest, artifact, realm }`
+//! - `RegistryOp::FetchMetadata { artifact_hash, realm? }` → reply
+//!   `RegistryReply::FetchedMetadata { entry, artifact_len }` without artifact bytes
 //!   or `RegistryReply::NotFound`
 //! - Malformed payload → reply `RegistryReply::Error { message }` (R9: never panic on hostile input)
 //!
@@ -40,6 +42,11 @@
 //! are Omega concerns. This
 //! creature exists so the kernel's admission + transport contracts have an honest
 //! "fetch a manifest+artifact and admit it" path to exercise end-to-end.
+//!
+//! The in-memory catalog is bounded by default ([`DEFAULT_MAX_REGISTRY_ENTRIES`]) so a peer cannot
+//! grow this reference store indefinitely by publishing ever-new artifacts. At capacity, a new key is
+//! refused while an existing key can still be re-published; `with_max_entries(0)` is the explicit
+//! unbounded opt-out for lab or demo workloads.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -52,9 +59,33 @@ use sigil::Manifest;
 // `SyncEntry`, and the `ReputationScore` / `QuarantineNotice` signals) lives in the `bestiary`
 // contract crate so the durable `bestiary-daemon` can share one wire contract with this in-memory
 // stub. Re-exported here so every `registry_mem::TypeName` consumer compiles unchanged.
-pub use bestiary::{
-    Entry, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, SyncEntry,
+use bestiary::{
+    registry_artifact_too_large_message, registry_op_too_large_message,
+    MAX_REGISTRY_ARTIFACT_BYTES, MAX_REGISTRY_OP_BYTES,
 };
+pub use bestiary::{
+    CatalogEntry, Entry, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, SyncEntry,
+};
+
+/// Default maximum number of distinct `(realm, artifact_hash)` entries retained by `registry-mem`.
+///
+/// `0` is reserved as an explicit opt-out via [`RegistryMem::with_max_entries`].
+pub const DEFAULT_MAX_REGISTRY_ENTRIES: usize = 1_024;
+
+enum PublishResult {
+    Stored(String),
+    Refused { artifact_hash: String, message: String },
+}
+
+impl PublishResult {
+    fn artifact_hash(self) -> String {
+        match self {
+            PublishResult::Stored(hash) | PublishResult::Refused { artifact_hash: hash, .. } => {
+                hash
+            }
+        }
+    }
+}
 
 /// The registry creature.
 pub struct RegistryMem {
@@ -65,9 +96,13 @@ pub struct RegistryMem {
     /// Maximum number of distinct catalog entries held at once. A peer that publishes an unbounded
     /// stream of distinct artifacts would otherwise grow the catalog without limit. At capacity a
     /// *new* `(realm, artifact_hash)` is refused (re-publishing an existing key still succeeds — it
-    /// resets signals in place, no growth). **`0` means unbounded** (the default; preserves prior
-    /// behavior). Set via [`RegistryMem::with_max_entries`].
+    /// resets signals in place, no growth). **`0` means unbounded** and must be selected explicitly
+    /// via [`RegistryMem::with_max_entries`].
     max_entries: usize,
+    /// Maximum serialized `RegistryOp` bytes this creature will decode. `0` means unbounded.
+    max_op_bytes: usize,
+    /// Maximum artifact bytes retained per publish. `0` means unbounded.
+    max_artifact_bytes: usize,
 }
 
 impl Default for RegistryMem {
@@ -78,14 +113,34 @@ impl Default for RegistryMem {
 
 impl RegistryMem {
     pub fn new() -> Self {
-        RegistryMem { entries: Mutex::new(HashMap::new()), max_entries: 0 }
+        RegistryMem {
+            entries: Mutex::new(HashMap::new()),
+            max_entries: DEFAULT_MAX_REGISTRY_ENTRIES,
+            max_op_bytes: MAX_REGISTRY_OP_BYTES,
+            max_artifact_bytes: MAX_REGISTRY_ARTIFACT_BYTES,
+        }
     }
 
-    /// Cap the number of distinct catalog entries (resilience guardrail; default `0` = unbounded).
-    /// At capacity a publish of a *new* key is refused rather than growing the catalog without
-    /// bound; re-publishing an existing key always succeeds.
+    /// Cap the number of distinct catalog entries.
+    ///
+    /// The default is [`DEFAULT_MAX_REGISTRY_ENTRIES`]. At capacity a publish of a *new* key is
+    /// refused rather than growing the catalog without bound; re-publishing an existing key always
+    /// succeeds. Pass `0` to opt out and make the in-memory catalog unbounded.
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries;
+        self
+    }
+
+    /// Cap serialized `RegistryOp` bytes before JSON decode (default [`MAX_REGISTRY_OP_BYTES`]).
+    /// `0` means unbounded.
+    pub fn with_max_op_bytes(mut self, max_op_bytes: usize) -> Self {
+        self.max_op_bytes = max_op_bytes;
+        self
+    }
+
+    /// Cap stored artifact bytes (default [`MAX_REGISTRY_ARTIFACT_BYTES`]). `0` means unbounded.
+    pub fn with_max_artifact_bytes(mut self, max_artifact_bytes: usize) -> Self {
+        self.max_artifact_bytes = max_artifact_bytes;
         self
     }
 
@@ -99,7 +154,22 @@ impl RegistryMem {
     /// Direct (non-bus) publish into a named Realm. Returns the artifact_hash the entry is keyed
     /// under inside that Realm.
     pub fn publish_in(&self, realm: RealmId, manifest: Manifest, artifact: Vec<u8>) -> String {
+        self.publish_in_checked(realm, manifest, artifact).artifact_hash()
+    }
+
+    fn publish_in_checked(
+        &self,
+        realm: RealmId,
+        manifest: Manifest,
+        artifact: Vec<u8>,
+    ) -> PublishResult {
         let hash = sha256_hex(&artifact);
+        if self.max_artifact_bytes != 0 && artifact.len() > self.max_artifact_bytes {
+            let message =
+                registry_artifact_too_large_message(artifact.len(), self.max_artifact_bytes);
+            eprintln!("registry-mem: {message}; refusing artifact {hash} in realm {}", realm.0);
+            return PublishResult::Refused { artifact_hash: hash, message };
+        }
         let key = (realm, hash.clone());
         let mut g = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         // Catalog-pressure guard (resilience): at capacity, refuse a *new* key rather than grow the
@@ -107,17 +177,18 @@ impl RegistryMem {
         // in place and adds no entry. `0` disables the cap. The returned hash is still the correct
         // content address of the bytes; a later fetch of a refused key simply misses.
         if self.max_entries != 0 && g.len() >= self.max_entries && !g.contains_key(&key) {
-            eprintln!(
-                "registry-mem: catalog at capacity ({}); refusing new artifact {hash} in realm {}",
+            let message = format!(
+                "catalog at capacity ({}); refusing new artifact {hash} in realm {}",
                 self.max_entries, key.0 .0
             );
-            return hash;
+            eprintln!("registry-mem: {message}");
+            return PublishResult::Refused { artifact_hash: hash, message };
         }
         // A (re)publish resets the reputation/quarantine signals to None. For `quarantine` this is
         // the T5 reversibility rule made concrete: re-publishing a quarantined
         // `(realm, artifact_hash)` clears the marker — the substrate never permanently blacklists.
         g.insert(key, Entry { manifest, artifact, reputation: None, quarantine: None });
-        hash
+        PublishResult::Stored(hash)
     }
 
     /// Attach (or replace) a reputation score on an existing `(realm, artifact_hash)` entry.
@@ -192,6 +263,47 @@ impl RegistryMem {
             .collect()
     }
 
+    pub fn catalog_entries(&self, realm: Option<&RealmId>) -> Vec<CatalogEntry> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|((r, _), _)| realm.is_none() || realm == Some(r))
+            .map(|((r, hash), entry)| CatalogEntry {
+                artifact_hash: hash.clone(),
+                realm: r.clone(),
+                manifest: entry.manifest.clone(),
+                reputation: entry.reputation.clone(),
+                quarantine: entry.quarantine.clone(),
+            })
+            .collect()
+    }
+
+    /// Realm-aware metadata fetch. Returns the byte-light catalog row and the artifact length without
+    /// cloning the artifact bytes into the reply.
+    pub fn fetch_metadata_in(
+        &self,
+        realm: &RealmId,
+        artifact_hash: &str,
+    ) -> Option<(CatalogEntry, usize)> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(realm.clone(), artifact_hash.to_string()))
+            .map(|entry| {
+                (
+                    CatalogEntry {
+                        artifact_hash: artifact_hash.to_string(),
+                        realm: realm.clone(),
+                        manifest: entry.manifest.clone(),
+                        reputation: entry.reputation.clone(),
+                        quarantine: entry.quarantine.clone(),
+                    },
+                    entry.artifact.len(),
+                )
+            })
+    }
+
     /// Realm-implicit fetch — looks in the `"local"` Realm.
     pub fn fetch(&self, artifact_hash: &str) -> Option<Entry> {
         self.fetch_in(&RealmId::local(), artifact_hash)
@@ -220,91 +332,133 @@ impl Creature for RegistryMem {
     fn bind(&mut self, _ctx: CreatureCtx) {}
 
     fn handle(&mut self, env: Envelope) -> Outcome {
-        let reply = match serde_json::from_slice::<RegistryOp>(&env.payload) {
-            // Realm-implicit: the `"local"` Realm. Reply with the matching Realm-implicit variant —
-            // a Realm-implicit caller gets a Realm-implicit reply back, round-tripping the wire.
-            Ok(RegistryOp::Publish { manifest, artifact }) => {
-                let artifact_hash = self.publish_in(RealmId::local(), manifest, artifact);
-                RegistryReply::Published { artifact_hash }
-            }
-            Ok(RegistryOp::Fetch { artifact_hash }) => match self
-                .fetch_in(&RealmId::local(), &artifact_hash)
-            {
-                Some(entry) => {
-                    RegistryReply::Fetched { manifest: entry.manifest, artifact: entry.artifact }
+        let reply = if self.max_op_bytes != 0 && env.payload.len() > self.max_op_bytes {
+            let message = registry_op_too_large_message(env.payload.len(), self.max_op_bytes);
+            eprintln!(
+                "registry-mem: rejected an oversized op from {:?} (corr={:?}): {message}",
+                env.header.from, env.header.corr
+            );
+            RegistryReply::Error { message }
+        } else {
+            match serde_json::from_slice::<RegistryOp>(&env.payload) {
+                // Realm-implicit: the `"local"` Realm. Reply with the matching Realm-implicit variant —
+                // a Realm-implicit caller gets a Realm-implicit reply back, round-tripping the wire.
+                Ok(RegistryOp::Publish { manifest, artifact }) => {
+                    match self.publish_in_checked(RealmId::local(), manifest, artifact) {
+                        PublishResult::Stored(artifact_hash) => {
+                            RegistryReply::Published { artifact_hash }
+                        }
+                        PublishResult::Refused { message, .. } => RegistryReply::Error { message },
+                    }
                 }
-                None => RegistryReply::NotFound,
-            },
-            // Realm-explicit. Reply with the matching Realm-explicit variant carrying the
-            // resolved Realm so the caller can confirm.
-            Ok(RegistryOp::PublishInRealm { manifest, artifact, realm }) => {
-                let artifact_hash = self.publish_in(realm.clone(), manifest, artifact);
-                RegistryReply::PublishedInRealm { artifact_hash, realm }
-            }
-            Ok(RegistryOp::FetchInRealm { artifact_hash, realm }) => {
-                match self.fetch_in(&realm, &artifact_hash) {
-                    Some(entry) => RegistryReply::FetchedInRealm {
-                        manifest: entry.manifest,
-                        artifact: entry.artifact,
-                        realm,
-                    },
-                    None => RegistryReply::NotFound,
+                Ok(RegistryOp::Fetch { artifact_hash }) => {
+                    match self.fetch_in(&RealmId::local(), &artifact_hash) {
+                        Some(entry) => RegistryReply::Fetched {
+                            manifest: entry.manifest,
+                            artifact: entry.artifact,
+                        },
+                        None => RegistryReply::NotFound,
+                    }
                 }
-            }
-            // Reputation + quarantine signals + anti-entropy snapshot.
-            Ok(RegistryOp::AttestFitness {
-                artifact_hash,
-                realm,
-                score,
-                attesting_realm,
-                signed_by,
-                signature,
-            }) => {
-                let applied = self.attest_fitness(
-                    &realm,
-                    &artifact_hash,
-                    ReputationScore { score, attesting_realm, signed_by, signature },
-                );
-                if applied {
-                    RegistryReply::Attested { artifact_hash, realm }
-                } else {
-                    // A reputation signal for an artifact we don't hold is dropped (the federator
-                    // publishes first, then attests; a race or a stale delta lands here). Make the
-                    // missed signal discoverable rather than a silent NotFound. (T8)
-                    eprintln!(
+                Ok(RegistryOp::FetchMetadata { artifact_hash }) => {
+                    match self.fetch_metadata_in(&RealmId::local(), &artifact_hash) {
+                        Some((entry, artifact_len)) => {
+                            RegistryReply::FetchedMetadata { entry, artifact_len }
+                        }
+                        None => RegistryReply::NotFound,
+                    }
+                }
+                // Realm-explicit. Reply with the matching Realm-explicit variant carrying the
+                // resolved Realm so the caller can confirm.
+                Ok(RegistryOp::PublishInRealm { manifest, artifact, realm }) => {
+                    match self.publish_in_checked(realm.clone(), manifest, artifact) {
+                        PublishResult::Stored(artifact_hash) => {
+                            RegistryReply::PublishedInRealm { artifact_hash, realm }
+                        }
+                        PublishResult::Refused { message, .. } => RegistryReply::Error { message },
+                    }
+                }
+                Ok(RegistryOp::FetchInRealm { artifact_hash, realm }) => {
+                    match self.fetch_in(&realm, &artifact_hash) {
+                        Some(entry) => RegistryReply::FetchedInRealm {
+                            manifest: entry.manifest,
+                            artifact: entry.artifact,
+                            realm,
+                        },
+                        None => RegistryReply::NotFound,
+                    }
+                }
+                Ok(RegistryOp::FetchMetadataInRealm { artifact_hash, realm }) => {
+                    match self.fetch_metadata_in(&realm, &artifact_hash) {
+                        Some((entry, artifact_len)) => {
+                            RegistryReply::FetchedMetadata { entry, artifact_len }
+                        }
+                        None => RegistryReply::NotFound,
+                    }
+                }
+                // Reputation + quarantine signals + anti-entropy snapshot.
+                Ok(RegistryOp::AttestFitness {
+                    artifact_hash,
+                    realm,
+                    score,
+                    attesting_realm,
+                    signed_by,
+                    signature,
+                }) => {
+                    let applied = self.attest_fitness(
+                        &realm,
+                        &artifact_hash,
+                        ReputationScore { score, attesting_realm, signed_by, signature },
+                    );
+                    if applied {
+                        RegistryReply::Attested { artifact_hash, realm }
+                    } else {
+                        // A reputation signal for an artifact we don't hold is dropped (the federator
+                        // publishes first, then attests; a race or a stale delta lands here). Make the
+                        // missed signal discoverable rather than a silent NotFound. (T8)
+                        eprintln!(
                         "registry-mem: AttestFitness dropped — no entry for {artifact_hash} in realm {}",
                         realm.0
                     );
-                    RegistryReply::NotFound
+                        RegistryReply::NotFound
+                    }
                 }
-            }
-            Ok(RegistryOp::MarkQuarantine { artifact_hash, realm, reason, attesting_peers }) => {
-                let applied = self.mark_quarantine(
-                    &realm,
-                    &artifact_hash,
-                    QuarantineNotice { reason, attesting_peers },
-                );
-                if applied {
-                    RegistryReply::Quarantined { artifact_hash, realm }
-                } else {
-                    eprintln!(
+                Ok(RegistryOp::MarkQuarantine {
+                    artifact_hash,
+                    realm,
+                    reason,
+                    attesting_peers,
+                }) => {
+                    let applied = self.mark_quarantine(
+                        &realm,
+                        &artifact_hash,
+                        QuarantineNotice { reason, attesting_peers },
+                    );
+                    if applied {
+                        RegistryReply::Quarantined { artifact_hash, realm }
+                    } else {
+                        eprintln!(
                         "registry-mem: MarkQuarantine dropped — no entry for {artifact_hash} in realm {}",
                         realm.0
                     );
-                    RegistryReply::NotFound
+                        RegistryReply::NotFound
+                    }
                 }
-            }
-            Ok(RegistryOp::ListEntries { realm }) => {
-                RegistryReply::Entries { entries: self.sync_entries(realm.as_ref()) }
-            }
-            Err(e) => {
-                eprintln!(
+                Ok(RegistryOp::ListEntries { realm }) => {
+                    RegistryReply::Entries { entries: self.sync_entries(realm.as_ref()) }
+                }
+                Ok(RegistryOp::ListMetadata { realm }) => {
+                    RegistryReply::Metadata { entries: self.catalog_entries(realm.as_ref()) }
+                }
+                Err(e) => {
+                    eprintln!(
                     "registry-mem: rejected a malformed op from {:?} (corr={:?}, {} bytes): {e}",
                     env.header.from,
                     env.header.corr,
                     env.payload.len()
                 );
-                RegistryReply::Error { message: format!("malformed registry op: {e}") }
+                    RegistryReply::Error { message: format!("malformed registry op: {e}") }
+                }
             }
         };
         // Reply preserves `corr` so the requester correlates the response with its request — the
@@ -748,6 +902,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn list_metadata_snapshots_catalog_without_artifact_bytes() {
+        let mut r = RegistryMem::new();
+        r.publish_in(RealmId::new("crew"), manifest("x"), b"x-bytes".to_vec());
+        r.publish_in(RealmId::new("guests"), manifest("y"), b"y-bytes".to_vec());
+
+        let env =
+            op_env(RegistryOp::ListMetadata { realm: Some(RealmId::new("guests")) }, CreatureId(1));
+        let payload = r.handle(env).dispatches[0].payload.clone();
+        let json = String::from_utf8(payload.clone()).unwrap();
+        assert!(!json.contains("\"artifact\""), "metadata reply must not carry artifact bytes");
+
+        match serde_json::from_slice::<RegistryReply>(&payload).unwrap() {
+            RegistryReply::Metadata { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].realm, RealmId::new("guests"));
+                assert_eq!(entries[0].manifest.name, "y");
+                assert_eq!(entries[0].artifact_hash, sha256_hex(b"y-bytes"));
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_metadata_returns_length_without_artifact_bytes() {
+        let mut r = RegistryMem::new();
+        let realm = RealmId::new("crew");
+        let artifact = b"large-enough-to-not-inline".to_vec();
+        let hash = r.publish_in(realm.clone(), manifest("meta"), artifact.clone());
+
+        let env = op_env(
+            RegistryOp::FetchMetadataInRealm { artifact_hash: hash.clone(), realm: realm.clone() },
+            CreatureId(1),
+        );
+        let payload = r.handle(env).dispatches[0].payload.clone();
+        let json = String::from_utf8(payload.clone()).unwrap();
+        assert!(!json.contains("\"artifact\""), "metadata fetch must not carry artifact bytes");
+
+        match serde_json::from_slice::<RegistryReply>(&payload).unwrap() {
+            RegistryReply::FetchedMetadata { entry, artifact_len } => {
+                assert_eq!(entry.realm, realm);
+                assert_eq!(entry.artifact_hash, hash);
+                assert_eq!(entry.manifest.name, "meta");
+                assert_eq!(artifact_len, artifact.len());
+            }
+            other => panic!("expected FetchedMetadata, got {other:?}"),
+        }
+    }
+
     /// **Op wire tags stay distinct.** The reputation/quarantine ops use distinct `op`
     /// tags; the publish/fetch variants serialize independently. Locks the zero-retrofit guarantee.
     #[test]
@@ -769,6 +972,17 @@ mod tests {
         assert!(!json.contains("signature"), "None signature elides");
         let list = RegistryOp::ListEntries { realm: None };
         assert!(serde_json::to_string(&list).unwrap().contains("\"op\":\"list_entries\""));
+        let metadata = RegistryOp::ListMetadata { realm: None };
+        assert!(serde_json::to_string(&metadata).unwrap().contains("\"op\":\"list_metadata\""));
+        let fetch_metadata = RegistryOp::FetchMetadata { artifact_hash: "h".into() };
+        assert!(serde_json::to_string(&fetch_metadata)
+            .unwrap()
+            .contains("\"op\":\"fetch_metadata\""));
+        let fetch_metadata_in_realm =
+            RegistryOp::FetchMetadataInRealm { artifact_hash: "h".into(), realm: RealmId::local() };
+        assert!(serde_json::to_string(&fetch_metadata_in_realm)
+            .unwrap()
+            .contains("\"op\":\"fetch_metadata_in_realm\""));
     }
 
     #[test]
@@ -796,10 +1010,63 @@ mod tests {
     }
 
     #[test]
+    fn oversized_registry_payload_is_rejected_before_json_parse() {
+        let mut r = RegistryMem::new().with_max_op_bytes(8);
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::Creature(CreatureId(7)),
+                reply_to: None,
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: None,
+                commitment: None,
+                schema: "registry.op".into(),
+            },
+            payload: b"{ not json".to_vec(),
+        };
+        let reply = r.handle(env);
+        let reply: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("too large"), "expected size error, got {message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_publish_artifact_is_rejected_and_not_stored() {
+        let mut r = RegistryMem::new().with_max_artifact_bytes(4);
+        let bytes = b"12345".to_vec();
+        let hash = sha256_hex(&bytes);
+
+        let env = op_env(
+            RegistryOp::Publish { manifest: manifest("too-big"), artifact: bytes.clone() },
+            CreatureId(1),
+        );
+        let reply = r.handle(env);
+        let reply: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("artifact too large"), "unexpected error: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(r.fetch(&hash).is_none(), "oversized bus publish was not stored");
+
+        let direct_hash = r.publish(manifest("direct-too-big"), bytes);
+        assert_eq!(direct_hash, hash, "direct publish still reports the content address");
+        assert!(r.fetch(&hash).is_none(), "oversized direct publish was not stored");
+    }
+
+    #[test]
     fn max_entries_refuses_new_artifact_at_capacity_but_allows_republish() {
         // Cap the catalog at 1 distinct entry. The first publish lands; a *new* artifact is refused
         // (not stored), but re-publishing an existing key still succeeds (resets signals in place,
-        // no growth). `0` would be unbounded (the default).
+        // no growth). `0` is the explicit unbounded opt-out.
         let r = RegistryMem::new().with_max_entries(1);
         let h1 = r.publish(manifest("a"), b"artifact-one".to_vec());
         assert!(r.fetch(&h1).is_some(), "first artifact stored under cap");
@@ -815,5 +1082,38 @@ mod tests {
         let h1_again = r.publish(manifest("a"), b"artifact-one".to_vec());
         assert_eq!(h1_again, h1);
         assert!(r.fetch(&h1).is_some(), "re-publish of an existing key succeeds at capacity");
+    }
+
+    #[test]
+    fn default_max_entries_is_bounded_and_zero_opt_out_is_unbounded() {
+        let r = RegistryMem::new();
+
+        for i in 0..DEFAULT_MAX_REGISTRY_ENTRIES {
+            let bytes = format!("artifact-{i}").into_bytes();
+            let h = r.publish(manifest(&format!("bounded-{i}")), bytes);
+            assert!(r.fetch(&h).is_some(), "entry {i} stored under the default cap");
+        }
+        assert_eq!(r.len(), DEFAULT_MAX_REGISTRY_ENTRIES);
+
+        let overflow_bytes = b"default-overflow".to_vec();
+        let overflow_hash = r.publish(manifest("overflow"), overflow_bytes.clone());
+        assert_eq!(overflow_hash, sha256_hex(&overflow_bytes));
+        assert!(r.fetch(&overflow_hash).is_none(), "new entry refused at default capacity");
+        assert_eq!(r.len(), DEFAULT_MAX_REGISTRY_ENTRIES);
+
+        let existing_bytes = b"artifact-0".to_vec();
+        let existing_hash = sha256_hex(&existing_bytes);
+        let republish_hash = r.publish(manifest("bounded-0-republish"), existing_bytes);
+        assert_eq!(republish_hash, existing_hash);
+        assert!(r.fetch(&existing_hash).is_some(), "existing key can be re-published at capacity");
+        assert_eq!(r.len(), DEFAULT_MAX_REGISTRY_ENTRIES);
+
+        let unbounded = RegistryMem::new().with_max_entries(0);
+        for i in 0..=DEFAULT_MAX_REGISTRY_ENTRIES {
+            let bytes = format!("unbounded-artifact-{i}").into_bytes();
+            let h = unbounded.publish(manifest(&format!("unbounded-{i}")), bytes);
+            assert!(unbounded.fetch(&h).is_some(), "entry {i} stored under explicit opt-out");
+        }
+        assert_eq!(unbounded.len(), DEFAULT_MAX_REGISTRY_ENTRIES + 1);
     }
 }

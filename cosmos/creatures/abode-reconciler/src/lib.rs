@@ -14,7 +14,8 @@
 //!
 //! On a [`ReconcilerMsg::Reconcile { fork_a, fork_b }`] for the *same* Abode (same `abode_key`), the
 //! reconciler:
-//! 1. **Verifies both forks** through the substrate's snapshot gates — size ceiling (R9), signature
+//! 1. **Bounds the reconcile message before JSON decode**, then verifies both forks through the
+//!    substrate's snapshot gates — size ceiling (R9), signature
 //!    (each fork must be validly signed by the Abode key, unless the operator opts out for a sealed
 //!    lab), and integrity (`state_hash == sha256(payload)`). A fork that fails any gate → `Rejected`,
 //!    never a panic.
@@ -51,6 +52,21 @@ pub const SCHEMA: &str = "abode.reconciler";
 /// *several* forks at once, so it bounds each fork at half that. A peer can't have the reconciler
 /// admit an enormous fork just because it knows the address (R9).
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Fixed allowance for non-payload JSON fields in one reconcile message.
+const RECONCILER_MESSAGE_OVERHEAD_BYTES: usize = 256 * 1024;
+
+/// The pre-parse ceiling for a serialized [`ReconcilerMsg`], derived from the instance's
+/// `max_payload_bytes`. A reconcile carries two snapshots. `AbodeSnapshot.payload_bytes` currently
+/// serializes as a JSON `Vec<u8>` array; a single byte can occupy up to four wire bytes (`255,`).
+/// The cap therefore allows two max-sized fork payloads at worst-case JSON expansion plus fixed
+/// metadata overhead.
+fn max_reconciler_message_bytes(max_payload_bytes: usize) -> usize {
+    max_payload_bytes
+        .saturating_mul(2)
+        .saturating_mul(4)
+        .saturating_add(RECONCILER_MESSAGE_OVERHEAD_BYTES)
+}
 
 // ===================================================================================================
 // Injected CRDT merge model (IoC)
@@ -168,6 +184,19 @@ impl Creature for AbodeReconciler {
     fn handle(&mut self, env: Envelope) -> Outcome {
         if env.header.schema != SCHEMA {
             return Outcome::none(); // misbind / stray — never crash (R9).
+        }
+        let max_message_bytes = max_reconciler_message_bytes(self.cfg.max_payload_bytes);
+        if env.payload.len() > max_message_bytes {
+            return reply(
+                &env,
+                ReconcilerMsg::Rejected {
+                    reason: format!(
+                        "reconciler message {} bytes exceeds max {} bytes",
+                        env.payload.len(),
+                        max_message_bytes
+                    ),
+                },
+            );
         }
         let Ok(msg) = ReconcilerMsg::parse(&env.payload) else {
             return Outcome::none(); // R9: malformed input → drop, never panic.
@@ -465,5 +494,39 @@ mod tests {
             payload: b"{not json".to_vec(),
         };
         assert!(r.handle(env).dispatches.is_empty());
+    }
+
+    #[test]
+    fn oversized_reconcile_message_is_rejected_before_json_decode() {
+        let mut r = AbodeReconciler::new(
+            ReconcilerConfig::new(key(0x02), Box::new(SortedConcatMerge)).with_max_payload_bytes(8),
+        );
+        r.set_me_for_tests(ME);
+        let max_message_bytes = max_reconciler_message_bytes(8);
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(100)),
+                to: Address::Creature(ME),
+                reply_to: Some(Address::Creature(CreatureId(100))),
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(99),
+                commitment: None,
+                schema: SCHEMA.into(),
+            },
+            payload: vec![b'{'; max_message_bytes + 1],
+        };
+
+        let out = r.handle(env);
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].corr, Some(99));
+        match ReconcilerMsg::parse(&out.dispatches[0].payload).unwrap() {
+            ReconcilerMsg::Rejected { reason } => {
+                assert!(reason.contains("exceeds max"), "got: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 }

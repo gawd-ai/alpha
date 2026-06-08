@@ -72,13 +72,19 @@ something else writes a third on the same socket and the kernel is none the wise
 themselves live in the `bestiary` contract crate (`registry-mem` re-exports them), so the catalogue
 contract and its durable implementation never drift.
 
+`registry-mem` is intentionally bounded by default: it refuses new `(RealmId, artifact_hash)` keys at
+`DEFAULT_MAX_REGISTRY_ENTRIES` while still allowing re-publish of an existing key. `with_max_entries(0)`
+is the explicit opt-out for demos or labs that accept unbounded in-memory catalog growth.
+
 - **Keyed by `(RealmId, artifact_hash)`.** `artifact_hash` is `sha256(artifact_bytes)`. Two
   creatures with identical bytes in different Realms are distinct entries by construction — Realm
   grain is load-bearing, not cosmetic.
-- **Ops are JSON in the envelope payload.** `Publish` / `Fetch` operate in the local Realm;
-  `PublishInRealm` / `FetchInRealm` name a Realm explicitly. Artifact bytes ride **hex-encoded**, not
-  as a serde number array — the latter expands ~4× and parses orders of magnitude slower, enough to
-  blow a publish RPC's timeout on a multi-megabyte `.so`.
+- **Ops are JSON in the envelope payload.** `Publish` / `Fetch` / `FetchMetadata` operate in the
+  local Realm; `PublishInRealm` / `FetchInRealm` / `FetchMetadataInRealm` name a Realm explicitly.
+  Full fetch carries artifact bytes for load/replication paths. Metadata fetch carries only the
+  catalog row plus artifact length for operator/control lookups. Artifact bytes ride **hex-encoded**,
+  not as a serde number array — the latter expands ~4× and parses orders of magnitude slower, enough
+  to blow a publish RPC's timeout on a multi-megabyte `.so`.
 - **The `Entry` carries two optional slots** beyond `(manifest, artifact)`: a `reputation`
   (`ReputationScore`) and a reversible `quarantine` (`QuarantineNotice`). Both default to `None`, so
   the wire bytes of a slot-less entry are unchanged. A (re)publish of a `(realm, artifact_hash)`
@@ -114,6 +120,12 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
   the daemon's own key** (`ForeignAuthor`). The on-disk log is a self-owned journal, not a federation
   inbox: peer entries never arrive as foreign records replayed at bind — they arrive only through
   `PushEntries`, verified and **re-signed under the local identity** on ingest.
+- **Bounded by default, like the in-memory registry.** The durable store refuses new
+  `(RealmId, artifact_hash)` keys past `DEFAULT_MAX_BESTIARY_ENTRIES` and rejects an artifact above the
+  128 MiB ceiling, with `0` the explicit unbounded opt-out (`with_max_entries` / `with_max_artifact_bytes`);
+  `recover()` replays an existing catalogue even above the current cap. A publish past the entry cap is a
+  wire-honest error (not a false `Published`); a federation `PushEntries` of a *new* key into a full
+  catalogue is skipped (best-effort lattice merge) rather than failing the whole batch.
 - **Verifiable entry proofs.** `ProveEntry` returns a standalone `EntryProof` — the daemon signs
   `(realm, artifact_hash, manifest_hash, first_seen, attester)` with its Abode key. Anyone verifies it
   with the attester's pubkey, and because it commits to the compaction-stable `first_seen` rather than a
@@ -275,7 +287,9 @@ four things, and admission gates them all:
    `PublishInRealm` write path. The merge is **pinned to the requested Realm**, not the Realm a peer
    tags on each entry — a scoped pull of Realm X can only ever write Realm X locally, so a peer
    cannot smuggle entries into a Realm that was not pulled. Pull, not gossip: a pull happens when an
-   operator or scheduler sends `PullFrom`; the substrate ships no clock.
+   operator or scheduler sends `PullFrom`; the substrate ships no clock. Unanswered pulls are parked
+   under a bounded default pending table, with an explicit `0` opt-out for lab/demo deployments that
+   accept unbounded in-flight pull state.
 3. **Signed reputation.** A `FederateReputation` op signs a `ReputationDelta` with the **observer's**
    Abode key and ships it as a SEER `consensus` `Answer`. The receiver verifies the signature — an
    unsigned or invalid delta never touches the registry — applies the **injected**
@@ -347,4 +361,6 @@ placement decision is auditable. The die binds the *value*; it does not bind *li
 last, it can selectively abort an unfavourable round by withholding the reveal (a ~1-bit bias). Plain
 two-party commit-reveal does not close that; an operator mitigates at the policy layer
 (deadline-forfeit, reputation penalty), and a VRF closes it — a later pair on the same socket, the
-shape unchanged.
+shape unchanged. The reference die still has a resource floor: commit/reveal messages are capped
+before JSON decode, and committed-but-unrevealed rounds are capped by default, with an explicit `0`
+opt-out for lab/demo deployments that accept unbounded pending state.

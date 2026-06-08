@@ -10,7 +10,7 @@
 //! It parses the wire as generic JSON rather than linking the kernel's event structs, so it stays a
 //! plain creature with no dependency on `sanctum` — any language could write the same observer.
 
-use aether::{Creature, CreatureCtx, Envelope, Outcome};
+use aether::{Creature, CreatureCtx, Envelope, Outcome, MAX_SENSE_EVENT_BYTES};
 use serde_json::Value;
 
 /// A pure-observer creature. Bind it, subscribe it to `proprioception` + `fitness`, and it prints
@@ -29,7 +29,11 @@ impl Monitor {
     /// Format one sense envelope as a tape line — exposed (not just `println!`'d) so a host that
     /// wants to route the tape elsewhere (a log, a UI, a test assertion) can reuse the rendering.
     pub fn render(&self, env: &Envelope) -> String {
-        let body: Value = serde_json::from_slice(&env.payload).unwrap_or(Value::Null);
+        let body: Value = if env.payload.len() > MAX_SENSE_EVENT_BYTES {
+            Value::Null
+        } else {
+            serde_json::from_slice(&env.payload).unwrap_or(Value::Null)
+        };
         let prefix = if self.tag.is_empty() { String::new() } else { format!("[{}] ", self.tag) };
         match env.header.schema.as_str() {
             "proprioception" => {
@@ -111,6 +115,16 @@ mod tests {
     fn tag_prefixes_the_tape_when_set() {
         let m = Monitor::new("realm-a");
         assert!(m.render(&env("fitness", br#"{"module":1,"ok":true}"#)).starts_with("[realm-a]"));
+    }
+
+    #[test]
+    fn oversized_sense_payload_degrades_without_json_parse() {
+        let m = Monitor::default();
+        let line = m.render(&env("budget_signal", &vec![b'{'; MAX_SENSE_EVENT_BYTES + 1]));
+        assert!(
+            line.contains("creature #0"),
+            "oversized known-schema payload renders from Null fallback: {line}"
+        );
     }
 
     #[test]

@@ -23,8 +23,9 @@
 //!   `Authoritative → Migrated { to: destination_node }` and replies `MigrateAck` to the operator.
 //!   The source's Abode is now non-authoritative; further `SetState` / `Migrate` /
 //!   `SnapshotRequest` reject. (T5 in spirit: hand-off is explicit; no two-active-fork window.)
-//! - `RestoreRequest { snapshot, note }` *(peer op)* — admission's only public surface. Runs the
-//!   substrate-shipped gates ([`AbodeSnapshot::assert_payload_size`] →
+//! - `RestoreRequest { snapshot, note }` *(peer op)* — admission's only public surface. Bounds the
+//!   serialized migrator message before JSON decode, then runs the substrate-shipped gates
+//!   ([`AbodeSnapshot::assert_payload_size`] →
 //!   [`assert_integrity`](AbodeSnapshot::assert_integrity) →
 //!   [`verify_signature`](AbodeSnapshot::verify_signature) if signatures are required) before
 //!   consulting the injected [`RestorePolicy`]. On admit: transitions `Empty →
@@ -93,6 +94,18 @@ use sigil::{Ed25519KeyMaterial, Ed25519Verifier, Verifier};
 /// a `kind`-tagged enum keeps the wire surface uniform; consumers filter by `schema` and then
 /// dispatch on the enum variant. Same convention as `seer::SCHEMA`.
 pub const SCHEMA: &str = "abode.migrator";
+
+/// Fixed allowance for non-payload JSON fields in one migrator message.
+const MIGRATOR_MESSAGE_OVERHEAD_BYTES: usize = 256 * 1024;
+
+/// The pre-parse ceiling for a serialized [`MigratorMsg`], derived from the instance's
+/// `max_payload_bytes`. The largest accepted migrator messages carry one raw state payload
+/// (`SetState`) or one snapshot (`RestoreRequest` / `SnapshotReply`). `Vec<u8>` serializes as a JSON
+/// array, where one byte can occupy up to four wire bytes (`255,`), so the cap allows one max-sized
+/// payload at worst-case JSON expansion plus fixed metadata overhead.
+fn max_migrator_message_bytes(max_payload_bytes: usize) -> usize {
+    max_payload_bytes.saturating_mul(4).saturating_add(MIGRATOR_MESSAGE_OVERHEAD_BYTES)
+}
 
 /// 4-byte magic prefix this hand-off migrator writes at the head of
 /// [`AbodeSnapshot::payload_bytes`]. A migrator that receives an unknown prefix rejects with
@@ -486,6 +499,19 @@ impl Creature for AbodeMigrator {
             // silently ignore (consistent with distributor / realm-gateway).
             return Outcome::none();
         }
+        let max_message_bytes = max_migrator_message_bytes(self.max_payload_bytes);
+        if env.payload.len() > max_message_bytes {
+            return reply(
+                &env,
+                MigratorMsg::MigrateFailed {
+                    reason: format!(
+                        "migrator message {} bytes exceeds max {} bytes",
+                        env.payload.len(),
+                        max_message_bytes
+                    ),
+                },
+            );
+        }
         let Ok(msg) = MigratorMsg::parse(&env.payload) else {
             // Malformed payload from somewhere; drop silently. The fabric-integrity floor (R9)
             // says we never panic on hostile input.
@@ -539,6 +565,18 @@ impl AbodeMigrator {
     // ----- operator-facing handlers ------------------------------------------------------------
 
     fn on_set_state(&mut self, env: &Envelope, payload: Vec<u8>) -> Outcome {
+        let wrapped_len = SCHEMA_V0_3_MAGIC.len().saturating_add(payload.len());
+        if wrapped_len > self.max_payload_bytes {
+            return reply(
+                env,
+                MigratorMsg::MigrateFailed {
+                    reason: format!(
+                        "set_state rejected: wrapped payload {wrapped_len} bytes exceeds max snapshot payload {} bytes",
+                        self.max_payload_bytes
+                    ),
+                },
+            );
+        }
         if self.pending.is_some() {
             return reply(
                 env,
@@ -1078,6 +1116,51 @@ mod tests {
         m.handle(op_env(MigratorMsg::SetState { payload: b"old".to_vec() }, 1));
         m.handle(op_env(MigratorMsg::SetState { payload: b"new".to_vec() }, 2));
         assert_eq!(m.state(), &AbodeState::Authoritative { payload: b"new".to_vec() });
+    }
+
+    #[test]
+    fn set_state_rejects_payload_that_cannot_fit_snapshot_ceiling_after_wrapping() {
+        let mut m = build_migrator(key(0xA9)).with_max_payload_bytes(SCHEMA_V0_3_MAGIC.len() + 3);
+        let out = m.handle(op_env(MigratorMsg::SetState { payload: b"toolong".to_vec() }, 1));
+        let reply = MigratorMsg::parse(&out.dispatches[0].payload).unwrap();
+        match reply {
+            MigratorMsg::MigrateFailed { reason } => {
+                assert!(reason.contains("set_state rejected"), "got: {reason}");
+                assert!(reason.contains("exceeds max snapshot payload"), "got: {reason}");
+            }
+            other => panic!("expected MigrateFailed, got {other:?}"),
+        }
+        assert_eq!(m.state(), &AbodeState::Empty);
+    }
+
+    #[test]
+    fn oversized_migrator_message_is_rejected_before_json_decode() {
+        let mut m = build_migrator(key(0xAA)).with_max_payload_bytes(8);
+        let max_message_bytes = max_migrator_message_bytes(8);
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(100)),
+                to: Address::Creature(CreatureId(7)),
+                reply_to: Some(Address::Creature(CreatureId(100))),
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(77),
+                commitment: None,
+                schema: SCHEMA.into(),
+            },
+            payload: vec![b'{'; max_message_bytes + 1],
+        };
+        let out = m.handle(env);
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].corr, Some(77));
+        match MigratorMsg::parse(&out.dispatches[0].payload).unwrap() {
+            MigratorMsg::MigrateFailed { reason } => {
+                assert!(reason.contains("exceeds max"), "got: {reason}");
+            }
+            other => panic!("expected MigrateFailed, got {other:?}"),
+        }
     }
 
     #[test]

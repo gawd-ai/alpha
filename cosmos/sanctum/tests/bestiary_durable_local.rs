@@ -22,11 +22,13 @@ use aether::{
 };
 use anima::NativeEngine;
 use bestiary::{
-    BestiaryOp, BestiaryReply, DeterministicCurator, FsBestiaryStore, RegistryOp, RegistryReply,
+    BestiaryOp, BestiaryReply, BestiaryStore, DeterministicCurator, FsBestiaryStore, RegistryOp,
+    RegistryReply,
 };
 use bestiary_daemon::{BestiaryConfig, BestiaryDaemon};
 use policy_signed::SignedPolicy;
 use sanctum::Kernel;
+use sha2::{Digest, Sha256};
 use sigil::{Backend, Capabilities, Ed25519KeyMaterial, Ed25519Verifier, Manifest};
 
 // ---- self-cleaning temp root (no external tempdir dep) ----
@@ -65,6 +67,12 @@ fn signed_boot_manifest(name: &str, key: &Ed25519KeyMaterial) -> Manifest {
     m
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 /// Boot a single-node kernel with a durable daemon (over `root`) bound to REGISTRY. Returns the
 /// kernel + the daemon's creature id.
 fn boot_daemon(
@@ -72,10 +80,19 @@ fn boot_daemon(
     node_key: &Ed25519KeyMaterial,
     abode: Ed25519KeyMaterial,
 ) -> (Arc<Kernel>, CreatureId) {
+    boot_daemon_with_config(root, node_key, abode, BestiaryConfig::local())
+}
+
+fn boot_daemon_with_config(
+    root: &std::path::Path,
+    node_key: &Ed25519KeyMaterial,
+    abode: Ed25519KeyMaterial,
+    cfg: BestiaryConfig,
+) -> (Arc<Kernel>, CreatureId) {
     let k = kernel(node_key);
     let store = Arc::new(FsBestiaryStore::new(root, abode).unwrap());
     let curator = Arc::new(DeterministicCurator::default());
-    let daemon = BestiaryDaemon::new(store, curator, BestiaryConfig::local());
+    let daemon = BestiaryDaemon::new(store, curator, cfg);
     let id = k
         .load_instance(signed_boot_manifest("bestiary-daemon", node_key), Box::new(daemon))
         .expect("daemon admits");
@@ -196,6 +213,44 @@ fn durable_publish_fetch_prove_and_survive_restart() {
         match reply {
             RegistryReply::FetchedInRealm { artifact, .. } => assert_eq!(artifact, bytes),
             other => panic!("expected FetchedInRealm, got {other:?}"),
+        }
+
+        // Metadata fetch reports length without returning artifact bytes.
+        let reply = registry_op(
+            &bus,
+            &rx,
+            probe,
+            Address::Creature(id),
+            RegistryOp::FetchMetadataInRealm { artifact_hash: hash.clone(), realm: realm.clone() },
+            21,
+        );
+        match reply {
+            RegistryReply::FetchedMetadata { entry, artifact_len } => {
+                assert_eq!(entry.artifact_hash, hash);
+                assert_eq!(entry.realm, realm);
+                assert_eq!(entry.manifest.name, "c");
+                assert_eq!(artifact_len, bytes.len());
+            }
+            other => panic!("expected FetchedMetadata, got {other:?}"),
+        }
+
+        // Metadata listing is byte-light: it reports the catalog row without carrying artifact bytes.
+        let reply = registry_op(
+            &bus,
+            &rx,
+            probe,
+            Address::Creature(id),
+            RegistryOp::ListMetadata { realm: Some(realm.clone()) },
+            22,
+        );
+        match reply {
+            RegistryReply::Metadata { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].artifact_hash, hash);
+                assert_eq!(entries[0].realm, realm);
+                assert_eq!(entries[0].manifest.name, "c");
+            }
+            other => panic!("expected Metadata, got {other:?}"),
         }
 
         // A standalone ProveEntry attestation verifies under the daemon's abode key.
@@ -357,6 +412,153 @@ fn daemon_answers_registry_ops_byte_identically_to_registry_mem() {
     .unwrap();
     let reply: RegistryReply = serde_json::from_slice(&bytes).unwrap();
     assert!(matches!(reply, RegistryReply::Error { .. }), "malformed op → Error (parity)");
+
+    k.shutdown_all(Deadline::from_millis(1500));
+}
+
+#[test]
+fn daemon_rejects_oversized_registry_payload_before_json_parse() {
+    let root = TempRoot::new("registry-op-cap");
+    let node_key = Ed25519KeyMaterial::from_seed([0x55; 32]).unwrap();
+    let abode = Ed25519KeyMaterial::from_seed([0x56; 32]).unwrap();
+    let mut cfg = BestiaryConfig::local();
+    cfg.max_registry_op_bytes = 8;
+    let (k, id) = boot_daemon_with_config(&root.0, &node_key, abode, cfg);
+    let (probe, bus, rx) = k.open_endpoint(Capabilities::default());
+
+    let bytes = roundtrip(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        "registry.op",
+        b"{ not json".to_vec(),
+        1,
+        Duration::from_secs(3),
+    )
+    .expect("registry reply");
+    let reply: RegistryReply = serde_json::from_slice(&bytes).unwrap();
+    match reply {
+        RegistryReply::Error { message } => {
+            assert!(message.contains("too large"), "expected size error, got {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    k.shutdown_all(Deadline::from_millis(1500));
+}
+
+#[test]
+fn daemon_rejects_oversized_registry_publish_artifact() {
+    let root = TempRoot::new("registry-artifact-cap");
+    let node_key = Ed25519KeyMaterial::from_seed([0x57; 32]).unwrap();
+    let abode = Ed25519KeyMaterial::from_seed([0x58; 32]).unwrap();
+    let mut cfg = BestiaryConfig::local();
+    cfg.max_artifact_bytes = 4;
+    let (k, id) = boot_daemon_with_config(&root.0, &node_key, abode, cfg);
+    let (probe, bus, rx) = k.open_endpoint(Capabilities::default());
+    let realm = RealmId::new("crew");
+    let bytes = b"12345".to_vec();
+    let hash = sha256_hex(&bytes);
+
+    let reply = registry_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        RegistryOp::PublishInRealm {
+            manifest: Manifest::new("too-big", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            artifact: bytes,
+            realm: realm.clone(),
+        },
+        1,
+    );
+    match reply {
+        RegistryReply::Error { message } => {
+            assert!(message.contains("artifact too large"), "unexpected error: {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let reply = registry_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        RegistryOp::FetchInRealm { artifact_hash: hash, realm },
+        2,
+    );
+    assert!(matches!(reply, RegistryReply::NotFound), "oversized artifact was not stored");
+
+    k.shutdown_all(Deadline::from_millis(1500));
+}
+
+#[test]
+fn daemon_rejects_oversized_bestiary_payload_before_json_parse() {
+    let root = TempRoot::new("bestiary-op-cap");
+    let node_key = Ed25519KeyMaterial::from_seed([0x59; 32]).unwrap();
+    let abode = Ed25519KeyMaterial::from_seed([0x5A; 32]).unwrap();
+    let mut cfg = BestiaryConfig::local();
+    cfg.max_bestiary_op_bytes = 8;
+    let (k, id) = boot_daemon_with_config(&root.0, &node_key, abode, cfg);
+    let (probe, bus, rx) = k.open_endpoint(Capabilities::default());
+
+    let bytes = roundtrip(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        "bestiary.op",
+        b"{ not json".to_vec(),
+        1,
+        Duration::from_secs(3),
+    )
+    .expect("bestiary reply");
+    let reply: BestiaryReply = serde_json::from_slice(&bytes).unwrap();
+    match reply {
+        BestiaryReply::Error { message } => {
+            assert!(message.contains("too large"), "expected size error, got {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    k.shutdown_all(Deadline::from_millis(1500));
+}
+
+#[test]
+fn daemon_rejects_oversized_push_entry_artifacts() {
+    let root = TempRoot::new("push-artifact-cap");
+    let src_root = TempRoot::new("push-artifact-cap-src");
+    let node_key = Ed25519KeyMaterial::from_seed([0x5B; 32]).unwrap();
+    let abode = Ed25519KeyMaterial::from_seed([0x5C; 32]).unwrap();
+    let src_abode = Ed25519KeyMaterial::from_seed([0x5D; 32]).unwrap();
+    let mut cfg = BestiaryConfig::local();
+    cfg.max_artifact_bytes = 4;
+    let (k, id) = boot_daemon_with_config(&root.0, &node_key, abode, cfg);
+    let (probe, bus, rx) = k.open_endpoint(Capabilities::default());
+
+    let src = FsBestiaryStore::new(&src_root.0, src_abode).unwrap();
+    let realm = RealmId::new("crew");
+    src.put(
+        &realm,
+        Manifest::new("pushed-too-big", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+        b"12345".to_vec(),
+    )
+    .unwrap();
+    let entries = src.signed_entries(Some(&realm)).unwrap();
+
+    let reply = bestiary_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        BestiaryOp::PushEntries { entries },
+        1,
+    );
+    assert!(
+        matches!(reply, BestiaryReply::PushAck { accepted: 0, rejected: 1 }),
+        "oversized pushed artifact must be rejected, got {reply:?}"
+    );
 
     k.shutdown_all(Deadline::from_millis(1500));
 }

@@ -21,6 +21,9 @@
 //!   Reads run inline (fast); orchestration verbs run on a worker so a cold `author` never
 //!   head-of-line-blocks a `status`.
 
+use std::fmt;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -39,12 +42,14 @@ use agent_templated::{AgentTemplated, AuthoringReply, AuthoringRequest};
 // `bestiary.op` (BestiaryOp/BestiaryReply) the `bestiary_prove` verb speaks — both from the Bestiary
 // contract crate, so `run_verb` names the wire without reaching into a registry creature.
 use bestiary::{
-    BestiaryOp, BestiaryReply, RegistryOp, RegistryReply, BESTIARY_OP_SCHEMA, REGISTRY_OP_SCHEMA,
+    BestiaryOp, BestiaryReply, CatalogEntry, RegistryOp, RegistryReply, BESTIARY_OP_SCHEMA,
+    REGISTRY_OP_SCHEMA,
 };
 use build_cargo::{BuildCargo, BuildConfig, BuildOp, BuildReply, Sandbox};
 use build_critter::{BuildCritter, BuildCritterOp};
 use monitor::Monitor;
 use registry_mem::RegistryMem;
+use serde::de::DeserializeOwned;
 use transport_tcp::{TransportCtl, TransportCtlReply, CTL_SCHEMA};
 
 use serde_json::{json, Value};
@@ -56,6 +61,45 @@ pub use control::{
 
 /// The one-line command summary printed by the REPL banner and the `help` verb.
 pub const COMMANDS: &str = "commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | bestiary prove <artifact-hash> <realm> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit";
+
+/// Control-surface manifests are JSON metadata, not artifacts. Keep the node-local path reader
+/// bounded so a granted surface caller cannot make the control plane slurp an arbitrary local file.
+pub const MAX_CONTROL_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// Artifact bytes may cross the bus for registry publish, and beast/critter path-loads are read into
+/// memory by their engines. Native daemons still load by path for `dlopen`, but bus-carried artifacts
+/// and non-native path loads get this hard ceiling.
+pub const MAX_CONTROL_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+/// A `control_verb` is a command envelope, not an artifact carrier. Bound it before JSON parsing so
+/// remote/bus control cannot spend unbounded memory deserializing a command body.
+pub const MAX_CONTROL_VERB_BYTES: usize = 1024 * 1024;
+/// A `control_result` is metadata + operator-facing text, not a bulk-data carrier. Bound it before
+/// surface-side JSON parsing so a malformed or hostile control responder cannot force unbounded
+/// allocation in HTTP/MCP callers.
+pub const MAX_CONTROL_RESULT_BYTES: usize = MAX_CONTROL_VERB_BYTES;
+/// Maximum bytes shown when a control surface presents an arbitrary creature reply or sense payload.
+///
+/// Control is an operator/API surface, not a bulk-data transport. Small replies stay exact; larger
+/// replies are returned as a lossy UTF-8 preview with byte counts and a truncation flag.
+pub const MAX_PRESENTED_PAYLOAD_BYTES: usize = 64 * 1024;
+/// The control worker runs slow request/reply orchestration off the kernel drain thread. Bound its
+/// queue so a slow `author`/`send` cannot accumulate unbounded pending jobs.
+pub const CONTROL_WORKER_QUEUE_CAP: usize = 64;
+
+/// Authoring replies carry source text and manifest metadata, not artifacts. Keep them bounded
+/// before the control core deserializes a role response.
+const MAX_AUTHORING_REPLY_BYTES: usize = 8 * 1024 * 1024;
+/// Build replies can legitimately carry one max-size artifact as a hex string.
+/// Size this around the existing 128 MiB artifact ceiling plus manifest/error overhead.
+const MAX_ARTIFACT_ROLE_REPLY_BYTES: usize =
+    (MAX_CONTROL_ARTIFACT_BYTES as usize * 2) + (8 * 1024 * 1024);
+/// Registry publish replies are tiny acknowledgements/errors, never artifacts.
+const MAX_REGISTRY_ACK_REPLY_BYTES: usize = 1024 * 1024;
+/// Registry metadata listing is a control-surface read, not anti-entropy; keep it byte-light.
+const MAX_REGISTRY_METADATA_REPLY_BYTES: usize = 8 * 1024 * 1024;
+/// Registry fetch uses the metadata-only registry op; it should never inherit artifact-sized caps.
+const MAX_REGISTRY_FETCH_REPLY_BYTES: usize = MAX_REGISTRY_METADATA_REPLY_BYTES;
+/// `bestiary prove` and compaction replies are metadata/proofs, never artifacts.
+const MAX_BESTIARY_REPLY_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------------------------
 // Human/AI shared control (modeled on sctl session_allow_ai / session_ai_status)
@@ -245,6 +289,64 @@ pub struct VerbResult {
     pub ok: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadPreview {
+    pub text: String,
+    pub bytes: usize,
+    pub truncated: bool,
+    pub limit: usize,
+}
+
+pub fn payload_preview(payload: &[u8]) -> PayloadPreview {
+    let take = payload.len().min(MAX_PRESENTED_PAYLOAD_BYTES);
+    PayloadPreview {
+        text: String::from_utf8_lossy(&payload[..take]).to_string(),
+        bytes: payload.len(),
+        truncated: payload.len() > MAX_PRESENTED_PAYLOAD_BYTES,
+        limit: MAX_PRESENTED_PAYLOAD_BYTES,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlResultDecodeError {
+    TooLarge { len: usize, limit: usize },
+    Json(String),
+}
+
+impl fmt::Display for ControlResultDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { len, limit } => {
+                write!(f, "control result payload is {len} bytes, exceeds {limit} byte limit")
+            }
+            Self::Json(e) => write!(f, "could not parse control result: {e}"),
+        }
+    }
+}
+
+pub fn parse_control_result(payload: &[u8]) -> Result<VerbResult, ControlResultDecodeError> {
+    if payload.len() > MAX_CONTROL_RESULT_BYTES {
+        return Err(ControlResultDecodeError::TooLarge {
+            len: payload.len(),
+            limit: MAX_CONTROL_RESULT_BYTES,
+        });
+    }
+    serde_json::from_slice(payload).map_err(|e| ControlResultDecodeError::Json(e.to_string()))
+}
+
+pub fn control_result_decode_failure(err: ControlResultDecodeError) -> VerbResult {
+    match err {
+        ControlResultDecodeError::TooLarge { len, limit } => VerbResult::err(
+            json!({ "error": "control-result-too-large", "bytes": len, "limit": limit }),
+            format!("control: result payload is {len} bytes, exceeds {limit} byte limit"),
+        ),
+        ControlResultDecodeError::Json(detail) => VerbResult::err(
+            json!({ "error": "bad-control-result", "detail": detail }),
+            format!("control: could not parse the result: {detail}"),
+        ),
+    }
+}
+
 impl VerbResult {
     /// A successful result — `json` is the machine body, `human` the REPL line. `pub` so a surface
     /// creature (out-of-crate) can build one when short-circuiting before the bus round-trip.
@@ -265,6 +367,26 @@ impl VerbResult {
     /// True when the gate refused this verb — lets the API answer 403 rather than a generic 400.
     pub fn is_gate_block(&self) -> bool {
         !self.ok && self.json.get("error").and_then(Value::as_str) == Some("ai-not-allowed")
+    }
+}
+
+fn reply_result(payload: &[u8]) -> VerbResult {
+    let preview = payload_preview(payload);
+    if preview.truncated {
+        VerbResult::ok(
+            json!({
+                "reply": preview.text,
+                "reply_bytes": preview.bytes,
+                "reply_truncated": true,
+                "reply_limit": preview.limit
+            }),
+            format!(
+                "reply: {} ... (truncated; {} bytes total, showing {} bytes)",
+                preview.text, preview.bytes, preview.limit
+            ),
+        )
+    } else {
+        VerbResult::ok(json!({ "reply": preview.text }), format!("reply: {}", preview.text))
     }
 }
 
@@ -330,6 +452,32 @@ fn no_probe_err() -> VerbResult {
         json!({ "error": "no-probe", "hint": "this verb needs a request/reply endpoint" }),
         "internal: this verb needs a probe endpoint (routing error)",
     )
+}
+
+fn read_node_file_bounded(path: &str, label: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("read {label} {path}: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("read {label} {path}: not a regular file"));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "read {label} {path}: file is {} bytes, exceeds {} byte limit",
+            metadata.len(),
+            max_bytes
+        ));
+    }
+
+    let file = File::open(path).map_err(|e| format!("read {label} {path}: {e}"))?;
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::with_capacity(metadata.len().min(1024 * 1024) as usize);
+    reader.read_to_end(&mut bytes).map_err(|e| format!("read {label} {path}: {e}"))?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > max_bytes) {
+        return Err(format!(
+            "read {label} {path}: file grew past {} byte limit while reading",
+            max_bytes
+        ));
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -531,15 +679,16 @@ pub fn run_verb(verb: Verb, ctx: &mut VerbCtx, progress: &mut dyn FnMut(&str)) -
 }
 
 fn verb_load(ctx: &mut VerbCtx, manifest_path: &str, artifact_path: &str) -> VerbResult {
-    let m_bytes = match std::fs::read(manifest_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return VerbResult::err(
-                json!({ "ok": false, "error": format!("read manifest {manifest_path}: {e}") }),
-                format!("load failed: read manifest {manifest_path}: {e}"),
-            )
-        }
-    };
+    let m_bytes =
+        match read_node_file_bounded(manifest_path, "manifest", MAX_CONTROL_MANIFEST_BYTES) {
+            Ok(b) => b,
+            Err(e) => {
+                return VerbResult::err(
+                    json!({ "ok": false, "error": e }),
+                    format!("load failed: {e}"),
+                )
+            }
+        };
     let m = match Manifest::parse(&m_bytes) {
         Ok(m) => m,
         Err(e) => {
@@ -549,7 +698,21 @@ fn verb_load(ctx: &mut VerbCtx, manifest_path: &str, artifact_path: &str) -> Ver
             )
         }
     };
-    match ctx.kernel.load(m, Artifact::Path(artifact_path.into())) {
+    let artifact = match m.abi.backend {
+        Backend::Daemon => Artifact::Path(artifact_path.into()),
+        Backend::Beast | Backend::Critter => {
+            match read_node_file_bounded(artifact_path, "artifact", MAX_CONTROL_ARTIFACT_BYTES) {
+                Ok(bytes) => Artifact::Bytes(bytes),
+                Err(e) => {
+                    return VerbResult::err(
+                        json!({ "ok": false, "error": e }),
+                        format!("load failed: {e}"),
+                    )
+                }
+            }
+        }
+    };
+    match ctx.kernel.load(m, artifact) {
         Ok(id) => VerbResult::ok(
             json!({ "ok": true, "creature_id": id.0 }),
             format!("loaded id={}", id.0),
@@ -570,10 +733,41 @@ fn verb_load(ctx: &mut VerbCtx, manifest_path: &str, artifact_path: &str) -> Ver
 /// ms; the durable daemon does a small fs write); this only bites if nothing is bound to REGISTRY.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug)]
+enum RoleReplyDecodeError {
+    TooLarge { len: usize, limit: usize },
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for RoleReplyDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { len, limit } => {
+                write!(f, "payload is {len} bytes, exceeds {limit} byte limit")
+            }
+            Self::Json(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+fn parse_role_reply<T: DeserializeOwned>(
+    payload: &[u8],
+    limit: usize,
+) -> Result<T, RoleReplyDecodeError> {
+    if payload.len() > limit {
+        return Err(RoleReplyDecodeError::TooLarge { len: payload.len(), limit });
+    }
+    serde_json::from_slice(payload).map_err(RoleReplyDecodeError::Json)
+}
+
 /// Ship a `RegistryOp` to `Role::REGISTRY` and decode the `RegistryReply`. The `Err` arm is a
 /// ready-to-return [`VerbResult`] (no probe / route failure / timeout / parse error), so callers
 /// `match` on the reply variant and bubble `Err(res)` through.
-fn registry_request(ctx: &mut VerbCtx, op: RegistryOp) -> Result<RegistryReply, VerbResult> {
+fn registry_request(
+    ctx: &mut VerbCtx,
+    op: RegistryOp,
+    reply_limit: usize,
+) -> Result<RegistryReply, VerbResult> {
     let Some((bus, rx)) = ctx.probe else { return Err(no_probe_err()) };
     let payload = match serde_json::to_vec(&op) {
         Ok(p) => p,
@@ -590,12 +784,14 @@ fn registry_request(ctx: &mut VerbCtx, op: RegistryOp) -> Result<RegistryReply, 
         .with_reply_to(Address::Creature(bus.id()))
         .with_corr(c);
     match request_reply(bus, rx, d, c, REGISTRY_TIMEOUT) {
-        Ok(Some(env)) => serde_json::from_slice::<RegistryReply>(&env.payload).map_err(|e| {
-            VerbResult::err(
-                json!({ "ok": false, "error": e.to_string() }),
-                format!("registry reply parse failed: {e}"),
-            )
-        }),
+        Ok(Some(env)) => {
+            parse_role_reply::<RegistryReply>(&env.payload, reply_limit).map_err(|e| {
+                VerbResult::err(
+                    json!({ "ok": false, "error": e.to_string() }),
+                    format!("registry reply parse failed: {e}"),
+                )
+            })
+        }
         Ok(None) => Err(VerbResult::err(
             json!({ "ok": false, "error": "nothing bound to REGISTRY" }),
             "registry op failed: nothing bound to REGISTRY (running --minimal?)",
@@ -616,12 +812,13 @@ fn bestiary_request(ctx: &mut VerbCtx, op: BestiaryOp) -> Result<BestiaryReply, 
         .with_reply_to(Address::Creature(bus.id()))
         .with_corr(c);
     match request_reply(bus, rx, d, c, REGISTRY_TIMEOUT) {
-        Ok(Some(env)) => serde_json::from_slice::<BestiaryReply>(&env.payload).map_err(|e| {
-            VerbResult::err(
-                json!({ "ok": false, "error": e.to_string() }),
-                format!("bestiary reply parse failed: {e}"),
-            )
-        }),
+        Ok(Some(env)) => parse_role_reply::<BestiaryReply>(&env.payload, MAX_BESTIARY_REPLY_BYTES)
+            .map_err(|e| {
+                VerbResult::err(
+                    json!({ "ok": false, "error": e.to_string() }),
+                    format!("bestiary reply parse failed: {e}"),
+                )
+            }),
         Ok(None) => Err(VerbResult::err(
             json!({ "ok": false, "error": "nothing bound to REGISTRY" }),
             "bestiary op failed: nothing bound to REGISTRY (running --minimal?)",
@@ -648,15 +845,16 @@ fn verb_registry_publish(
 ) -> VerbResult {
     // NODE-LOCAL paths — the same operator caveat as `load`: these name files on the node's own
     // filesystem, not client uploads. A surface caller hands the node a path it can already read.
-    let m_bytes = match std::fs::read(manifest_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return VerbResult::err(
-                json!({ "ok": false, "error": format!("read manifest {manifest_path}: {e}") }),
-                format!("registry publish failed: read manifest {manifest_path}: {e}"),
-            )
-        }
-    };
+    let m_bytes =
+        match read_node_file_bounded(manifest_path, "manifest", MAX_CONTROL_MANIFEST_BYTES) {
+            Ok(b) => b,
+            Err(e) => {
+                return VerbResult::err(
+                    json!({ "ok": false, "error": e }),
+                    format!("registry publish failed: {e}"),
+                )
+            }
+        };
     let manifest = match Manifest::parse(&m_bytes) {
         Ok(m) => m,
         Err(e) => {
@@ -666,20 +864,21 @@ fn verb_registry_publish(
             )
         }
     };
-    let artifact = match std::fs::read(artifact_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return VerbResult::err(
-                json!({ "ok": false, "error": format!("read artifact {artifact_path}: {e}") }),
-                format!("registry publish failed: read artifact {artifact_path}: {e}"),
-            )
-        }
-    };
+    let artifact =
+        match read_node_file_bounded(artifact_path, "artifact", MAX_CONTROL_ARTIFACT_BYTES) {
+            Ok(b) => b,
+            Err(e) => {
+                return VerbResult::err(
+                    json!({ "ok": false, "error": e }),
+                    format!("registry publish failed: {e}"),
+                )
+            }
+        };
     let op = match &realm {
         None => RegistryOp::Publish { manifest, artifact },
         Some(r) => RegistryOp::PublishInRealm { manifest, artifact, realm: r.clone() },
     };
-    match registry_request(ctx, op) {
+    match registry_request(ctx, op, MAX_REGISTRY_ACK_REPLY_BYTES) {
         Ok(RegistryReply::Published { artifact_hash }) => VerbResult::ok(
             json!({ "ok": true, "artifact_hash": artifact_hash, "realm": "local" }),
             format!("published artifact {artifact_hash} into realm `local`"),
@@ -693,11 +892,11 @@ fn verb_registry_publish(
     }
 }
 
-/// Render a fetched entry as **metadata** (name/version/content_address) + artifact length — never the
-/// raw bytes inline. `realm` is `Some` for a Realm-explicit fetch (echoed back), `None` for `local`.
-fn fetched_ok(manifest: &Manifest, artifact_len: usize, realm: Option<&RealmId>) -> VerbResult {
-    let realm_str = realm.map(|r| r.0.clone()).unwrap_or_else(|| "local".to_string());
-    let mut j = json!({
+/// Render a metadata-only fetched entry — never raw artifact bytes inline.
+fn fetched_metadata_ok(entry: &CatalogEntry, artifact_len: usize) -> VerbResult {
+    let manifest = &entry.manifest;
+    let realm_str = entry.realm.0.clone();
+    let j = json!({
         "ok": true,
         "name": manifest.name,
         "version": manifest.version,
@@ -705,10 +904,6 @@ fn fetched_ok(manifest: &Manifest, artifact_len: usize, realm: Option<&RealmId>)
         "artifact_len": artifact_len,
         "realm": realm_str,
     });
-    if realm.is_none() {
-        // Make the implicit-Realm case explicit for a machine reader without claiming a named Realm.
-        j["realm"] = json!("local");
-    }
     VerbResult::ok(
         j,
         format!(
@@ -724,17 +919,15 @@ fn verb_registry_fetch(
     realm: Option<RealmId>,
 ) -> VerbResult {
     let op = match &realm {
-        None => RegistryOp::Fetch { artifact_hash: artifact_hash.to_string() },
-        Some(r) => {
-            RegistryOp::FetchInRealm { artifact_hash: artifact_hash.to_string(), realm: r.clone() }
-        }
+        None => RegistryOp::FetchMetadata { artifact_hash: artifact_hash.to_string() },
+        Some(r) => RegistryOp::FetchMetadataInRealm {
+            artifact_hash: artifact_hash.to_string(),
+            realm: r.clone(),
+        },
     };
-    match registry_request(ctx, op) {
-        Ok(RegistryReply::Fetched { manifest, artifact }) => {
-            fetched_ok(&manifest, artifact.len(), None)
-        }
-        Ok(RegistryReply::FetchedInRealm { manifest, artifact, realm }) => {
-            fetched_ok(&manifest, artifact.len(), Some(&realm))
+    match registry_request(ctx, op, MAX_REGISTRY_FETCH_REPLY_BYTES) {
+        Ok(RegistryReply::FetchedMetadata { entry, artifact_len }) => {
+            fetched_metadata_ok(&entry, artifact_len)
         }
         Ok(RegistryReply::NotFound) => VerbResult::err(
             json!({ "ok": false, "not_found": true, "artifact_hash": artifact_hash }),
@@ -747,8 +940,21 @@ fn verb_registry_fetch(
 
 fn verb_registry_list(ctx: &mut VerbCtx, realm: Option<RealmId>) -> VerbResult {
     let scope = realm.as_ref().map(|r| r.0.clone()).unwrap_or_else(|| "(all realms)".to_string());
-    match registry_request(ctx, RegistryOp::ListEntries { realm }) {
-        Ok(RegistryReply::Entries { entries }) => {
+    match registry_request(
+        ctx,
+        RegistryOp::ListMetadata { realm },
+        MAX_REGISTRY_METADATA_REPLY_BYTES,
+    ) {
+        Ok(RegistryReply::Metadata { entries }) => {
+            let mut entries = entries;
+            entries.sort_by(|a, b| {
+                a.realm
+                    .0
+                    .cmp(&b.realm.0)
+                    .then_with(|| a.manifest.name.cmp(&b.manifest.name))
+                    .then_with(|| a.manifest.version.cmp(&b.manifest.version))
+                    .then_with(|| a.artifact_hash.cmp(&b.artifact_hash))
+            });
             let arr: Vec<Value> = entries
                 .iter()
                 .map(|e| {
@@ -833,10 +1039,7 @@ fn verb_send(ctx: &mut VerbCtx, id: u64, text: &str, node: Option<&str>) -> Verb
         (Duration::from_secs(2), "2s")
     };
     match request_reply(bus, rx, d, c, budget) {
-        Ok(Some(env)) => {
-            let reply = String::from_utf8_lossy(&env.payload).to_string();
-            VerbResult::ok(json!({ "reply": reply }), format!("reply: {reply}"))
-        }
+        Ok(Some(env)) => reply_result(&env.payload),
         Ok(None) => {
             VerbResult::ok(json!({ "timeout": true }), format!("(no reply within {window})"))
         }
@@ -858,10 +1061,7 @@ fn verb_intent(ctx: &mut VerbCtx, outcome: &str, text: &str) -> VerbResult {
     .with_corr(c);
     match bus.send(d) {
         Ok(()) => match recv_corr(rx, c, Duration::from_secs(2)) {
-            Some(env) => {
-                let reply = String::from_utf8_lossy(&env.payload).to_string();
-                VerbResult::ok(json!({ "reply": reply }), format!("reply: {reply}"))
-            }
+            Some(env) => reply_result(&env.payload),
             None => VerbResult::ok(json!({ "timeout": true }), "(no reply within 2s)"),
         },
         Err(e) => VerbResult::err(
@@ -911,7 +1111,7 @@ fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str))
             )
         }
     };
-    let resp = match serde_json::from_slice::<AuthoringReply>(&env.payload) {
+    let resp = match parse_role_reply::<AuthoringReply>(&env.payload, MAX_AUTHORING_REPLY_BYTES) {
         Ok(AuthoringReply::Authored(r)) => r,
         Ok(AuthoringReply::Failed(e)) => return author_err(format!("authoring failed: {e:?}")),
         Err(e) => return author_err(format!("author parse failed: {e}")),
@@ -947,7 +1147,10 @@ fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str))
         Ok(None) => return author_err("author failed: nothing bound to BUILD".into()),
         Err(e) => return author_err(format!("author failed: BUILD route failed: {e}")),
     };
-    let (manifest, artifact) = match serde_json::from_slice::<BuildReply>(&env.payload) {
+    let (manifest, artifact) = match parse_role_reply::<BuildReply>(
+        &env.payload,
+        MAX_ARTIFACT_ROLE_REPLY_BYTES,
+    ) {
         Ok(BuildReply::Built { manifest, artifact }) => (manifest, artifact),
         Ok(BuildReply::Failed { kind, message, stderr, .. }) => {
             let human = if stderr.trim().is_empty() {
@@ -1014,7 +1217,7 @@ fn verb_author_critter(
             )
         }
     };
-    let resp = match serde_json::from_slice::<AuthoringReply>(&env.payload) {
+    let resp = match parse_role_reply::<AuthoringReply>(&env.payload, MAX_AUTHORING_REPLY_BYTES) {
         Ok(AuthoringReply::Authored(r)) => r,
         Ok(AuthoringReply::Failed(e)) => return author_err(format!("authoring failed: {e:?}")),
         Err(e) => return author_err(format!("author parse failed: {e}")),
@@ -1043,7 +1246,10 @@ fn verb_author_critter(
         Ok(None) => return author_err("author failed: no reply from build-critter".into()),
         Err(e) => return author_err(format!("author failed: build-critter route failed: {e}")),
     };
-    let (manifest, artifact) = match serde_json::from_slice::<BuildReply>(&env.payload) {
+    let (manifest, artifact) = match parse_role_reply::<BuildReply>(
+        &env.payload,
+        MAX_ARTIFACT_ROLE_REPLY_BYTES,
+    ) {
         Ok(BuildReply::Built { manifest, artifact }) => (manifest, artifact),
         Ok(BuildReply::Failed { kind, message, .. }) => {
             return VerbResult::err(
@@ -1158,10 +1364,23 @@ fn verb_cluster_join(ctx: &mut VerbCtx, node_id: &str, addr: &str, pubkey: &str)
         .with_reply_to(Address::Creature(bus.id()))
         .with_corr(c);
     match request_reply(bus, rx, d, c, Duration::from_secs(3)) {
-        Ok(Some(_)) => VerbResult::ok(
-            json!({ "ok": true, "joined": node_id, "addr": addr }),
-            format!("admitted + dialing `{node_id}` ({addr}); gossip will spread it across the mesh. Run `cluster` to watch it converge."),
-        ),
+        // Decode the reply: a member-table-cap refusal comes back as `Rejected`, not a silent
+        // success. Reporting `ok` on a `Rejected` would tell the operator the node joined when it did
+        // not (mirrors `verb_cluster`, which also decodes the typed reply).
+        Ok(Some(env)) => match TransportCtlReply::parse(&env.payload) {
+            Some(TransportCtlReply::Connecting { node_id }) => VerbResult::ok(
+                json!({ "ok": true, "joined": node_id, "addr": addr }),
+                format!("admitted + dialing `{node_id}` ({addr}); gossip will spread it across the mesh. Run `cluster` to watch it converge."),
+            ),
+            Some(TransportCtlReply::Rejected { reason }) => VerbResult::err(
+                json!({ "ok": false, "error": reason }),
+                format!("cluster join rejected: {reason}"),
+            ),
+            _ => VerbResult::err(
+                json!({ "error": "bad-cluster-reply" }),
+                "cluster join: unexpected reply from the transport",
+            ),
+        },
         Ok(None) => VerbResult::ok(json!({ "timeout": true }), "(no ack from the transport within 3s)"),
         Err(e) => VerbResult::err(
             json!({ "error": e.to_string() }),
@@ -1485,4 +1704,106 @@ pub fn workspace_root() -> PathBuf {
 /// front-end needs to drive any role or creature).
 pub fn open_probe(kernel: &Kernel) -> (CreatureId, BusHandle, InboxReceiver) {
     kernel.open_endpoint(Capabilities::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_control_result_accepts_bounded_result() {
+        let original = VerbResult::ok(json!({ "ok": true }), "ready");
+        let payload = serde_json::to_vec(&original).unwrap();
+
+        let parsed = parse_control_result(&payload).unwrap();
+
+        assert!(parsed.ok);
+        assert_eq!(parsed.json, json!({ "ok": true }));
+        assert_eq!(parsed.human, "ready");
+    }
+
+    #[test]
+    fn parse_control_result_rejects_oversized_payload_before_json_decode() {
+        let payload = vec![b'{'; MAX_CONTROL_RESULT_BYTES + 1];
+
+        let err = parse_control_result(&payload).unwrap_err();
+
+        assert_eq!(
+            err,
+            ControlResultDecodeError::TooLarge {
+                len: MAX_CONTROL_RESULT_BYTES + 1,
+                limit: MAX_CONTROL_RESULT_BYTES,
+            }
+        );
+        let res = control_result_decode_failure(err);
+        assert!(!res.ok);
+        assert_eq!(res.json["error"].as_str(), Some("control-result-too-large"));
+    }
+
+    #[test]
+    fn parse_control_result_reports_malformed_json() {
+        let err = parse_control_result(b"{not json").unwrap_err();
+
+        assert!(matches!(err, ControlResultDecodeError::Json(_)));
+        let res = control_result_decode_failure(err);
+        assert!(!res.ok);
+        assert_eq!(res.json["error"].as_str(), Some("bad-control-result"));
+    }
+
+    #[test]
+    fn parse_role_reply_rejects_payloads_over_its_domain_limit() {
+        let payload = serde_json::to_vec(&RegistryReply::NotFound).unwrap();
+
+        let parsed = parse_role_reply::<RegistryReply>(&payload, payload.len()).unwrap();
+        assert!(matches!(parsed, RegistryReply::NotFound));
+
+        let err = parse_role_reply::<RegistryReply>(&payload, payload.len() - 1).unwrap_err();
+        assert!(matches!(
+            err,
+            RoleReplyDecodeError::TooLarge {
+                len,
+                limit
+            } if len == payload.len() && limit == payload.len() - 1
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // deliberate compile-time cap invariants
+    fn registry_fetch_and_list_use_metadata_reply_cap() {
+        assert_eq!(
+            MAX_REGISTRY_FETCH_REPLY_BYTES, MAX_REGISTRY_METADATA_REPLY_BYTES,
+            "metadata fetch should share the byte-light metadata cap"
+        );
+        assert!(
+            MAX_REGISTRY_FETCH_REPLY_BYTES < MAX_ARTIFACT_ROLE_REPLY_BYTES,
+            "metadata fetch should not inherit the artifact-sized role reply cap"
+        );
+        let list_payload =
+            serde_json::to_vec(&RegistryReply::Metadata { entries: Vec::new() }).unwrap();
+
+        let parsed =
+            parse_role_reply::<RegistryReply>(&list_payload, MAX_REGISTRY_METADATA_REPLY_BYTES)
+                .unwrap();
+
+        assert!(matches!(parsed, RegistryReply::Metadata { entries } if entries.is_empty()));
+
+        let fetch_payload = serde_json::to_vec(&RegistryReply::FetchedMetadata {
+            entry: CatalogEntry {
+                artifact_hash: "h".into(),
+                realm: RealmId::local(),
+                manifest: Manifest::new("c", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+                reputation: None,
+                quarantine: None,
+            },
+            artifact_len: 3,
+        })
+        .unwrap();
+        let parsed =
+            parse_role_reply::<RegistryReply>(&fetch_payload, MAX_REGISTRY_FETCH_REPLY_BYTES)
+                .unwrap();
+        assert!(
+            matches!(parsed, RegistryReply::FetchedMetadata { artifact_len: 3, .. }),
+            "metadata fetch reply decodes under the metadata cap"
+        );
+    }
 }

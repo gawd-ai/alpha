@@ -27,7 +27,7 @@ use std::time::Duration;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        DefaultBodyLimit, Query, State,
     },
     http::{header, StatusCode},
     middleware::{self, Next},
@@ -52,6 +52,13 @@ const AUTHOR_TIMEOUT: Duration = Duration::from_secs(400);
 /// Bound for every non-author verb's control round-trip. `ControlCore` always replies promptly
 /// (reads inline, the worker emits a result), so this only bites if the control plane is gone.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// HTTP JSON request bodies are just another route into `control_verb`; cap them at the same size the
+/// control core accepts so the surface cannot buffer unbounded input before the bus guard runs.
+const MAX_HTTP_JSON_BODY_BYTES: usize = omni::MAX_CONTROL_VERB_BYTES;
+/// Maximum HTTP requests waiting on a `control_result` at once. The control core already bounds its
+/// orchestration worker queue; this bounds the surface-side corr table too, so a burst of clients
+/// cannot allocate one pending oneshot per request until timeouts drain.
+const MAX_PENDING_CONTROL_REQUESTS: usize = 256;
 
 /// A 64-hex-char API key from the OS CSPRNG. Printed once at boot when the operator supplies none.
 pub fn generate_api_key() -> Result<String, String> {
@@ -87,6 +94,24 @@ impl SurfaceState {
     }
     fn bus(&self) -> Option<Arc<dyn Bus>> {
         self.bus.lock().unwrap().clone()
+    }
+    fn register_pending(
+        &self,
+        corr: u64,
+        tx: oneshot::Sender<VerbResult>,
+    ) -> Result<(), VerbResult> {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
+            return Err(surface_busy(pending.len()));
+        }
+        pending.insert(corr, tx);
+        Ok(())
+    }
+    fn take_pending(&self, corr: u64) -> Option<oneshot::Sender<VerbResult>> {
+        self.pending.lock().unwrap().remove(&corr)
+    }
+    fn remove_pending(&self, corr: u64) {
+        self.pending.lock().unwrap().remove(&corr);
     }
 }
 
@@ -156,24 +181,9 @@ impl Creature for SurfaceHttp {
                         match sense_rx.recv_timeout(Duration::from_millis(250)) {
                             Ok(env) => {
                                 let frame = if env.header.schema == CONTROL_PROGRESS_SCHEMA {
-                                    let line = serde_json::from_slice::<Value>(&env.payload)
-                                        .ok()
-                                        .and_then(|v| {
-                                            v.get("line")
-                                                .and_then(|l| l.as_str())
-                                                .map(str::to_string)
-                                        })
-                                        .unwrap_or_default();
-                                    json!({ "kind": "progress", "line": line })
+                                    progress_frame(&env)
                                 } else {
-                                    json!({
-                                        "kind": "sense",
-                                        "from": format!("{:?}", env.header.from),
-                                        "schema": env.header.schema,
-                                        "seq": env.header.seq,
-                                        "stamp": env.header.stamp,
-                                        "payload": String::from_utf8_lossy(&env.payload),
-                                    })
+                                    sense_frame(&env)
                                 };
                                 let _ = state.stream_tx.send(frame.to_string());
                             }
@@ -233,10 +243,10 @@ impl Creature for SurfaceHttp {
         // — sense frames go to the dedicated endpoint). A reply wakes the HTTP handler on its corr.
         if env.header.schema == CONTROL_RESULT_SCHEMA {
             if let Some(corr) = env.header.corr {
-                if let Some(tx) = self.state.pending.lock().unwrap().remove(&corr) {
-                    if let Ok(res) = serde_json::from_slice::<VerbResult>(&env.payload) {
-                        let _ = tx.send(res);
-                    }
+                if let Some(tx) = self.state.take_pending(corr) {
+                    let res = omni::parse_control_result(&env.payload)
+                        .unwrap_or_else(omni::control_result_decode_failure);
+                    let _ = tx.send(res);
                 }
             }
         }
@@ -277,7 +287,9 @@ async fn request_control(st: &Arc<SurfaceState>, verb: Verb, timeout: Duration) 
     };
     let corr = st.corr.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = oneshot::channel::<VerbResult>();
-    st.pending.lock().unwrap().insert(corr, tx);
+    if let Err(res) = st.register_pending(corr, tx) {
+        return res;
+    }
 
     let payload = serde_json::to_vec(&verb).unwrap_or_default();
     let d = Dispatch::to(st.target.address(), payload)
@@ -285,7 +297,7 @@ async fn request_control(st: &Arc<SurfaceState>, verb: Verb, timeout: Duration) 
         .with_reply_to(Address::Creature(me))
         .with_corr(corr);
     if let Err(e) = bus.emit(d) {
-        st.pending.lock().unwrap().remove(&corr);
+        st.remove_pending(corr);
         return VerbResult::err(
             json!({ "error": "control-unreachable", "detail": e.to_string() }),
             format!("control plane unreachable: {e}"),
@@ -294,7 +306,7 @@ async fn request_control(st: &Arc<SurfaceState>, verb: Verb, timeout: Duration) 
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(res)) => res,
         _ => {
-            st.pending.lock().unwrap().remove(&corr);
+            st.remove_pending(corr);
             VerbResult::err(
                 json!({ "error": "control-timeout" }),
                 "control plane did not reply in time",
@@ -303,11 +315,26 @@ async fn request_control(st: &Arc<SurfaceState>, verb: Verb, timeout: Duration) 
     }
 }
 
+fn surface_busy(pending: usize) -> VerbResult {
+    VerbResult::err(
+        json!({
+            "error": "surface-busy",
+            "pending": pending,
+            "limit": MAX_PENDING_CONTROL_REQUESTS
+        }),
+        format!(
+            "control surface busy: {pending} pending requests (limit {MAX_PENDING_CONTROL_REQUESTS})"
+        ),
+    )
+}
+
 fn into_response(res: VerbResult) -> Response {
     let code = if res.ok {
         StatusCode::OK
     } else if res.is_gate_block() {
         StatusCode::FORBIDDEN
+    } else if res.json.get("error").and_then(Value::as_str) == Some("surface-busy") {
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_REQUEST
     };
@@ -337,6 +364,7 @@ fn router(state: Arc<SurfaceState>) -> Router {
         .route("/api/ai/status", post(h_ai_status))
         .route("/api/cluster", get(h_cluster))
         .route("/api/cluster/connect", post(h_cluster_connect))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_JSON_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     let public = Router::new().route("/api/health", get(h_health)).route("/api/ws", get(h_ws));
     protected.merge(public).with_state(state)
@@ -655,9 +683,63 @@ async fn handle_socket(mut socket: WebSocket, st: Arc<SurfaceState>) {
     }
 }
 
+fn sense_frame(env: &Envelope) -> Value {
+    let preview = omni::payload_preview(&env.payload);
+    let mut frame = json!({
+        "kind": "sense",
+        "from": format!("{:?}", env.header.from),
+        "schema": env.header.schema.clone(),
+        "seq": env.header.seq,
+        "stamp": env.header.stamp,
+        "payload": preview.text,
+        "payload_bytes": preview.bytes,
+    });
+    if preview.truncated {
+        if let Some(obj) = frame.as_object_mut() {
+            obj.insert("payload_truncated".to_string(), Value::Bool(true));
+            obj.insert(
+                "payload_limit".to_string(),
+                Value::Number(serde_json::Number::from(preview.limit as u64)),
+            );
+        }
+    }
+    frame
+}
+
+fn progress_frame(env: &Envelope) -> Value {
+    let line = if env.payload.len() <= omni::MAX_PRESENTED_PAYLOAD_BYTES {
+        serde_json::from_slice::<Value>(&env.payload)
+            .ok()
+            .and_then(|v| v.get("line").and_then(|l| l.as_str()).map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    json!({ "kind": "progress", "line": line })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, opt_realm};
+    use super::*;
+    use aether::{Address, CreatureId, Envelope, Header};
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use omni::MAX_PRESENTED_PAYLOAD_BYTES;
+
+    fn test_state() -> Arc<SurfaceState> {
+        let (stream_tx, _rx0) = broadcast::channel::<String>(1);
+        Arc::new(SurfaceState {
+            bus: Mutex::new(None),
+            me: Mutex::new(None),
+            corr: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            stream_tx,
+            api_key: "test-key".to_string(),
+            target: ControlTarget::Local,
+            shutdown_tx: Mutex::new(None),
+            stop: AtomicBool::new(false),
+        })
+    }
 
     #[test]
     fn opt_realm_normalizes_empty_to_none_matching_mcp() {
@@ -678,5 +760,111 @@ mod tests {
         assert!(!constant_time_eq(b"secret-extra", b"secret"));
         assert!(!constant_time_eq(b"sec", b"secret"));
         assert!(!constant_time_eq(b"", b"secret"));
+    }
+
+    #[test]
+    fn pending_control_requests_are_bounded() {
+        let st = test_state();
+        let mut receivers = Vec::new();
+
+        for corr in 0..MAX_PENDING_CONTROL_REQUESTS as u64 {
+            let (tx, rx) = oneshot::channel();
+            st.register_pending(corr, tx).expect("under cap");
+            receivers.push(rx);
+        }
+
+        let (tx, _rx) = oneshot::channel();
+        let err = st.register_pending(999_999, tx).expect_err("at cap refuses");
+        assert_eq!(err.json["error"].as_str(), Some("surface-busy"));
+        assert_eq!(err.json["limit"].as_u64(), Some(MAX_PENDING_CONTROL_REQUESTS as u64));
+        assert_eq!(
+            st.pending.lock().unwrap().len(),
+            MAX_PENDING_CONTROL_REQUESTS,
+            "refused request is not inserted"
+        );
+
+        let removed = st.take_pending(0).expect("existing corr is present");
+        drop(removed);
+        let (tx, rx) = oneshot::channel();
+        st.register_pending(999_999, tx).expect("space reopens after a reply/timeout removes one");
+        receivers.push(rx);
+    }
+
+    #[tokio::test]
+    async fn surface_busy_maps_to_service_unavailable() {
+        let response = into_response(surface_busy(MAX_PENDING_CONTROL_REQUESTS));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"].as_str(), Some("surface-busy"));
+    }
+
+    #[test]
+    fn sense_frame_truncates_large_payload_preview() {
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(7)),
+                to: Address::Creature(CreatureId(1)),
+                reply_to: None,
+                seq: 3,
+                causal: vec![],
+                stamp: 9,
+                sig: String::new(),
+                corr: None,
+                commitment: None,
+                schema: "fitness".to_string(),
+            },
+            payload: vec![b'a'; MAX_PRESENTED_PAYLOAD_BYTES + 1],
+        };
+        let frame = sense_frame(&env);
+        assert_eq!(frame["payload"].as_str().unwrap().len(), MAX_PRESENTED_PAYLOAD_BYTES);
+        assert_eq!(frame["payload_bytes"].as_u64(), Some((MAX_PRESENTED_PAYLOAD_BYTES + 1) as u64));
+        assert_eq!(frame["payload_truncated"].as_bool(), Some(true));
+        assert_eq!(frame["payload_limit"].as_u64(), Some(MAX_PRESENTED_PAYLOAD_BYTES as u64));
+    }
+
+    #[test]
+    fn progress_frame_drops_oversized_payload_before_json_decode() {
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(7)),
+                to: Address::Creature(CreatureId(1)),
+                reply_to: None,
+                seq: 3,
+                causal: vec![],
+                stamp: 9,
+                sig: String::new(),
+                corr: Some(11),
+                commitment: None,
+                schema: omni::CONTROL_PROGRESS_SCHEMA.to_string(),
+            },
+            payload: vec![b'{'; MAX_PRESENTED_PAYLOAD_BYTES + 1],
+        };
+        let frame = progress_frame(&env);
+        assert_eq!(frame["kind"].as_str(), Some("progress"));
+        assert_eq!(frame["line"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn progress_frame_extracts_line_from_bounded_payload() {
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(7)),
+                to: Address::Creature(CreatureId(1)),
+                reply_to: None,
+                seq: 3,
+                causal: vec![],
+                stamp: 9,
+                sig: String::new(),
+                corr: Some(11),
+                commitment: None,
+                schema: omni::CONTROL_PROGRESS_SCHEMA.to_string(),
+            },
+            payload: serde_json::to_vec(&serde_json::json!({ "corr": 11, "line": "compiling" }))
+                .unwrap(),
+        };
+        let frame = progress_frame(&env);
+        assert_eq!(frame["kind"].as_str(), Some("progress"));
+        assert_eq!(frame["line"].as_str(), Some("compiling"));
     }
 }

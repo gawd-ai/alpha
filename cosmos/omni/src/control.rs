@@ -22,7 +22,8 @@
 //! verbs (`author`/`send`/`intent`/`cluster`/…) to a single worker that owns a probe endpoint. A
 //! build in the worker never blocks an inline `status`.
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
@@ -34,7 +35,10 @@ use sigil::Capabilities;
 
 use serde_json::json;
 
-use crate::{run_verb, AiControl, Verb, VerbCtx, VerbResult};
+use crate::{
+    run_verb, AiControl, Verb, VerbCtx, VerbResult, CONTROL_WORKER_QUEUE_CAP,
+    MAX_CONTROL_VERB_BYTES,
+};
 
 /// Schema of an inbound control envelope: its payload is a JSON [`Verb`]. A surface addresses these
 /// to [`Role::CONTROL`](aether::Role::CONTROL) (local) or `Address::Node(peer, control_id)` (remote).
@@ -92,8 +96,9 @@ pub struct ControlCore {
     transport: Option<CreatureId>,
     /// Set in [`bind`](ControlCore::bind): the channel feeding the orchestration worker. Dropping it
     /// (on `shutdown`) closes the worker's `recv` so the thread exits.
-    job_tx: Option<Sender<Job>>,
+    job_tx: Option<SyncSender<Job>>,
     worker: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl ControlCore {
@@ -114,6 +119,7 @@ impl ControlCore {
             transport,
             job_tx: None,
             worker: None,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -154,17 +160,22 @@ impl Creature for ControlCore {
         // the weak cycle; replies it emits carry the probe's identity, but the surface correlates
         // by `corr`, so `from` is immaterial.
         let (_probe_id, probe_bus, probe_rx) = kernel.open_endpoint(Capabilities::default());
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::sync_channel::<Job>(CONTROL_WORKER_QUEUE_CAP);
         self.job_tx = Some(tx);
+        self.stop.store(false, Ordering::Relaxed);
 
         let weak = self.kernel.clone();
         let ai = self.ai.clone();
         let cb = self.critter_builder;
         let tr = self.transport;
+        let stop = self.stop.clone();
         let spawned = std::thread::Builder::new().name("omni-worker".into()).spawn(move || {
             // One verb at a time, sharing one corr space (no cross-talk) — exactly the daemon
             // API's probe-worker discipline, now driven by envelopes instead of HTTP.
             while let Ok(job) = rx.recv() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let Job { verb, reply_to, corr } = job;
                 // Upgrade per job: hold a strong ref only for the duration of `run_verb`, so a
                 // dropped node lets the worker exit. If the kernel is already gone, stop.
@@ -184,6 +195,9 @@ impl Creature for ControlCore {
                 let mut ctx = VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, cb, &ai, true);
                 ctx.transport = tr;
                 let res = run_verb(verb, &mut ctx, &mut progress);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let payload = serde_json::to_vec(&res).unwrap_or_else(|_| b"{}".to_vec());
                 let mut d = Dispatch::to(reply_to, payload).with_schema(CONTROL_RESULT_SCHEMA);
                 if let Some(c) = corr {
@@ -207,6 +221,23 @@ impl Creature for ControlCore {
         if env.header.schema != CONTROL_SCHEMA {
             return Outcome::none();
         }
+        if env.payload.len() > MAX_CONTROL_VERB_BYTES {
+            return reply(
+                &env,
+                VerbResult::err(
+                    json!({
+                        "error": "control-verb-too-large",
+                        "bytes": env.payload.len(),
+                        "limit": MAX_CONTROL_VERB_BYTES
+                    }),
+                    format!(
+                        "control: verb payload is {} bytes, exceeds {} byte limit",
+                        env.payload.len(),
+                        MAX_CONTROL_VERB_BYTES
+                    ),
+                ),
+            );
+        }
         let verb = match serde_json::from_slice::<Verb>(&env.payload) {
             Ok(v) => v,
             Err(e) => {
@@ -225,8 +256,27 @@ impl Creature for ControlCore {
             // returns immediately, so a cold `author` never stalls the kernel's drain thread.
             let job = Job { verb, reply_to: env.reply_target(), corr: env.header.corr };
             match &self.job_tx {
-                Some(tx) if tx.send(job).is_ok() => Outcome::none(),
-                _ => reply(
+                Some(tx) => match tx.try_send(job) {
+                    Ok(()) => Outcome::none(),
+                    Err(TrySendError::Full(_)) => reply(
+                        &env,
+                        VerbResult::err(
+                            json!({
+                                "error": "control-worker-busy",
+                                "queue_cap": CONTROL_WORKER_QUEUE_CAP
+                            }),
+                            "control: the orchestration worker queue is full",
+                        ),
+                    ),
+                    Err(TrySendError::Disconnected(_)) => reply(
+                        &env,
+                        VerbResult::err(
+                            json!({ "error": "control-worker-unavailable" }),
+                            "control: the orchestration worker is unavailable",
+                        ),
+                    ),
+                },
+                None => reply(
                     &env,
                     VerbResult::err(
                         json!({ "error": "control-worker-unavailable" }),
@@ -250,6 +300,7 @@ impl Creature for ControlCore {
     fn shutdown(&mut self, _deadline: Deadline) {
         // Close the job channel so the worker's `recv` returns `Err` and the thread exits, then
         // join it (kernel-driven teardown: no leaked thread at the post-shutdown tid snapshot).
+        self.stop.store(true, Ordering::Relaxed);
         self.job_tx = None;
         if let Some(w) = self.worker.take() {
             let _ = w.join();

@@ -27,7 +27,7 @@ use aether::{
     Topic, Verifier,
 };
 use anima::{Artifact, BudgetControl, Engine, EngineError, LoadedModule};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigil::{Backend, Capabilities, Manifest, ManifestError};
 
@@ -48,6 +48,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn mlock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
+
+/// Kernel control ops are tiny (`Unload`, `ExtendBudget`). Cap them before serde so a hostile
+/// envelope cannot hide a huge ignored JSON field inside an otherwise-valid control op.
+const MAX_KERNEL_CONTROL_BYTES: usize = 64 * 1024;
 
 /// The FITNESS topic, allocated once — used both to *check* for subscribers (the no-listener
 /// fast-path that avoids doubling bus traffic on the per-envelope sense) and, when one exists, to
@@ -148,6 +152,32 @@ pub struct BudgetRequest {
     pub mem_bytes: Option<u64>,
     pub wall_ms: Option<u64>,
     pub justification: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SenseDecodeError {
+    #[error("sense event payload too large: {len} bytes exceeds {limit} byte limit")]
+    TooLarge { len: usize, limit: usize },
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+fn decode_sense_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, SenseDecodeError> {
+    if payload.len() > aether::MAX_SENSE_EVENT_BYTES {
+        return Err(SenseDecodeError::TooLarge {
+            len: payload.len(),
+            limit: aether::MAX_SENSE_EVENT_BYTES,
+        });
+    }
+    Ok(serde_json::from_slice(payload)?)
+}
+
+pub fn decode_budget_signal_event(payload: &[u8]) -> Result<BudgetSignalEvent, SenseDecodeError> {
+    decode_sense_payload(payload)
+}
+
+pub fn decode_budget_request(payload: &[u8]) -> Result<BudgetRequest, SenseDecodeError> {
+    decode_sense_payload(payload)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -804,13 +834,17 @@ fn publish_fitness(bus: &BusHandle, router: &Router, me: CreatureId, ok: bool) {
 fn run_control_listener(kernel: std::sync::Weak<Kernel>, rx: InboxReceiver) {
     while let Ok(env) = rx.recv() {
         let Some(k) = kernel.upgrade() else { break };
-        // Be permissive on schema — we accept any envelope addressed to the kernel that
-        // parses as `KernelControl`. A stricter dispatcher could require `schema == "kernel_control"`.
-        let op = match serde_json::from_slice::<KernelControl>(&env.payload) {
+        let op = match decode_kernel_control(&env) {
             Ok(op) => op,
-            Err(e) => {
-                // R9: never panic on a malformed control payload — but don't let it vanish silently
-                // either. A bad/forged control op now leaves an operator-visible trace.
+            Err(ControlDecodeError::Oversized { len, limit }) => {
+                eprintln!(
+                    "sanctum: control listener skipped an oversized payload from {:?} \
+                     (corr={:?}, {len} bytes, limit {limit})",
+                    env.header.from, env.header.corr
+                );
+                continue;
+            }
+            Err(ControlDecodeError::Malformed(e)) => {
                 eprintln!(
                     "sanctum: control listener skipped a malformed payload from {:?} \
                      (corr={:?}, {} bytes): {e}",
@@ -856,6 +890,25 @@ fn run_control_listener(kernel: std::sync::Weak<Kernel>, rx: InboxReceiver) {
             eprintln!("sanctum: a kernel control op panicked (isolated; listener continues)");
         }
     }
+}
+
+#[derive(Debug)]
+enum ControlDecodeError {
+    Oversized { len: usize, limit: usize },
+    Malformed(String),
+}
+
+fn decode_kernel_control(env: &Envelope) -> Result<KernelControl, ControlDecodeError> {
+    if env.payload.len() > MAX_KERNEL_CONTROL_BYTES {
+        return Err(ControlDecodeError::Oversized {
+            len: env.payload.len(),
+            limit: MAX_KERNEL_CONTROL_BYTES,
+        });
+    }
+    // Be permissive on schema — we accept any envelope addressed to the kernel that parses as
+    // `KernelControl`. A stricter dispatcher could require `schema == "kernel_control"`.
+    serde_json::from_slice::<KernelControl>(&env.payload)
+        .map_err(|e| ControlDecodeError::Malformed(e.to_string()))
 }
 
 /// Publish a [`BudgetSignalEvent`] on the PROPRIOCEPTION topic.
@@ -1251,6 +1304,18 @@ mod tests {
     }
 
     #[test]
+    fn budget_signal_decode_rejects_oversized_payload_before_json_decode() {
+        let payload = vec![b'{'; aether::MAX_SENSE_EVENT_BYTES + 1];
+        match decode_budget_signal_event(&payload) {
+            Err(SenseDecodeError::TooLarge { len, limit }) => {
+                assert_eq!(len, aether::MAX_SENSE_EVENT_BYTES + 1);
+                assert_eq!(limit, aether::MAX_SENSE_EVENT_BYTES);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn budget_request_roundtrips_with_optional_dimensions() {
         let r = BudgetRequest {
             module: 7,
@@ -1265,6 +1330,21 @@ mod tests {
         assert_eq!(back.fuel, Some(50_000));
         assert!(back.mem_bytes.is_none());
         assert_eq!(back.wall_ms, Some(500));
+    }
+
+    #[test]
+    fn budget_request_decode_accepts_valid_payload_under_limit() {
+        let r = BudgetRequest {
+            module: 7,
+            fuel: Some(50_000),
+            mem_bytes: None,
+            wall_ms: None,
+            justification: "near-completion grace ask".into(),
+        };
+        let bytes = serde_json::to_vec(&r).unwrap();
+        let back = decode_budget_request(&bytes).unwrap();
+        assert_eq!(back.module, 7);
+        assert_eq!(back.fuel, Some(50_000));
     }
 
     #[test]
@@ -1300,5 +1380,48 @@ mod tests {
         assert!(json.contains("\"module\":99"));
         let back: KernelControl = serde_json::from_slice(json.as_bytes()).unwrap();
         assert!(matches!(back, KernelControl::Unload { module: 99 }));
+    }
+
+    #[test]
+    fn kernel_control_decoder_rejects_oversized_payload_before_json_parse() {
+        let mut payload = br#"{"op":"Unload","module":7,"ignored":""#.to_vec();
+        payload.extend(std::iter::repeat_n(b'x', MAX_KERNEL_CONTROL_BYTES + 1));
+        payload.extend_from_slice(br#""}"#);
+        let env = Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::Kernel,
+                reply_to: None,
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(7),
+                commitment: None,
+                schema: "kernel_control".into(),
+            },
+            payload,
+        };
+
+        let err = decode_kernel_control(&env).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ControlDecodeError::Oversized {
+                    len,
+                    limit: MAX_KERNEL_CONTROL_BYTES
+                } if len > MAX_KERNEL_CONTROL_BYTES
+            ),
+            "expected oversized control error, got {err:?}"
+        );
+
+        let normal = Envelope {
+            payload: serde_json::to_vec(&KernelControl::Unload { module: 7 }).unwrap(),
+            ..env
+        };
+        assert!(matches!(
+            decode_kernel_control(&normal).unwrap(),
+            KernelControl::Unload { module: 7 }
+        ));
     }
 }

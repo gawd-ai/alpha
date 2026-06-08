@@ -47,6 +47,12 @@
 //!   [`QuarantineTrust`] honors its `attesting_peers` for the `realm`. Otherwise it is dropped — a
 //!   peer you don't trust cannot quarantine your creatures.
 //!
+//! The watch map is bounded by default ([`DEFAULT_MAX_WATCHED_MODULES`]) so hostile or accidental
+//! control traffic cannot grow immune-response memory without bound. At capacity, a `Watch` for a
+//! new module is refused while updates to an already-watched module remain allowed. Operators can
+//! set `with_max_watched(0)` when they explicitly want an unbounded lab/replay workload; the local
+//! issued set remains bounded by the watched modules.
+//!
 //! ## What stays the substrate's, not this creature's
 //!
 //! - **Quarantine is reversible (T5).** The immune-response writes
@@ -75,10 +81,11 @@ use std::collections::{HashMap, HashSet};
 
 use aether::{
     Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, NodeId, Outcome, RealmId,
+    MAX_SENSE_EVENT_BYTES,
 };
 use omega_federator::FederatorMsg;
 use registry_mem::RegistryOp;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Wire schema for the immune-response's own control ops + replies. Single schema + a `kind`-tagged
 /// enum, same convention as `fitness-selector` / `omega-federator` / `abode-migrator`.
@@ -107,6 +114,15 @@ const EVENT_LEAKED: &str = "unload_leaked_resources";
 /// The budget-signal `level` that means an apoptosis-level breach. A local quarantine trigger.
 const LEVEL_HARD: &str = "hard";
 
+/// Default maximum number of distinct creature ids retained in the watch map.
+///
+/// `0` is reserved as an explicit opt-out via [`ImmuneResponse::with_max_watched`].
+pub const DEFAULT_MAX_WATCHED_MODULES: usize = 4_096;
+
+/// Maximum serialized operator control message decoded before JSON parsing (R9 hostile-input floor).
+/// Matches the crate's other decode caps (sense + federator), so every wire decode is bounded.
+pub const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
+
 // ===================================================================================================
 // Deserialize mirrors of the kernel's proprioception-topic events (no kernel dependency)
 // ===================================================================================================
@@ -129,6 +145,13 @@ struct BudgetSignalWire {
     level: String,
     #[allow(dead_code)] // parsed for completeness / forward-compat; reaction keys off `level`.
     kind: String,
+}
+
+fn decode_sense_wire<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
+    if payload.len() > MAX_SENSE_EVENT_BYTES {
+        return None;
+    }
+    serde_json::from_slice(payload).ok()
 }
 
 // ===================================================================================================
@@ -233,11 +256,49 @@ pub struct ImmuneResponse {
     watch: HashMap<CreatureId, (RealmId, String)>,
     /// Creatures this immune-response has locally quarantined (for `StatusQuery` observability).
     issued: HashSet<CreatureId>,
+    /// Maximum number of distinct watched creatures retained at once. At capacity a `Watch` for a
+    /// *new* creature is refused; already-watched creatures can still be updated. **`0` means
+    /// unbounded** and must be selected explicitly via [`ImmuneResponse::with_max_watched`].
+    max_watched: usize,
 }
 
 impl ImmuneResponse {
     pub fn new(cfg: ImmuneConfig) -> Self {
-        ImmuneResponse { cfg, me: None, watch: HashMap::new(), issued: HashSet::new() }
+        ImmuneResponse {
+            cfg,
+            me: None,
+            watch: HashMap::new(),
+            issued: HashSet::new(),
+            max_watched: DEFAULT_MAX_WATCHED_MODULES,
+        }
+    }
+
+    /// Cap the number of distinct watched modules tracked.
+    ///
+    /// The default is [`DEFAULT_MAX_WATCHED_MODULES`]. At capacity a `Watch` for a *new* module is
+    /// refused rather than growing the watch map without bound; already-watched modules keep their
+    /// update path. Pass `0` to opt out and make the watch map unbounded.
+    pub fn with_max_watched(mut self, max_watched: usize) -> Self {
+        self.max_watched = max_watched;
+        self
+    }
+
+    fn can_insert_watch(&self, module: CreatureId) -> bool {
+        self.max_watched == 0
+            || self.watch.contains_key(&module)
+            || self.watch.len() < self.max_watched
+    }
+
+    fn insert_watch(&mut self, module: CreatureId, realm: RealmId, artifact_hash: String) -> bool {
+        if !self.can_insert_watch(module) {
+            eprintln!(
+                "immune-response: watch map at capacity ({}); refusing watch for new module {}",
+                self.max_watched, module.0
+            );
+            return false;
+        }
+        self.watch.insert(module, (realm, artifact_hash));
+        true
     }
 
     /// Seed a watch entry at construction (tests / an operator who knows the map up front).
@@ -247,7 +308,7 @@ impl ImmuneResponse {
         realm: RealmId,
         artifact_hash: impl Into<String>,
     ) -> Self {
-        self.watch.insert(module, (realm, artifact_hash.into()));
+        self.insert_watch(module, realm, artifact_hash.into());
         self
     }
 
@@ -290,7 +351,7 @@ impl ImmuneResponse {
     // ----- proprioception-topic sensing (local, trusted) ---------------------------------------
 
     fn on_budget_signal(&mut self, env: &Envelope) -> Outcome {
-        let Ok(ev) = serde_json::from_slice::<BudgetSignalWire>(&env.payload) else {
+        let Some(ev) = decode_sense_wire::<BudgetSignalWire>(&env.payload) else {
             return Outcome::none(); // R9: malformed event → drop, never panic.
         };
         // Only a *hard* breach is a defense trigger; a `warn` is a budget-policy concern,
@@ -304,7 +365,7 @@ impl ImmuneResponse {
     }
 
     fn on_proprioception(&mut self, env: &Envelope) -> Outcome {
-        let Ok(ev) = serde_json::from_slice::<ProprioWire>(&env.payload) else {
+        let Some(ev) = decode_sense_wire::<ProprioWire>(&env.payload) else {
             return Outcome::none();
         };
         // `loaded` / `unloaded` are normal lifecycle — not faults. Only a leaked-resources unload is
@@ -370,7 +431,7 @@ impl ImmuneResponse {
     // ----- inbound cross-Realm notice (trust-gated — T2) ----------------------------------------
 
     fn on_federator_msg(&mut self, env: &Envelope) -> Outcome {
-        let Ok(msg) = FederatorMsg::parse(&env.payload) else {
+        let Ok(msg) = FederatorMsg::parse_bounded(&env.payload) else {
             return Outcome::none(); // R9: never panic on malformed input.
         };
         match msg {
@@ -413,13 +474,27 @@ impl ImmuneResponse {
     // ----- control plane (operator → immune-response) ------------------------------------------
 
     fn on_control(&mut self, env: &Envelope) -> Outcome {
+        if env.payload.len() > MAX_CONTROL_MESSAGE_BYTES {
+            return Outcome::none(); // R9: refuse oversized operator input before JSON decode.
+        }
         let Ok(msg) = ImmuneMsg::parse(&env.payload) else {
             return Outcome::none(); // R9: never panic on malformed input.
         };
         match msg {
             ImmuneMsg::Watch { module, realm, artifact_hash } => {
-                self.watch.insert(CreatureId(module), (realm, artifact_hash));
-                reply(env, ImmuneMsg::Watching { module })
+                if self.insert_watch(CreatureId(module), realm, artifact_hash) {
+                    reply(env, ImmuneMsg::Watching { module })
+                } else {
+                    reply(
+                        env,
+                        ImmuneMsg::Ignored {
+                            reason: format!(
+                                "immune-response watch map at capacity ({})",
+                                self.max_watched
+                            ),
+                        },
+                    )
+                }
             }
             ImmuneMsg::Report { module, reason } => self.on_report(env, module, reason),
             ImmuneMsg::StatusQuery => self.on_status(env),
@@ -588,15 +663,19 @@ mod tests {
         serde_json::from_slice(&d.payload).unwrap()
     }
 
-    fn watch_target(i: &mut ImmuneResponse, module: u64) {
-        i.handle(control_env(
+    fn watch_env(module: u64, artifact_hash: impl Into<String>, corr: u64) -> Envelope {
+        control_env(
             ImmuneMsg::Watch {
                 module,
                 realm: RealmId::new(REALM),
-                artifact_hash: format!("h{module}"),
+                artifact_hash: artifact_hash.into(),
             },
-            1,
-        ));
+            corr,
+        )
+    }
+
+    fn watch_target(i: &mut ImmuneResponse, module: u64) {
+        i.handle(watch_env(module, format!("h{module}"), 1));
     }
 
     // ----- Watch + StatusQuery ----
@@ -614,6 +693,77 @@ mod tests {
             other => panic!("expected Watching, got {other:?}"),
         }
         assert_eq!(out.dispatches[0].corr, Some(3));
+    }
+
+    #[test]
+    fn max_watched_refuses_new_watch_at_capacity_but_allows_update() {
+        let mut i = immune().with_max_watched(1);
+
+        let first = i.handle(watch_env(7, "h7", 3));
+        match parse_reply(&first.dispatches[0]) {
+            ImmuneMsg::Watching { module } => assert_eq!(module, 7),
+            other => panic!("expected Watching, got {other:?}"),
+        }
+        assert_eq!(i.watched_count(), 1);
+
+        let overflow = i.handle(watch_env(8, "h8", 4));
+        match parse_reply(&overflow.dispatches[0]) {
+            ImmuneMsg::Ignored { reason } => {
+                assert!(reason.contains("capacity"), "reason: {reason}");
+            }
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+        assert_eq!(i.watched_count(), 1, "new module refused at capacity");
+
+        let update = i.handle(watch_env(7, "h7-updated", 5));
+        match parse_reply(&update.dispatches[0]) {
+            ImmuneMsg::Watching { module } => assert_eq!(module, 7),
+            other => panic!("expected Watching, got {other:?}"),
+        }
+        assert_eq!(i.watched_count(), 1, "existing watch updates at capacity");
+
+        let out = i
+            .handle(control_env(ImmuneMsg::Report { module: 7, reason: "manual fault".into() }, 6));
+        let mark = out
+            .dispatches
+            .iter()
+            .find(|d| d.schema == REGISTRY_OP_SCHEMA)
+            .expect("updated watch key is quarantined");
+        match parse_op(mark) {
+            RegistryOp::MarkQuarantine { artifact_hash, .. } => {
+                assert_eq!(artifact_hash, "h7-updated")
+            }
+            other => panic!("expected MarkQuarantine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_max_watched_is_bounded_and_zero_opt_out_is_unbounded() {
+        let mut i = immune();
+        let base = 1_000u64;
+
+        for offset in 0..DEFAULT_MAX_WATCHED_MODULES {
+            let module = base + offset as u64;
+            let _ = i.handle(watch_env(module, format!("h{module}"), 1));
+        }
+        assert_eq!(i.watched_count(), DEFAULT_MAX_WATCHED_MODULES);
+
+        let overflow = base + DEFAULT_MAX_WATCHED_MODULES as u64;
+        let out = i.handle(watch_env(overflow, format!("h{overflow}"), 2));
+        match parse_reply(&out.dispatches[0]) {
+            ImmuneMsg::Ignored { reason } => {
+                assert!(reason.contains("capacity"), "reason: {reason}");
+            }
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+        assert_eq!(i.watched_count(), DEFAULT_MAX_WATCHED_MODULES);
+
+        let mut unbounded = immune().with_max_watched(0);
+        for offset in 0..=DEFAULT_MAX_WATCHED_MODULES {
+            let module = 20_000 + offset as u64;
+            let _ = unbounded.handle(watch_env(module, format!("h{module}"), 1));
+        }
+        assert_eq!(unbounded.watched_count(), DEFAULT_MAX_WATCHED_MODULES + 1);
     }
 
     #[test]
@@ -680,6 +830,19 @@ mod tests {
     }
 
     #[test]
+    fn oversized_budget_signal_is_dropped_without_quarantine() {
+        let mut i = immune();
+        watch_target(&mut i, 7);
+        let env = Envelope {
+            header: header(Address::Creature(ME), BUDGET_SIGNAL_SCHEMA, None),
+            payload: vec![b'{'; MAX_SENSE_EVENT_BYTES + 1],
+        };
+        let out = i.handle(env);
+        assert!(out.dispatches.is_empty(), "oversized budget signal is ignored");
+        assert_eq!(i.issued_count(), 0);
+    }
+
+    #[test]
     fn drops_a_budget_signal_naming_its_own_id() {
         // Anti-feedback defense-in-depth: a creature is never its own immune trigger.
         let mut i = immune();
@@ -718,6 +881,19 @@ mod tests {
         watch_target(&mut i, 8);
         assert!(i.handle(proprio_env(8, "loaded")).dispatches.is_empty());
         assert!(i.handle(proprio_env(8, "unloaded")).dispatches.is_empty());
+        assert_eq!(i.issued_count(), 0);
+    }
+
+    #[test]
+    fn oversized_proprioception_event_is_dropped_without_quarantine() {
+        let mut i = immune();
+        watch_target(&mut i, 8);
+        let env = Envelope {
+            header: header(Address::Creature(ME), PROPRIO_SCHEMA, None),
+            payload: vec![b'{'; MAX_SENSE_EVENT_BYTES + 1],
+        };
+        let out = i.handle(env);
+        assert!(out.dispatches.is_empty(), "oversized proprioception event is ignored");
         assert_eq!(i.issued_count(), 0);
     }
 
@@ -820,6 +996,29 @@ mod tests {
         let mut i = immune_with(Box::new(TrustNone), None);
         let out = i.handle(notice_env(vec!["attacker".into()]));
         assert!(out.dispatches.is_empty(), "an untrusted notice produces no registry write");
+    }
+
+    #[test]
+    fn oversized_federator_notice_is_dropped_without_quarantine() {
+        let mut i = immune_with(Box::new(TrustAll), None);
+        let env = Envelope {
+            header: header(Address::Creature(ME), omega_federator::SCHEMA, None),
+            payload: vec![b'{'; omega_federator::MAX_FEDERATOR_MESSAGE_BYTES + 1],
+        };
+        let out = i.handle(env);
+        assert!(out.dispatches.is_empty(), "oversized federator message is ignored");
+        assert_eq!(i.issued_count(), 0);
+    }
+
+    #[test]
+    fn oversized_control_message_is_dropped_before_json_decode() {
+        let mut i = immune_with(Box::new(TrustAll), None);
+        let env = Envelope {
+            header: header(Address::Creature(ME), SCHEMA, Some(1)),
+            payload: vec![b'{'; MAX_CONTROL_MESSAGE_BYTES + 1],
+        };
+        let out = i.handle(env);
+        assert!(out.dispatches.is_empty(), "oversized operator control message is ignored (R9)");
     }
 
     // ----- propagation ----

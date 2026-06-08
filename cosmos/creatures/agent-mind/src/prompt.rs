@@ -6,11 +6,19 @@
 //! missing/malformed json stub, or a source that doesn't carry the tier's required entrypoint, is a
 //! structured [`AuthoringError::Invalid`] — never a synthesized permissive default (a defaulted
 //! `ManifestStub` carries `net: None` + empty `provides`, a silent capability mis-declaration for a
-//! native trusted-by-admission creature).
+//! native trusted-by-admission creature). The parser also caps the raw completion before scanning
+//! fenced blocks so an injected model cannot force unbounded parser allocation.
 
 use agent_templated::{AuthoringError, AuthoringRequest, AuthoringResponse};
 use build_cargo::ManifestStub;
 use mind::{Prompt, RETRY_MARKER};
+
+/// Maximum model-completion bytes parsed by the model-backed author.
+///
+/// This matches the build creatures' 8 MiB operation envelope scale: a 4 MiB source plus manifest
+/// JSON/fence overhead fits, while an arbitrarily large model response is rejected before the fence
+/// scanner copies block bodies.
+pub const MAX_MODEL_COMPLETION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Which creature tier the request asks for. Mirrors `agent-templated`'s keyword routing: a request
 /// mentioning "critter" authors the sandboxed script tier; everything else is a native daemon.
@@ -130,6 +138,15 @@ pub fn build_request(req: &AuthoringRequest) -> Prompt {
 
 /// Parse a model completion into an [`AuthoringResponse`] for `tier`. Fails closed (see module docs).
 pub fn parse_response(tier: Tier, content: &str) -> Result<AuthoringResponse, AuthoringError> {
+    if content.len() > MAX_MODEL_COMPLETION_BYTES {
+        return Err(AuthoringError::Invalid {
+            message: format!(
+                "model response too large: {} bytes exceeds {} byte limit (fail-closed)",
+                content.len(),
+                MAX_MODEL_COMPLETION_BYTES
+            ),
+        });
+    }
     let (source_langs, required, template): (&[&str], &str, &str) = match tier {
         // A daemon must end in `declare_creature!`; a critter must define `fn handle`. The required
         // token is the fail-loud backstop against a truncated/partial model response.
@@ -310,6 +327,19 @@ forge::declare_creature!(D);
             parse_response(Tier::Daemon, "```json\n{\"name\":\"x\",\"version\":\"0.1.0\"}\n```")
                 .unwrap_err();
         assert!(matches!(e, AuthoringError::Invalid { .. }), "got {e:?}");
+    }
+
+    #[test]
+    fn parse_response_rejects_oversized_completion_before_scanning() {
+        let content = "x".repeat(MAX_MODEL_COMPLETION_BYTES + 1);
+        let e = parse_response(Tier::Daemon, &content).unwrap_err();
+        match e {
+            AuthoringError::Invalid { message } => {
+                assert!(message.contains("too large"), "got {message}");
+                assert!(message.contains("fail-closed"), "got {message}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

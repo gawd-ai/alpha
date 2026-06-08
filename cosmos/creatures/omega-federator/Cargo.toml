@@ -10,6 +10,7 @@ description = "The Omega federation creature: cross-Realm routing, pull-based re
 
 [dependencies]
 aether = { path = "../../aether" }
+bestiary = { path = "../../bestiary" }
 seer = { path = "../../seer" }
 sigil = { path = "../../sigil" }
 # The `omega` concept crate owns the gateway socket name (`omega::GATEWAY_ROLE`) this

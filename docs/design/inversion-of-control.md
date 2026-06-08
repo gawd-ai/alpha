@@ -182,6 +182,8 @@ conversation moves:
 envelopes; they never decide topic semantics. The wire format is identical across every `seer`
 topic — `placement`, `policy`, `budget`, `fitness`, `consensus` reserve the same shape — so a
 consensus / VRF / weight model lands as another `seer` consumer, never as a new bus contract.
+The reference `agent-curious` bounds its parked authoring Query state by default as a resource
+floor; liveness/deadline policy still belongs to the orchestrator.
 
 ### Single-shot is the reduced case
 

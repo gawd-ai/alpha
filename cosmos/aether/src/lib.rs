@@ -46,6 +46,14 @@ pub use instance::{
 };
 pub use router::{InboxReceiver, JournalEntry, RouteError, Router, KERNEL_ID};
 
+/// Default maximum JSON payload size for high-volume sense-topic events.
+///
+/// The router bounds queues, but topic consumers still parse opaque payloads after delivery.
+/// Proprioception, fitness, and budget-signal consumers use this cap before JSON decode so a
+/// directly addressed or fanned-out sense event cannot force unbounded allocation in an observer
+/// or policy creature. Larger artifacts and registry operations have their own domain limits.
+pub const MAX_SENSE_EVENT_BYTES: usize = 1024 * 1024;
+
 // One trust vocabulary across the workspace: the verify mechanism lives in the contract crate.
 pub use sigil::{Ed25519KeyMaterial, Ed25519Verifier, StubVerifier, Verifier};
 

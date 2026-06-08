@@ -303,7 +303,8 @@ fn loop_b_fetch_url_title_authored_built_loaded_run_against_local_http_server() 
     // Stand up a tiny in-test HTTP server that returns a known title. Listening on an ephemeral
     // port keeps the test parallel-safe; we read the bound port from the listener after binding.
     let (port, server_done) = spawn_one_shot_http_server(
-        "<!doctype html><html><head><title>GAWD M3 fetch demo</title></head><body>hello</body></html>",
+        b"<!doctype html><html><head><title>GAWD M3 fetch demo</title></head><body>hello</body></html>"
+            .to_vec(),
     );
 
     let url = format!("http://127.0.0.1:{port}/page");
@@ -326,12 +327,31 @@ fn loop_b_fetch_url_title_authored_built_loaded_run_against_local_http_server() 
     // The server thread exits after one request; join for hygiene.
     let _ = server_done.join();
 
+    let (port, server_done) = spawn_one_shot_http_server(vec![b'x'; 1024 * 1024 + 1]);
+    let url = format!("http://127.0.0.1:{port}/too-large");
+    world
+        .probe_bus
+        .emit(
+            Dispatch::to(Address::Creature(id), url.into_bytes())
+                .with_reply_to(Address::Creature(world.probe_bus.id()))
+                .with_corr(4),
+        )
+        .expect("send oversized-response url to authored creature");
+    let reply = recv_with_corr(&world.probe_rx, 4, scaled(Duration::from_secs(10)))
+        .expect("authored fetch-url-title replies to oversized response");
+    let message = String::from_utf8_lossy(&reply.payload).to_string();
+    assert!(
+        message.contains("response too large"),
+        "authored creature reports the response cap, got {message:?}"
+    );
+    let _ = server_done.join();
+
     world.kernel.shutdown_all(Deadline::default());
 }
 
 /// A one-shot HTTP/1.0 responder on `127.0.0.1:0` (ephemeral port). Returns `(port, join_handle)`.
-/// Serves `body` with a known minimal HTML response, then closes. Test-grade only.
-fn spawn_one_shot_http_server(body: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+/// Serves `body` with a known minimal response, then closes. Test-grade only.
+fn spawn_one_shot_http_server(body: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -343,12 +363,12 @@ fn spawn_one_shot_http_server(body: &'static str) -> (u16, std::thread::JoinHand
             let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf);
-            let resp = format!(
-                "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+            let headers = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
             );
-            let _ = s.write_all(resp.as_bytes());
+            let _ = s.write_all(headers.as_bytes());
+            let _ = s.write_all(&body);
             let _ = s.shutdown(std::net::Shutdown::Write);
         }
     });

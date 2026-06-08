@@ -20,6 +20,7 @@ use sigil::{Backend, Capabilities, Ed25519KeyMaterial, Ed25519Verifier, Manifest
 
 use omni::{
     boot_control, boot_organs_with_monitor, recv_corr, AiControl, Verb, VerbResult, CONTROL_SCHEMA,
+    MAX_CONTROL_ARTIFACT_BYTES, MAX_CONTROL_MANIFEST_BYTES,
 };
 
 // ---- self-cleaning temp dir (no external tempdir dep) ----
@@ -38,11 +39,20 @@ impl TempDir {
     /// Write a manifest JSON + an artifact file; return `(manifest_path, artifact_path)`.
     fn creature_files(&self, name: &str, bytes: &[u8]) -> (String, String) {
         let m = Manifest::new(name, "0.2.0", Backend::Daemon, "gawd_creature_v1");
-        let m_path = self.0.join(format!("{name}.manifest.json"));
+        let m_path = self.manifest_file(name, &m);
         let a_path = self.0.join(format!("{name}.artifact.bin"));
-        std::fs::write(&m_path, serde_json::to_vec(&m).unwrap()).unwrap();
         std::fs::write(&a_path, bytes).unwrap();
-        (m_path.to_string_lossy().into_owned(), a_path.to_string_lossy().into_owned())
+        (m_path, a_path.to_string_lossy().into_owned())
+    }
+    fn manifest_file(&self, name: &str, manifest: &Manifest) -> String {
+        let m_path = self.0.join(format!("{name}.manifest.json"));
+        std::fs::write(&m_path, serde_json::to_vec(manifest).unwrap()).unwrap();
+        m_path.to_string_lossy().into_owned()
+    }
+    fn sparse_file(&self, name: &str, len: u64) -> String {
+        let path = self.0.join(name);
+        std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+        path.to_string_lossy().into_owned()
     }
 }
 impl Drop for TempDir {
@@ -194,6 +204,57 @@ fn realm_scoped_list_excludes_other_realms() {
 }
 
 #[test]
+fn registry_list_is_sorted_for_stable_operator_output() {
+    let (kernel, _ai) = node(true);
+    let files = TempDir::new("list-sort");
+    let (m_z, a_z) = files.creature_files("sort-z", b"sort-z-bytes");
+    let (m_b, a_b) = files.creature_files("sort-b", b"sort-b-bytes");
+    let (m_a, a_a) = files.creature_files("sort-a", b"sort-a-bytes");
+
+    for (corr, manifest_path, artifact_path, realm) in
+        [(1, m_z, a_z, "guests"), (2, m_b, a_b, "crew"), (3, m_a, a_a, "crew")]
+    {
+        let res = control(
+            &kernel,
+            corr,
+            &Verb::RegistryPublish {
+                manifest_path,
+                artifact_path,
+                realm: Some(RealmId::new(realm)),
+            },
+        );
+        assert!(res.ok, "publish {realm} ok: {:?}", res.json);
+    }
+
+    let res = control(&kernel, 4, &Verb::RegistryList { realm: None });
+    assert!(res.ok, "list ok: {:?}", res.json);
+    let rows: Vec<(String, String)> = res.json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| {
+            let name = e.get("name").and_then(|v| v.as_str())?;
+            if !name.starts_with("sort-") {
+                return None;
+            }
+            Some((e.get("realm").and_then(|v| v.as_str()).unwrap().to_string(), name.to_string()))
+        })
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![
+            ("crew".to_string(), "sort-a".to_string()),
+            ("crew".to_string(), "sort-b".to_string()),
+            ("guests".to_string(), "sort-z".to_string()),
+        ],
+        "registry list should be deterministic by realm, name, version, hash"
+    );
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
 fn publish_is_gated_but_reads_are_not() {
     // Gate OFF: a mutating verb (publish) over the bus is refused with `ai-not-allowed`, while the
     // reads (list/fetch) still answer — exactly the `load`-vs-`status` posture.
@@ -216,6 +277,51 @@ fn publish_is_gated_but_reads_are_not() {
     let fetch =
         control(&kernel, 3, &Verb::RegistryFetch { artifact_hash: "nope".into(), realm: None });
     assert!(!fetch.is_gate_block(), "a read's failure is never a gate refusal");
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
+fn node_local_path_reads_are_bounded_before_load_or_publish() {
+    let (kernel, _ai) = node(true);
+    let files = TempDir::new("path-bounds");
+
+    let huge_manifest =
+        files.sparse_file("too-large.manifest.json", MAX_CONTROL_MANIFEST_BYTES + 1);
+    let res = control(
+        &kernel,
+        1,
+        &Verb::Load { manifest_path: huge_manifest, artifact_path: "/no/such/artifact".into() },
+    );
+    assert!(!res.ok, "oversized manifest is refused");
+    let err = res.json["error"].as_str().unwrap_or_default();
+    assert!(err.contains("exceeds") && err.contains("manifest"), "bounded error: {err}");
+
+    let critter_manifest =
+        Manifest::new("huge-critter", "0.1.0", Backend::Critter, "gawd_critter_v1");
+    let m_path = files.manifest_file("huge-critter", &critter_manifest);
+    let huge_artifact = files.sparse_file("too-large.rhai", MAX_CONTROL_ARTIFACT_BYTES + 1);
+    let res =
+        control(&kernel, 2, &Verb::Load { manifest_path: m_path, artifact_path: huge_artifact });
+    assert!(!res.ok, "oversized non-native artifact is refused before engine read");
+    let err = res.json["error"].as_str().unwrap_or_default();
+    assert!(err.contains("exceeds") && err.contains("artifact"), "bounded error: {err}");
+
+    let (m_path, _) = files.creature_files("published-huge", b"small");
+    let huge_artifact =
+        files.sparse_file("too-large-registry-artifact.bin", MAX_CONTROL_ARTIFACT_BYTES + 1);
+    let res = control(
+        &kernel,
+        3,
+        &Verb::RegistryPublish { manifest_path: m_path, artifact_path: huge_artifact, realm: None },
+    );
+    assert!(!res.ok, "oversized publish artifact is refused before registry bus payload");
+    let err = res.json["error"].as_str().unwrap_or_default();
+    assert!(err.contains("exceeds") && err.contains("artifact"), "bounded error: {err}");
+
+    let list = control(&kernel, 4, &Verb::RegistryList { realm: None });
+    assert!(list.ok, "node still answers after bounded read refusals");
+    assert_eq!(list.json["entries"].as_array().map(Vec::len), Some(0));
 
     kernel.shutdown_all(aether::Deadline::default());
 }

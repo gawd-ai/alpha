@@ -61,6 +61,22 @@ use serde::{Deserialize, Serialize};
 /// [`SeerEnvelope::topic`], not in the wire schema (S1: one bus contract, never N per role).
 pub const SCHEMA: &str = "seer";
 
+/// Default maximum serialized [`SeerEnvelope`] payload accepted by live SEER consumers.
+///
+/// SEER is a high-volume consult/sense stream; this cap prevents direct bus traffic from forcing a
+/// consumer to allocate and parse arbitrarily large opaque JSON bodies. Consumers may opt into a
+/// narrower limit with [`SeerEnvelope::parse_with_limit`].
+pub const MAX_SEER_ENVELOPE_BYTES: usize = 1024 * 1024;
+
+/// Error returned by bounded SEER parsing.
+#[derive(Debug, thiserror::Error)]
+pub enum SeerParseError {
+    #[error("seer envelope payload too large: {len} bytes exceeds {limit} byte limit")]
+    TooLarge { len: usize, limit: usize },
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
 /// The reserved set of SEER topics. Adding a topic is a one-line addition here plus a typed-body
 /// reservation under [`topics`]. The set is closed at the substrate level — a creature using a
 /// topic the substrate doesn't know cannot lift consensus / weight / VRF up to a model later
@@ -250,6 +266,17 @@ impl SeerEnvelope {
     /// surface a structured "malformed seer envelope" rather than a panic.
     pub fn parse(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
+    }
+    /// Parse from a payload byte slice after enforcing [`MAX_SEER_ENVELOPE_BYTES`].
+    pub fn parse_bounded(bytes: &[u8]) -> Result<Self, SeerParseError> {
+        Self::parse_with_limit(bytes, MAX_SEER_ENVELOPE_BYTES)
+    }
+    /// Parse from a payload byte slice with a caller-supplied byte limit.
+    pub fn parse_with_limit(bytes: &[u8], limit: usize) -> Result<Self, SeerParseError> {
+        if bytes.len() > limit {
+            return Err(SeerParseError::TooLarge { len: bytes.len(), limit });
+        }
+        Ok(Self::parse(bytes)?)
     }
 }
 
@@ -951,6 +978,25 @@ mod tests {
         let json = String::from_utf8(env.to_bytes()).unwrap();
         assert!(!json.contains("fraction"), "absent fraction must not appear: {json}");
         assert!(!json.contains("note"), "absent note must not appear: {json}");
+    }
+
+    #[test]
+    fn bounded_parse_rejects_oversized_payload_before_json_decode() {
+        let payload = vec![b'{'; MAX_SEER_ENVELOPE_BYTES + 1];
+        match SeerEnvelope::parse_bounded(&payload) {
+            Err(SeerParseError::TooLarge { len, limit }) => {
+                assert_eq!(len, MAX_SEER_ENVELOPE_BYTES + 1);
+                assert_eq!(limit, MAX_SEER_ENVELOPE_BYTES);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_parse_accepts_valid_payload_under_limit() {
+        let env = SeerEnvelope::thought(SeerTopic::Authoring, 7, "internal", "ok");
+        let back = SeerEnvelope::parse_bounded(&env.to_bytes()).unwrap();
+        assert_eq!(back, env);
     }
 
     #[test]

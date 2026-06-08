@@ -72,6 +72,27 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   reserved). A failing-first regression pins beast initial-memory-over-cap rejection, and post-apoptosis
   `NoSuchModule` assertions prove the kill actually stops the creature on the beast and critter tiers.
 
+### Resilience — hostile-input & resource bounds
+- A uniform resource-exhaustion pass across the substrate: every consumer that decodes a wire payload
+  now bounds the **serialized size before JSON decode** (`SeerEnvelope::parse_bounded` +
+  `seer::MAX_SEER_ENVELOPE_BYTES`, `aether::MAX_SENSE_EVENT_BYTES`, registry/bestiary op caps, migrator
+  and reconciler pre-parse ceilings, the verifiable-die and kernel-control message caps, and bounded
+  control-verb / control-result / JSON-RPC-line readers on the surfaces), and the TCP transport caps a
+  single frame and the grafted gossip-member count.
+- Reference creatures that retain per-key state now **bound it by default**, each with an explicit `0`
+  opt-out: `registry-mem` and the durable `FsBestiaryStore` (entries + artifact bytes),
+  `fitness-selector` (observed ids), `immune-response` (watched ids), `policy-budget` (tracked modules),
+  `agent-curious` (parked Query exchanges), `omega-federator` (in-flight pulls), `verifiable-die`
+  (unrevealed rounds), `transport-tcp` (member table), and the HTTP/MCP surfaces (parked `corr → reply`
+  waiters, which shed new requests as `503` / `surface-busy` rather than allocate without bound).
+  **Behavior note:** these defaults flip the affected reference creatures from *unbounded* to *bounded*;
+  embedders that relied on unbounded growth opt back in with the matching `with_max_*(0)` builder.
+- New **byte-light** read paths so control surfaces inspect the catalogue without dragging artifact
+  bytes across the bus: additive `RegistryOp::{FetchMetadata, FetchMetadataInRealm, ListMetadata}` →
+  `RegistryReply::{FetchedMetadata, Metadata}` over a new `CatalogEntry` (artifact-carrying `Fetch` /
+  `ListEntries` stay for load and anti-entropy). A publish into a full catalogue is a wire-honest error,
+  not a false `Published`.
+
 ## 0.4.0 - 2026-06-04
 
 Alpha's first public release. The five governing loops are alive end to end, and the substrate's

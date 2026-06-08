@@ -142,6 +142,7 @@ fn boot(
             anti_entropy_interval: push_interval,
             compaction_interval: Duration::ZERO,
             replication_peers: peers,
+            ..BestiaryConfig::local()
         },
     );
     let daemon_id = k

@@ -33,6 +33,12 @@ const CRITTER_ABI_TAG: &str = "gawd_critter_v1";
 
 /// The entrypoint a critter must define (the kernel always drives this one function).
 const HANDLE_FN: &str = "handle";
+/// BUILD requests carry source + metadata, not artifacts. Bound the bus payload before JSON parsing
+/// so a misbehaving authoring creature cannot force unbounded deserialization in the build organ.
+const MAX_BUILD_CRITTER_OP_BYTES: usize = 8 * 1024 * 1024;
+/// A critter ships as source text. Keep this roomy for generated scripts but reject pathological
+/// model output before Rhai parsing/compilation.
+const MAX_CRITTER_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
 /// What an authoring agent sends to build a critter — the no-cargo analog of
 /// [`build_cargo::BuildOp`]. A `#[serde(tag = "op")]` enum so future ops land additively.
@@ -73,6 +79,20 @@ impl BuildCritter {
 
     /// Validate → assemble → sign. Pure (no I/O), so it is the unit-test entrypoint too.
     pub fn author(&self, source: &str, stub: &ManifestStub) -> BuildReply {
+        if source.trim().is_empty() {
+            return failed(BuildErrorKind::Invalid, "source is empty".into());
+        }
+        if source.len() > MAX_CRITTER_SOURCE_BYTES {
+            return failed(
+                BuildErrorKind::Invalid,
+                format!(
+                    "source is {} bytes, exceeds {} byte limit",
+                    source.len(),
+                    MAX_CRITTER_SOURCE_BYTES
+                ),
+            );
+        }
+
         // 1. Compile gate. A bare engine resolves the same syntax the runtime loader will; a parse
         //    error is the agent's to fix, so report it as `Compile` (re-triable), not `Invalid`.
         let mut engine = rhai::Engine::new();
@@ -152,13 +172,26 @@ impl Creature for BuildCritter {
     fn bind(&mut self, _ctx: CreatureCtx) {}
 
     fn handle(&mut self, env: Envelope) -> Outcome {
-        let reply = match serde_json::from_slice::<BuildCritterOp>(&env.payload) {
-            Ok(BuildCritterOp::Author { source, manifest_stub }) => {
-                self.author(&source, &manifest_stub)
+        let reply = if env.payload.len() > MAX_BUILD_CRITTER_OP_BYTES {
+            failed(
+                BuildErrorKind::Invalid,
+                format!(
+                    "build-critter op payload is {} bytes, exceeds {} byte limit",
+                    env.payload.len(),
+                    MAX_BUILD_CRITTER_OP_BYTES
+                ),
+            )
+        } else {
+            match serde_json::from_slice::<BuildCritterOp>(&env.payload) {
+                Ok(BuildCritterOp::Author { source, manifest_stub }) => {
+                    self.author(&source, &manifest_stub)
+                }
+                // Not our op (e.g. a daemon `BuildOp` mis-addressed here): a clean structured refusal,
+                // never a panic on hostile input (R9).
+                Err(e) => {
+                    failed(BuildErrorKind::Invalid, format!("not a BuildCritterOp::Author: {e}"))
+                }
             }
-            // Not our op (e.g. a daemon `BuildOp` mis-addressed here): a clean structured refusal,
-            // never a panic on hostile input (R9).
-            Err(e) => failed(BuildErrorKind::Invalid, format!("not a BuildCritterOp::Author: {e}")),
         };
         // Stamp the same `build.reply` schema header build-cargo sets, so both BUILD creatures are
         // indistinguishable to a schema-based router/telemetry filter — the shared `BuildReply` wire
@@ -248,6 +281,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_source_before_rhai_compile() {
+        let bc = BuildCritter::new(key(), "author");
+        match bc.author(&"x".repeat(MAX_CRITTER_SOURCE_BYTES + 1), &stub()) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            BuildReply::Built { .. } => panic!("oversized source must not build"),
+        }
+    }
+
+    #[test]
     fn rejects_imports_at_the_same_gate_as_the_runtime_loader() {
         let bc = BuildCritter::new(key(), "author");
         match bc.author("import \"helper\" as helper; fn handle(env) { env.payload }", &stub()) {
@@ -282,5 +327,40 @@ mod tests {
         let reply: BuildReply =
             serde_json::from_slice(&out.dispatches[0].payload).expect("a BuildReply");
         assert!(matches!(reply, BuildReply::Failed { kind: BuildErrorKind::Invalid, .. }));
+    }
+
+    #[test]
+    fn oversized_author_payload_is_a_clean_invalid_reply_before_json_parse() {
+        let mut bc = BuildCritter::new(key(), "author");
+        let env = {
+            use aether::{Address, CreatureId, Header};
+            Envelope {
+                header: Header {
+                    from: Address::Creature(CreatureId(1)),
+                    to: Address::Creature(CreatureId(2)),
+                    reply_to: None,
+                    seq: 0,
+                    causal: vec![],
+                    stamp: 0,
+                    sig: String::new(),
+                    corr: None,
+                    commitment: None,
+                    schema: String::new(),
+                },
+                payload: vec![b'{'; MAX_BUILD_CRITTER_OP_BYTES + 1],
+            }
+        };
+        let out = bc.handle(env);
+        assert_eq!(out.dispatches.len(), 1, "always replies");
+        let reply: BuildReply =
+            serde_json::from_slice(&out.dispatches[0].payload).expect("a BuildReply");
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("build-critter op payload"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            BuildReply::Built { .. } => panic!("oversized payload must not build"),
+        }
     }
 }

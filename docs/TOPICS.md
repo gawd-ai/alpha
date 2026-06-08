@@ -38,6 +38,13 @@ The substrate publishes; what the signal *means for action* is the subscribing c
 | `proprioception` | `Topic::PROPRIOCEPTION` | Liveness / sense stream — Loops **1** (Sense) & **4** (Defend) | kernel, on creature **load / unload / leak**, plus the `BudgetSignalEvent` | [`cosmos/creatures/immune-response`](../cosmos/creatures/immune-response) (senses faults), [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor) (the nervous-system observer) | kernel sense events; `BudgetSignalEvent` |
 | `fitness` | `Topic::FITNESS` | Outcome stream — Loop **2** (Select). Kernel emits `Fitness{module, ok}` after **every** handle (`module` is the creature id field) | kernel (only when a subscriber exists — no-listener short-circuit) | **passive observers only** — [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor); and a passive relay → [`cosmos/creatures/fitness-selector`](../cosmos/creatures/fitness-selector) (see note) | `{ module, ok }`, schema `"fitness"` |
 
+Sense-topic consumers bound JSON parsing with `aether::MAX_SENSE_EVENT_BYTES` (1 MiB) before
+decoding `proprioception`, `fitness`, or `budget_signal` payloads.
+The reference `fitness-selector` also bounds its distinct observed-module tally by default; operators
+can explicitly opt out with `with_max_obs(0)` for unbounded replay or lab workloads.
+The reference `policy-budget` bounds its tracked-module grace/decision state by default; operators can
+explicitly opt out with `with_max_tracked_modules(0)`.
+
 > **The `fitness` anti-feedback rule.** The kernel publishes a fitness event after *every* handle —
 > *including the selector's own handles*. A drain-thread creature that subscribed directly to
 > `fitness` would feed on its own events (a 1-in-1-out livelock). So the `fitness-selector` is fed by
@@ -68,7 +75,7 @@ topic and the conversation move live in the payload.
 
 ### The topics (`SeerTopic`)
 
-All six are reserved at the substrate level so a consumer can never widen the wire later. Status is
+All seven are reserved at the substrate level so a consumer can never widen the wire later. Status is
 **live** (a shipped consumer) or **reserved/draft** (the shape compiles; bodies may still change
 before a consumer pins them).
 
@@ -80,6 +87,7 @@ before a consumer pins them).
 | `policy` | reserved/draft | richer admission consult | — (live path: mechanically-applied policy creatures) | `policy::{QueryBody, AnswerBody}` |
 | `budget` | reserved/draft | grace request | — (live path: `proprioception` + `KernelControl::ExtendBudget`) | `budget::{QueryBody, AnswerBody}` |
 | `fitness` | reserved/draft | fitness-score consult across raters | — (live path: injected `FitnessScorer` + registry promotion) | `fitness::{QueryBody, AnswerBody}` |
+| `curation` | reserved/draft | durable Bestiary curation consult | — (live path: in-process `bestiary::AICurator`) | `curation::{QueryBody, AnswerBody}` |
 
 > Note: a SEER **`fitness` consult topic** (ask N raters to score) is distinct from the **`fitness`
 > broadcast topic** in §1 (the kernel's per-handle outcome stream). Same word, two layers.
@@ -93,6 +101,10 @@ before a consumer pins them).
 - **Topic isolation by discrimination.** Delivery is by address; the consumer checks
   `seer.topic` and drops envelopes whose topic doesn't match its binding. No router-level topic
   enforcement, by design.
+- **Bounded hostile-input parsing.** Live consumers use `SeerEnvelope::parse_bounded`, whose default
+  cap is `seer::MAX_SEER_ENVELOPE_BYTES` (1 MiB), before decoding the opaque JSON body.
+- **Bounded parked state is a consumer floor.** Reference consumers that park SEER exchanges, such
+  as `agent-curious`, cap their pending tables by default; `0` is an explicit lab/demo opt-out.
 - **`Steer` is generic** and **time is injected.** Whether a creature honors a steer is its model;
   `deadline_ms` (where a body has it) is **advisory** — the substrate ships no clock and enforces no
   timeout.
@@ -104,7 +116,7 @@ use aether::seer::{SeerEnvelope, SeerKind, SeerTopic, SCHEMA};
 
 fn on_envelope(env: &aether::Envelope) {
     if env.header.schema != SCHEMA { return; }                 // not a SEER message
-    let seer = match SeerEnvelope::parse(&env.payload) { Ok(s) => s, Err(_) => return };
+    let seer = match SeerEnvelope::parse_bounded(&env.payload) { Ok(s) => s, Err(_) => return };
     if seer.topic != SeerTopic::Placement { return; }          // topic isolation: not mine
     if let SeerKind::Query { query_id, body } = seer.kind {
         // decode `body` against placement::QueryBody, reconcile by *your* model, then:

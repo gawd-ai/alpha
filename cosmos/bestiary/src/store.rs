@@ -43,7 +43,13 @@ use sha2::{Digest, Sha256};
 use sigil::{Ed25519KeyMaterial, Ed25519Verifier, Manifest, RealmId, Verifier};
 
 use crate::curator::{CurationContext, CurationDecision, Curator};
-use crate::wire::{Entry, QuarantineNotice, ReputationScore, SyncEntry};
+use crate::wire::{CatalogEntry, Entry, QuarantineNotice, ReputationScore, SyncEntry};
+use crate::{registry_artifact_too_large_message, MAX_REGISTRY_ARTIFACT_BYTES};
+
+/// Default maximum number of live `(realm, artifact_hash)` entries retained by [`FsBestiaryStore`].
+///
+/// `0` is reserved as an explicit opt-out via [`FsBestiaryStore::with_max_entries`].
+pub const DEFAULT_MAX_BESTIARY_ENTRIES: usize = 1_024;
 
 /// 4-byte format tag, woven into the genesis chain root so a log can't be confused with another
 /// line-oriented file and so the chain's first link is anchored to this format.
@@ -59,6 +65,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
+}
+
+/// The store's blob path component is a SHA-256 hex digest produced by [`sha256_hex`]. Keep that
+/// contract local to the filesystem-backed store: wire payloads can be malformed, but they must
+/// never become arbitrary path components or durable tombstone keys.
+fn is_artifact_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn invalid_artifact_hash(hash: &str) -> StoreError {
+    StoreError::Integrity(format!(
+        "invalid artifact_hash (len {}, expected 64 lowercase hex chars)",
+        hash.len()
+    ))
 }
 
 /// Structured failure modes for the durable store. Distinct from a creature's admission/policy
@@ -85,6 +105,9 @@ pub enum StoreError {
     /// The catalog is at its `max_entries` cap and a new key was refused.
     #[error("bestiary at capacity: {0}")]
     Capacity(String),
+    /// A caller asked the store to retain bytes beyond its configured bounds.
+    #[error("bestiary limit exceeded: {0}")]
+    Limit(String),
     /// A log record was authored by a key that is not this daemon's — the journal is self-owned, so a
     /// foreign record at rest is rejected (peer entries arrive only via verified, re-signed pushes).
     #[error("bestiary foreign-author log record: {0}")]
@@ -278,8 +301,18 @@ pub trait BestiaryStore: Send + Sync {
     /// Fetch the live entry for `(realm, artifact_hash)`, loading the artifact bytes from the blob
     /// store. `None` if absent or tombstoned.
     fn get(&self, realm: &RealmId, artifact_hash: &str) -> Result<Option<Entry>, StoreError>;
+    /// Fetch the live entry metadata for `(realm, artifact_hash)` plus the artifact byte length.
+    /// Does not read artifact bytes; it only stats the content-addressed blob to prove the stored row
+    /// still has backing bytes.
+    fn get_metadata(
+        &self,
+        realm: &RealmId,
+        artifact_hash: &str,
+    ) -> Result<Option<(CatalogEntry, usize)>, StoreError>;
     /// Snapshot live entries as [`SyncEntry`]s for anti-entropy pull. `realm: None` = all Realms.
     fn list(&self, realm: Option<&RealmId>) -> Result<Vec<SyncEntry>, StoreError>;
+    /// Snapshot live entry metadata for control/catalog listing. Does not read artifact blobs.
+    fn list_metadata(&self, realm: Option<&RealmId>) -> Result<Vec<CatalogEntry>, StoreError>;
     /// Attach/replace a reputation score on an existing entry. `false` if absent/tombstoned or the
     /// score is non-finite (defense-in-depth: a non-finite score never enters the trust store).
     fn attest(
@@ -369,8 +402,10 @@ pub struct FsBestiaryStore {
     root: PathBuf,
     abode_key: Ed25519KeyMaterial,
     pubkey: String,
-    /// `0` = unbounded; otherwise the distinct-entry cap (a new key past it is refused).
+    /// Live-entry cap. A new key past it is refused; `0` means unbounded.
     max_entries: usize,
+    /// `0` = unbounded; otherwise the largest artifact blob this store will retain.
+    max_artifact_bytes: usize,
     /// Per-process unique suffix source for atomic temp files (no clock/rng needed).
     tmp_seq: AtomicU64,
     inner: Mutex<Inner>,
@@ -389,7 +424,8 @@ impl FsBestiaryStore {
             root,
             abode_key,
             pubkey,
-            max_entries: 0,
+            max_entries: DEFAULT_MAX_BESTIARY_ENTRIES,
+            max_artifact_bytes: MAX_REGISTRY_ARTIFACT_BYTES,
             tmp_seq: AtomicU64::new(0),
             inner: Mutex::new(Inner::default()),
         };
@@ -398,10 +434,19 @@ impl FsBestiaryStore {
         Ok(store)
     }
 
-    /// Cap the number of distinct catalog entries (default `0` = unbounded). At capacity a `Put` of a
-    /// *new* key is refused; re-publishing an existing key always succeeds.
+    /// Cap the number of distinct catalog entries.
+    ///
+    /// The default is [`DEFAULT_MAX_BESTIARY_ENTRIES`]. At capacity a `Put` of a *new* key is
+    /// refused; re-publishing an existing key always succeeds. Pass `0` to opt out and make the
+    /// live-entry catalog unbounded.
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries;
+        self
+    }
+
+    /// Cap stored artifact bytes (default [`MAX_REGISTRY_ARTIFACT_BYTES`]). `0` means unbounded.
+    pub fn with_max_artifact_bytes(mut self, max_artifact_bytes: usize) -> Self {
+        self.max_artifact_bytes = max_artifact_bytes;
         self
     }
 
@@ -452,6 +497,9 @@ impl FsBestiaryStore {
     }
 
     fn write_blob(&self, artifact_hash: &str, artifact: &[u8]) -> Result<(), StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Err(invalid_artifact_hash(artifact_hash));
+        }
         let path = self.blob_path(artifact_hash);
         if path.exists() {
             return Ok(()); // content-addressed dedupe: identical bytes already on disk
@@ -460,6 +508,9 @@ impl FsBestiaryStore {
     }
 
     fn read_blob(&self, artifact_hash: &str) -> Result<Vec<u8>, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Err(invalid_artifact_hash(artifact_hash));
+        }
         fs::read(self.blob_path(artifact_hash))
             .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))
     }
@@ -573,6 +624,12 @@ impl BestiaryStore for FsBestiaryStore {
         manifest: Manifest,
         artifact: Vec<u8>,
     ) -> Result<String, StoreError> {
+        if self.max_artifact_bytes != 0 && artifact.len() > self.max_artifact_bytes {
+            return Err(StoreError::Limit(registry_artifact_too_large_message(
+                artifact.len(),
+                self.max_artifact_bytes,
+            )));
+        }
         let hash = sha256_hex(&artifact);
         let key = (realm.clone(), hash.clone());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -583,11 +640,13 @@ impl BestiaryStore for FsBestiaryStore {
         }
         let is_new = !inner.entries.contains_key(&key);
         if is_new && self.max_entries != 0 && inner.entries.len() >= self.max_entries {
-            eprintln!(
-                "bestiary: catalog at capacity ({}); refusing new artifact {hash} in realm {}",
+            // Refuse-new with a wire-honest error (matches `registry-mem`, which returns
+            // `RegistryReply::Error`): the daemon maps this to a structured failure rather than a
+            // false `Published`. A re-publish of an existing key never reaches here (it is not new).
+            return Err(StoreError::Capacity(format!(
+                "catalog at capacity ({}); refused new artifact {hash} in realm {}",
                 self.max_entries, realm.0
-            );
-            return Ok(hash); // refuse-new, return the (correct) hash — matches the in-memory stub
+            )));
         }
 
         self.write_blob(&hash, &artifact)?;
@@ -609,6 +668,9 @@ impl BestiaryStore for FsBestiaryStore {
     }
 
     fn get(&self, realm: &RealmId, artifact_hash: &str) -> Result<Option<Entry>, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Ok(None);
+        }
         let key = (realm.clone(), artifact_hash.to_string());
         let live = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -626,6 +688,39 @@ impl BestiaryStore for FsBestiaryStore {
             }
             None => Ok(None),
         }
+    }
+
+    fn get_metadata(
+        &self,
+        realm: &RealmId,
+        artifact_hash: &str,
+    ) -> Result<Option<(CatalogEntry, usize)>, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Ok(None);
+        }
+        let key = (realm.clone(), artifact_hash.to_string());
+        let live = {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::live_entry(&inner, &key)
+        };
+        let Some(live) = live else {
+            return Ok(None);
+        };
+        let meta = fs::metadata(self.blob_path(artifact_hash))
+            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
+        let artifact_len = usize::try_from(meta.len()).map_err(|_| {
+            StoreError::Corrupt(format!("blob {artifact_hash} length does not fit usize"))
+        })?;
+        Ok(Some((
+            CatalogEntry {
+                artifact_hash: artifact_hash.to_string(),
+                realm: realm.clone(),
+                manifest: live.manifest,
+                reputation: live.reputation,
+                quarantine: live.quarantine,
+            },
+            artifact_len,
+        )))
     }
 
     fn list(&self, realm: Option<&RealmId>) -> Result<Vec<SyncEntry>, StoreError> {
@@ -653,12 +748,31 @@ impl BestiaryStore for FsBestiaryStore {
         Ok(out)
     }
 
+    fn list_metadata(&self, realm: Option<&RealmId>) -> Result<Vec<CatalogEntry>, StoreError> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(inner
+            .entries
+            .iter()
+            .filter(|((r, _), _)| realm.is_none() || realm == Some(r))
+            .map(|((r, hash), live)| CatalogEntry {
+                artifact_hash: hash.clone(),
+                realm: r.clone(),
+                manifest: live.manifest.clone(),
+                reputation: live.reputation.clone(),
+                quarantine: live.quarantine.clone(),
+            })
+            .collect())
+    }
+
     fn attest(
         &self,
         realm: &RealmId,
         artifact_hash: &str,
         score: ReputationScore,
     ) -> Result<bool, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Ok(false);
+        }
         if !score.score.is_finite() {
             eprintln!(
                 "bestiary: rejected a non-finite reputation score for {artifact_hash} in realm {} (not stored)",
@@ -685,6 +799,9 @@ impl BestiaryStore for FsBestiaryStore {
         artifact_hash: &str,
         notice: QuarantineNotice,
     ) -> Result<bool, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Ok(false);
+        }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(live) = inner.entries.get(&key) else {
@@ -711,6 +828,9 @@ impl BestiaryStore for FsBestiaryStore {
     }
 
     fn unquarantine(&self, realm: &RealmId, artifact_hash: &str) -> Result<bool, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Ok(false);
+        }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match inner.entries.get(&key) {
@@ -729,6 +849,9 @@ impl BestiaryStore for FsBestiaryStore {
     }
 
     fn tombstone(&self, realm: &RealmId, artifact_hash: &str) -> Result<bool, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Err(invalid_artifact_hash(artifact_hash));
+        }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if inner.tombstones.contains(&key) {
@@ -754,6 +877,9 @@ impl BestiaryStore for FsBestiaryStore {
         }
         let realm = record.op.realm().clone();
         let hash = record.op.artifact_hash().to_string();
+        if !is_artifact_hash(&hash) {
+            return Err(invalid_artifact_hash(&hash));
+        }
 
         match &record.op {
             LogOp::Tombstone { .. } => {
@@ -765,6 +891,12 @@ impl BestiaryStore for FsBestiaryStore {
                 let sync = entry
                     .sync
                     .ok_or_else(|| StoreError::Corrupt("Put push carried no SyncEntry".into()))?;
+                if self.max_artifact_bytes != 0 && sync.artifact.len() > self.max_artifact_bytes {
+                    return Err(StoreError::Limit(registry_artifact_too_large_message(
+                        sync.artifact.len(),
+                        self.max_artifact_bytes,
+                    )));
+                }
                 // 2. Content integrity: the bytes must hash to the declared key, and the record + sync
                 //    must agree on the key.
                 if sha256_hex(&sync.artifact) != hash
@@ -786,7 +918,19 @@ impl BestiaryStore for FsBestiaryStore {
                 // tombstoned key (a peer re-pushing something we permanently evicted), so compare the
                 // live presence before AND after rather than trusting the put was applied.
                 let was_present = self.get(&realm, &hash)?.is_some();
-                self.put(&realm, sync.manifest.clone(), sync.artifact.clone())?;
+                match self.put(&realm, sync.manifest.clone(), sync.artifact.clone()) {
+                    Ok(_) => {}
+                    // A full catalog refuses a *new* pushed key. Lattice merge is best-effort, so
+                    // skip this entry (nothing landed) rather than failing the whole push batch.
+                    Err(StoreError::Capacity(msg)) => {
+                        eprintln!(
+                            "bestiary: dropping pushed entry {hash} in realm {}: {msg}",
+                            realm.0
+                        );
+                        return Ok(outcome);
+                    }
+                    Err(e) => return Err(e),
+                }
                 let now_present = self.get(&realm, &hash)?.is_some();
                 outcome.membership_changed = !was_present && now_present;
                 // Reputation: take the verified-greater (a bare/unsigned or lesser score never clobbers).
@@ -918,6 +1062,12 @@ impl BestiaryStore for FsBestiaryStore {
                         rec.seq
                     )));
                 }
+                if !is_artifact_hash(rec.op.artifact_hash()) {
+                    return Err(StoreError::Corrupt(format!(
+                        "{realm_hash}.jsonl seq {} invalid artifact_hash",
+                        rec.seq
+                    )));
+                }
                 // The filename is a hash, not trusted: the record's own realm must hash to it.
                 if Self::realm_hash(rec.op.realm()) != realm_hash {
                     return Err(StoreError::Corrupt(format!(
@@ -961,6 +1111,9 @@ impl BestiaryStore for FsBestiaryStore {
         realm: &RealmId,
         artifact_hash: &str,
     ) -> Result<Option<EntryProof>, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Ok(None);
+        }
         let key = (realm.clone(), artifact_hash.to_string());
         let live = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1233,6 +1386,100 @@ mod tests {
     }
 
     #[test]
+    fn metadata_list_does_not_read_artifact_blobs() {
+        let root = TempRoot::new("metadata-no-blob");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let hash = s.put(&realm, manifest("c"), b"artifact-bytes".to_vec()).unwrap();
+        let (entry, artifact_len) = s.get_metadata(&realm, &hash).unwrap().unwrap();
+        assert_eq!(entry.artifact_hash, hash);
+        assert_eq!(entry.manifest.name, "c");
+        assert_eq!(artifact_len, b"artifact-bytes".len());
+
+        std::fs::remove_file(s.blob_path(&hash)).unwrap();
+
+        let metadata = s.list_metadata(Some(&realm)).unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].artifact_hash, hash);
+        assert_eq!(metadata[0].manifest.name, "c");
+
+        let missing = s
+            .get_metadata(&realm, &hash)
+            .expect_err("single-entry metadata fetch verifies backing blob exists");
+        assert!(matches!(missing, StoreError::Corrupt(_)), "missing blob is detected: {missing:?}");
+
+        let full = s.list(Some(&realm)).expect_err("full anti-entropy listing needs the blob");
+        assert!(matches!(full, StoreError::Corrupt(_)), "missing blob is detected: {full:?}");
+    }
+
+    #[test]
+    fn filesystem_store_refuses_non_canonical_artifact_hashes() {
+        let root = TempRoot::new("hash-shape");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let bad = "../escape";
+
+        assert!(s.get(&realm, bad).unwrap().is_none(), "malformed fetch is a miss");
+        assert!(s.prove(&realm, bad).unwrap().is_none(), "malformed proof request is a miss");
+        assert!(!s.attest(&realm, bad, ReputationScore::unsigned(0.5, None)).unwrap());
+        assert!(!s
+            .quarantine(
+                &realm,
+                bad,
+                QuarantineNotice { reason: "bad".into(), attesting_peers: Vec::new() },
+            )
+            .unwrap());
+        assert!(matches!(s.read_blob(bad).unwrap_err(), StoreError::Integrity(_)));
+        assert!(matches!(s.tombstone(&realm, bad).unwrap_err(), StoreError::Integrity(_)));
+    }
+
+    #[test]
+    fn filesystem_store_rejects_oversized_artifacts_before_blob_write() {
+        let root = TempRoot::new("artifact-cap");
+        let s = store(&root).with_max_artifact_bytes(4);
+        let realm = RealmId::new("crew");
+        let bytes = b"12345".to_vec();
+        let hash = sha256_hex(&bytes);
+
+        let err = s.put(&realm, manifest("too-big"), bytes).unwrap_err();
+        assert!(matches!(err, StoreError::Limit(_)), "oversized artifact rejected: {err:?}");
+        assert!(s.get(&realm, &hash).unwrap().is_none(), "oversized artifact was not stored");
+        assert!(!s.blob_path(&hash).exists(), "oversized artifact was not written as a blob");
+    }
+
+    #[test]
+    fn merge_push_rejects_malformed_tombstone_hashes() {
+        let root_a = TempRoot::new("bad-tomb-a");
+        let root_b = TempRoot::new("bad-tomb-b");
+        let src = FsBestiaryStore::new(&root_a.0, key()).unwrap();
+        let dst = FsBestiaryStore::new(&root_b.0, key()).unwrap();
+        let realm = RealmId::new("crew");
+        let bad = SignedSyncEntry {
+            sync: None,
+            record: src.sign_op(LogOp::Tombstone { realm, artifact_hash: "../escape".into() }, 0),
+        };
+
+        let err = dst.merge_push(bad).unwrap_err();
+        assert!(matches!(err, StoreError::Integrity(_)), "malformed tombstone rejected: {err:?}");
+        assert!(dst.signed_entries(None).unwrap().is_empty(), "rejected tombstone was not stored");
+    }
+
+    #[test]
+    fn recover_rejects_malformed_artifact_hashes_in_the_log() {
+        let root = TempRoot::new("bad-hash-log");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let realm_hash = FsBestiaryStore::realm_hash(&realm);
+        let rec = s.sign_op(LogOp::Tombstone { realm, artifact_hash: "../escape".into() }, 0);
+        let mut line = serde_json::to_vec(&rec).unwrap();
+        line.push(b'\n');
+        fs::write(s.log_path(&realm_hash), line).unwrap();
+
+        let err = s.recover().unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "bad log hash rejected: {err:?}");
+    }
+
+    #[test]
     fn recover_rejects_a_tampered_log() {
         let root = TempRoot::new("tamper");
         let realm = RealmId::new("crew");
@@ -1446,15 +1693,63 @@ mod tests {
     }
 
     #[test]
-    fn capacity_refuses_new_but_returns_hash() {
+    fn capacity_refuses_new_with_a_wire_honest_error() {
         let root = TempRoot::new("cap");
         let s = store(&root).with_max_entries(1);
         let realm = RealmId::local();
         let h1 = s.put(&realm, manifest("a"), b"one".to_vec()).unwrap();
         assert!(s.get(&realm, &h1).unwrap().is_some());
-        let h2 = s.put(&realm, manifest("b"), b"two".to_vec()).unwrap();
-        assert_eq!(h2, sha256_hex(b"two"), "hash returned even when refused");
-        assert!(s.get(&realm, &h2).unwrap().is_none(), "new key refused at capacity");
+        let refused = s.put(&realm, manifest("b"), b"two".to_vec());
+        assert!(
+            matches!(refused, Err(StoreError::Capacity(_))),
+            "a new key at capacity is a wire-honest error, not a false success: {refused:?}"
+        );
+        assert!(
+            s.get(&realm, &sha256_hex(b"two")).unwrap().is_none(),
+            "new key refused at capacity"
+        );
         assert!(s.get(&realm, &h1).unwrap().is_some(), "existing entry untouched");
+    }
+
+    #[test]
+    fn default_entry_cap_is_bounded_and_zero_opt_out_is_explicit() {
+        let root = TempRoot::new("default-cap");
+        let s = store(&root);
+        assert_eq!(s.max_entries, DEFAULT_MAX_BESTIARY_ENTRIES);
+
+        let unbounded_root = TempRoot::new("default-cap-unbounded");
+        let unbounded = store(&unbounded_root).with_max_entries(0);
+        assert_eq!(unbounded.max_entries, 0, "0 is the explicit unbounded opt-out");
+    }
+
+    #[test]
+    fn recover_replays_existing_catalog_even_when_current_cap_is_lower() {
+        let root = TempRoot::new("recover-over-cap");
+        let realm = RealmId::local();
+        let h1;
+        let h2;
+        {
+            let writer = store(&root).with_max_entries(0);
+            h1 = writer.put(&realm, manifest("a"), b"one".to_vec()).unwrap();
+            h2 = writer.put(&realm, manifest("b"), b"two".to_vec()).unwrap();
+        }
+
+        let capped = store(&root).with_max_entries(1);
+        capped.recover().unwrap();
+        assert!(capped.get(&realm, &h1).unwrap().is_some(), "first entry recovered");
+        assert!(
+            capped.get(&realm, &h2).unwrap().is_some(),
+            "recovery replays existing entries even above the current live cap"
+        );
+
+        let refused = capped.put(&realm, manifest("c"), b"three".to_vec());
+        assert!(
+            matches!(refused, Err(StoreError::Capacity(_))),
+            "a new entry past the cap is a wire-honest Capacity error, not a false success: {refused:?}"
+        );
+        assert!(
+            capped.get(&realm, &sha256_hex(b"three")).unwrap().is_none(),
+            "new entries are still refused after over-cap recovery"
+        );
     }
 }

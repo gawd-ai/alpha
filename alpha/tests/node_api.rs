@@ -198,6 +198,15 @@ fn send_to_missing_creature_is_a_route_error_not_a_successful_timeout() {
 }
 
 #[test]
+fn oversized_http_json_body_is_rejected_at_the_surface() {
+    let d = Daemon::spawn(free_port(), true, true);
+    let oversized = format!(r#"{{"request":"{}"}}"#, "x".repeat(1024 * 1024 + 1));
+
+    let (sc, body) = http(d.port, "POST", "/api/author/critter", Some("testkey"), Some(&oversized));
+    assert_eq!(sc, 413, "oversized JSON body should be rejected before control: {body}");
+}
+
+#[test]
 fn co_drive_author_critter_then_send_over_the_api() {
     // --allow-ai opens the gate; full boot wires AUTHORING + build-critter so authoring really runs.
     let d = Daemon::spawn(free_port(), false, true);

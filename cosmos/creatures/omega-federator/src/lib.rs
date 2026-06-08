@@ -10,7 +10,9 @@
 //!    `registry-mem` for its catalog ([`RegistryOp::ListEntries`]) and merges every entry into the
 //!    *local* registry via the [`RegistryOp::PublishInRealm`] write path (tagged with the
 //!    entry's own Realm). Pull, not gossip — enough for multi-Realm reconciliation; the
-//!    receiving Sanctum's admission gate still re-verifies every artifact on load (T2).
+//!    receiving Sanctum's admission gate still re-verifies every artifact on load (T2). In-flight
+//!    unanswered pulls are capped by default; `with_max_pending_pulls(0)` is the explicit lab/demo
+//!    opt-out.
 //! 3. **Signed reputation propagation.** On a `FederateReputation` control op the federator signs a
 //!    [`ReputationDelta`] with the **observer's Abode key** (T3 — a self-reported/unsigned delta is
 //!    rejected at ingest without ever touching the registry) and ships it as a SEER
@@ -63,6 +65,17 @@ pub const SCHEMA: &str = "omega.federator";
 /// The registry's reply schema — the federator filters pull replies by it. Mirrors the literal
 /// `registry-mem` writes on every reply.
 const REGISTRY_REPLY_SCHEMA: &str = "registry.reply";
+/// Cap on a pull reply (`ListEntries` → `Entries`) before decode. A pull reply is the **one** path
+/// that aggregates a whole Realm's catalogue — every `SyncEntry` with its artifact bytes — so it is
+/// bounded *separately* from a single registry op (which carries at most one artifact). An `Entries`
+/// reply above this cap is dropped with a log and its parked pull is reclaimed, so a too-large
+/// snapshot is observable and recoverable (retry a narrower Realm scope) rather than a silent drop.
+const MAX_REGISTRY_REPLY_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum bytes decoded for one [`FederatorMsg`] control/inter-federator payload.
+pub const MAX_FEDERATOR_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Default cap for in-flight anti-entropy pulls. `0` in
+/// [`OmegaFederator::with_max_pending_pulls`] means unbounded.
+pub const DEFAULT_MAX_PENDING_PULLS: usize = 128;
 
 /// Proprioception event the federator emits when it drops a **malformed reputation attestation** —
 /// a non-finite score or a delta whose observer signature didn't verify. Lets the
@@ -272,6 +285,21 @@ impl FederatorMsg {
     pub fn parse(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }
+    pub fn parse_bounded(bytes: &[u8]) -> Result<Self, FederatorMsgParseError> {
+        if bytes.len() > MAX_FEDERATOR_MESSAGE_BYTES {
+            return Err(FederatorMsgParseError::TooLarge {
+                len: bytes.len(),
+                limit: MAX_FEDERATOR_MESSAGE_BYTES,
+            });
+        }
+        Self::parse(bytes).map_err(FederatorMsgParseError::Json)
+    }
+}
+
+#[derive(Debug)]
+pub enum FederatorMsgParseError {
+    TooLarge { len: usize, limit: usize },
+    Json(serde_json::Error),
 }
 
 // ===================================================================================================
@@ -318,8 +346,8 @@ pub struct OmegaFederator {
     /// Maximum number of in-flight anti-entropy pulls held at once. A peer registry that never
     /// answers a `ListEntries` would otherwise leak a `pending_pulls` entry per pull forever. At
     /// capacity a new pull is refused (the in-flight pulls are kept — refuse-new, never evict-live).
-    /// **`0` means unbounded** (the default; preserves prior behavior). Set via
-    /// [`OmegaFederator::with_max_pending_pulls`].
+    /// **`0` means unbounded** and should be reserved for lab/demo deployments that intentionally
+    /// accept unbounded pending state.
     max_pending_pulls: usize,
 }
 
@@ -332,13 +360,13 @@ impl OmegaFederator {
             pending_pulls: HashMap::new(),
             next_consult_corr: 3_000_000,
             ingest_rejections: IngestRejections::default(),
-            max_pending_pulls: 0,
+            max_pending_pulls: DEFAULT_MAX_PENDING_PULLS,
         }
     }
 
-    /// Cap the number of concurrently in-flight anti-entropy pulls (resilience guardrail; default
-    /// `0` = unbounded). At capacity, a new `PullFrom` is refused with a `Rejected` ack rather than
-    /// growing the pending-pulls table without bound when a peer never answers.
+    /// Cap the number of concurrently in-flight anti-entropy pulls. `0` disables the cap. At
+    /// capacity, a new `PullFrom` is refused with a `Rejected` ack rather than growing the
+    /// pending-pulls table without bound when a peer never answers.
     pub fn with_max_pending_pulls(mut self, max_pending_pulls: usize) -> Self {
         self.max_pending_pulls = max_pending_pulls;
         self
@@ -364,6 +392,12 @@ impl OmegaFederator {
     /// Whether an anti-entropy pull is in flight.
     pub fn has_pending_pull(&self) -> bool {
         !self.pending_pulls.is_empty()
+    }
+
+    /// Number of in-flight anti-entropy pulls. Exposed for tests and operator-facing diagnostics;
+    /// not part of the wire contract.
+    pub fn pending_pull_count(&self) -> usize {
+        self.pending_pulls.len()
     }
 
     fn alloc_corr(&mut self) -> u64 {
@@ -476,7 +510,7 @@ impl OmegaFederator {
     // ----- control plane (operator → federator) -------------------------------------------------
 
     fn on_control(&mut self, env: &Envelope) -> Outcome {
-        let Ok(msg) = FederatorMsg::parse(&env.payload) else {
+        let Ok(msg) = FederatorMsg::parse_bounded(&env.payload) else {
             return Outcome::none(); // R9: never panic on malformed input.
         };
         match msg {
@@ -656,7 +690,7 @@ impl OmegaFederator {
     // ----- reputation ingest (SEER consensus) ---------------------------------------------------
 
     fn on_seer(&mut self, env: &Envelope) -> Outcome {
-        let Ok(seer) = SeerEnvelope::parse(&env.payload) else {
+        let Ok(seer) = SeerEnvelope::parse_bounded(&env.payload) else {
             self.ingest_rejections.malformed += 1;
             return Outcome::none();
         };
@@ -764,9 +798,25 @@ impl OmegaFederator {
     // ----- anti-entropy merge (registry Entries reply) ------------------------------------------
 
     fn on_registry_reply(&mut self, env: &Envelope) -> Outcome {
+        // An oversized pull reply cannot be merged, but it must not be dropped silently while its
+        // parked pull leaks forever. Log it and reclaim the matching pending slot so the operator
+        // can retry a narrower Realm scope. (A malformed-but-in-bound reply still drops below.)
+        if env.payload.len() > MAX_REGISTRY_REPLY_BYTES {
+            if let Some(corr) = env.header.corr {
+                if self.pending_pulls.remove(&corr).is_some() {
+                    eprintln!(
+                        "omega-federator: dropped an oversized pull reply ({} bytes > {} cap) for \
+                         corr {corr}; pull slot reclaimed — retry with a narrower Realm scope",
+                        env.payload.len(),
+                        MAX_REGISTRY_REPLY_BYTES
+                    );
+                }
+            }
+            return Outcome::none();
+        }
         // Only Entries replies matter (pull results). Other registry replies (Published from our
         // own merge writes, etc.) are acknowledgements we drop.
-        let Ok(reply) = serde_json::from_slice::<RegistryReply>(&env.payload) else {
+        let Some(reply) = parse_registry_reply(&env.payload) else {
             return Outcome::none();
         };
         let RegistryReply::Entries { entries } = reply else {
@@ -876,6 +926,17 @@ impl OmegaFederator {
 }
 
 // ----- helpers --------------------------------------------------------------------------------
+
+fn parse_registry_reply(payload: &[u8]) -> Option<RegistryReply> {
+    parse_registry_reply_with_limit(payload, MAX_REGISTRY_REPLY_BYTES)
+}
+
+fn parse_registry_reply_with_limit(payload: &[u8], limit: usize) -> Option<RegistryReply> {
+    if payload.len() > limit {
+        return None;
+    }
+    serde_json::from_slice(payload).ok()
+}
 
 /// Reply to the envelope's `reply_to` (or `from`) with a federator message + SCHEMA + corr.
 fn reply(env: &Envelope, msg: FederatorMsg) -> Outcome {
@@ -1098,7 +1159,8 @@ mod tests {
     #[test]
     fn max_pending_pulls_refuses_new_pull_at_capacity_and_keeps_in_flight() {
         // Cap in-flight pulls at 1. The first PullFrom parks; a second is refused with a Rejected
-        // ack (no ListEntries dispatched), and the first pull stays in flight. `0` = unbounded.
+        // ack (no ListEntries dispatched), and the first pull stays in flight. `0` is the explicit
+        // unbounded opt-out.
         let mut f = fed(0xC2).with_max_pending_pulls(1);
         let pull = |realm: &str| {
             control_env(
@@ -1132,6 +1194,64 @@ mod tests {
         }
         // The first pull is still in flight — refuse-new never evicted it.
         assert!(f.has_pending_pull(), "first pull still in flight after refusal");
+    }
+
+    #[test]
+    fn default_pending_pull_cap_refuses_new_pull_and_zero_opt_out_is_unbounded() {
+        let pull = || {
+            control_env(
+                FederatorMsg::PullFrom {
+                    source_realm: RealmId::new("guests"),
+                    peer_node: NodeId(PEER_NODE.into()),
+                    peer_registry: CreatureId(60),
+                },
+                11,
+            )
+        };
+
+        let mut bounded = fed(0xC3);
+        for i in 0..DEFAULT_MAX_PENDING_PULLS {
+            let out = bounded.handle(pull());
+            assert!(
+                out.dispatches
+                    .iter()
+                    .any(|d| matches!(parse_op_opt(d), Some(RegistryOp::ListEntries { .. }))),
+                "pull {i} dispatches ListEntries under the default cap"
+            );
+        }
+        assert_eq!(bounded.pending_pull_count(), DEFAULT_MAX_PENDING_PULLS);
+
+        let refused = bounded.handle(pull());
+        assert!(
+            !refused
+                .dispatches
+                .iter()
+                .any(|d| matches!(parse_op_opt(d), Some(RegistryOp::ListEntries { .. }))),
+            "default-cap refusal does not dispatch another pull"
+        );
+        match FederatorMsg::parse(&refused.dispatches[0].payload) {
+            Ok(FederatorMsg::Rejected { reason }) => {
+                assert!(reason.contains("capacity"), "refusal explains the cap: {reason}");
+            }
+            other => panic!("expected Rejected at default capacity, got {other:?}"),
+        }
+        assert_eq!(
+            bounded.pending_pull_count(),
+            DEFAULT_MAX_PENDING_PULLS,
+            "refusal does not park another pending pull"
+        );
+
+        let mut unbounded = fed(0xC4).with_max_pending_pulls(0);
+        for i in 0..=DEFAULT_MAX_PENDING_PULLS {
+            let out = unbounded.handle(pull());
+            assert!(
+                out.dispatches
+                    .iter()
+                    .any(|d| matches!(parse_op_opt(d), Some(RegistryOp::ListEntries { .. }))),
+                "unbounded opt-out dispatches pull {i}"
+            );
+        }
+        assert_eq!(unbounded.pending_pull_count(), DEFAULT_MAX_PENDING_PULLS + 1);
     }
 
     fn parse_op_opt(d: &Dispatch) -> Option<RegistryOp> {
@@ -1197,6 +1317,16 @@ mod tests {
             payload: RegistryReply::Entries { entries: vec![] }.to_bytes(),
         };
         assert!(f.handle(reply_env).dispatches.is_empty());
+    }
+
+    #[test]
+    fn registry_reply_parser_drops_payload_over_limit_before_json_decode() {
+        let payload = RegistryReply::Entries { entries: vec![] }.to_bytes();
+        let parsed = parse_registry_reply_with_limit(&payload, payload.len());
+        assert!(matches!(parsed, Some(RegistryReply::Entries { entries }) if entries.is_empty()));
+
+        let oversized = parse_registry_reply_with_limit(&payload, payload.len() - 1);
+        assert!(oversized.is_none(), "payload over the configured limit is ignored");
     }
 
     /// The merge has *two* independent re-apply arms (reputation, quarantine). The pinned-realm
@@ -1354,6 +1484,18 @@ mod tests {
             }
             other => panic!("expected AttestFitness, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_consensus_seer_is_counted_as_malformed_without_registry_write() {
+        let mut f = fed(0xD0);
+        let env = Envelope {
+            header: header(Address::Creature(ME), seer::SCHEMA, Some(1)),
+            payload: vec![b'{'; seer::MAX_SEER_ENVELOPE_BYTES + 1],
+        };
+        let out = f.handle(env);
+        assert!(out.dispatches.is_empty(), "oversized consensus SEER must not write registry");
+        assert_eq!(f.ingest_rejections().malformed, 1);
     }
 
     #[test]
@@ -1560,6 +1702,23 @@ mod tests {
             payload: b"{not json".to_vec(),
         };
         assert!(f.handle(env).dispatches.is_empty());
+    }
+
+    #[test]
+    fn oversized_federator_message_is_dropped_before_json_decode() {
+        let mut f = fed(0x03);
+        let env = Envelope {
+            header: header(Address::Creature(ME), SCHEMA, None),
+            payload: vec![b'{'; MAX_FEDERATOR_MESSAGE_BYTES + 1],
+        };
+        assert!(f.handle(env).dispatches.is_empty());
+        match FederatorMsg::parse_bounded(&vec![b'{'; MAX_FEDERATOR_MESSAGE_BYTES + 1]) {
+            Err(FederatorMsgParseError::TooLarge { len, limit }) => {
+                assert_eq!(len, MAX_FEDERATOR_MESSAGE_BYTES + 1);
+                assert_eq!(limit, MAX_FEDERATOR_MESSAGE_BYTES);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
     }
 
     #[test]

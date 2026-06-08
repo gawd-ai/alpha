@@ -58,14 +58,26 @@
 //!   without a substrate change.
 //! - It doesn't time out pending exchanges itself. *Time is injected policy, never fabric* — an
 //!   orchestrator that wants a deadline rides it on top, never inside.
+//! - It does cap the number of parked exchanges by default. That is a memory/resource floor, not a
+//!   timeout policy; `with_max_pending(0)` is the explicit lab/demo opt-out.
 
 use std::collections::HashMap;
 
 use aether::{Address, Creature, CreatureCtx, Dispatch, Envelope, Outcome};
-use agent_templated::{AuthoringError, AuthoringReply, AuthoringRequest, AuthoringResponse};
+use agent_templated::{
+    decode_authoring_request, AuthoringError, AuthoringReply, AuthoringRequest, AuthoringResponse,
+};
 use build_cargo::ManifestStub;
 use seer::{topics, SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA};
 use sigil::{Capabilities, Entrypoint, NetCapability};
+
+/// Default number of concurrently parked authoring consults. `0` in
+/// [`AgentCurious::with_max_pending`] means unbounded.
+pub const DEFAULT_MAX_PENDING_EXCHANGES: usize = 128;
+/// Maximum answer-content bytes scanned when mapping a SEER answer to this creature's choices.
+pub const MAX_ANSWER_CLASSIFIER_BYTES: usize = 8 * 1024;
+/// Maximum answer-content bytes echoed in an `Invalid` reply for an unrecognized answer.
+pub const MAX_ANSWER_ERROR_PREVIEW_BYTES: usize = 1024;
 
 /// Schema strings the creature reads on inbound envelopes + emits on outbound. The
 /// REQUEST/REPLY entry-and-exit constants (those are *not* SEER — they bracket the
@@ -117,7 +129,7 @@ enum AnswerChoice {
 }
 
 fn parse_answer(content: &str) -> AnswerChoice {
-    let lower = content.to_ascii_lowercase();
+    let lower = prefix_on_char_boundary(content, MAX_ANSWER_CLASSIFIER_BYTES).to_ascii_lowercase();
     if lower.contains("abort") {
         return AnswerChoice::Abort;
     }
@@ -130,13 +142,32 @@ fn parse_answer(content: &str) -> AnswerChoice {
     AnswerChoice::Unknown
 }
 
+fn prefix_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+fn bounded_preview(s: &str, max: usize) -> String {
+    let prefix = prefix_on_char_boundary(s, max);
+    if prefix.len() == s.len() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}\n... (truncated; {} bytes total)", s.len())
+    }
+}
+
 /// The curious authoring creature. Stateful: parks pending exchanges by `corr`.
 ///
 /// **Concurrency.** `handle` takes `&mut self`, and the kernel routes envelopes to a creature's
 /// inbox single-threaded per creature (see `aether::Bus`), so the `HashMap` is never accessed
 /// concurrently. The whole creature is `Send` but not `Sync`, matching every other reference
 /// creature in the workspace.
-#[derive(Default)]
 pub struct AgentCurious {
     pending: HashMap<u64, PendingExchange>,
     /// Monotonically increasing across the creature's lifetime — only assigned when parking. The
@@ -147,9 +178,19 @@ pub struct AgentCurious {
     /// Maximum number of parked exchanges held at once. An orchestrator that never answers a
     /// consult would otherwise leak a `pending` entry per unanswered request forever. At capacity a
     /// new request is refused with a structured failure (the existing in-flight exchanges are kept —
-    /// refuse-new, never evict-live). **`0` means unbounded** (the default; preserves prior
-    /// behavior). Set a real number in production via [`AgentCurious::with_max_pending`].
+    /// refuse-new, never evict-live). **`0` means unbounded** and should be reserved for lab/demo
+    /// deployments that intentionally accept unbounded pending state.
     max_pending: usize,
+}
+
+impl Default for AgentCurious {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            next_query_id: 0,
+            max_pending: DEFAULT_MAX_PENDING_EXCHANGES,
+        }
+    }
 }
 
 impl AgentCurious {
@@ -157,9 +198,9 @@ impl AgentCurious {
         AgentCurious::default()
     }
 
-    /// Cap the number of concurrently-parked exchanges (resilience guardrail; default `0` =
-    /// unbounded). At capacity, a new consult is refused with `AuthoringError::Invalid` rather than
-    /// growing the pending table without bound.
+    /// Cap the number of concurrently-parked exchanges. `0` disables the cap. At capacity, a new
+    /// consult is refused with `AuthoringError::Invalid` rather than growing the pending table
+    /// without bound.
     pub fn with_max_pending(mut self, max_pending: usize) -> Self {
         self.max_pending = max_pending;
         self
@@ -193,16 +234,9 @@ impl Creature for AgentCurious {
 
 impl AgentCurious {
     fn on_request(&mut self, env: Envelope) -> Outcome {
-        let req: AuthoringRequest = match serde_json::from_slice(&env.payload) {
+        let req: AuthoringRequest = match decode_authoring_request(&env.payload) {
             Ok(r) => r,
-            Err(e) => {
-                return reply_failed(
-                    &env,
-                    AuthoringError::Invalid {
-                        message: format!("malformed authoring request: {e}"),
-                    },
-                );
-            }
+            Err(e) => return reply_failed(&env, e),
         };
         let corr = env.header.corr.unwrap_or(0);
         let reply_to = env.reply_target();
@@ -276,7 +310,7 @@ impl AgentCurious {
     /// other topics are silently dropped — the substrate doesn't adjudicate cross-topic), then
     /// kind-discriminates.
     fn on_seer(&mut self, env: Envelope) -> Outcome {
-        let seer = match SeerEnvelope::parse(&env.payload) {
+        let seer = match SeerEnvelope::parse_bounded(&env.payload) {
             Ok(o) => o,
             Err(e) => {
                 return reply_failed(
@@ -355,7 +389,10 @@ impl AgentCurious {
                 Err(AuthoringError::NoTemplate { request: pending.request.clone() })
             }
             AnswerChoice::Unknown => Err(AuthoringError::Invalid {
-                message: format!("unrecognized answer content: `{}`", answer.content),
+                message: format!(
+                    "unrecognized answer content: `{}`",
+                    bounded_preview(&answer.content, MAX_ANSWER_ERROR_PREVIEW_BYTES)
+                ),
             }),
         };
 
@@ -466,12 +503,20 @@ fn template_reverse_string(template_label: &str) -> AuthoringResponse {
 
 const FETCH_URL_TITLE_SOURCE: &str = r#"use forge::prelude::*;
 
+const MAX_URL_BYTES: usize = 8 * 1024;
+
 #[derive(Default)]
 pub struct FetchUrlTitle;
 
 impl Creature for FetchUrlTitle {
     fn bind(&mut self, _ctx: CreatureCtx) {}
     fn handle(&mut self, env: Envelope) -> Outcome {
+        if env.payload.len() > MAX_URL_BYTES {
+            return Outcome::reply(
+                &env,
+                format!("<error: url too large: exceeds {} byte limit>", MAX_URL_BYTES).into_bytes(),
+            );
+        }
         // Inline simple body — agent-curious ships the same template *shape* as agent-templated
         // (the curious agent demonstrates the embryo's conversation seam, not template breadth).
         let url = String::from_utf8_lossy(&env.payload).to_string();
@@ -588,6 +633,8 @@ mod tests {
             AuthoringReply::Authored(r) => {
                 assert_eq!(r.crate_name, "fetch-url-title");
                 assert_eq!(r.template, "agent-curious/fetch-url-title");
+                assert!(r.source.contains("const MAX_URL_BYTES"));
+                assert!(r.source.contains("url too large"));
             }
             other => panic!("expected fetch-url-title authored, got {other:?}"),
         }
@@ -735,6 +782,46 @@ mod tests {
         assert_eq!(a.pending_len(), 0, "exchange consumed even on Invalid (the convo is over)");
     }
 
+    #[test]
+    fn answer_classifier_scans_only_the_bounded_prefix() {
+        assert!(matches!(parse_answer("please reverse it"), AnswerChoice::Reverse));
+        let late_keyword = format!("{} reverse", "x".repeat(MAX_ANSWER_CLASSIFIER_BYTES + 1));
+        assert!(
+            matches!(parse_answer(&late_keyword), AnswerChoice::Unknown),
+            "a choice keyword beyond the classifier cap is ignored"
+        );
+    }
+
+    #[test]
+    fn unknown_answer_content_error_uses_bounded_preview() {
+        let mut a = AgentCurious::new();
+        let first = a.handle(request_env(301, "another novel two"));
+        let q = decode_seer(&first.dispatches[2]);
+        let qid = match q.kind {
+            SeerKind::Query { query_id, .. } => query_id,
+            _ => panic!("expected Query"),
+        };
+
+        let huge_unknown = "x".repeat(MAX_ANSWER_ERROR_PREVIEW_BYTES + 4096);
+        let out = a.handle(answer_env(301, qid, &huge_unknown));
+        match decode_reply(&out.dispatches[0]) {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("truncated"), "got {message}");
+                assert!(
+                    message.len() < MAX_ANSWER_ERROR_PREVIEW_BYTES + 256,
+                    "message should contain only a bounded preview; len={}",
+                    message.len()
+                );
+                assert!(
+                    !message.contains(&"x".repeat(MAX_ANSWER_ERROR_PREVIEW_BYTES + 1)),
+                    "message should not echo the full oversized answer"
+                );
+            }
+            other => panic!("expected Failed(Invalid), got {other:?}"),
+        }
+        assert_eq!(a.pending_len(), 0, "matched unknown answer still consumes the exchange");
+    }
+
     // -------------------------------------------------------------------------------------------
     // Steer — embryo-level mid-flight intervention, on the SEER wire.
     // -------------------------------------------------------------------------------------------
@@ -864,6 +951,25 @@ mod tests {
     }
 
     #[test]
+    fn oversized_request_yields_invalid_failed_reply_and_never_parks() {
+        let mut a = AgentCurious::new();
+        let env = make_env(
+            schema::REQUEST,
+            801,
+            vec![b'{'; agent_templated::MAX_AUTHORING_REQUEST_BYTES + 1],
+        );
+        let out = a.handle(env);
+        assert_eq!(out.dispatches.len(), 1);
+        match decode_reply(&out.dispatches[0]) {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("too large"), "unexpected message: {message}");
+            }
+            other => panic!("expected Failed(Invalid), got {other:?}"),
+        }
+        assert_eq!(a.pending_len(), 0, "oversized request never parks");
+    }
+
+    #[test]
     fn malformed_seer_envelope_yields_invalid_failed_reply() {
         // A malformed *outer* SeerEnvelope (not parseable JSON) returns a Failed reply (we
         // can't even know whether it was meant to be an Answer or a Steer). A malformed *body*
@@ -882,6 +988,23 @@ mod tests {
         // legitimate end of the conversation. Only a well-formed (corr, query_id)-matching
         // answer or a Steer{abort} consumes the pending state.
         assert_eq!(a.pending_len(), 1, "malformed envelope does not consume pending");
+    }
+
+    #[test]
+    fn oversized_seer_envelope_yields_invalid_failed_reply_and_preserves_pending() {
+        let mut a = AgentCurious::new();
+        let _ = a.handle(request_env(905, "ambiguous one"));
+        let mut env = answer_env(905, 1, "reverse");
+        env.payload = vec![b'{'; seer::MAX_SEER_ENVELOPE_BYTES + 1];
+        let out = a.handle(env);
+        assert_eq!(out.dispatches.len(), 1);
+        match decode_reply(&out.dispatches[0]) {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("too large"), "unexpected message: {message}");
+            }
+            other => panic!("expected Failed(Invalid), got {other:?}"),
+        }
+        assert_eq!(a.pending_len(), 1, "oversized envelope does not consume pending");
     }
 
     #[test]
@@ -933,7 +1056,8 @@ mod tests {
     #[test]
     fn max_pending_refuses_new_consult_at_capacity_and_keeps_in_flight() {
         // Cap at 1: the first ambiguous request parks; the second is refused (not parked), and the
-        // first exchange stays in flight (refuse-new, never evict-live). `0` would be unbounded.
+        // first exchange stays in flight (refuse-new, never evict-live). `0` is the explicit
+        // unbounded opt-out.
         let mut a = AgentCurious::new().with_max_pending(1);
         let out1 = a.handle(request_env(2000, "first ambiguous"));
         assert_eq!(a.pending_len(), 1, "first ambiguous request parks");
@@ -960,5 +1084,41 @@ mod tests {
             other => panic!("expected the kept exchange to resolve, got {other:?}"),
         }
         assert_eq!(a.pending_len(), 0, "kept exchange resolved; table drains");
+    }
+
+    #[test]
+    fn default_pending_cap_refuses_new_consult_and_zero_opt_out_is_unbounded() {
+        let mut bounded = AgentCurious::new();
+        for i in 0..DEFAULT_MAX_PENDING_EXCHANGES {
+            let out = bounded.handle(request_env(3000 + i as u64, "ambiguous"));
+            assert!(
+                out.dispatches.iter().any(|d| d.schema == schema::SEER),
+                "request {i} parks under the default cap"
+            );
+        }
+        assert_eq!(bounded.pending_len(), DEFAULT_MAX_PENDING_EXCHANGES);
+
+        let refused = bounded.handle(request_env(3999, "ambiguous"));
+        assert_eq!(
+            bounded.pending_len(),
+            DEFAULT_MAX_PENDING_EXCHANGES,
+            "default-cap refusal does not park another exchange"
+        );
+        match decode_reply(&refused.dispatches[0]) {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("capacity"), "refusal explains the cap: {message}");
+            }
+            other => panic!("expected Failed(Invalid) at default capacity, got {other:?}"),
+        }
+
+        let mut unbounded = AgentCurious::new().with_max_pending(0);
+        for i in 0..=DEFAULT_MAX_PENDING_EXCHANGES {
+            let out = unbounded.handle(request_env(5000 + i as u64, "ambiguous"));
+            assert!(
+                out.dispatches.iter().any(|d| d.schema == schema::SEER),
+                "unbounded opt-out parks request {i}"
+            );
+        }
+        assert_eq!(unbounded.pending_len(), DEFAULT_MAX_PENDING_EXCHANGES + 1);
     }
 }

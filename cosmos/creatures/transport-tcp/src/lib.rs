@@ -39,7 +39,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{Builder, JoinHandle};
@@ -77,6 +77,10 @@ const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 /// Cap on members grafted from a single gossip frame (R9). Far above any real cluster's
 /// membership — a bound on dialer threads one message can spawn, not a topology limit.
 const MAX_GOSSIP_MEMBERS: usize = 1024;
+/// Default cap on the accumulated dynamic member table. One slot is reserved for `self` in gossip
+/// frames, so a full default member table still fits under `MAX_GOSSIP_MEMBERS`. `0` in
+/// [`TransportTcp::with_max_members`] is the explicit unbounded lab/demo opt-out.
+pub const DEFAULT_MAX_MEMBERS: usize = MAX_GOSSIP_MEMBERS - 1;
 
 /// Poison-tolerant `Mutex` acquisition (R9). Every worker thread in this creature runs OUTSIDE the
 /// kernel drain's `catch_unwind`, so a panic while one holds a `TransportState` lock would poison it
@@ -195,6 +199,7 @@ impl TransportCtl {
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum TransportCtlReply {
     Connecting { node_id: String },
+    Rejected { reason: String },
     Members { self_node: String, members: Vec<MemberView> },
 }
 impl TransportCtlReply {
@@ -232,6 +237,9 @@ struct TransportState {
     /// Known cluster members: NodeId → (pubkey, dial addr). Seeded from config, grown by gossip / the
     /// `Connect` control op. Source for gossip payloads + the `Members` graph query.
     members: Mutex<HashMap<NodeId, MemberInfo>>,
+    /// Maximum accumulated members retained at once. Existing members can be updated at capacity;
+    /// new members are refused. `0` means unbounded.
+    max_members: AtomicUsize,
     /// NodeIds we already spawned a persistent dialer for — prevents duplicate dialer threads when a
     /// peer is learned more than once (config + gossip + re-introduction).
     dialing: Mutex<HashSet<NodeId>>,
@@ -280,6 +288,7 @@ impl TransportTcp {
             listen_addr,
             peers_by_pubkey: Mutex::new(peers_by_pubkey),
             members: Mutex::new(members),
+            max_members: AtomicUsize::new(DEFAULT_MAX_MEMBERS),
             dialing: Mutex::new(HashSet::new()),
             gossip: AtomicBool::new(false),
             writers: Mutex::new(HashMap::new()),
@@ -301,6 +310,13 @@ impl TransportTcp {
         if let Some(a) = advertise_addr {
             *mlock(&self.state.advertise_addr) = a;
         }
+        self
+    }
+
+    /// Cap the accumulated dynamic member table. `0` disables the cap. At capacity a new member from
+    /// `transport.ctl` or gossip is refused; already-known members can still be updated.
+    pub fn with_max_members(self, max_members: usize) -> Self {
+        self.state.max_members.store(max_members, Ordering::Relaxed);
         self
     }
 }
@@ -981,7 +997,15 @@ fn write_all_with_stop(
 /// tie-break), which is exactly why the realm-gateway/omega-federator preserve it on rewrite.
 fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId) {
     let target_mid = match &env.header.to {
-        Address::Node(_, mid) => *mid,
+        Address::Node(node, mid) if *node == state.self_node => *mid,
+        Address::Node(node, _mid) => {
+            eprintln!(
+                "transport-tcp: dropped an inbound frame from peer {} addressed to node {}, \
+                 but this transport is node {}",
+                peer.0, node.0, state.self_node.0
+            );
+            return;
+        }
         // The router should never deliver a non-Node envelope here; if it does we drop it
         // (re-routing locally would be undefined intent) but make the contract violation visible.
         other => {
@@ -1085,38 +1109,60 @@ fn spawn_dialer(state: &Arc<TransportState>, peer: PeerConfig) {
     }
 }
 
-/// Admit a peer into the allowlist + member set. Returns `true` if it was newly learned (so the
-/// caller knows to dial it + propagate). Never admits self.
+/// Admit a peer into the allowlist + member set. Reports whether the graph changed, was already
+/// current, or the new member was refused. Never admits self.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmitMemberResult {
+    Changed,
+    Unchanged,
+    Refused,
+}
+
 fn admit_member(
     state: &Arc<TransportState>,
     node_id: &NodeId,
     pubkey_hex: &str,
     addr: &str,
-) -> bool {
+) -> AdmitMemberResult {
     if *node_id == state.self_node {
-        return false;
+        return AdmitMemberResult::Refused;
     }
-    let newly = {
+    let result = {
+        let max_members = state.max_members.load(Ordering::Relaxed);
         let mut members = mlock(&state.members);
         match members.get(node_id) {
-            Some(existing) if existing.pubkey_hex == pubkey_hex && existing.addr == addr => false,
+            Some(existing) if existing.pubkey_hex == pubkey_hex && existing.addr == addr => {
+                AdmitMemberResult::Unchanged
+            }
             _ => {
+                if !members.contains_key(node_id)
+                    && max_members != 0
+                    && members.len() >= max_members
+                {
+                    eprintln!(
+                        "transport-tcp: member table at capacity ({max_members}); refusing new member {}",
+                        node_id.0
+                    );
+                    return AdmitMemberResult::Refused;
+                }
                 members.insert(
                     node_id.clone(),
                     MemberInfo { pubkey_hex: pubkey_hex.to_string(), addr: addr.to_string() },
                 );
-                true
+                AdmitMemberResult::Changed
             }
         }
     };
     // Keep the handshake allowlist current (idempotent) so this peer can connect either direction.
-    mlock(&state.peers_by_pubkey).insert(pubkey_hex.to_string(), node_id.clone());
+    if result != AdmitMemberResult::Refused {
+        mlock(&state.peers_by_pubkey).insert(pubkey_hex.to_string(), node_id.clone());
+    }
     // A newly-learned member is a graph change — surface it on the same sense stream peer_connected
     // rides, so a subscriber can observe admissions (operator-initiated and gossip-grafted alike).
-    if newly {
+    if result == AdmitMemberResult::Changed {
         publish_peer_event(state, node_id, "peer_admitted");
     }
-    newly
+    result
 }
 
 /// Snapshot self + known members as gossip entries.
@@ -1164,7 +1210,7 @@ fn ingest_gossip(state: &Arc<TransportState>, members: Vec<GossipMember>) {
         if node_id == state.self_node {
             continue;
         }
-        if admit_member(state, &node_id, &m.pubkey_hex, &m.addr) {
+        if admit_member(state, &node_id, &m.pubkey_hex, &m.addr) == AdmitMemberResult::Changed {
             any_new = true;
             spawn_dialer(
                 state,
@@ -1186,12 +1232,25 @@ fn handle_ctl(state: &Arc<TransportState>, env: &Envelope) -> Outcome {
     match op {
         TransportCtl::Connect { node_id, pubkey_hex, addr } => {
             let node_id = NodeId(node_id);
-            let newly = admit_member(state, &node_id, &pubkey_hex, &addr);
+            let admitted = admit_member(state, &node_id, &pubkey_hex, &addr);
+            if admitted == AdmitMemberResult::Refused {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        TransportCtlReply::Rejected {
+                            reason: "transport member table at capacity or self-admission refused"
+                                .into(),
+                        }
+                        .to_bytes(),
+                    )
+                    .with_schema(CTL_SCHEMA),
+                );
+            }
             spawn_dialer(
                 state,
                 PeerConfig { node_id: node_id.clone(), pubkey_hex, dial_addr: Some(addr) },
             );
-            if newly {
+            if admitted == AdmitMemberResult::Changed {
                 gossip_broadcast(state);
             }
             Outcome::send(
@@ -1282,6 +1341,7 @@ mod tests {
             gossip: AtomicBool::new(false),
             peers_by_pubkey: Mutex::new(HashMap::new()),
             members: Mutex::new(HashMap::new()),
+            max_members: AtomicUsize::new(DEFAULT_MAX_MEMBERS),
             dialing: Mutex::new(HashSet::new()),
             writers: Mutex::new(HashMap::new()),
             sockets: Mutex::new(HashMap::new()),
@@ -1331,6 +1391,11 @@ mod tests {
 
     // ---- cluster membership unit coverage ----
 
+    #[test]
+    fn default_member_cap_leaves_room_for_self_in_gossip_frame() {
+        assert_eq!(DEFAULT_MAX_MEMBERS + 1, MAX_GOSSIP_MEMBERS);
+    }
+
     /// A bound-free transport state (no listener/threads) for testing the pure membership logic.
     fn test_state(self_id: &str) -> Arc<TransportState> {
         let (k, _) = Ed25519KeyMaterial::generate().unwrap();
@@ -1343,23 +1408,105 @@ mod tests {
         TransportTcp::new(cfg).state.clone()
     }
 
+    #[derive(Default)]
+    struct RecordingBus {
+        sent: std::sync::Mutex<Vec<Dispatch>>,
+    }
+
+    impl Bus for RecordingBus {
+        fn emit(&self, d: Dispatch) -> Result<(), aether::BusError> {
+            mlock(&self.sent).push(d);
+            Ok(())
+        }
+
+        fn whoami(&self) -> CreatureId {
+            CreatureId(999)
+        }
+    }
+
+    fn attach_recording_bus(state: &Arc<TransportState>) -> Arc<RecordingBus> {
+        let bus = Arc::new(RecordingBus::default());
+        let bus_for_state: Arc<dyn Bus> = bus.clone();
+        *mlock(&state.bus) = Some(bus_for_state);
+        bus
+    }
+
+    fn inbound_env(to: Address) -> Envelope {
+        Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(42)),
+                to,
+                reply_to: Some(Address::Creature(CreatureId(7))),
+                seq: 0,
+                causal: Vec::new(),
+                stamp: 0,
+                sig: "sig".into(),
+                corr: Some(55),
+                commitment: Some("commitment".into()),
+                schema: "test.schema".into(),
+            },
+            payload: b"payload".to_vec(),
+        }
+    }
+
+    #[test]
+    fn inbound_frame_must_be_addressed_to_this_node_before_local_delivery() {
+        let state = test_state("me");
+        let bus = attach_recording_bus(&state);
+        let peer = NodeId("peer".into());
+
+        deliver_locally(
+            &state,
+            inbound_env(Address::Node(NodeId("someone-else".into()), CreatureId(3))),
+            &peer,
+        );
+        assert!(
+            mlock(&bus.sent).is_empty(),
+            "wrong-node frames must be refused at the wire boundary"
+        );
+
+        deliver_locally(&state, inbound_env(Address::Node(NodeId("me".into()), KERNEL_ID)), &peer);
+        assert!(
+            mlock(&bus.sent).is_empty(),
+            "remote peers must not be able to address the local kernel control inbox"
+        );
+
+        deliver_locally(
+            &state,
+            inbound_env(Address::Node(NodeId("me".into()), CreatureId(3))),
+            &peer,
+        );
+        let sent = mlock(&bus.sent).clone();
+        assert_eq!(sent.len(), 1, "a self-node frame still routes locally");
+        assert_eq!(sent[0].to, Address::Creature(CreatureId(3)));
+        assert_eq!(sent[0].reply_to, Some(Address::Node(peer, CreatureId(7))));
+        assert_eq!(sent[0].corr, Some(55));
+        assert_eq!(sent[0].schema, "test.schema");
+        assert_eq!(sent[0].commitment.as_deref(), Some("commitment"));
+        assert_eq!(sent[0].payload, b"payload");
+    }
+
     #[test]
     fn admit_member_is_idempotent_and_never_admits_self() {
         let state = test_state("me");
-        assert!(
+        assert_eq!(
             admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
-            "first admit is new"
+            AdmitMemberResult::Changed,
+            "first admit is a graph change"
         );
-        assert!(
-            !admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
-            "re-admit with identical data is not new"
+        assert_eq!(
+            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
+            AdmitMemberResult::Unchanged,
+            "re-admit with identical data is unchanged"
         );
-        assert!(
+        assert_eq!(
             admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:2"),
-            "a changed dial addr is a fresh learn"
+            AdmitMemberResult::Changed,
+            "a changed dial addr is a graph change"
         );
-        assert!(
-            !admit_member(&state, &NodeId("me".into()), "pk_me", "127.0.0.1:9"),
+        assert_eq!(
+            admit_member(&state, &NodeId("me".into()), "pk_me", "127.0.0.1:9"),
+            AdmitMemberResult::Refused,
             "self is never admitted"
         );
         assert_eq!(
@@ -1371,6 +1518,85 @@ mod tests {
             !mlock(&state.members).contains_key(&NodeId("me".into())),
             "self stays out of members"
         );
+    }
+
+    #[test]
+    fn admit_member_refuses_new_members_at_capacity_but_updates_existing() {
+        let state = test_state("me");
+        state.max_members.store(1, Ordering::Relaxed);
+
+        assert_eq!(
+            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
+            AdmitMemberResult::Changed
+        );
+        assert_eq!(
+            admit_member(&state, &NodeId("b".into()), "pk_b", "127.0.0.1:2"),
+            AdmitMemberResult::Refused,
+            "new member refused at capacity"
+        );
+        assert!(!mlock(&state.members).contains_key(&NodeId("b".into())));
+        assert!(
+            !mlock(&state.peers_by_pubkey).contains_key("pk_b"),
+            "refused member must not enter the handshake allowlist"
+        );
+
+        assert_eq!(
+            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:3"),
+            AdmitMemberResult::Changed,
+            "existing member updates at capacity"
+        );
+        assert_eq!(
+            mlock(&state.members).get(&NodeId("a".into())).map(|m| m.addr.clone()),
+            Some("127.0.0.1:3".into())
+        );
+
+        state.max_members.store(0, Ordering::Relaxed);
+        assert_eq!(
+            admit_member(&state, &NodeId("b".into()), "pk_b", "127.0.0.1:2"),
+            AdmitMemberResult::Changed,
+            "0 is the explicit unbounded opt-out"
+        );
+    }
+
+    #[test]
+    fn control_connect_replies_rejected_when_member_table_is_at_capacity() {
+        let state = test_state("me");
+        state.max_members.store(1, Ordering::Relaxed);
+        assert_eq!(
+            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
+            AdmitMemberResult::Changed
+        );
+        let env = Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(42)),
+                to: Address::Creature(CreatureId(1)),
+                reply_to: Some(Address::Creature(CreatureId(42))),
+                seq: 0,
+                causal: Vec::new(),
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(7),
+                commitment: None,
+                schema: CTL_SCHEMA.into(),
+            },
+            payload: TransportCtl::Connect {
+                node_id: "b".into(),
+                pubkey_hex: "pk_b".into(),
+                addr: "127.0.0.1:2".into(),
+            }
+            .to_bytes(),
+        };
+
+        let out = handle_ctl(&state, &env);
+        assert_eq!(out.dispatches.len(), 1);
+        match TransportCtlReply::parse(&out.dispatches[0].payload) {
+            Some(TransportCtlReply::Rejected { reason }) => {
+                assert!(reason.contains("capacity"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(!mlock(&state.members).contains_key(&NodeId("b".into())));
+        assert!(!mlock(&state.peers_by_pubkey).contains_key("pk_b"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Two **reference** injected creatures that subscribe to
-//! [`BudgetSignalEvent`] on the proprioception topic and decide what to do about a creature in
+//! [`sanctum::BudgetSignalEvent`] on the proprioception topic and decide what to do about a creature in
 //! trouble with a quantitative cap.
 //!
 //! - [`BudgetApoptosis`] — the **simplest possible** policy: every `Hard` becomes one
@@ -16,32 +16,37 @@
 //! **Neither is substrate.** Both are reference creatures, one of many possible budget responses
 //! (kill, demote-tier, escalate to a human, raise-then-kill, exponential-backoff, …). Operators
 //! ship their own. The fabric ships the *event* (`BudgetSignalEvent` with level/kind/vector) and
-//! the *control ops* (`Unload`, `ExtendBudget`, and a creature's `BudgetRequest`), never the decision.
+//! the *control ops* (`Unload`, `ExtendBudget`, and a creature's `sanctum::BudgetRequest`), never the decision.
 //!
 //! **The full gradient loop is live:**
 //! - The wasm engine emits `Warn` (via `budget_warn_at`), so `BudgetGraceful`'s Warn branches fire
 //!   from real beast execution, not just injection.
 //! - The kernel **honors** `ExtendBudget`: a granted fuel lift takes effect on the creature's next
 //!   handle (the wasm tier's live fuel ceiling). So a grace grant here actually rescues a creature.
-//! - `BudgetGraceful` also consumes a creature-initiated `BudgetRequest` (schema `budget_request`):
+//! - `BudgetGraceful` also consumes a creature-initiated `sanctum::BudgetRequest` (schema `budget_request`):
 //!   it honors the first fuel ask per module (one-shot) by issuing `ExtendBudget`. The symmetric,
 //!   creature-side direction of the same gradient.
 //!
 //! **Remaining honest limits:**
 //! - `mem_bytes`/`wall_ms` `ExtendBudget` lifts are accepted by the wire but not yet honored (the
 //!   wasm `StoreLimiter` isn't live-mutable); only the fuel dimension lifts today.
-//! - Per-module grace state is held in a `HashMap` that only grows. A production policy would
-//!   subscribe to a `module_unloaded` event and prune; we don't, because the proprioception
-//!   topic does not carry that lifecycle schema yet. For a reference creature the unbounded map is
-//!   acceptable.
+//! - Per-module grace/decision state is bounded by default ([`DEFAULT_MAX_TRACKED_MODULES`]). A
+//!   production policy would also subscribe to unload lifecycle and prune; this reference refuses
+//!   new tracked modules at capacity while preserving decisions for already-tracked modules.
+//!   `with_max_tracked_modules(0)` is the explicit lab/demo opt-out.
 //!
 //! Wiring is identical to [`BudgetApoptosis`]: open an endpoint, subscribe
 //! to `Topic::PROPRIOCEPTION`, drain the inbox into `handle`, send the resulting dispatches back
 //! through the bus.
 
 use aether::{Address, Creature, CreatureCtx, Dispatch, Envelope, LimitKind, Outcome};
-use sanctum::{BudgetRequest, BudgetSignalEvent, KernelControl};
+use sanctum::{decode_budget_request, decode_budget_signal_event, KernelControl};
 use std::collections::HashMap;
+
+/// Default maximum number of distinct modules tracked by [`BudgetGraceful`]'s in-memory state.
+///
+/// `0` is reserved as an explicit opt-out via [`BudgetGraceful::with_max_tracked_modules`].
+pub const DEFAULT_MAX_TRACKED_MODULES: usize = 1_024;
 
 // =============================================================================================
 // BudgetApoptosis — the simplest policy
@@ -73,7 +78,7 @@ impl Creature for BudgetApoptosis {
         // `BudgetSignalEvent` are ours. Unknown shapes (`Proprioception`, `Fitness`,
         // `BudgetRequest`) are silently ignored — every subscriber on a shared topic learns to
         // look past what isn't for it.
-        let Ok(b) = serde_json::from_slice::<BudgetSignalEvent>(&env.payload) else {
+        let Ok(b) = decode_budget_signal_event(&env.payload) else {
             return Outcome::none();
         };
         // Policy: Hard -> unload, Warn -> ignore. A richer creature would inspect
@@ -190,11 +195,29 @@ pub struct BudgetGraceful {
     /// Most recent decision per module, exposed by [`Self::last_decision`] for tests /
     /// observability. Overwritten on each new signal for that module.
     last_decision: HashMap<u64, BudgetDecision>,
+    /// Maximum distinct modules retained across `grace_granted` and `last_decision`. At capacity a
+    /// new module's retained state is refused, but already-tracked modules still update. `0` means
+    /// unbounded and must be selected explicitly.
+    max_tracked_modules: usize,
 }
 
 impl BudgetGraceful {
     pub fn new() -> Self {
-        BudgetGraceful { grace_granted: HashMap::new(), last_decision: HashMap::new() }
+        BudgetGraceful {
+            grace_granted: HashMap::new(),
+            last_decision: HashMap::new(),
+            max_tracked_modules: DEFAULT_MAX_TRACKED_MODULES,
+        }
+    }
+
+    /// Cap the number of distinct modules tracked by this reference policy.
+    ///
+    /// The default is [`DEFAULT_MAX_TRACKED_MODULES`]. At capacity, state for a *new* module is not
+    /// retained and a new grace grant is refused because it could not be marked one-shot. Already
+    /// tracked modules continue to update. Pass `0` to opt out and make the state tables unbounded.
+    pub fn with_max_tracked_modules(mut self, max_tracked_modules: usize) -> Self {
+        self.max_tracked_modules = max_tracked_modules;
+        self
     }
 
     /// Inspect the most recent decision this policy made for `module`. Returns `None` if no
@@ -202,6 +225,46 @@ impl BudgetGraceful {
     /// observability — production policies would emit a side-topic envelope.
     pub fn last_decision(&self, module: u64) -> Option<&BudgetDecision> {
         self.last_decision.get(&module)
+    }
+
+    /// Distinct modules currently retained across grace and last-decision state.
+    pub fn tracked_module_count(&self) -> usize {
+        let mut count = self.last_decision.len();
+        for module in self.grace_granted.keys() {
+            if !self.last_decision.contains_key(module) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn has_tracked_module(&self, module: u64) -> bool {
+        self.last_decision.contains_key(&module) || self.grace_granted.contains_key(&module)
+    }
+
+    fn can_track_module(&self, module: u64) -> bool {
+        self.max_tracked_modules == 0
+            || self.has_tracked_module(module)
+            || self.tracked_module_count() < self.max_tracked_modules
+    }
+
+    fn record_decision(&mut self, module: u64, decision: BudgetDecision) {
+        if self.can_track_module(module) {
+            self.last_decision.insert(module, decision);
+        } else {
+            eprintln!(
+                "policy-budget: tracked-module table at capacity ({}); not recording decision for module {}",
+                self.max_tracked_modules, module
+            );
+        }
+    }
+
+    fn mark_grace_granted(&mut self, module: u64, kind: LimitKind) -> bool {
+        if !self.can_track_module(module) {
+            return false;
+        }
+        self.grace_granted.entry(module).or_default().mark_granted(kind);
+        true
     }
 
     /// The pure classifier. Reads the vector, returns the trajectory. No state read or
@@ -253,7 +316,7 @@ impl BudgetGraceful {
         // of trajectory; the trajectory becomes the *reason* (observable, not actionable).
         if level == "hard" {
             let d = BudgetDecision::Unload { reason };
-            self.last_decision.insert(module, d.clone());
+            self.record_decision(module, d.clone());
             return d;
         }
 
@@ -275,31 +338,37 @@ impl BudgetGraceful {
             // ProductiveThenTerminal, fresh: grant 1.5× (rounded up) — the workload deserves
             // headroom and the cap looks miscalibrated.
             (BudgetTrajectory::ProductiveThenTerminal { .. }, false) => {
-                let new_cap = vector.limit.saturating_add(vector.limit / 2).max(1);
-                self.grace_granted.entry(module).or_default().mark_granted(kind);
-                BudgetDecision::Grant { reason, kind, new_cap }
+                if self.mark_grace_granted(module, kind) {
+                    let new_cap = vector.limit.saturating_add(vector.limit / 2).max(1);
+                    BudgetDecision::Grant { reason, kind, new_cap }
+                } else {
+                    BudgetDecision::Observe { reason }
+                }
             }
 
             // SteadyClimb, fresh: grant a more modest 1.25× — creep often keeps creeping;
             // give the creature room to finish a unit of work but don't bless the trend.
             (BudgetTrajectory::SteadyClimb { .. }, false) => {
-                let new_cap = vector.limit.saturating_add(vector.limit / 4).max(1);
-                self.grace_granted.entry(module).or_default().mark_granted(kind);
-                BudgetDecision::Grant { reason, kind, new_cap }
+                if self.mark_grace_granted(module, kind) {
+                    let new_cap = vector.limit.saturating_add(vector.limit / 4).max(1);
+                    BudgetDecision::Grant { reason, kind, new_cap }
+                } else {
+                    BudgetDecision::Observe { reason }
+                }
             }
         };
-        self.last_decision.insert(module, d.clone());
+        self.record_decision(module, d.clone());
         d
     }
 
-    /// **Consume a creature-initiated [`BudgetRequest`].** A creature asks for more fuel;
+    /// **Consume a creature-initiated [`sanctum::BudgetRequest`].** A creature asks for more fuel;
     /// this reference honors the *first* fuel ask per module (one-shot, reusing the same `grace_granted`
     /// guard as the Warn path) so a creature can't loop-request unbounded budget, and observes the
     /// rest. A production policy would weigh `justification` against a quota / trajectory / cost
     /// model — the substrate ships the seam, never the model (IoC). Only the fuel dimension is
     /// honored (the kernel lifts fuel live; mem/wall lifts are future engine work).
     fn on_budget_request(&mut self, env: &Envelope) -> Outcome {
-        let Ok(req) = serde_json::from_slice::<BudgetRequest>(&env.payload) else {
+        let Ok(req) = decode_budget_request(&env.payload) else {
             return Outcome::none();
         };
         let Some(fuel) = req.fuel else {
@@ -311,14 +380,20 @@ impl BudgetGraceful {
             .map(|g| g.is_granted(LimitKind::Fuel))
             .unwrap_or(false);
         if already {
-            self.last_decision.insert(
+            self.record_decision(
                 req.module,
                 BudgetDecision::Observe { reason: BudgetTrajectory::Unclassifiable },
             );
             return Outcome::none(); // one-shot exhausted — a creature can't keep asking for more
         }
-        self.grace_granted.entry(req.module).or_default().mark_granted(LimitKind::Fuel);
-        self.last_decision.insert(
+        if !self.mark_grace_granted(req.module, LimitKind::Fuel) {
+            self.record_decision(
+                req.module,
+                BudgetDecision::Observe { reason: BudgetTrajectory::Unclassifiable },
+            );
+            return Outcome::none(); // cannot mark one-shot state, so do not grant untracked grace
+        }
+        self.record_decision(
             req.module,
             BudgetDecision::Grant {
                 reason: BudgetTrajectory::Unclassifiable,
@@ -357,7 +432,7 @@ impl Creature for BudgetGraceful {
         }
         // Same parse-or-pass-through discipline as BudgetApoptosis — fan-out delivers
         // everything on PROPRIOCEPTION; only BudgetSignalEvent shapes are ours.
-        let Ok(b) = serde_json::from_slice::<BudgetSignalEvent>(&env.payload) else {
+        let Ok(b) = decode_budget_signal_event(&env.payload) else {
             return Outcome::none();
         };
 
@@ -369,7 +444,7 @@ impl Creature for BudgetGraceful {
             "memory" => LimitKind::Memory,
             "wall" => LimitKind::Wall,
             _ => {
-                self.last_decision.insert(
+                self.record_decision(
                     b.module,
                     BudgetDecision::Observe { reason: BudgetTrajectory::Unclassifiable },
                 );
@@ -419,6 +494,7 @@ impl Creature for BudgetGraceful {
 mod tests {
     use super::*;
     use aether::{BudgetVector, CreatureId, Header};
+    use sanctum::{BudgetRequest, BudgetSignalEvent};
 
     fn proprio_env(payload: &[u8]) -> Envelope {
         Envelope {
@@ -499,6 +575,15 @@ mod tests {
         assert!(p.handle(e).dispatches.is_empty());
     }
 
+    #[test]
+    fn graceful_drops_oversized_budget_request_before_json_decode() {
+        let mut p = BudgetGraceful::new();
+        let mut e = proprio_env(&vec![b'{'; aether::MAX_SENSE_EVENT_BYTES + 1]);
+        e.header.schema = "budget_request".into();
+        assert!(p.handle(e).dispatches.is_empty());
+        assert!(p.last_decision(0).is_none(), "oversized request records no policy decision");
+    }
+
     // -----------------------------------------------------------------------------------------
     // BudgetApoptosis — unchanged tests
     // -----------------------------------------------------------------------------------------
@@ -540,6 +625,13 @@ mod tests {
             serde_json::to_vec(&sanctum::Proprioception { module: 1, event: "loaded".into() })
                 .unwrap();
         assert!(p.handle(proprio_env(&other)).dispatches.is_empty());
+    }
+
+    #[test]
+    fn apoptosis_oversized_budget_signal_is_no_op() {
+        let mut p = BudgetApoptosis::new();
+        let oversized = vec![b'{'; aether::MAX_SENSE_EVENT_BYTES + 1];
+        assert!(p.handle(proprio_env(&oversized)).dispatches.is_empty());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -826,6 +918,77 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn graceful_tracked_module_cap_refuses_new_grace_but_keeps_existing_and_hard_floor() {
+        let mut p = BudgetGraceful::new().with_max_tracked_modules(1);
+        let productive = BudgetVector {
+            consumed: 9000,
+            limit: 10_000,
+            dispatches_this_envelope: 5,
+            wall_ms_elapsed: 50,
+            envelopes_since_load: 3,
+        };
+
+        let first = p.handle(proprio_env(&event(11, "warn", "fuel", productive)));
+        assert_eq!(first.dispatches.len(), 1, "first tracked module can receive grace");
+        assert_eq!(p.tracked_module_count(), 1);
+
+        let refused = p.handle(proprio_env(&event(12, "warn", "fuel", productive)));
+        assert!(refused.dispatches.is_empty(), "new module cannot receive untracked grace");
+        assert!(p.last_decision(12).is_none(), "new module did not grow retained state at cap");
+        assert_eq!(p.tracked_module_count(), 1);
+
+        let existing_other_kind = p.handle(proprio_env(&event(11, "warn", "memory", productive)));
+        assert_eq!(
+            existing_other_kind.dispatches.len(),
+            1,
+            "already-tracked modules keep updating at capacity"
+        );
+        assert_eq!(p.tracked_module_count(), 1);
+
+        let hard = p.handle(proprio_env(&event(13, "hard", "fuel", productive)));
+        assert_eq!(hard.dispatches.len(), 1, "hard floor still unloads even when state is full");
+        let op: KernelControl = serde_json::from_slice(&hard.dispatches[0].payload).unwrap();
+        assert!(matches!(op, KernelControl::Unload { module: 13 }));
+        assert!(p.last_decision(13).is_none(), "hard action is not blocked by retained-state cap");
+        assert_eq!(p.tracked_module_count(), 1);
+    }
+
+    #[test]
+    fn graceful_default_tracked_module_cap_is_bounded_and_zero_opt_out_is_unbounded() {
+        let weak = BudgetVector {
+            consumed: 100,
+            limit: 1000,
+            dispatches_this_envelope: 0,
+            wall_ms_elapsed: 0,
+            envelopes_since_load: 2,
+        };
+        let mut bounded = BudgetGraceful::new();
+        for module in 0..DEFAULT_MAX_TRACKED_MODULES {
+            let out =
+                bounded.handle(proprio_env(&event(module as u64 + 1_000, "warn", "fuel", weak)));
+            assert!(out.dispatches.is_empty(), "weak warn only records observation state");
+        }
+        assert_eq!(bounded.tracked_module_count(), DEFAULT_MAX_TRACKED_MODULES);
+
+        let overflow = 1_000 + DEFAULT_MAX_TRACKED_MODULES as u64;
+        let out = bounded.handle(proprio_env(&event(overflow, "warn", "fuel", weak)));
+        assert!(out.dispatches.is_empty());
+        assert!(
+            bounded.last_decision(overflow).is_none(),
+            "default cap refuses new retained state"
+        );
+        assert_eq!(bounded.tracked_module_count(), DEFAULT_MAX_TRACKED_MODULES);
+
+        let mut unbounded = BudgetGraceful::new().with_max_tracked_modules(0);
+        for module in 0..=DEFAULT_MAX_TRACKED_MODULES {
+            let out =
+                unbounded.handle(proprio_env(&event(module as u64 + 20_000, "warn", "fuel", weak)));
+            assert!(out.dispatches.is_empty());
+        }
+        assert_eq!(unbounded.tracked_module_count(), DEFAULT_MAX_TRACKED_MODULES + 1);
+    }
+
     // -----------------------------------------------------------------------------------------
     // BudgetGraceful — edge cases
     // -----------------------------------------------------------------------------------------
@@ -852,6 +1015,14 @@ mod tests {
         assert!(p.handle(proprio_env(&other)).dispatches.is_empty());
         // No decision recorded because no BudgetSignalEvent parsed.
         assert!(p.last_decision(1).is_none());
+    }
+
+    #[test]
+    fn graceful_oversized_budget_signal_is_no_op() {
+        let mut p = BudgetGraceful::new();
+        let oversized = vec![b'{'; aether::MAX_SENSE_EVENT_BYTES + 1];
+        assert!(p.handle(proprio_env(&oversized)).dispatches.is_empty());
+        assert!(p.last_decision(0).is_none(), "oversized signal records no policy decision");
     }
 
     #[test]

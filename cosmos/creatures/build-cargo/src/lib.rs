@@ -22,6 +22,8 @@
 //! - It does not retry — the *agent* feeds back `prev_error` and re-authors; this creature is a pure
 //!   compile-once function. Stateless on purpose: the loop's intelligence lives in the agent.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +39,17 @@ use std::time::{Duration, Instant};
 /// yielding a "successful" build of source that was never actually compiled. Counter is process-
 /// local on purpose; cross-process uniqueness is already covered by `process::id()`.
 static WORK_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// BUILD requests carry source + metadata, not artifacts. Bound the bus payload before JSON parsing
+/// so a misbehaving authoring creature cannot force unbounded deserialization in the build organ.
+const MAX_BUILD_OP_BYTES: usize = 8 * 1024 * 1024;
+/// The authored Rust source lands in a temp workspace and then in cargo. Keep it roomy for generated
+/// code while refusing pathological model output before any filesystem or compiler work starts.
+const MAX_AUTHORED_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// A built artifact is returned as bus bytes and then often loaded directly. Keep the compiler output
+/// bounded too; a successful build that emits a giant cdylib is still not an acceptable artifact for
+/// this in-process authoring loop.
+const MAX_BUILT_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 
 use aether::{Address, Bus, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome, Topic};
 use serde::{Deserialize, Serialize};
@@ -321,8 +334,21 @@ impl BuildCargo {
                 req.crate_name, req.manifest_stub.name
             )));
         }
+        if req.crate_version != req.manifest_stub.version {
+            return Err(BuildFailure::invalid(format!(
+                "crate_version `{}` does not match manifest_stub.version `{}`",
+                req.crate_version, req.manifest_stub.version
+            )));
+        }
         if req.source.trim().is_empty() {
             return Err(BuildFailure::invalid("source is empty"));
+        }
+        if req.source.len() > MAX_AUTHORED_SOURCE_BYTES {
+            return Err(BuildFailure::invalid(format!(
+                "source is {} bytes, exceeds {} byte limit",
+                req.source.len(),
+                MAX_AUTHORED_SOURCE_BYTES
+            )));
         }
         // crate names with whitespace / slashes would break Cargo.toml — cargo would reject anyway,
         // but a structured Invalid here is more honest than a Compile reply with a cargo error.
@@ -330,6 +356,15 @@ impl BuildCargo {
             return Err(BuildFailure::invalid(format!(
                 "crate_name `{}` is not a valid cargo crate name (alphanumeric / `-` / `_`)",
                 req.crate_name
+            )));
+        }
+        // `crate_version` lands in Cargo.toml's `[package] version` field. Cargo will fully validate
+        // semver, but gate the interpolation shape here so a malformed version is a structured
+        // Invalid reply rather than TOML structure injection or a noisy cargo parse error.
+        if !is_cargo_package_version(&req.crate_version) {
+            return Err(BuildFailure::invalid(format!(
+                "crate_version `{}` is not a safe Cargo package version (ASCII alphanumeric / `.`, `-`, `+`)",
+                req.crate_version
             )));
         }
         // Validate dependency names + interpolated strings BEFORE they reach Cargo.toml. The dep
@@ -474,12 +509,15 @@ impl BuildCargo {
         //    the same agent-facing crate.
         let lib_basename = lib_filename(&cargo_crate_name);
         let lib_path = self.config.target_dir.join("release").join(&lib_basename);
-        let artifact_bytes = std::fs::read(&lib_path).map_err(|e| BuildFailure {
-            kind: BuildErrorKind::NoArtifact,
-            message: format!("expected cdylib not found at {}: {e}", lib_path.display()),
-            stderr: cargo_out.stderr.clone(),
-            stdout: cargo_out.stdout.clone(),
-        })?;
+        let artifact_bytes =
+            read_file_bounded(&lib_path, "produced cdylib", MAX_BUILT_ARTIFACT_BYTES).map_err(
+                |e| BuildFailure {
+                    kind: BuildErrorKind::NoArtifact,
+                    message: e,
+                    stderr: cargo_out.stderr.clone(),
+                    stdout: cargo_out.stdout.clone(),
+                },
+            )?;
 
         // 6. Compute hashes, populate provenance, sign. The signature commits to the manifest with
         //    `signature` field cleared (Manifest::signing_payload), so re-verification on the
@@ -680,16 +718,35 @@ impl Creature for BuildCargo {
     }
 
     fn handle(&mut self, env: Envelope) -> Outcome {
-        let reply = match serde_json::from_slice::<BuildOp>(&env.payload) {
-            Ok(BuildOp::Build { crate_name, crate_version, source, manifest_stub, deps }) => {
-                self.build(BuildRequest { crate_name, crate_version, source, manifest_stub, deps })
-            }
-            Err(e) => BuildReply::Failed {
+        let reply = if env.payload.len() > MAX_BUILD_OP_BYTES {
+            BuildReply::Failed {
                 kind: BuildErrorKind::Invalid,
-                message: format!("malformed build op: {e}"),
+                message: format!(
+                    "build op payload is {} bytes, exceeds {} byte limit",
+                    env.payload.len(),
+                    MAX_BUILD_OP_BYTES
+                ),
                 stderr: String::new(),
                 stdout: String::new(),
-            },
+            }
+        } else {
+            match serde_json::from_slice::<BuildOp>(&env.payload) {
+                Ok(BuildOp::Build { crate_name, crate_version, source, manifest_stub, deps }) => {
+                    self.build(BuildRequest {
+                        crate_name,
+                        crate_version,
+                        source,
+                        manifest_stub,
+                        deps,
+                    })
+                }
+                Err(e) => BuildReply::Failed {
+                    kind: BuildErrorKind::Invalid,
+                    message: format!("malformed build op: {e}"),
+                    stderr: String::new(),
+                    stdout: String::new(),
+                },
+            }
         };
         let payload = reply.to_bytes();
         Outcome::send(Dispatch::reply_to_env(&env, payload).with_schema("build.reply"))
@@ -708,7 +765,7 @@ fn generate_cargo_toml(
     let mut s = String::new();
     s.push_str("[package]\n");
     s.push_str(&format!("name = \"{crate_name}\"\n"));
-    s.push_str(&format!("version = \"{crate_version}\"\n"));
+    s.push_str(&format!("version = {}\n", toml_string(crate_version)));
     s.push_str("edition = \"2021\"\n");
     // The authored creature inherits the workspace's allocator invariant — no custom allocators —
     // implicitly: it has no `#[global_allocator]` because the template doesn't add one. The
@@ -761,6 +818,11 @@ fn toml_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn is_cargo_package_version(s: &str) -> bool {
+    !s.trim().is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
 /// Reap this build's UNIQUE outputs from the SHARED target dir so they don't accumulate forever.
@@ -871,6 +933,38 @@ fn truncate(mut s: String, max: usize) -> String {
     s
 }
 
+fn read_file_bounded(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("{label} {} unreadable: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{label} {} is not a regular file", path.display()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{label} {} is {} bytes, exceeds {} byte limit",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        ));
+    }
+
+    let file =
+        File::open(path).map_err(|e| format!("{label} {} unreadable: {e}", path.display()))?;
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::with_capacity(metadata.len().min(1024 * 1024) as usize);
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{label} {} read failed: {e}", path.display()))?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > max_bytes) {
+        return Err(format!(
+            "{label} {} grew past {} byte limit while reading",
+            path.display(),
+            max_bytes
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,11 +983,12 @@ mod tests {
     fn generate_cargo_toml_includes_path_dep_to_sdk() {
         let toml = generate_cargo_toml(
             "x",
-            "0.1.0",
+            "0.1.0-alpha.1+build.7",
             &PathBuf::from("/tmp/gawd"),
             &[CargoDep { name: "ureq".into(), spec: CargoDepSpec::Version("2".into()) }],
         );
         assert!(toml.contains("crate-type = [\"cdylib\"]"));
+        assert!(toml.contains("version = \"0.1.0-alpha.1+build.7\""));
         assert!(toml.contains("forge = { path = \"/tmp/gawd/forge\" }"));
         assert!(toml.contains("ureq = \"2\""));
     }
@@ -943,6 +1038,107 @@ mod tests {
     }
 
     #[test]
+    fn crate_version_must_match_manifest_stub_version() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let reply = bc.build(BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.2.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![],
+        });
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("does not match"), "{message}");
+            }
+            _ => panic!("version mismatch should yield Invalid"),
+        }
+    }
+
+    #[test]
+    fn crate_version_rejects_toml_structure_injection_before_disk() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let injected = "0.1.0\"\n[profile.release]\npanic = \"abort";
+        let reply = bc.build(BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: injected.into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: injected.into(),
+                ..Default::default()
+            },
+            deps: vec![],
+        });
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("safe Cargo package version"), "{message}");
+            }
+            _ => panic!("version injection should yield Invalid"),
+        }
+    }
+
+    #[test]
+    fn oversized_source_is_rejected_before_disk() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let reply = bc.build(BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.1.0".into(),
+            source: "x".repeat(MAX_AUTHORED_SOURCE_BYTES + 1),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![],
+        });
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("oversized source should yield Invalid"),
+        }
+    }
+
+    #[test]
+    fn oversized_built_artifact_file_is_rejected_before_reading() {
+        let dir = std::env::temp_dir().join(format!(
+            "build-cargo-artifact-bound-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("libhuge.so");
+        std::fs::File::create(&path).unwrap().set_len(MAX_BUILT_ARTIFACT_BYTES + 1).unwrap();
+
+        let err = read_file_bounded(&path, "produced cdylib", MAX_BUILT_ARTIFACT_BYTES)
+            .expect_err("oversized artifact file should be refused before read");
+        assert!(err.contains("produced cdylib"), "{err}");
+        assert!(err.contains("exceeds"), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn malformed_build_op_on_the_bus_yields_failed_reply_not_panic() {
         use aether::{Address, CreatureId, Header};
         let mut bc = BuildCargo::new(BuildConfig::with_workspace_root(
@@ -971,5 +1167,40 @@ mod tests {
             matches!(r, BuildReply::Failed { kind: BuildErrorKind::Invalid, .. }),
             "expected Invalid Failed reply, got {r:?}"
         );
+    }
+
+    #[test]
+    fn oversized_build_op_payload_is_rejected_before_json_parse() {
+        use aether::{Address, CreatureId, Header};
+        let mut bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::Creature(CreatureId(7)),
+                reply_to: None,
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: None,
+                commitment: None,
+                schema: "".into(),
+            },
+            payload: vec![b'{'; MAX_BUILD_OP_BYTES + 1],
+        };
+        let out = bc.handle(env);
+        let r: BuildReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        match r {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("build op payload"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("oversized build op should yield Invalid"),
+        }
     }
 }

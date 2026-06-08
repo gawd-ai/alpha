@@ -91,7 +91,7 @@ impl Creature for EmbodimentAdvertiser {
         if env.header.schema != SCHEMA_SEER {
             return Outcome::none();
         }
-        let seer = match SeerEnvelope::parse(&env.payload) {
+        let seer = match SeerEnvelope::parse_bounded(&env.payload) {
             Ok(s) => s,
             // A malformed SeerEnvelope on the advertiser's inbox is hostile or buggy input. Drop
             // silently — answering "I couldn't parse you" would imply the substrate adjudicates
@@ -335,6 +335,13 @@ mod tests {
         let mut a = EmbodimentAdvertiser::new(NodeId("node-A".into()), vec![nv_offer(10, 8)]);
         let out = a.handle(seer_env(1, b"not json".to_vec()));
         assert!(out.dispatches.is_empty(), "garbage SEER payload → silent drop");
+    }
+
+    #[test]
+    fn drops_oversized_seer_payload_silently() {
+        let mut a = EmbodimentAdvertiser::new(NodeId("node-A".into()), vec![nv_offer(10, 8)]);
+        let out = a.handle(seer_env(1, vec![b'{'; seer::MAX_SEER_ENVELOPE_BYTES + 1]));
+        assert!(out.dispatches.is_empty(), "oversized SEER payload → silent drop");
     }
 
     #[test]

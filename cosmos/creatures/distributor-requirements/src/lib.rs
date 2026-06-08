@@ -388,7 +388,7 @@ impl Distributor {
     }
 
     fn on_seer(&mut self, env: Envelope) -> Outcome {
-        let seer = match SeerEnvelope::parse(&env.payload) {
+        let seer = match SeerEnvelope::parse_bounded(&env.payload) {
             Ok(s) => s,
             Err(_) => return Outcome::none(),
         };
@@ -885,6 +885,18 @@ mod tests {
         env.payload = b"not json at all".to_vec();
         let out = d.handle(env);
         assert!(out.dispatches.is_empty(), "garbage SEER → silent drop");
+        assert_eq!(d.pending_consults(), 1);
+    }
+
+    #[test]
+    fn drops_oversized_seer_payload_silently_when_pending() {
+        let mut d = make_dist(PickModel::FirstFit);
+        let _ = d.handle(intent_env(7, "reverse", vec!["cpu >= 4"], b"abc"));
+
+        let mut env = answer_env(10_000, 1, vec![offer("node-A", 42, 8)]);
+        env.payload = vec![b'{'; seer::MAX_SEER_ENVELOPE_BYTES + 1];
+        let out = d.handle(env);
+        assert!(out.dispatches.is_empty(), "oversized SEER → silent drop");
         assert_eq!(d.pending_consults(), 1);
     }
 

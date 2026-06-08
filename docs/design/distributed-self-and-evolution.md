@@ -77,6 +77,10 @@ one Abode through a three-state machine:
                                                                                      (sealed)
 ```
 
+Migrator messages are bounded before JSON decode. The default cap allows one max-sized state/snapshot
+payload at worst-case JSON `Vec<u8>` expansion plus metadata overhead, and `SetState` rejects local
+state whose `v3.0`-wrapped snapshot would exceed this migrator's configured snapshot ceiling.
+
 A `Migrate { destination_node, destination_migrator }` op orchestrates the hand-off: take a snapshot →
 wrap it with the migrator's own version-magic (`b"v3.0"`) → sign with the Abode key → ship a
 `RestoreRequest` carrying an **unguessable per-migration challenge** → await the matching
@@ -87,14 +91,16 @@ so at most one body is ever the self. No two-active-fork window exists on this p
 
 The **responder** (the destination migrator) admits an inbound `RestoreRequest` only through, in order:
 
-1. **fork-window** — the migrator must be `Empty`. An `Authoritative` migrator refuses and points the
+1. **serialized-message bound** — the request must fit the migrator's pre-parse cap before JSON
+   decoding.
+2. **fork-window** — the migrator must be `Empty`. An `Authoritative` migrator refuses and points the
    caller at the reconciler (fork/merge is a separate path, not a silent second active fork); a
    `Migrated` migrator refuses because it is sealed.
-2. **substrate gates** — size → integrity → signature, the three above.
-3. **schema dispatch** — `payload_bytes` must carry the `v3.0` magic; an unknown prefix is refused
+3. **substrate gates** — size → integrity → signature, the three above.
+4. **schema dispatch** — `payload_bytes` must carry the `v3.0` magic; an unknown prefix is refused
    structurally (the bytes are opaque to the fabric, so the migrator owns this dispatch — a richer
    migrator using another encoding ships its own prefix and the substrate's gates are unchanged).
-4. **injected `RestorePolicy`** — the operator's final say: `fn admit(&self, &AbodeSnapshot) ->
+5. **injected `RestorePolicy`** — the operator's final say: `fn admit(&self, &AbodeSnapshot) ->
    Result<(), String>`. The substrate ships none; `policy-abode-allowlist` is the reference (admit
    when `abode_key` is on an allowlist). The reason rides verbatim in the reply so the originator can
    audit and reissue.
@@ -134,14 +140,16 @@ it ships the socket and the verify/sign envelope, and the **lattice is injected*
 `abode-reconciler` (schema `"abode.reconciler"`, bound to `Role::ABODE_RECONCILER`) handles a
 `Reconcile { fork_a, fork_b }` by:
 
-1. **gating both forks** through the same substrate snapshot primitives — size (a tighter per-fork
+1. **bounding the reconcile message before JSON decode**; the default cap allows two max-sized fork
+   payloads at worst-case JSON `Vec<u8>` expansion plus metadata overhead.
+2. **gating both forks** through the same substrate snapshot primitives — size (a tighter per-fork
    ceiling, since a reconcile admits several forks at once), signature, integrity. A failed gate is a
    `Rejected { reason }`, never a panic.
-2. **confirming same-self** — both forks carry the same `abode_key`, equal to the reconciler's own
+3. **confirming same-self** — both forks carry the same `abode_key`, equal to the reconciler's own
    pubkey (it holds that self's key). Merging two *different* selves is refused; that is not a fork.
-3. **unwrapping** the `v3.0` framing so the merge model sees pure state, running
+4. **unwrapping** the `v3.0` framing so the merge model sees pure state, running
    `MergeModel::merge(state_a, state_b)`, and **re-wrapping** the result.
-4. **re-signing** the merged snapshot with the Abode key (carrying `requires` + `realm` forward) and
+5. **re-signing** the merged snapshot with the Abode key (carrying `requires` + `realm` forward) and
    replying `Reconciled { merged }` — a fresh authoritative snapshot that re-enters the
    migration/restore path unchanged.
 
@@ -201,6 +209,10 @@ field, since the kernel is model-free and names only an id) and a per-creature `
 - if the score is finite and `>= threshold`, the selector **signs the promotion claim** — the
   `(artifact_hash, realm, score, attesting_realm)` tuple — with the Abode key and writes
   `RegistryOp::AttestFitness { …, signed_by, signature }` onto the registry's reputation slot.
+
+The observation tally is bounded by default (`DEFAULT_MAX_OBSERVED_MODULES`). At capacity, a new
+creature id's observation is dropped while already-tracked ids keep accumulating; `with_max_obs(0)` is
+the explicit opt-out for unbounded replay or lab workloads.
 
 That signature **is heredity made checkable** — the Baldwin effect made concrete. A bare score is an
 *assertion* anyone who can write the registry could fabricate; a *signed* promotion is a verifiable
@@ -304,6 +316,9 @@ and `Kernel::extend_budget` lifts it on a grant. The reference `policy-budget` (
 first real consumer: it honors a creature's *first* fuel ask per creature (one-shot, so a creature
 can't loop-beg unbounded budget) and observes the rest; a `Hard` signal still becomes an apoptosis
 `Unload`.
+Its per-module grace/decision tables are bounded by default (`DEFAULT_MAX_TRACKED_MODULES`); a new
+module at capacity cannot receive untracked grace, while a `Hard` signal still unloads because the cap
+only limits retained policy state.
 
 This is **tier-honest**. The metering tiers expose budget control; the native tier — trusted by
 admission, with no fuel or operation metering — exposes none, so a grant to a native creature returns

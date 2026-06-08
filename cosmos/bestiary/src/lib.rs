@@ -37,13 +37,15 @@ pub mod op;
 pub mod store;
 mod wire;
 
-pub use wire::{Entry, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, SyncEntry};
+pub use wire::{
+    CatalogEntry, Entry, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, SyncEntry,
+};
 
 pub use curator::{AICurator, CurationContext, CurationDecision, Curator, DeterministicCurator};
 pub use op::{BestiaryOp, BestiaryReply};
 pub use store::{
     BestiaryStore, CompactStats, CurationSnapshot, EntryProof, FsBestiaryStore, LogOp, LogRecord,
-    MergeOutcome, SignedSyncEntry, StoreError,
+    MergeOutcome, SignedSyncEntry, StoreError, DEFAULT_MAX_BESTIARY_ENTRIES,
 };
 
 /// The `registry.op` schema string — the existing in-memory and durable stores both answer it
@@ -56,3 +58,23 @@ pub const REGISTRY_REPLY_SCHEMA: &str = "registry.reply";
 pub const BESTIARY_OP_SCHEMA: &str = "bestiary.op";
 /// The `bestiary.reply` schema string (see [`BESTIARY_OP_SCHEMA`]).
 pub const BESTIARY_REPLY_SCHEMA: &str = "bestiary.reply";
+/// Maximum artifact bytes a registry publish stores by default. This matches the control surface's
+/// node-local artifact read cap; `0` in implementation-specific config means unbounded.
+pub const MAX_REGISTRY_ARTIFACT_BYTES: usize = 128 * 1024 * 1024;
+/// Maximum serialized `registry.op` payload bytes decoded by default. Artifact bytes are hex-encoded
+/// on this JSON wire, so a full-size artifact needs roughly 2x space plus manifest overhead.
+pub const MAX_REGISTRY_OP_BYTES: usize = (MAX_REGISTRY_ARTIFACT_BYTES * 2) + (4 * 1024 * 1024);
+/// Maximum serialized `bestiary.op` payload bytes decoded by default.
+pub const MAX_BESTIARY_OP_BYTES: usize = MAX_REGISTRY_OP_BYTES;
+
+pub fn registry_op_too_large_message(len: usize, limit: usize) -> String {
+    format!("registry op too large: {len} bytes (limit {limit})")
+}
+
+pub fn bestiary_op_too_large_message(len: usize, limit: usize) -> String {
+    format!("bestiary op too large: {len} bytes (limit {limit})")
+}
+
+pub fn registry_artifact_too_large_message(len: usize, limit: usize) -> String {
+    format!("registry artifact too large: {len} bytes (limit {limit})")
+}

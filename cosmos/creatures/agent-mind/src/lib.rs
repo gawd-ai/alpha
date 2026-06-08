@@ -41,7 +41,7 @@ use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, Instant};
 
 use aether::{Address, Bus, Creature, CreatureCtx, Deadline, Dispatch, Envelope, Outcome};
-use agent_templated::{AuthoringError, AuthoringReply};
+use agent_templated::{decode_authoring_request, AuthoringError, AuthoringReply};
 use sha2::{Digest, Sha256};
 
 mod prompt;
@@ -119,12 +119,10 @@ impl Creature for AgentMind {
 
     fn handle(&mut self, env: Envelope) -> Outcome {
         // Decode on the drain thread; a malformed request is a synchronous Failed (no worker).
-        let req: agent_templated::AuthoringRequest = match serde_json::from_slice(&env.payload) {
+        let req = match decode_authoring_request(&env.payload) {
             Ok(r) => r,
             Err(e) => {
-                let reply = AuthoringReply::Failed(AuthoringError::Invalid {
-                    message: format!("malformed authoring request: {e}"),
-                });
+                let reply = AuthoringReply::Failed(e);
                 return Outcome::send(
                     Dispatch::reply_to_env(&env, reply.to_bytes())
                         .with_schema(AUTHORING_REPLY_SCHEMA),
@@ -436,6 +434,24 @@ mod tests {
         assert_eq!(out.dispatches.len(), 1, "malformed request answers synchronously");
         let reply: AuthoringReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
         assert!(matches!(reply, AuthoringReply::Failed(AuthoringError::Invalid { .. })));
+        agent.shutdown(Deadline::default());
+    }
+
+    #[test]
+    fn oversized_request_yields_synchronous_invalid_reply_without_worker() {
+        let mut agent = AgentMind::fake();
+        let bus = bind_with_mock(&mut agent);
+        let out = agent
+            .handle(request_env(vec![b'{'; agent_templated::MAX_AUTHORING_REQUEST_BYTES + 1], 2));
+        assert_eq!(out.dispatches.len(), 1, "oversized request answers synchronously");
+        let reply: AuthoringReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        match reply {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("too large"), "unexpected message: {message}");
+            }
+            other => panic!("expected Failed(Invalid), got {other:?}"),
+        }
+        assert!(mlock(&bus.sent).is_empty(), "oversized request must not start a worker");
         agent.shutdown(Deadline::default());
     }
 

@@ -63,6 +63,32 @@ pub struct AuthoringRequest {
 /// off the substrate's wire contract.
 pub const DRILL_PREFIX: &str = "[drill]";
 
+/// Maximum direct bus payload accepted for an [`AuthoringRequest`].
+///
+/// HTTP/control entry points already cap their bodies before they reach AUTHORING. This guard is
+/// for direct bus envelopes addressed to `Role::AUTHORING`, including model-backed or curious
+/// agents that consume this shared wire contract.
+pub const MAX_AUTHORING_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Decode an inbound authoring request with the substrate-wide request-size guard.
+///
+/// `agent-templated` owns the shared AUTHORING request/reply shapes, so the model-backed and
+/// curious authoring creatures call this helper rather than carrying private JSON limits.
+pub fn decode_authoring_request(payload: &[u8]) -> Result<AuthoringRequest, AuthoringError> {
+    if payload.len() > MAX_AUTHORING_REQUEST_BYTES {
+        return Err(AuthoringError::Invalid {
+            message: format!(
+                "authoring request payload too large: {} bytes exceeds {} byte limit",
+                payload.len(),
+                MAX_AUTHORING_REQUEST_BYTES
+            ),
+        });
+    }
+    serde_json::from_slice(payload).map_err(|e| AuthoringError::Invalid {
+        message: format!("malformed authoring request: {e}"),
+    })
+}
+
 /// What the agent emits when a template matches: enough to hand straight to the BUILD socket.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AuthoringResponse {
@@ -271,14 +297,12 @@ impl Creature for AgentTemplated {
     fn bind(&mut self, _ctx: CreatureCtx) {}
 
     fn handle(&mut self, env: Envelope) -> Outcome {
-        let reply = match serde_json::from_slice::<AuthoringRequest>(&env.payload) {
+        let reply = match decode_authoring_request(&env.payload) {
             Ok(req) => match self.author(&req) {
                 Ok(resp) => AuthoringReply::Authored(resp),
                 Err(e) => AuthoringReply::Failed(e),
             },
-            Err(e) => AuthoringReply::Failed(AuthoringError::Invalid {
-                message: format!("malformed authoring request: {e}"),
-            }),
+            Err(e) => AuthoringReply::Failed(e),
         };
         let payload = reply.to_bytes();
         Outcome::send(Dispatch::reply_to_env(&env, payload).with_schema("authoring.reply"))
@@ -415,12 +439,21 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+const MAX_URL_BYTES: usize = 8 * 1024;
+const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+
 #[derive(Default)]
 pub struct FetchUrlTitle;
 
 impl Creature for FetchUrlTitle {
     fn bind(&mut self, _ctx: CreatureCtx) {}
     fn handle(&mut self, env: Envelope) -> Outcome {
+        if env.payload.len() > MAX_URL_BYTES {
+            return Outcome::reply(
+                &env,
+                format!("<error: url too large: exceeds {} byte limit>", MAX_URL_BYTES).into_bytes(),
+            );
+        }
         let url = match std::str::from_utf8(&env.payload) {
             Ok(s) => s.trim().to_string(),
             Err(_) => return Outcome::reply(&env, b"<invalid utf8>".to_vec()),
@@ -445,7 +478,14 @@ fn fetch_title(url: &str) -> Result<String, String> {
     );
     stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let mut limited = stream.take(MAX_HTTP_RESPONSE_BYTES as u64 + 1);
+    limited.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > MAX_HTTP_RESPONSE_BYTES {
+        return Err(format!(
+            "response too large: exceeds {} byte limit",
+            MAX_HTTP_RESPONSE_BYTES
+        ));
+    }
     let s = String::from_utf8_lossy(&buf);
     let body_start = s.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     let body = &s[body_start..];
@@ -588,6 +628,21 @@ mod tests {
     }
 
     #[test]
+    fn fetch_url_title_template_caps_response_buffering() {
+        let r = AgentTemplated::new()
+            .author(&AuthoringRequest {
+                request: "fetch the title from a URL".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(r.source.contains("const MAX_HTTP_RESPONSE_BYTES"));
+        assert!(r.source.contains("stream.take(MAX_HTTP_RESPONSE_BYTES as u64 + 1)"));
+        assert!(r.source.contains("response too large"));
+        assert!(r.source.contains("const MAX_URL_BYTES"));
+        assert!(r.source.contains("url too large"));
+    }
+
+    #[test]
     fn unmatched_request_yields_no_template_error_not_panic() {
         let e = AgentTemplated::new()
             .author(&AuthoringRequest {
@@ -662,6 +717,35 @@ mod tests {
             matches!(r, AuthoringReply::Failed(AuthoringError::Invalid { .. })),
             "expected Invalid Failed reply, got {r:?}"
         );
+    }
+
+    #[test]
+    fn oversized_bus_request_yields_invalid_reply_before_json_parse() {
+        use aether::{Address, CreatureId, Header};
+        let mut a = AgentTemplated::new();
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::Creature(CreatureId(7)),
+                reply_to: None,
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: None,
+                commitment: None,
+                schema: "".into(),
+            },
+            payload: vec![b'{'; MAX_AUTHORING_REQUEST_BYTES + 1],
+        };
+        let out = a.handle(env);
+        let r: AuthoringReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        match r {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("too large"), "unexpected message: {message}");
+            }
+            other => panic!("expected Invalid Failed reply, got {other:?}"),
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────

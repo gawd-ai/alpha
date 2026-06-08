@@ -28,6 +28,8 @@
 //! off the kernel drain thread).
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "openai")]
+use std::io::Read;
 use std::time::Duration;
 
 /// A marker the prompt builder writes into the user prompt on a retry (when `prev_error` is set),
@@ -258,6 +260,13 @@ impl Model for SlowModel {
 // OpenAiModel — the real HTTP path (feature `openai`).
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
+/// Maximum successful HTTP response bytes read by the OpenAI-compatible model client.
+#[cfg(feature = "openai")]
+pub const MAX_OPENAI_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum non-2xx HTTP response body bytes retained in [`ModelError::Http`].
+#[cfg(feature = "openai")]
+pub const MAX_OPENAI_HTTP_ERROR_BODY_BYTES: usize = 4096;
+
 /// An OpenAI-compatible chat-completions model. Covers api.openai.com (TLS) and local
 /// OpenAI-compatible servers (Ollama / LM-Studio) — `Authorization: Bearer` is sent only when an
 /// API key is present, so a keyless local server works unchanged. Built from a [`ModelConfig`] the
@@ -314,13 +323,12 @@ impl Model for OpenAiModel {
         let resp = match request.send_string(&body) {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
-                let mut text = r.into_string().unwrap_or_default();
-                truncate_on_char_boundary(&mut text, 4096);
+                let text = read_error_body_bounded(r);
                 return Err(ModelError::Http { status: code, body: text });
             }
             Err(e) => return Err(ModelError::Transport(e.to_string())),
         };
-        let text = resp.into_string().map_err(|e| ModelError::Transport(e.to_string()))?;
+        let text = read_success_body_bounded(resp)?;
         let v: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| ModelError::Decode(e.to_string()))?;
         let content = v["choices"][0]["message"]["content"]
@@ -352,6 +360,48 @@ fn truncate_on_char_boundary(s: &mut String, max: usize) {
         cut -= 1;
     }
     s.truncate(cut);
+}
+
+#[cfg(feature = "openai")]
+fn read_body_bytes_bounded(
+    resp: ureq::Response,
+    max: usize,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
+    let mut bytes = Vec::new();
+    let mut reader = resp.into_reader().take(max as u64 + 1);
+    reader.read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > max;
+    if truncated {
+        bytes.truncate(max);
+    }
+    Ok((bytes, truncated))
+}
+
+#[cfg(feature = "openai")]
+fn read_success_body_bounded(resp: ureq::Response) -> Result<String, ModelError> {
+    let (bytes, truncated) = read_body_bytes_bounded(resp, MAX_OPENAI_HTTP_RESPONSE_BYTES)
+        .map_err(|e| ModelError::Transport(e.to_string()))?;
+    if truncated {
+        return Err(ModelError::Decode(format!(
+            "model response too large: exceeds {} byte limit",
+            MAX_OPENAI_HTTP_RESPONSE_BYTES
+        )));
+    }
+    String::from_utf8(bytes).map_err(|e| ModelError::Decode(e.to_string()))
+}
+
+#[cfg(feature = "openai")]
+fn read_error_body_bounded(resp: ureq::Response) -> String {
+    let Ok((bytes, truncated)) = read_body_bytes_bounded(resp, MAX_OPENAI_HTTP_ERROR_BODY_BYTES)
+    else {
+        return String::new();
+    };
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    truncate_on_char_boundary(&mut text, MAX_OPENAI_HTTP_ERROR_BODY_BYTES);
+    if truncated {
+        text.push_str("\n... (truncated)");
+    }
+    text
 }
 
 #[cfg(feature = "openai")]

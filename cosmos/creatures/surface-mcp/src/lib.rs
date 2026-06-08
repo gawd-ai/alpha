@@ -30,6 +30,13 @@ use serde_json::{json, Value};
 const SERVER_NAME: &str = "alpha-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2025-11-25";
+/// Bound one JSON-RPC input line. MCP requests are small JSON objects; a 1 MiB line is roomy for
+/// authoring prompts and prevents one hostile stdio peer from growing this process without bound.
+const MAX_JSON_RPC_LINE_BYTES: usize = 1024 * 1024;
+/// Bound in-flight control requests parked by the MCP bridge. The stdio loop is synchronous, but a
+/// bounded table keeps the surface robust if that bridge grows concurrent request handling later or
+/// stale replies accumulate under unusual host behavior.
+const MAX_PENDING_CONTROL_REQUESTS: usize = 256;
 
 /// Generous ceiling for a cold `author` (a real `cargo build`); everything else replies in ms.
 const AUTHOR_TIMEOUT: Duration = Duration::from_secs(400);
@@ -51,6 +58,20 @@ impl SurfaceState {
     }
     fn bus(&self) -> Option<Arc<dyn Bus>> {
         self.bus.lock().unwrap().clone()
+    }
+    fn register_pending(&self, corr: u64, tx: Sender<VerbResult>) -> Result<(), VerbResult> {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
+            return Err(surface_busy(pending.len()));
+        }
+        pending.insert(corr, tx);
+        Ok(())
+    }
+    fn take_pending(&self, corr: u64) -> Option<Sender<VerbResult>> {
+        self.pending.lock().unwrap().remove(&corr)
+    }
+    fn remove_pending(&self, corr: u64) {
+        self.pending.lock().unwrap().remove(&corr);
     }
 }
 
@@ -108,10 +129,10 @@ impl Creature for SurfaceMcp {
         // loop's request waiting on this corr.
         if env.header.schema == CONTROL_RESULT_SCHEMA {
             if let Some(corr) = env.header.corr {
-                if let Some(tx) = self.state.pending.lock().unwrap().remove(&corr) {
-                    if let Ok(res) = serde_json::from_slice::<VerbResult>(&env.payload) {
-                        let _ = tx.send(res);
-                    }
+                if let Some(tx) = self.state.take_pending(corr) {
+                    let res = omni::parse_control_result(&env.payload)
+                        .unwrap_or_else(omni::control_result_decode_failure);
+                    let _ = tx.send(res);
                 }
             }
         }
@@ -134,21 +155,32 @@ impl Creature for SurfaceMcp {
 fn run_stdio(state: Arc<SurfaceState>) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    let mut line = String::new();
     let mut reader = stdin.lock();
     loop {
         if state.stop.load(Ordering::Relaxed) {
             break;
         }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF — the host closed stdin
-            Ok(_) => {}
+        let line = match read_line_capped(&mut reader, MAX_JSON_RPC_LINE_BYTES) {
+            Ok(RpcLine::Eof) => break, // EOF — the host closed stdin
+            Ok(RpcLine::Line(line)) => line,
+            Ok(RpcLine::TooLong) => {
+                write_msg(
+                    &mut stdout,
+                    &error(
+                        Value::Null,
+                        -32700,
+                        &format!(
+                            "Parse error: JSON-RPC line exceeds {MAX_JSON_RPC_LINE_BYTES} bytes"
+                        ),
+                    ),
+                );
+                continue;
+            }
             Err(e) => {
                 eprintln!("surface-mcp: stdin read error: {e}");
                 break;
             }
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -187,6 +219,61 @@ fn run_stdio(state: Arc<SurfaceState>) {
         };
         write_msg(&mut stdout, &response);
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RpcLine {
+    Line(String),
+    Eof,
+    TooLong,
+}
+
+fn read_line_capped<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<RpcLine> {
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if out.is_empty() { Ok(RpcLine::Eof) } else { bytes_to_line(out) };
+        }
+
+        let newline = available.iter().position(|b| *b == b'\n');
+        let take = newline.map_or(available.len(), |i| i + 1);
+        let over_limit = out.len().saturating_add(take) > max;
+        if over_limit {
+            reader.consume(take);
+            if newline.is_none() {
+                drain_line(reader)?;
+            }
+            return Ok(RpcLine::TooLong);
+        }
+
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return bytes_to_line(out);
+        }
+    }
+}
+
+fn drain_line<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let take = newline.map_or(available.len(), |i| i + 1);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(());
+        }
+    }
+}
+
+fn bytes_to_line(bytes: Vec<u8>) -> std::io::Result<RpcLine> {
+    String::from_utf8(bytes)
+        .map(RpcLine::Line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 fn initialize_result(params: &Value) -> Value {
@@ -246,14 +333,16 @@ fn request_control(state: &SurfaceState, verb: Verb, timeout: Duration) -> VerbR
     };
     let corr = state.corr.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = channel::<VerbResult>();
-    state.pending.lock().unwrap().insert(corr, tx);
+    if let Err(res) = state.register_pending(corr, tx) {
+        return res;
+    }
     let payload = serde_json::to_vec(&verb).unwrap_or_default();
     let d = Dispatch::to(state.target.address(), payload)
         .with_schema(CONTROL_SCHEMA)
         .with_reply_to(Address::Creature(me))
         .with_corr(corr);
     if let Err(e) = bus.emit(d) {
-        state.pending.lock().unwrap().remove(&corr);
+        state.remove_pending(corr);
         return VerbResult::err(
             json!({ "error": "control-unreachable", "detail": e.to_string() }),
             format!("control plane unreachable: {e}"),
@@ -262,13 +351,26 @@ fn request_control(state: &SurfaceState, verb: Verb, timeout: Duration) -> VerbR
     match rx.recv_timeout(timeout) {
         Ok(res) => res,
         Err(_) => {
-            state.pending.lock().unwrap().remove(&corr);
+            state.remove_pending(corr);
             VerbResult::err(
                 json!({ "error": "control-timeout" }),
                 "control plane did not reply in time",
             )
         }
     }
+}
+
+fn surface_busy(pending: usize) -> VerbResult {
+    VerbResult::err(
+        json!({
+            "error": "surface-busy",
+            "pending": pending,
+            "limit": MAX_PENDING_CONTROL_REQUESTS,
+        }),
+        format!(
+            "MCP control surface busy: {pending} pending requests (limit {MAX_PENDING_CONTROL_REQUESTS})"
+        ),
+    )
 }
 
 // ---- the tool catalog + dispatch ---------------------------------------------------------------
@@ -578,4 +680,73 @@ fn uarg(args: &Value, key: &str) -> u64 {
 /// (the local Realm). Keeps the implicit-Realm path off the wire, matching the `Verb` field default.
 fn oarg_realm(args: &Value, key: &str) -> Option<RealmId> {
     args.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(RealmId::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    fn test_state() -> SurfaceState {
+        SurfaceState {
+            bus: Mutex::new(None),
+            me: Mutex::new(None),
+            corr: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            target: ControlTarget::Local,
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn capped_reader_accepts_normal_json_rpc_lines() {
+        let mut reader = Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n");
+        assert_eq!(
+            read_line_capped(&mut reader, MAX_JSON_RPC_LINE_BYTES).unwrap(),
+            RpcLine::Line("{\"jsonrpc\":\"2.0\",\"id\":1}\n".into())
+        );
+        assert_eq!(read_line_capped(&mut reader, MAX_JSON_RPC_LINE_BYTES).unwrap(), RpcLine::Eof);
+    }
+
+    #[test]
+    fn capped_reader_drains_oversized_lines_and_continues() {
+        let mut bytes = vec![b'a'; 17];
+        bytes.extend_from_slice(b"\n{\"id\":2}\n");
+        let mut reader = Cursor::new(bytes);
+
+        assert_eq!(read_line_capped(&mut reader, 16).unwrap(), RpcLine::TooLong);
+        assert_eq!(
+            read_line_capped(&mut reader, 16).unwrap(),
+            RpcLine::Line("{\"id\":2}\n".into())
+        );
+    }
+
+    #[test]
+    fn pending_control_requests_are_bounded() {
+        let st = test_state();
+        let mut receivers = Vec::new();
+
+        for corr in 0..MAX_PENDING_CONTROL_REQUESTS as u64 {
+            let (tx, rx) = channel();
+            st.register_pending(corr, tx).expect("under cap");
+            receivers.push(rx);
+        }
+
+        let (tx, _rx) = channel();
+        let err = st.register_pending(999_999, tx).expect_err("at cap refuses");
+        assert!(!err.ok);
+        assert_eq!(err.json["error"].as_str(), Some("surface-busy"));
+        assert_eq!(err.json["limit"].as_u64(), Some(MAX_PENDING_CONTROL_REQUESTS as u64));
+        assert_eq!(
+            st.pending.lock().unwrap().len(),
+            MAX_PENDING_CONTROL_REQUESTS,
+            "refused request is not parked"
+        );
+
+        assert!(st.take_pending(0).is_some(), "existing corr is removable");
+        let (tx, rx) = channel();
+        st.register_pending(999_999, tx).expect("space reopens after one is removed");
+        receivers.push(rx);
+    }
 }

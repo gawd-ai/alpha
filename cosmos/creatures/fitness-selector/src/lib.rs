@@ -28,6 +28,12 @@
 //!   [`RegistryOp::AttestFitness`] onto the local registry. Reply `Ticked { evaluated, promoted }`.
 //! - `StatusQuery` — read-only dump of the watch count, per-module observation summary, threshold.
 //!
+//! The per-module observation tally is capped by default
+//! ([`DEFAULT_MAX_OBSERVED_MODULES`]) so a spray of ever-new fitness ids cannot grow memory without
+//! bound. At capacity, observations for new modules are dropped while already-tracked modules keep
+//! accumulating; operators can set `with_max_obs(0)` when they explicitly want an unbounded replay
+//! or lab workload.
+//!
 //! **No automatic eviction.** A score *below* threshold simply isn't promoted — the selector never
 //! unloads, quarantines, or retires anything. Retiring the unfit is a *defense* signal (a different
 //! observation — budget breach, fault, leak), and that is the immune-response creature, bound to
@@ -80,9 +86,12 @@
 
 use std::collections::HashMap;
 
-use aether::{Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome, RealmId};
+use aether::{
+    Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome, RealmId,
+    MAX_SENSE_EVENT_BYTES,
+};
 use registry_mem::{RegistryOp, ReputationScore};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sigil::Ed25519KeyMaterial;
 
 /// Wire schema for the selector's own control ops + replies. Single schema + a `kind`-tagged enum,
@@ -101,6 +110,11 @@ pub const FITNESS_EVENT_SCHEMA: &str = "fitness";
 /// The registry op schema — what the selector writes its promotions under (matches the literal
 /// `registry-mem` reads on every op).
 const REGISTRY_OP_SCHEMA: &str = "registry.op";
+
+/// Default maximum number of distinct creature ids retained in the observation tally.
+///
+/// `0` is reserved as an explicit opt-out via [`FitnessSelector::with_max_obs`].
+pub const DEFAULT_MAX_OBSERVED_MODULES: usize = 4_096;
 
 // ===================================================================================================
 // Observations — the per-creature tally the injected scorer reads
@@ -172,6 +186,13 @@ pub trait FitnessScorer: Send + Sync {
 struct FitnessEvent {
     module: u64,
     ok: bool,
+}
+
+fn decode_sense_wire<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
+    if payload.len() > MAX_SENSE_EVENT_BYTES {
+        return None;
+    }
+    serde_json::from_slice(payload).ok()
 }
 
 // ===================================================================================================
@@ -268,7 +289,7 @@ pub struct FitnessSelector {
     /// Maximum number of distinct observed creatures tallied at once. A spray of fitness events for
     /// ever-new creature ids would otherwise grow `obs` without bound. At capacity an observation for
     /// a *new* creature is dropped (tallies for already-tracked creatures always update). **`0` means
-    /// unbounded** (the default; preserves prior behavior). Set via [`FitnessSelector::with_max_obs`].
+    /// unbounded** and must be selected explicitly via [`FitnessSelector::with_max_obs`].
     max_obs: usize,
 }
 
@@ -281,13 +302,15 @@ impl FitnessSelector {
             me: None,
             watch: HashMap::new(),
             obs: HashMap::new(),
-            max_obs: 0,
+            max_obs: DEFAULT_MAX_OBSERVED_MODULES,
         }
     }
 
-    /// Cap the number of distinct observed modules tracked (resilience guardrail; default `0` =
-    /// unbounded). At capacity an observation for a *new* module is dropped rather than growing the
-    /// tally map without bound; already-tracked modules keep accumulating.
+    /// Cap the number of distinct observed modules tracked.
+    ///
+    /// The default is [`DEFAULT_MAX_OBSERVED_MODULES`]. At capacity an observation for a *new* module
+    /// is dropped rather than growing the tally map without bound; already-tracked modules keep
+    /// accumulating. Pass `0` to opt out and make the tally map unbounded.
     pub fn with_max_obs(mut self, max_obs: usize) -> Self {
         self.max_obs = max_obs;
         self
@@ -327,6 +350,11 @@ impl FitnessSelector {
         self.obs.get(&module)
     }
 
+    /// How many distinct creature ids currently have observation tallies.
+    pub fn observation_count(&self) -> usize {
+        self.obs.len()
+    }
+
     fn me_id(&self) -> Option<CreatureId> {
         self.me
     }
@@ -353,7 +381,7 @@ impl FitnessSelector {
     // ----- fitness signal ingest ---------------------------------------------------------------
 
     fn on_fitness(&mut self, env: &Envelope) -> Outcome {
-        let Ok(ev) = serde_json::from_slice::<FitnessEvent>(&env.payload) else {
+        let Some(ev) = decode_sense_wire::<FitnessEvent>(&env.payload) else {
             return Outcome::none(); // R9: malformed event → drop, never panic.
         };
         let mid = CreatureId(ev.module);
@@ -657,6 +685,18 @@ mod tests {
             payload: b"{not json".to_vec(),
         };
         assert!(s.handle(env).dispatches.is_empty());
+    }
+
+    #[test]
+    fn oversized_fitness_event_is_dropped_before_json_decode() {
+        let mut s = selector(0xAA, 0.5);
+        let env = Envelope {
+            header: header(Address::Creature(ME), FITNESS_EVENT_SCHEMA, None),
+            payload: vec![b'{'; MAX_SENSE_EVENT_BYTES + 1],
+        };
+        let out = s.handle(env);
+        assert!(out.dispatches.is_empty(), "fitness ingest never replies");
+        assert!(s.observations(CreatureId(7)).is_none(), "oversized event is ignored");
     }
 
     // ----- Observe (latency + synthetic) ----
@@ -1028,7 +1068,7 @@ mod tests {
     fn max_obs_drops_observations_for_new_modules_at_capacity() {
         // Cap the tally map at 1 distinct module. The first observed module is tracked; a fitness
         // event for a *second* module is dropped (never panics — R9), but the already-tracked
-        // module keeps accumulating. `0` would be unbounded (the default).
+        // module keeps accumulating. `0` is the explicit unbounded opt-out.
         let mut s = selector(0x09, 0.5).with_max_obs(1);
         let _ = s.handle(fitness_env(10, true));
         assert!(s.observations(CreatureId(10)).is_some(), "first module tracked");
@@ -1042,5 +1082,34 @@ mod tests {
         let _ = s.handle(fitness_env(10, false));
         let o = s.observations(CreatureId(10)).expect("module 10 still tracked");
         assert_eq!(o.handled, 2, "tracked module keeps accumulating at capacity");
+    }
+
+    #[test]
+    fn default_max_obs_is_bounded_and_zero_opt_out_is_unbounded() {
+        let mut s = selector(0x0A, 0.5);
+        let base = 1_000u64;
+
+        for offset in 0..DEFAULT_MAX_OBSERVED_MODULES {
+            let _ = s.handle(fitness_env(base + offset as u64, true));
+        }
+        assert_eq!(s.observation_count(), DEFAULT_MAX_OBSERVED_MODULES);
+
+        let overflow = CreatureId(base + DEFAULT_MAX_OBSERVED_MODULES as u64);
+        let out = s.handle(fitness_env(overflow.0, true));
+        assert!(out.dispatches.is_empty(), "fitness ingest never replies");
+        assert!(s.observations(overflow).is_none(), "new module dropped at default capacity");
+        assert_eq!(s.observation_count(), DEFAULT_MAX_OBSERVED_MODULES);
+
+        let tracked = CreatureId(base);
+        let _ = s.handle(fitness_env(tracked.0, false));
+        let o = s.observations(tracked).expect("tracked module remains mutable at capacity");
+        assert_eq!(o.handled, 2);
+        assert_eq!(o.ok, 1);
+
+        let mut unbounded = selector(0x0B, 0.5).with_max_obs(0);
+        for offset in 0..=DEFAULT_MAX_OBSERVED_MODULES {
+            let _ = unbounded.handle(fitness_env(20_000 + offset as u64, true));
+        }
+        assert_eq!(unbounded.observation_count(), DEFAULT_MAX_OBSERVED_MODULES + 1);
     }
 }

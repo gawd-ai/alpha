@@ -4,15 +4,19 @@
 //! `run_verb` call. This is the dogfooding claim: a control command is just bus traffic.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use aether::{Address, Dispatch, Role, StubSigner, StubVerifier};
+use aether::{
+    Address, Creature, CreatureCtx, Dispatch, Envelope, Outcome, Role, StubSigner, StubVerifier,
+};
 use anima::{Artifact, NativeEngine, ScriptEngine, WasmEngine};
 use sanctum::Kernel;
 use sigil::{Backend, Capabilities, Manifest};
 
 use omni::{
-    boot_control, boot_organs_with_monitor, recv_corr, AiControl, Verb, VerbResult, CONTROL_SCHEMA,
+    boot_control, boot_organs_with_monitor, recv_corr, AiControl, Verb, VerbResult,
+    CONTROL_RESULT_SCHEMA, CONTROL_SCHEMA, CONTROL_WORKER_QUEUE_CAP, MAX_CONTROL_VERB_BYTES,
+    MAX_PRESENTED_PAYLOAD_BYTES,
 };
 
 /// Boot a live node with control bound on `Role::CONTROL`. Returns the kernel + the shared gate.
@@ -35,6 +39,16 @@ fn node(allow_ai: bool) -> (Arc<Kernel>, Arc<AiControl>) {
 fn control(kernel: &Kernel, corr: u64, verb: &Verb) -> VerbResult {
     let (probe_id, bus, rx) = kernel.open_endpoint(Capabilities::default());
     let payload = serde_json::to_vec(verb).unwrap();
+    control_payload(probe_id, &bus, &rx, corr, payload)
+}
+
+fn control_payload(
+    probe_id: aether::CreatureId,
+    bus: &aether::BusHandle,
+    rx: &aether::InboxReceiver,
+    corr: u64,
+    payload: Vec<u8>,
+) -> VerbResult {
     bus.send(
         Dispatch::to(Address::Role(Role::new(Role::CONTROL)), payload)
             .with_schema(CONTROL_SCHEMA)
@@ -42,8 +56,26 @@ fn control(kernel: &Kernel, corr: u64, verb: &Verb) -> VerbResult {
             .with_corr(corr),
     )
     .expect("control envelope routes to Role::CONTROL");
-    let reply = recv_corr(&rx, corr, Duration::from_secs(20)).expect("a VerbResult reply");
+    let reply = recv_corr(rx, corr, Duration::from_secs(20)).expect("a VerbResult reply");
     serde_json::from_slice::<VerbResult>(&reply.payload).expect("payload is a VerbResult")
+}
+
+struct NoReply;
+
+impl Creature for NoReply {
+    fn bind(&mut self, _ctx: CreatureCtx) {}
+    fn handle(&mut self, _env: Envelope) -> Outcome {
+        Outcome::none()
+    }
+}
+
+struct LargeReply;
+
+impl Creature for LargeReply {
+    fn bind(&mut self, _ctx: CreatureCtx) {}
+    fn handle(&mut self, env: Envelope) -> Outcome {
+        Outcome::reply(&env, vec![b'a'; MAX_PRESENTED_PAYLOAD_BYTES + 1])
+    }
 }
 
 #[test]
@@ -132,4 +164,96 @@ fn the_allow_ai_gate_holds_over_the_bus() {
     assert!(blocked.is_gate_block(), "refusal is the allow-ai gate: {:?}", blocked.json);
 
     kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
+fn oversized_control_verb_payload_is_rejected_before_json_parse() {
+    let (kernel, _ai) = node(true);
+    let (probe_id, bus, rx) = kernel.open_endpoint(Capabilities::default());
+    let payload = vec![b'{'; MAX_CONTROL_VERB_BYTES + 1];
+
+    let res = control_payload(probe_id, &bus, &rx, 77, payload);
+    assert!(!res.ok, "oversized control verb is refused");
+    assert_eq!(res.json.get("error").and_then(|v| v.as_str()), Some("control-verb-too-large"));
+    assert_eq!(res.json.get("limit").and_then(|v| v.as_u64()), Some(MAX_CONTROL_VERB_BYTES as u64));
+
+    let read = control(&kernel, 78, &Verb::Status);
+    assert!(read.ok, "node still answers after an oversized control verb");
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
+fn send_reply_payload_is_previewed_when_too_large_for_control_surface() {
+    let (kernel, _ai) = node(true);
+    let large = kernel
+        .load_instance(
+            Manifest::new("large-reply", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            Box::new(LargeReply),
+        )
+        .expect("large-reply creature loads");
+
+    let res = control(&kernel, 88, &Verb::Send { id: large.0, text: "small".into(), node: None });
+    assert!(res.ok, "send ok: {:?}", res.json);
+    let reply = res.json.get("reply").and_then(|v| v.as_str()).expect("reply preview");
+    assert_eq!(reply.len(), MAX_PRESENTED_PAYLOAD_BYTES);
+    assert_eq!(
+        res.json.get("reply_bytes").and_then(|v| v.as_u64()),
+        Some((MAX_PRESENTED_PAYLOAD_BYTES + 1) as u64)
+    );
+    assert_eq!(res.json.get("reply_truncated").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        res.json.get("reply_limit").and_then(|v| v.as_u64()),
+        Some(MAX_PRESENTED_PAYLOAD_BYTES as u64)
+    );
+    assert!(res.human.contains("truncated"), "human output names truncation: {}", res.human);
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
+fn control_worker_queue_is_bounded_when_a_job_blocks() {
+    let (kernel, _ai) = node(true);
+    let blackhole = kernel
+        .load_instance(
+            Manifest::new("no-reply", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            Box::new(NoReply),
+        )
+        .expect("no-reply creature loads");
+
+    let (probe_id, bus, rx) = kernel.open_endpoint(Capabilities::default());
+    let payload =
+        serde_json::to_vec(&Verb::Send { id: blackhole.0, text: "blocked".into(), node: None })
+            .unwrap();
+    let first_corr = 1_000;
+    for offset in 0..(CONTROL_WORKER_QUEUE_CAP as u64 + 8) {
+        bus.send(
+            Dispatch::to(Address::Role(Role::new(Role::CONTROL)), payload.clone())
+                .with_schema(CONTROL_SCHEMA)
+                .with_reply_to(Address::Creature(probe_id))
+                .with_corr(first_corr + offset),
+        )
+        .expect("control envelope routes to Role::CONTROL");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut saw_busy = false;
+    while Instant::now() < deadline {
+        let Ok(env) = rx.recv_timeout(Duration::from_millis(50)) else { continue };
+        if env.header.schema != CONTROL_RESULT_SCHEMA {
+            continue;
+        }
+        let res: VerbResult = serde_json::from_slice(&env.payload).expect("control result");
+        if res.json.get("error").and_then(|v| v.as_str()) == Some("control-worker-busy") {
+            saw_busy = true;
+            assert_eq!(
+                res.json.get("queue_cap").and_then(|v| v.as_u64()),
+                Some(CONTROL_WORKER_QUEUE_CAP as u64)
+            );
+            break;
+        }
+    }
+    assert!(saw_busy, "a blocked worker sheds excess jobs instead of growing the queue");
+
+    kernel.shutdown_all(aether::Deadline::from_millis(3_000));
 }

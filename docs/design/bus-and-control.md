@@ -159,6 +159,11 @@ pub struct SeerEnvelope { topic: SeerTopic, corr: u64, kind: SeerKind }
 thread so a creature with several outstanding queries matches each answer to the
 right one.
 
+Live SEER consumers parse with `SeerEnvelope::parse_bounded`, capped by default at
+1 MiB (`seer::MAX_SEER_ENVELOPE_BYTES`), before decoding the opaque JSON body.
+That keeps high-volume consult/sense traffic inside the hostile-input floor
+without adding a router-level topic table.
+
 **Reserved topics.** `Authoring` (the curiosity seam) and `Placement` (the
 distributor consult) have live consumers; `Consensus` carries signed reputation
 deltas for cross-Realm federation. `Policy`, `Budget`, `Fitness`, and `Curation`
@@ -260,12 +265,18 @@ publish` reads a manifest and an artifact **from node-local paths** (the same
 operator caveat as `load`: these are files on the node, not a client upload),
 parses and ships them as a `RegistryOp::Publish`; `registry fetch` returns the
 entry's *metadata* (name, version, content address, artifact length) rather than
-inlining the bytes; `registry list` enumerates a Realm's catalogue. Each carries
-an optional `realm` (omitted → the local Realm). `bestiary prove` rides the
-additive `bestiary.op` schema and asks for a verifiable `EntryProof` — only a
-durable `bestiary-daemon` answers it; the in-memory stub returns a structured
-error. `registry publish` is the only mutating one of the four and is gated like
-every other mutation; the three reads are not.
+inlining the bytes, using the byte-light `RegistryOp::FetchMetadata` /
+`FetchMetadataInRealm` path; `registry list` enumerates a Realm's catalogue via
+the byte-light `RegistryOp::ListMetadata` path. Full `RegistryOp::ListEntries`
+remains the anti-entropy wire for federation pulls because it intentionally
+carries artifact bytes. The control core therefore parses `registry fetch` and
+`registry list` replies under metadata-sized caps; only artifact-producing build
+and anti-entropy paths use artifact-sized caps. Each carries an optional `realm`
+(omitted → the local Realm). `bestiary prove` rides the additive `bestiary.op`
+schema and asks for a verifiable `EntryProof` — only a durable `bestiary-daemon`
+answers it; the in-memory stub returns a structured error. `registry publish` is
+the only mutating one of the four and is gated like every other mutation; the
+three reads are not.
 
 ### Remote control is free
 
@@ -315,9 +326,15 @@ constant time; `GET /api/ws` is authenticated by `?token=` because a browser
 WebSocket upgrade cannot set an `Authorization` header. The WebSocket streams the
 high-volume sense topics — PROPRIOCEPTION, FITNESS, SEER — through a **separate,
 drain-less** sense endpoint kept off the surface's own inbox, so a fitness burst
-can never shed a control reply under backpressure. The surface holds no kernel:
+can never shed a control reply under backpressure. (Separately — and not a surface
+property — the sense-topic *consumer creatures* such as `immune-response`,
+`monitor`, and `fitness-selector` cap their own JSON parsing at 1 MiB
+(`aether::MAX_SENSE_EVENT_BYTES`) before decoding a topic body.) The surface holds no kernel:
 every verb, including reads, is a `Role::CONTROL` round-trip, answered inline by
-the co-located `ControlCore`.
+the co-located `ControlCore`. Its pending `corr → oneshot` table is bounded too:
+if too many HTTP requests are already waiting on control replies, the surface
+returns `503` with `surface-busy` instead of allocating another parked request
+until a timeout drains.
 
 ### surface-mcp and the MCP control-hub
 
@@ -326,7 +343,9 @@ in the GAWD fabric, in an MCP control-hub profile — `alpha mcp`. There is no s
 process: the `surface-mcp` creature owns the process stdin/stdout directly,
 terminates newline-delimited JSON-RPC 2.0 (tools-only, protocol `2025-11-25`),
 and turns each tool call into a `Verb` envelope on the node's own bus. The MCP
-server *is* a bus citizen, not an HTTP client.
+server *is* a bus citizen, not an HTTP client. Like the HTTP surface, it bounds
+its parked `corr → reply` table and returns a structured `surface-busy` result
+inside the tool response instead of allocating unbounded waiters.
 
 The server id is `alpha-mcp` and the tool verbs are `alpha_*` —
 `alpha_status` / `alpha_list` / `alpha_journal` / `alpha_watch` /

@@ -45,6 +45,20 @@ pub struct Entry {
     pub quarantine: Option<QuarantineNotice>,
 }
 
+/// A byte-light catalog row for operator/control listing. It carries the same identity and signals
+/// as [`SyncEntry`] but deliberately omits artifact bytes; federation pulls still use
+/// [`SyncEntry`] so anti-entropy remains self-contained.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub artifact_hash: String,
+    pub realm: RealmId,
+    pub manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reputation: Option<ReputationScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine: Option<QuarantineNotice>,
+}
+
 /// An aggregated fitness/reputation signal on an artifact. A *signal*, not a gate —
 /// admission policy decides how much to credit it; the substrate enforces nothing (T7 / IoC). The
 /// `attesting_realm` records which Realm's observation produced this score, so a receiver can apply
@@ -168,9 +182,10 @@ pub struct SyncEntry {
 ///
 /// ### Two variant families
 ///
-/// **Realm-implicit variants** (`Publish` / `Fetch`) carry no Realm and operate in the `"local"`
-/// Realm. **Realm-explicit variants** (`PublishInRealm` / `FetchInRealm`) add the Realm grain
-/// explicitly. A Realm-aware caller picks the explicit variant; the wire `"op"` tag disambiguates.
+/// **Realm-implicit variants** (`Publish` / `Fetch` / `FetchMetadata`) carry no Realm and operate
+/// in the `"local"` Realm. **Realm-explicit variants** (`PublishInRealm` / `FetchInRealm` /
+/// `FetchMetadataInRealm`) add the Realm grain explicitly. A Realm-aware caller picks the explicit
+/// variant; the wire `"op"` tag disambiguates.
 ///
 /// Splitting into separate variants (rather than adding an optional field) is the choice that
 /// honors the "zero retrofits" rule. Adding a field to a struct variant breaks every Rust struct
@@ -193,6 +208,13 @@ pub enum RegistryOp {
         /// module's docs.
         artifact_hash: String,
     },
+    /// Looks in [`RealmId::local()`] and returns only catalog metadata plus artifact length. Unlike
+    /// [`Fetch`](Self::Fetch), this never returns artifact bytes; it is the control/operator lookup
+    /// path.
+    FetchMetadata {
+        /// `sha256(artifact_bytes)` hex — the registry's content-address key.
+        artifact_hash: String,
+    },
     /// Publish into a named Realm. Two creatures with identical artifact bytes in
     /// different Realms are stored under distinct `(realm, artifact_hash)` keys and do not
     /// collide.
@@ -205,6 +227,10 @@ pub enum RegistryOp {
     /// Fetch from a named Realm — returns [`RegistryReply::NotFound`] if the
     /// `(realm, artifact_hash)` key is absent, even if the same hash exists in another Realm.
     FetchInRealm { artifact_hash: String, realm: RealmId },
+    /// Fetch metadata from a named Realm — returns [`RegistryReply::NotFound`] if the
+    /// `(realm, artifact_hash)` key is absent. Unlike [`FetchInRealm`](Self::FetchInRealm), this
+    /// never returns artifact bytes.
+    FetchMetadataInRealm { artifact_hash: String, realm: RealmId },
     /// Attach/replace a reputation score on an existing `(realm, artifact_hash)`
     /// entry. Reply: [`RegistryReply::Attested`] on success, [`RegistryReply::NotFound`] if the
     /// entry is absent (attest the artifact you hold; the federator publishes first, then attests).
@@ -240,14 +266,21 @@ pub enum RegistryOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         realm: Option<RealmId>,
     },
+    /// Read-only byte-light catalog metadata for operator/control listing. Unlike
+    /// [`ListEntries`](Self::ListEntries), this does not carry artifact bytes and is not sufficient
+    /// for anti-entropy merge. Reply: [`RegistryReply::Metadata`].
+    ListMetadata {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        realm: Option<RealmId>,
+    },
 }
 
 /// What the registry sends back. Envelope payload = `serde_json::to_vec(&RegistryReply)`.
 ///
-/// The Realm-implicit reply variants (`Published` / `Fetched`) pair with the Realm-implicit ops;
-/// `PublishedInRealm` / `FetchedInRealm` pair with the Realm-explicit ops. The handler responds
-/// with whichever variant matches the op it received — a Realm-implicit request gets a
-/// Realm-implicit reply, by construction.
+/// The Realm-implicit reply variants (`Published` / `Fetched`) pair with the Realm-implicit full
+/// artifact ops; `PublishedInRealm` / `FetchedInRealm` pair with the Realm-explicit full artifact
+/// ops. Metadata fetch uses [`RegistryReply::FetchedMetadata`] for both implicit and explicit ops
+/// because the embedded [`CatalogEntry`] carries the resolved Realm.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum RegistryReply {
@@ -276,6 +309,11 @@ pub enum RegistryReply {
         artifact: Vec<u8>,
         realm: RealmId,
     },
+    /// Reply to [`RegistryOp::FetchMetadata`] / [`RegistryOp::FetchMetadataInRealm`].
+    FetchedMetadata {
+        entry: CatalogEntry,
+        artifact_len: usize,
+    },
     /// Reply to [`RegistryOp::AttestFitness`] — echoes the key the score landed on.
     Attested {
         artifact_hash: String,
@@ -289,6 +327,10 @@ pub enum RegistryReply {
     /// Reply to [`RegistryOp::ListEntries`] — the catalog snapshot the puller merges.
     Entries {
         entries: Vec<SyncEntry>,
+    },
+    /// Reply to [`RegistryOp::ListMetadata`] — a byte-light catalog snapshot for control surfaces.
+    Metadata {
+        entries: Vec<CatalogEntry>,
     },
     NotFound,
     Error {
@@ -389,6 +431,24 @@ mod tests {
         assert!(!json.contains("attesting_realm"), "None attesting_realm elides");
         assert!(!json.contains("signed_by"), "None signed_by elides");
         assert!(!json.contains("signature"), "None signature elides");
+
+        let metadata = RegistryOp::ListMetadata { realm: Some(RealmId::new("crew")) };
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains("\"op\":\"list_metadata\""));
+        assert!(json.contains("\"realm\":\"crew\""));
+
+        let fetch_metadata = RegistryOp::FetchMetadata { artifact_hash: "h".into() };
+        let json = serde_json::to_string(&fetch_metadata).unwrap();
+        assert!(json.contains("\"op\":\"fetch_metadata\""));
+        assert!(!json.contains("\"realm\""), "implicit metadata fetch has no Realm field");
+
+        let fetch_metadata_in_realm = RegistryOp::FetchMetadataInRealm {
+            artifact_hash: "h".into(),
+            realm: RealmId::new("crew"),
+        };
+        let json = serde_json::to_string(&fetch_metadata_in_realm).unwrap();
+        assert!(json.contains("\"op\":\"fetch_metadata_in_realm\""));
+        assert!(json.contains("\"realm\":\"crew\""));
     }
 
     /// **`SyncEntry` round-trips** with the hex-encoded artifact bytes and elided absent signals.
@@ -409,5 +469,20 @@ mod tests {
         let back: SyncEntry = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.artifact, b"some-bytes");
         assert_eq!(back.realm, RealmId::new("crew"));
+    }
+
+    #[test]
+    fn catalog_entry_omits_artifact_bytes_for_metadata_listing() {
+        let entry = CatalogEntry {
+            artifact_hash: "abcd".into(),
+            realm: RealmId::new("crew"),
+            manifest: manifest("x"),
+            reputation: None,
+            quarantine: None,
+        };
+        let reply = RegistryReply::Metadata { entries: vec![entry] };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(json.contains("\"reply\":\"metadata\""));
+        assert!(!json.contains("\"artifact\":"), "metadata listing must not carry artifact bytes");
     }
 }

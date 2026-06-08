@@ -44,9 +44,11 @@ use aether::{
     Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, NodeId, Outcome,
 };
 use bestiary::{
-    BestiaryOp, BestiaryReply, BestiaryStore, CurationContext, Curator, QuarantineNotice,
-    RegistryOp, RegistryReply, ReputationScore, BESTIARY_OP_SCHEMA, BESTIARY_REPLY_SCHEMA,
-    REGISTRY_REPLY_SCHEMA,
+    bestiary_op_too_large_message, registry_artifact_too_large_message,
+    registry_op_too_large_message, BestiaryOp, BestiaryReply, BestiaryStore, CurationContext,
+    Curator, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, BESTIARY_OP_SCHEMA,
+    BESTIARY_REPLY_SCHEMA, MAX_BESTIARY_OP_BYTES, MAX_REGISTRY_ARTIFACT_BYTES,
+    MAX_REGISTRY_OP_BYTES, REGISTRY_REPLY_SCHEMA,
 };
 use sigil::RealmId;
 
@@ -71,6 +73,12 @@ pub struct BestiaryConfig {
     pub compaction_interval: Duration,
     /// Peers to replicate to.
     pub replication_peers: Vec<ReplicationPeer>,
+    /// Maximum serialized `registry.op` bytes decoded by this daemon. `0` means unbounded.
+    pub max_registry_op_bytes: usize,
+    /// Maximum serialized `bestiary.op` bytes decoded by this daemon. `0` means unbounded.
+    pub max_bestiary_op_bytes: usize,
+    /// Maximum artifact bytes retained per registry publish or pushed entry. `0` means unbounded.
+    pub max_artifact_bytes: usize,
 }
 
 impl BestiaryConfig {
@@ -80,6 +88,9 @@ impl BestiaryConfig {
             anti_entropy_interval: Duration::ZERO,
             compaction_interval: Duration::ZERO,
             replication_peers: Vec::new(),
+            max_registry_op_bytes: MAX_REGISTRY_OP_BYTES,
+            max_bestiary_op_bytes: MAX_BESTIARY_OP_BYTES,
+            max_artifact_bytes: MAX_REGISTRY_ARTIFACT_BYTES,
         }
     }
 }
@@ -123,81 +134,120 @@ impl BestiaryDaemon {
     // ---- registry.op (byte-identical to registry-mem) ----
 
     fn serve_registry(&mut self, env: &Envelope) -> Outcome {
-        let reply = match serde_json::from_slice::<RegistryOp>(&env.payload) {
-            Ok(RegistryOp::Publish { manifest, artifact }) => {
-                match self.store.put(&RealmId::local(), manifest, artifact) {
-                    Ok(artifact_hash) => RegistryReply::Published { artifact_hash },
-                    Err(e) => RegistryReply::Error { message: e.to_string() },
+        let reply = if self.cfg.max_registry_op_bytes != 0
+            && env.payload.len() > self.cfg.max_registry_op_bytes
+        {
+            let message =
+                registry_op_too_large_message(env.payload.len(), self.cfg.max_registry_op_bytes);
+            eprintln!(
+                "bestiary-daemon: rejected an oversized registry op from {:?} (corr={:?}): {message}",
+                env.header.from, env.header.corr
+            );
+            RegistryReply::Error { message }
+        } else {
+            match serde_json::from_slice::<RegistryOp>(&env.payload) {
+                Ok(RegistryOp::Publish { manifest, artifact }) => {
+                    if let Some(message) = self.artifact_too_large(artifact.len()) {
+                        RegistryReply::Error { message }
+                    } else {
+                        match self.store.put(&RealmId::local(), manifest, artifact) {
+                            Ok(artifact_hash) => RegistryReply::Published { artifact_hash },
+                            Err(e) => RegistryReply::Error { message: e.to_string() },
+                        }
+                    }
                 }
-            }
-            Ok(RegistryOp::Fetch { artifact_hash }) => {
-                self.fetched(&RealmId::local(), &artifact_hash, false)
-            }
-            Ok(RegistryOp::PublishInRealm { manifest, artifact, realm }) => {
-                match self.store.put(&realm, manifest, artifact) {
-                    Ok(artifact_hash) => RegistryReply::PublishedInRealm { artifact_hash, realm },
-                    Err(e) => RegistryReply::Error { message: e.to_string() },
+                Ok(RegistryOp::Fetch { artifact_hash }) => {
+                    self.fetched(&RealmId::local(), &artifact_hash)
                 }
-            }
-            Ok(RegistryOp::FetchInRealm { artifact_hash, realm }) => {
-                let r = realm.clone();
-                match self.store.get(&realm, &artifact_hash) {
-                    Ok(Some(entry)) => RegistryReply::FetchedInRealm {
-                        manifest: entry.manifest,
-                        artifact: entry.artifact,
-                        realm: r,
-                    },
-                    Ok(None) => RegistryReply::NotFound,
-                    Err(e) => RegistryReply::Error { message: e.to_string() },
+                Ok(RegistryOp::FetchMetadata { artifact_hash }) => {
+                    self.fetched_metadata(&RealmId::local(), &artifact_hash)
                 }
-            }
-            Ok(RegistryOp::AttestFitness {
-                artifact_hash,
-                realm,
-                score,
-                attesting_realm,
-                signed_by,
-                signature,
-            }) => {
-                let rep = ReputationScore { score, attesting_realm, signed_by, signature };
-                match self.store.attest(&realm, &artifact_hash, rep) {
-                    Ok(true) => RegistryReply::Attested { artifact_hash, realm },
-                    Ok(false) => {
-                        eprintln!(
+                Ok(RegistryOp::PublishInRealm { manifest, artifact, realm }) => {
+                    if let Some(message) = self.artifact_too_large(artifact.len()) {
+                        RegistryReply::Error { message }
+                    } else {
+                        match self.store.put(&realm, manifest, artifact) {
+                            Ok(artifact_hash) => {
+                                RegistryReply::PublishedInRealm { artifact_hash, realm }
+                            }
+                            Err(e) => RegistryReply::Error { message: e.to_string() },
+                        }
+                    }
+                }
+                Ok(RegistryOp::FetchInRealm { artifact_hash, realm }) => {
+                    let r = realm.clone();
+                    match self.store.get(&realm, &artifact_hash) {
+                        Ok(Some(entry)) => RegistryReply::FetchedInRealm {
+                            manifest: entry.manifest,
+                            artifact: entry.artifact,
+                            realm: r,
+                        },
+                        Ok(None) => RegistryReply::NotFound,
+                        Err(e) => RegistryReply::Error { message: e.to_string() },
+                    }
+                }
+                Ok(RegistryOp::FetchMetadataInRealm { artifact_hash, realm }) => {
+                    self.fetched_metadata(&realm, &artifact_hash)
+                }
+                Ok(RegistryOp::AttestFitness {
+                    artifact_hash,
+                    realm,
+                    score,
+                    attesting_realm,
+                    signed_by,
+                    signature,
+                }) => {
+                    let rep = ReputationScore { score, attesting_realm, signed_by, signature };
+                    match self.store.attest(&realm, &artifact_hash, rep) {
+                        Ok(true) => RegistryReply::Attested { artifact_hash, realm },
+                        Ok(false) => {
+                            eprintln!(
                             "bestiary-daemon: AttestFitness dropped — no entry for {artifact_hash} in realm {}",
                             realm.0
                         );
-                        RegistryReply::NotFound
+                            RegistryReply::NotFound
+                        }
+                        Err(e) => RegistryReply::Error { message: e.to_string() },
                     }
-                    Err(e) => RegistryReply::Error { message: e.to_string() },
                 }
-            }
-            Ok(RegistryOp::MarkQuarantine { artifact_hash, realm, reason, attesting_peers }) => {
-                let notice = QuarantineNotice { reason, attesting_peers };
-                match self.store.quarantine(&realm, &artifact_hash, notice) {
-                    Ok(true) => RegistryReply::Quarantined { artifact_hash, realm },
-                    Ok(false) => {
-                        eprintln!(
+                Ok(RegistryOp::MarkQuarantine {
+                    artifact_hash,
+                    realm,
+                    reason,
+                    attesting_peers,
+                }) => {
+                    let notice = QuarantineNotice { reason, attesting_peers };
+                    match self.store.quarantine(&realm, &artifact_hash, notice) {
+                        Ok(true) => RegistryReply::Quarantined { artifact_hash, realm },
+                        Ok(false) => {
+                            eprintln!(
                             "bestiary-daemon: MarkQuarantine dropped — no entry for {artifact_hash} in realm {}",
                             realm.0
                         );
-                        RegistryReply::NotFound
+                            RegistryReply::NotFound
+                        }
+                        Err(e) => RegistryReply::Error { message: e.to_string() },
                     }
-                    Err(e) => RegistryReply::Error { message: e.to_string() },
                 }
-            }
-            Ok(RegistryOp::ListEntries { realm }) => match self.store.list(realm.as_ref()) {
-                Ok(entries) => RegistryReply::Entries { entries },
-                Err(e) => RegistryReply::Error { message: e.to_string() },
-            },
-            Err(e) => {
-                eprintln!(
+                Ok(RegistryOp::ListEntries { realm }) => match self.store.list(realm.as_ref()) {
+                    Ok(entries) => RegistryReply::Entries { entries },
+                    Err(e) => RegistryReply::Error { message: e.to_string() },
+                },
+                Ok(RegistryOp::ListMetadata { realm }) => {
+                    match self.store.list_metadata(realm.as_ref()) {
+                        Ok(entries) => RegistryReply::Metadata { entries },
+                        Err(e) => RegistryReply::Error { message: e.to_string() },
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
                     "bestiary-daemon: rejected a malformed registry op from {:?} (corr={:?}, {} bytes): {e}",
                     env.header.from,
                     env.header.corr,
                     env.payload.len()
                 );
-                RegistryReply::Error { message: format!("malformed registry op: {e}") }
+                    RegistryReply::Error { message: format!("malformed registry op: {e}") }
+                }
             }
         };
         Outcome::send(
@@ -205,7 +255,15 @@ impl BestiaryDaemon {
         )
     }
 
-    fn fetched(&self, realm: &RealmId, artifact_hash: &str, _in_realm: bool) -> RegistryReply {
+    fn artifact_too_large(&self, len: usize) -> Option<String> {
+        if self.cfg.max_artifact_bytes != 0 && len > self.cfg.max_artifact_bytes {
+            Some(registry_artifact_too_large_message(len, self.cfg.max_artifact_bytes))
+        } else {
+            None
+        }
+    }
+
+    fn fetched(&self, realm: &RealmId, artifact_hash: &str) -> RegistryReply {
         match self.store.get(realm, artifact_hash) {
             Ok(Some(entry)) => {
                 RegistryReply::Fetched { manifest: entry.manifest, artifact: entry.artifact }
@@ -215,44 +273,73 @@ impl BestiaryDaemon {
         }
     }
 
+    fn fetched_metadata(&self, realm: &RealmId, artifact_hash: &str) -> RegistryReply {
+        match self.store.get_metadata(realm, artifact_hash) {
+            Ok(Some((entry, artifact_len))) => {
+                RegistryReply::FetchedMetadata { entry, artifact_len }
+            }
+            Ok(None) => RegistryReply::NotFound,
+            Err(e) => RegistryReply::Error { message: e.to_string() },
+        }
+    }
+
     // ---- bestiary.op (the additive durable-Bestiary surface) ----
 
     fn serve_bestiary(&mut self, env: &Envelope) -> Outcome {
-        let reply = match serde_json::from_slice::<BestiaryOp>(&env.payload) {
-            Ok(BestiaryOp::ProveEntry { artifact_hash, realm }) => {
-                match self.store.prove(&realm, &artifact_hash) {
-                    Ok(Some(proof)) => BestiaryReply::EntryProof { proof },
-                    Ok(None) => BestiaryReply::NotFound,
-                    Err(e) => BestiaryReply::Error { message: e.to_string() },
-                }
-            }
-            Ok(BestiaryOp::Compact) => {
-                // Uses the curator's `decide` (fast / cache / deterministic) — the model-call
-                // `observe` pass runs only on the off-drain worker, never here on the drain thread.
-                match self.store.compact(&*self.curator) {
-                    Ok(s) => BestiaryReply::Compacted {
-                        scanned: s.scanned,
-                        gc: s.gc,
-                        quarantined: s.quarantined,
-                        blobs_removed: s.blobs_removed,
-                    },
-                    Err(e) => BestiaryReply::Error { message: e.to_string() },
-                }
-            }
-            Ok(BestiaryOp::PushEntries { entries }) => {
-                let (mut accepted, mut rejected) = (0usize, 0usize);
-                for entry in entries {
-                    match self.store.merge_push(entry) {
-                        Ok(_) => accepted += 1,
-                        Err(e) => {
-                            rejected += 1;
-                            eprintln!("bestiary-daemon: rejected a pushed entry: {e}");
-                        }
+        let reply = if self.cfg.max_bestiary_op_bytes != 0
+            && env.payload.len() > self.cfg.max_bestiary_op_bytes
+        {
+            let message =
+                bestiary_op_too_large_message(env.payload.len(), self.cfg.max_bestiary_op_bytes);
+            eprintln!(
+                "bestiary-daemon: rejected an oversized bestiary op from {:?} (corr={:?}): {message}",
+                env.header.from, env.header.corr
+            );
+            BestiaryReply::Error { message }
+        } else {
+            match serde_json::from_slice::<BestiaryOp>(&env.payload) {
+                Ok(BestiaryOp::ProveEntry { artifact_hash, realm }) => {
+                    match self.store.prove(&realm, &artifact_hash) {
+                        Ok(Some(proof)) => BestiaryReply::EntryProof { proof },
+                        Ok(None) => BestiaryReply::NotFound,
+                        Err(e) => BestiaryReply::Error { message: e.to_string() },
                     }
                 }
-                BestiaryReply::PushAck { accepted, rejected }
+                Ok(BestiaryOp::Compact) => {
+                    // Uses the curator's `decide` (fast / cache / deterministic) — the model-call
+                    // `observe` pass runs only on the off-drain worker, never here on the drain thread.
+                    match self.store.compact(&*self.curator) {
+                        Ok(s) => BestiaryReply::Compacted {
+                            scanned: s.scanned,
+                            gc: s.gc,
+                            quarantined: s.quarantined,
+                            blobs_removed: s.blobs_removed,
+                        },
+                        Err(e) => BestiaryReply::Error { message: e.to_string() },
+                    }
+                }
+                Ok(BestiaryOp::PushEntries { entries }) => {
+                    let (mut accepted, mut rejected) = (0usize, 0usize);
+                    for entry in entries {
+                        if let Some(sync) = &entry.sync {
+                            if let Some(message) = self.artifact_too_large(sync.artifact.len()) {
+                                rejected += 1;
+                                eprintln!("bestiary-daemon: rejected a pushed entry: {message}");
+                                continue;
+                            }
+                        }
+                        match self.store.merge_push(entry) {
+                            Ok(_) => accepted += 1,
+                            Err(e) => {
+                                rejected += 1;
+                                eprintln!("bestiary-daemon: rejected a pushed entry: {e}");
+                            }
+                        }
+                    }
+                    BestiaryReply::PushAck { accepted, rejected }
+                }
+                Err(e) => BestiaryReply::Error { message: format!("malformed bestiary op: {e}") },
             }
-            Err(e) => BestiaryReply::Error { message: format!("malformed bestiary op: {e}") },
         };
         Outcome::send(
             Dispatch::reply_to_env(env, reply.to_bytes()).with_schema(BESTIARY_REPLY_SCHEMA),

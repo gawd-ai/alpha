@@ -37,6 +37,12 @@
 //! who cares treats a non-reveal within a deadline as a forfeit (or a reputation penalty) so abort
 //! isn't free. The die binds the *value*; it does not bind *liveness*.
 //!
+//! **Resource floor.** Each committed-but-unrevealed round holds one hidden seed. The reference die
+//! caps that pending table by default so a requester cannot park unbounded rounds; operators can set
+//! the cap to `0` only when they intentionally want an unbounded lab/demo posture. The commit/reveal
+//! control message itself is also capped before JSON decode so a pathological `nonce` cannot force
+//! unbounded allocation.
+//!
 //! ## Fabric ships the slot; the model is injected (IoC)
 //!
 //! The substrate ships the `commitment` field + this *socket*; it ships **no** randomness model. The
@@ -57,6 +63,11 @@ use sha2::{Digest, Sha256};
 /// Wire schema for the die's commit/reveal control plane + replies. Single `kind`-tagged enum, same
 /// convention as the other creatures.
 pub const SCHEMA: &str = "verifiable.die";
+/// Maximum serialized commit/reveal message bytes accepted before JSON decode.
+pub const MAX_DIE_MESSAGE_BYTES: usize = 64 * 1024;
+/// Default cap for committed-but-unrevealed rounds. `0` in [`VerifiableDie::with_max_pending_rounds`]
+/// means unbounded.
+pub const DEFAULT_MAX_PENDING_ROUNDS: usize = 1024;
 
 // ===================================================================================================
 // Injected entropy (IoC) — substrate ships no randomness source
@@ -192,11 +203,24 @@ pub struct VerifiableDie {
     me: Option<CreatureId>,
     /// `round → (committed seed, option count)`. Held between commit and reveal.
     pending: HashMap<u64, ([u8; 32], u32)>,
+    /// Maximum committed-but-unrevealed rounds retained at once. `0` means unbounded.
+    max_pending_rounds: usize,
 }
 
 impl VerifiableDie {
     pub fn new(entropy: Box<dyn EntropySource>) -> Self {
-        VerifiableDie { entropy, me: None, pending: HashMap::new() }
+        VerifiableDie {
+            entropy,
+            me: None,
+            pending: HashMap::new(),
+            max_pending_rounds: DEFAULT_MAX_PENDING_ROUNDS,
+        }
+    }
+
+    /// Set the committed-but-unrevealed round cap. `0` disables the cap.
+    pub fn with_max_pending_rounds(mut self, max_pending_rounds: usize) -> Self {
+        self.max_pending_rounds = max_pending_rounds;
+        self
     }
 
     /// How many rounds are committed but not yet revealed.
@@ -213,6 +237,19 @@ impl Creature for VerifiableDie {
     fn handle(&mut self, env: Envelope) -> Outcome {
         if env.header.schema != SCHEMA {
             return Outcome::none(); // misbind / stray — never crash (R9).
+        }
+        if env.payload.len() > MAX_DIE_MESSAGE_BYTES {
+            return reply(
+                &env,
+                DieMsg::Rejected {
+                    reason: format!(
+                        "die message {} bytes exceeds max {} bytes",
+                        env.payload.len(),
+                        MAX_DIE_MESSAGE_BYTES
+                    ),
+                },
+                None,
+            );
         }
         let Ok(msg) = DieMsg::parse(&env.payload) else {
             return Outcome::none(); // R9: malformed input → drop, never panic.
@@ -243,6 +280,18 @@ impl VerifiableDie {
                 env,
                 DieMsg::Rejected {
                     reason: format!("round {round} already committed (reveal it first)"),
+                },
+                None,
+            );
+        }
+        if self.max_pending_rounds != 0 && self.pending.len() >= self.max_pending_rounds {
+            return reply(
+                env,
+                DieMsg::Rejected {
+                    reason: format!(
+                        "pending roll table at capacity ({}); reveal existing rounds before committing more",
+                        self.max_pending_rounds
+                    ),
                 },
                 None,
             );
@@ -493,6 +542,39 @@ mod tests {
     }
 
     #[test]
+    fn max_pending_rounds_refuses_new_commit_without_evicting_existing_round() {
+        let mut d = die_with([0x6A; 32]).with_max_pending_rounds(1);
+
+        let first = d.handle(env(DieMsg::Commit { round: 1, n: 6 }, 1));
+        assert!(matches!(parse(&first.dispatches[0]), DieMsg::Committed { round: 1, .. }));
+        assert_eq!(d.pending_count(), 1);
+
+        match parse(&d.handle(env(DieMsg::Commit { round: 2, n: 6 }, 2)).dispatches[0]) {
+            DieMsg::Rejected { reason } => {
+                assert!(reason.contains("capacity"), "reason: {reason}")
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(d.pending_count(), 1, "capacity refusal does not evict live commitment");
+
+        match parse(&d.handle(env(DieMsg::Commit { round: 1, n: 6 }, 3)).dispatches[0]) {
+            DieMsg::Rejected { reason } => {
+                assert!(reason.contains("already committed"), "reason: {reason}")
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(d.pending_count(), 1, "duplicate rejection still preserves original commitment");
+
+        let reveal = d.handle(env(DieMsg::Reveal { round: 1, nonce: "nonce".into() }, 4));
+        assert!(matches!(parse(&reveal.dispatches[0]), DieMsg::Revealed { round: 1, .. }));
+        assert_eq!(d.pending_count(), 0);
+
+        let second = d.handle(env(DieMsg::Commit { round: 2, n: 6 }, 5));
+        assert!(matches!(parse(&second.dispatches[0]), DieMsg::Committed { round: 2, .. }));
+        assert_eq!(d.pending_count(), 1, "reveal drains space for a new round");
+    }
+
+    #[test]
     fn revealing_an_uncommitted_round_is_rejected() {
         let mut d = die_with([0x77; 32]);
         match parse(
@@ -516,6 +598,25 @@ mod tests {
         let mut d = die_with([0x88; 32]);
         let e = Envelope { header: header(SCHEMA, None), payload: b"{not json".to_vec() };
         assert!(d.handle(e).dispatches.is_empty());
+    }
+
+    #[test]
+    fn oversized_die_message_is_rejected_before_json_decode() {
+        let mut d = die_with([0x8A; 32]);
+        let e = Envelope {
+            header: header(SCHEMA, Some(42)),
+            payload: vec![b'{'; MAX_DIE_MESSAGE_BYTES + 1],
+        };
+        let out = d.handle(e);
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].corr, Some(42));
+        match parse(&out.dispatches[0]) {
+            DieMsg::Rejected { reason } => {
+                assert!(reason.contains("exceeds max"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(d.pending_count(), 0);
     }
 
     #[test]
