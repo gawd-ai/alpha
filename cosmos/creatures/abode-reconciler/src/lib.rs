@@ -40,7 +40,7 @@
 use abode::AbodeSnapshot;
 use aether::{Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome};
 use serde::{Deserialize, Serialize};
-use sigil::{Ed25519KeyMaterial, Ed25519Verifier, Verifier};
+use sigil::{Ed25519KeyMaterial, Ed25519Verifier, Requirements, Verifier};
 use std::sync::Arc;
 
 /// Wire schema for the reconciler's control plane + replies. Single `kind`-tagged enum, same
@@ -55,6 +55,14 @@ pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 /// Fixed allowance for non-payload JSON fields in one reconcile message.
 const RECONCILER_MESSAGE_OVERHEAD_BYTES: usize = 256 * 1024;
+
+const ED25519_PUBLIC_KEY_HEX_BYTES: usize = 64;
+const ED25519_SIGNATURE_HEX_BYTES: usize = 128;
+const STATE_HASH_BYTES: usize = "sha256:".len() + 64;
+const MAX_RECONCILER_REALM_ID_BYTES: usize = 256;
+const MAX_RECONCILER_REQUIREMENT_LABELS: usize = 64;
+const MAX_RECONCILER_REQUIREMENT_LABEL_BYTES: usize = 256;
+const MAX_RECONCILER_REASON_BYTES: usize = 4 * 1024;
 
 /// The pre-parse ceiling for a serialized [`ReconcilerMsg`], derived from the instance's
 /// `max_payload_bytes`. A reconcile carries two snapshots. `AbodeSnapshot.payload_bytes` currently
@@ -218,7 +226,7 @@ impl AbodeReconciler {
     ) -> Outcome {
         match self.reconcile(fork_a, fork_b) {
             Ok(merged) => reply(env, ReconcilerMsg::Reconciled { merged }),
-            Err(reason) => reply(env, ReconcilerMsg::Rejected { reason }),
+            Err(reason) => reply(env, ReconcilerMsg::Rejected { reason: bounded_reason(reason) }),
         }
     }
 
@@ -247,6 +255,15 @@ impl AbodeReconciler {
                 self.pubkey, fork_a.abode_key
             ));
         }
+        if fork_a.requires != fork_b.requires {
+            return Err(
+                "fork metadata differs: requires must match; put evolvable placement needs inside the merge lattice"
+                    .into(),
+            );
+        }
+        if fork_a.realm != fork_b.realm {
+            return Err("fork metadata differs: realm assertions must match".into());
+        }
 
         // ---- unwrap the migrator's framing so the merge model sees pure state ----
         let state_a = abode_migrator::unwrap_payload_v0_3(&fork_a.payload_bytes)
@@ -255,7 +272,7 @@ impl AbodeReconciler {
             .map_err(|e| format!("fork_b framing: {e}"))?;
 
         // ---- the injected CRDT merge (the operator's lattice) ----
-        let merged_state = self.cfg.merge_model.merge(state_a, state_b)?;
+        let merged_state = self.cfg.merge_model.merge(state_a, state_b).map_err(bounded_reason)?;
 
         // ---- re-wrap + re-sign as a fresh authoritative snapshot ----
         let wrapped = abode_migrator::wrap_payload_v0_3(&merged_state);
@@ -276,6 +293,7 @@ impl AbodeReconciler {
 
     /// The substrate snapshot gates for one fork: size → signature (opt) → integrity. Never panics.
     fn gate(&self, fork: &AbodeSnapshot, which: &str) -> Result<(), String> {
+        validate_snapshot_metadata(fork).map_err(|reason| format!("{which} metadata: {reason}"))?;
         fork.assert_payload_size(self.cfg.max_payload_bytes)
             .map_err(|e| format!("{which} size: {e}"))?;
         if self.cfg.require_signed {
@@ -297,6 +315,78 @@ impl AbodeReconciler {
 
 // ----- helpers --------------------------------------------------------------------------------
 
+fn validate_snapshot_metadata(fork: &AbodeSnapshot) -> Result<(), &'static str> {
+    if !fixed_hex_shape_is_valid(&fork.abode_key, ED25519_PUBLIC_KEY_HEX_BYTES) {
+        return Err("abode_key must be a 64-character hex ed25519 public key");
+    }
+    if !state_hash_shape_is_valid(&fork.state_hash) {
+        return Err("state_hash must be sha256:<64 hex chars>");
+    }
+    if !requirements_shape_is_valid(&fork.requires) {
+        return Err("requirements fields exceed reconciler metadata caps");
+    }
+    if !optional_realm_shape_is_valid(fork.realm.as_ref()) {
+        return Err("realm must be valid and bounded");
+    }
+    if !optional_fixed_hex_shape_is_valid(fork.signature.as_deref(), ED25519_SIGNATURE_HEX_BYTES) {
+        return Err("signature must be a 128-character hex ed25519 signature");
+    }
+    Ok(())
+}
+
+fn requirements_shape_is_valid(requirements: &Requirements) -> bool {
+    labels_shape_is_valid(&requirements.accelerators)
+        && labels_shape_is_valid(&requirements.sensors)
+        && optional_label_shape_is_valid(requirements.connectivity.as_deref())
+        && optional_label_shape_is_valid(requirements.jurisdiction.as_deref())
+}
+
+fn labels_shape_is_valid(labels: &[String]) -> bool {
+    labels.len() <= MAX_RECONCILER_REQUIREMENT_LABELS
+        && labels.iter().all(|label| label.len() <= MAX_RECONCILER_REQUIREMENT_LABEL_BYTES)
+}
+
+fn optional_label_shape_is_valid(label: Option<&str>) -> bool {
+    label.is_none_or(|s| s.len() <= MAX_RECONCILER_REQUIREMENT_LABEL_BYTES)
+}
+
+fn optional_realm_shape_is_valid(realm: Option<&aether::RealmId>) -> bool {
+    realm.is_none_or(|r| r.0.len() <= MAX_RECONCILER_REALM_ID_BYTES && r.is_valid())
+}
+
+fn state_hash_shape_is_valid(state_hash: &str) -> bool {
+    let Some(hex) = state_hash.strip_prefix("sha256:") else {
+        return false;
+    };
+    state_hash.len() == STATE_HASH_BYTES && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn optional_fixed_hex_shape_is_valid(value: Option<&str>, exact_len: usize) -> bool {
+    value.is_none_or(|s| fixed_hex_shape_is_valid(s, exact_len))
+}
+
+fn fixed_hex_shape_is_valid(value: &str, exact_len: usize) -> bool {
+    value.len() == exact_len && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn bounded_reason(reason: String) -> String {
+    bounded_string(reason, MAX_RECONCILER_REASON_BYTES)
+}
+
+fn bounded_string(mut value: String, max_bytes: usize) -> String {
+    const TRUNCATED_SUFFIX: &str = "...[truncated]";
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut keep = max_bytes.saturating_sub(TRUNCATED_SUFFIX.len());
+    while keep > 0 && !value.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    value.truncate(keep);
+    value.push_str(TRUNCATED_SUFFIX);
+    value
+}
+
 fn reply(env: &Envelope, msg: ReconcilerMsg) -> Outcome {
     Outcome::send(Dispatch::reply_to_env(env, msg.to_bytes()).with_schema(SCHEMA))
 }
@@ -308,7 +398,7 @@ fn reply(env: &Envelope, msg: ReconcilerMsg) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether::{Address, Header};
+    use aether::{Address, Header, RealmId};
 
     const ME: CreatureId = CreatureId(9);
 
@@ -342,6 +432,11 @@ mod tests {
         let mut s = AbodeSnapshot::new(abode.public_hex().to_string(), wrapped);
         s.sign(abode);
         s
+    }
+
+    fn resign(abode: &Ed25519KeyMaterial, snapshot: &mut AbodeSnapshot) {
+        snapshot.signature = None;
+        snapshot.sign(abode);
     }
 
     fn reconcile_env(fork_a: AbodeSnapshot, fork_b: AbodeSnapshot, corr: u64) -> Envelope {
@@ -422,6 +517,47 @@ mod tests {
     }
 
     #[test]
+    fn refuses_forks_with_divergent_signed_requirements_metadata() {
+        let abode = key(0xC3);
+        let r = reconciler(0xC3);
+        let mut a = fork(&abode, b"a");
+        a.requires.accelerators.push("nvidia-a100".into());
+        resign(&abode, &mut a);
+        let b = fork(&abode, b"b");
+
+        let err = r.reconcile(a, b).unwrap_err();
+        assert!(err.contains("requires must match"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_forks_with_divergent_signed_realm_metadata() {
+        let abode = key(0xC4);
+        let r = reconciler(0xC4);
+        let mut a = fork(&abode, b"a");
+        a.realm = Some(RealmId::new("crew"));
+        resign(&abode, &mut a);
+        let b = fork(&abode, b"b");
+
+        let err = r.reconcile(a, b).unwrap_err();
+        assert!(err.contains("realm assertions must match"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_malformed_snapshot_metadata_before_signature_gate() {
+        let abode = key(0xC5);
+        let r = reconciler(0xC5);
+        let mut malformed = AbodeSnapshot::new(
+            "not-a-hex-public-key".to_string(),
+            abode_migrator::wrap_payload_v0_3(b"a"),
+        );
+        malformed.signature = Some("0".repeat(ED25519_SIGNATURE_HEX_BYTES));
+
+        let err = r.reconcile(malformed, fork(&abode, b"b")).unwrap_err();
+        assert!(err.contains("fork_a metadata"), "got: {err}");
+        assert!(err.contains("abode_key"), "got: {err}");
+    }
+
+    #[test]
     fn refuses_an_unsigned_fork_when_signatures_required() {
         let abode = key(0xD1);
         let r = reconciler(0xD1);
@@ -470,6 +606,31 @@ mod tests {
         {
             ReconcilerMsg::Rejected { reason } => {
                 assert!(reason.contains("unparseable"), "got: {reason}")
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_model_error_is_bounded_before_reply() {
+        struct HugeFailMerge;
+        impl MergeModel for HugeFailMerge {
+            fn merge(&self, _a: &[u8], _b: &[u8]) -> Result<Vec<u8>, String> {
+                Err("x".repeat(MAX_RECONCILER_REASON_BYTES + 1024))
+            }
+        }
+        let abode = key(0xE2);
+        let mut r = AbodeReconciler::new(ReconcilerConfig::new(key(0xE2), Box::new(HugeFailMerge)));
+        r.set_me_for_tests(ME);
+        match ReconcilerMsg::parse(
+            &r.handle(reconcile_env(fork(&abode, b"a"), fork(&abode, b"b"), 1)).dispatches[0]
+                .payload,
+        )
+        .unwrap()
+        {
+            ReconcilerMsg::Rejected { reason } => {
+                assert!(reason.len() <= MAX_RECONCILER_REASON_BYTES, "len: {}", reason.len());
+                assert!(reason.ends_with("[truncated]"), "got suffix in: {reason}");
             }
             other => panic!("expected Rejected, got {other:?}"),
         }

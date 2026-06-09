@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use sigil::{Capabilities, Verifier};
 
 use crate::address::{Address, CreatureId, Role, Topic};
-use crate::envelope::Envelope;
+use crate::envelope::{header_size_error, Envelope};
 
 /// The kernel's reserved routing handle. [`Address::Kernel`] resolves here.
 pub const KERNEL_ID: CreatureId = CreatureId(0);
@@ -74,6 +74,8 @@ pub enum RouteError {
     Backpressure(CreatureId),
     #[error("sender {from:?} is not permitted to address that destination")]
     Denied { from: CreatureId },
+    #[error("envelope header is {len} bytes, exceeds {limit} byte limit")]
+    HeaderTooLarge { len: usize, limit: usize },
 }
 
 pub struct Router {
@@ -183,6 +185,10 @@ impl Router {
     /// The one delivery method — every interaction flows through here, the single choke point for
     /// time (`stamp`), permission (verify), history (journal), and the bus-level capability check.
     pub fn route(&self, mut env: Envelope) -> Result<(), RouteError> {
+        if let Some((len, limit)) = header_size_error(&env.header) {
+            return Err(RouteError::HeaderTooLarge { len, limit });
+        }
+
         // time = a change of state: every routed envelope advances the node's logical clock.
         env.header.stamp = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
 

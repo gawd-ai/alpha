@@ -70,6 +70,12 @@ pub const DEFAULT_OPS_PER_MS: u64 = 10_000;
 /// the deliberate CPU opt-out — there is no "unlimited structural memory" opt-out by construction.
 pub const DEFAULT_STRUCTURAL_CAP: u64 = 1024 * 1024;
 
+/// Maximum bytes copied into a critter's convenience `env.text` view. `env.payload` remains the full
+/// byte-exact [`Blob`]; this cap only bounds the extra host-side lossy UTF-8 string the loader builds
+/// before the script runs. The effective cap is `min(mem_bytes-or-default, MAX_ENV_TEXT_BYTES)`, so a
+/// tight declared memory budget also tightens the text view.
+pub const MAX_ENV_TEXT_BYTES: usize = 1024 * 1024;
+
 /// Maximum parse-time expression nesting depth (global scope, then function body). Rhai's *default*
 /// caps are **profile-dependent** — halved in debug builds (function-body depth 16 debug vs 32
 /// release) to keep the parser's own recursion off a smaller test stack. Left unset, a critter could
@@ -262,7 +268,7 @@ impl Creature for ScriptInstance {
         }
         self.envelopes_handled = self.envelopes_handled.saturating_add(1);
 
-        let env_value = marshal_env(&env);
+        let env_value = marshal_env(&env, self.mem_cap);
         let started = std::time::Instant::now();
         let mut scope = Scope::new();
         let result = self.engine.call_fn::<Dynamic>(&mut scope, &self.ast, HANDLE_FN, (env_value,));
@@ -375,16 +381,20 @@ fn crossed(consumed: u64, limit: u64, threshold_pct: u8) -> bool {
 }
 
 /// Marshal an [`Envelope`] into the Rhai value a critter's `handle(env)` receives: an object map with
-/// `payload` (a Blob), `text` (the payload as a lossy UTF-8 string — Rhai has no Blob→String builtin,
-/// so this is the only way a critter does string work), `schema` (string), `from` (an address string
-/// the critter can echo back to `emit`), and `corr` (int, when present).
-fn marshal_env(env: &Envelope) -> Dynamic {
+/// `payload` (a Blob), `text` (a bounded lossy UTF-8 view of the payload — Rhai has no Blob→String
+/// builtin, so this is how a critter does string work), `text_truncated` (whether that view clipped
+/// the original bytes), `schema` (string), `from` (an address string the critter can echo back to
+/// `emit`), and `corr` (int, when present).
+fn marshal_env(env: &Envelope, mem_cap: u64) -> Dynamic {
     let mut m = RhaiMap::new();
     m.insert("payload".into(), Dynamic::from_blob(env.payload.clone()));
-    // `text` is the payload decoded as lossy UTF-8 (invalid bytes → U+FFFD). The critter engine
-    // exposes no Blob→String conversion, so string-oriented critters (`contains`, `kv-extract`) read
-    // `env.text`; byte-oriented ones (`reverse`, `uppercase`, `rot13`) stay on `env.payload`.
-    m.insert("text".into(), String::from_utf8_lossy(&env.payload).into_owned().into());
+    // `text` is the payload decoded as lossy UTF-8 (invalid bytes → U+FFFD), but bounded before the
+    // script sees it. The full byte payload stays available in `env.payload`; string-oriented
+    // critters (`contains`, `kv-extract`) read `env.text` and can check `env.text_truncated` when a
+    // complete text body matters.
+    let (text, text_truncated) = bounded_lossy_text(&env.payload, text_preview_cap(mem_cap));
+    m.insert("text".into(), text.into());
+    m.insert("text_truncated".into(), text_truncated.into());
     m.insert("schema".into(), env.header.schema.clone().into());
     m.insert("from".into(), addr_to_string(&env.header.from).into());
     if let Some(corr) = env.header.corr {
@@ -394,6 +404,31 @@ fn marshal_env(env: &Envelope) -> Dynamic {
         m.insert("corr".into(), (corr as i64).into());
     }
     Dynamic::from_map(m)
+}
+
+fn text_preview_cap(mem_cap: u64) -> usize {
+    usize::try_from(mem_cap.min(MAX_ENV_TEXT_BYTES as u64)).unwrap_or(MAX_ENV_TEXT_BYTES)
+}
+
+fn bounded_lossy_text(bytes: &[u8], max_bytes: usize) -> (String, bool) {
+    let prefix = utf8_boundary_prefix(bytes, max_bytes);
+    let truncated = prefix.len() < bytes.len();
+    (String::from_utf8_lossy(prefix).into_owned(), truncated)
+}
+
+fn utf8_boundary_prefix(bytes: &[u8], max_bytes: usize) -> &[u8] {
+    let mut end = max_bytes.min(bytes.len());
+    if end == bytes.len() {
+        return &bytes[..end];
+    }
+    while end > 0 && is_utf8_continuation(bytes[end]) {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+fn is_utf8_continuation(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
 }
 
 /// A critter's return value → reply payload bytes. A Blob is taken verbatim; a string is its UTF-8
@@ -469,6 +504,19 @@ mod tests {
         assert_eq!(budget_to_ops(0, DEFAULT_OPS_PER_MS), 0, "cpu_ms=0 ⇒ Rhai-unlimited (0)");
         assert_eq!(budget_to_ops(2, 1_000), 2_000);
         assert_eq!(budget_to_ops(u64::MAX, 1_000), u64::MAX, "saturates, never overflows");
+    }
+
+    #[test]
+    fn text_preview_cap_uses_lower_of_mem_cap_and_hard_ceiling() {
+        assert_eq!(text_preview_cap(64), 64);
+        assert_eq!(text_preview_cap(MAX_ENV_TEXT_BYTES as u64 + 1), MAX_ENV_TEXT_BYTES);
+    }
+
+    #[test]
+    fn bounded_lossy_text_marks_truncation_and_keeps_utf8_boundary() {
+        let (text, truncated) = bounded_lossy_text("ééé".as_bytes(), 5);
+        assert!(truncated);
+        assert_eq!(text, "éé");
     }
 
     #[test]

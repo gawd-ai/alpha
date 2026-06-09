@@ -98,6 +98,21 @@ pub const SCHEMA: &str = "abode.migrator";
 /// Fixed allowance for non-payload JSON fields in one migrator message.
 const MIGRATOR_MESSAGE_OVERHEAD_BYTES: usize = 256 * 1024;
 
+/// Maximum bytes accepted for node ids carried in migrator control metadata. The transport member
+/// gate uses the same shape: ASCII alnum plus `.`, `_`, `-`.
+const MAX_MIGRATOR_NODE_ID_BYTES: usize = 256;
+/// Human/operator note attached to a `RestoreRequest`. Currently unused by this reference migrator,
+/// but still bounded before any reply path can echo adjacent metadata.
+const MAX_MIGRATOR_NOTE_BYTES: usize = 4 * 1024;
+/// Human-readable refusal text emitted by policy or peers. Kept large enough for diagnostics, small
+/// enough that policy output cannot become an unbounded reflected payload.
+const MAX_MIGRATOR_REASON_BYTES: usize = 4 * 1024;
+/// A challenge minted by this migrator is 32 random bytes rendered as 64 hex chars. Allow a little
+/// room for future encodings, but reject metadata strings that are really payloads.
+const MAX_MIGRATOR_CHALLENGE_BYTES: usize = 128;
+const ED25519_PUBLIC_KEY_HEX_BYTES: usize = 64;
+const ED25519_SIGNATURE_HEX_BYTES: usize = 128;
+
 /// The pre-parse ceiling for a serialized [`MigratorMsg`], derived from the instance's
 /// `max_payload_bytes`. The largest accepted migrator messages carry one raw state payload
 /// (`SetState`) or one snapshot (`RestoreRequest` / `SnapshotReply`). `Vec<u8>` serializes as a JSON
@@ -617,6 +632,29 @@ impl AbodeMigrator {
         destination_migrator: CreatureId,
         expected_responder_pubkey: Option<String>,
     ) -> Outcome {
+        if !node_id_shape_is_valid(&destination_node) {
+            return reply(
+                env,
+                MigratorMsg::MigrateFailed {
+                    reason: format!(
+                        "migrate rejected: destination_node must be 1..={MAX_MIGRATOR_NODE_ID_BYTES} ASCII [A-Za-z0-9._-] bytes"
+                    ),
+                },
+            );
+        }
+        if !optional_hex_shape_is_valid(
+            expected_responder_pubkey.as_deref(),
+            ED25519_PUBLIC_KEY_HEX_BYTES,
+        ) {
+            return reply(
+                env,
+                MigratorMsg::MigrateFailed {
+                    reason:
+                        "migrate rejected: expected_responder_pubkey must be a 64-character hex ed25519 public key"
+                            .into(),
+                },
+            );
+        }
         if self.pending.is_some() {
             return reply(
                 env,
@@ -744,9 +782,25 @@ impl AbodeMigrator {
         &mut self,
         env: &Envelope,
         snapshot: AbodeSnapshot,
-        _note: Option<String>,
+        note: Option<String>,
         challenge: String,
     ) -> Outcome {
+        if !optional_len_is_valid(note.as_deref(), MAX_MIGRATOR_NOTE_BYTES)
+            || !challenge_shape_is_valid(&challenge)
+        {
+            return reply(
+                env,
+                MigratorMsg::RestoreResponse {
+                    admitted: false,
+                    reason: Some("restore rejected: malformed migrator metadata".into()),
+                    // Do not reflect an oversized or malformed challenge.
+                    challenge: String::new(),
+                    responder_node: self.self_node.clone(),
+                    responder_signature: None,
+                    responder_pubkey: None,
+                },
+            );
+        }
         // Every reply echoes the request's `challenge` and stamps this migrator's own node id in
         // band, so the source can authenticate the response — see `on_restore_response`.
         let self_node = self.self_node.clone();
@@ -755,7 +809,7 @@ impl AbodeMigrator {
                 env,
                 MigratorMsg::RestoreResponse {
                     admitted,
-                    reason,
+                    reason: reason.map(bounded_reason),
                     challenge: challenge.clone(),
                     responder_node: self_node.clone(),
                     // A refusal ran no admission, so it carries no witness (M9-2). Only the
@@ -818,7 +872,7 @@ impl AbodeMigrator {
 
         // Injected policy. Only AFTER substrate + schema gates pass; substrate ships none.
         if let Err(reason) = self.restore_policy.admit(&snapshot) {
-            return respond(false, Some(format!("restore-policy: {reason}")));
+            return respond(false, Some(format!("restore-policy: {}", bounded_reason(reason))));
         }
 
         // All gates passed. Activate, then sign a responder witness (M9-2) so the source can prove
@@ -861,6 +915,20 @@ impl AbodeMigrator {
         responder_signature: Option<String>,
         responder_pubkey: Option<String>,
     ) -> Outcome {
+        let reason = reason.map(bounded_reason);
+        if !challenge_shape_is_valid(&challenge)
+            || !node_id_shape_is_valid(&responder_node)
+            || !optional_hex_shape_is_valid(
+                responder_signature.as_deref(),
+                ED25519_SIGNATURE_HEX_BYTES,
+            )
+            || !optional_hex_shape_is_valid(
+                responder_pubkey.as_deref(),
+                ED25519_PUBLIC_KEY_HEX_BYTES,
+            )
+        {
+            return Outcome::none();
+        }
         // Match against pending by corr. A response without a matching pending is a late /
         // duplicate / spurious reply; drop silently.
         let pending = match (env.header.corr, self.pending.take()) {
@@ -965,8 +1033,9 @@ impl AbodeMigrator {
                 pending.operator_reply_to,
                 pending.operator_corr,
                 MigratorMsg::MigrateFailed {
-                    reason: reason
-                        .unwrap_or_else(|| "peer refused restore (no reason given)".into()),
+                    reason: bounded_reason(
+                        reason.unwrap_or_else(|| "peer refused restore (no reason given)".into()),
+                    ),
                 },
             ))
         }
@@ -1005,6 +1074,50 @@ fn responder_witness_payload(
         responder_node,
         responder_pubkey,
     ))
+}
+
+fn node_id_shape_is_valid(node: &NodeId) -> bool {
+    let s = node.0.as_str();
+    !s.is_empty()
+        && s.len() <= MAX_MIGRATOR_NODE_ID_BYTES
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn optional_len_is_valid(value: Option<&str>, max: usize) -> bool {
+    match value {
+        Some(s) => s.len() <= max,
+        None => true,
+    }
+}
+
+fn challenge_shape_is_valid(challenge: &str) -> bool {
+    challenge.len() <= MAX_MIGRATOR_CHALLENGE_BYTES
+        && challenge.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn optional_hex_shape_is_valid(value: Option<&str>, exact_len: usize) -> bool {
+    match value {
+        Some(s) => s.len() == exact_len && s.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => true,
+    }
+}
+
+fn bounded_reason(reason: String) -> String {
+    bounded_string(reason, MAX_MIGRATOR_REASON_BYTES)
+}
+
+fn bounded_string(mut value: String, max_bytes: usize) -> String {
+    const TRUNCATED_SUFFIX: &str = "...[truncated]";
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut keep = max_bytes.saturating_sub(TRUNCATED_SUFFIX.len());
+    while keep > 0 && !value.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    value.truncate(keep);
+    value.push_str(TRUNCATED_SUFFIX);
+    value
 }
 
 /// Reply to the envelope's `reply_to` (or `from`) with a migrator message + SCHEMA + the
@@ -1285,6 +1398,46 @@ mod tests {
     }
 
     #[test]
+    fn migrate_rejects_malformed_destination_metadata_before_parking() {
+        let mut m = build_migrator(key(0xAB));
+        m.handle(op_env(MigratorMsg::SetState { payload: b"S".to_vec() }, 1));
+
+        let out = m.handle(op_env(
+            MigratorMsg::Migrate {
+                destination_node: NodeId("bad node".into()),
+                destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
+            },
+            2,
+        ));
+        match MigratorMsg::parse(&out.dispatches[0].payload).unwrap() {
+            MigratorMsg::MigrateFailed { reason } => {
+                assert!(reason.contains("destination_node"), "got: {reason}");
+            }
+            other => panic!("expected MigrateFailed, got {other:?}"),
+        }
+        assert!(!m.has_pending_migration());
+        assert!(matches!(m.state(), AbodeState::Authoritative { .. }));
+
+        let out = m.handle(op_env(
+            MigratorMsg::Migrate {
+                destination_node: NodeId("peer-B".into()),
+                destination_migrator: CreatureId(99),
+                expected_responder_pubkey: Some("f".repeat(63)),
+            },
+            3,
+        ));
+        match MigratorMsg::parse(&out.dispatches[0].payload).unwrap() {
+            MigratorMsg::MigrateFailed { reason } => {
+                assert!(reason.contains("expected_responder_pubkey"), "got: {reason}");
+            }
+            other => panic!("expected MigrateFailed, got {other:?}"),
+        }
+        assert!(!m.has_pending_migration());
+        assert!(matches!(m.state(), AbodeState::Authoritative { .. }));
+    }
+
+    #[test]
     fn double_migrate_is_rejected_with_in_flight_reason() {
         let mut m = build_migrator(key(0xA7));
         m.handle(op_env(MigratorMsg::SetState { payload: b"S".to_vec() }, 1));
@@ -1326,6 +1479,15 @@ mod tests {
     }
 
     fn peer_restore_env(snapshot: AbodeSnapshot, corr: u64) -> Envelope {
+        peer_restore_env_with(snapshot, corr, None, String::new())
+    }
+
+    fn peer_restore_env_with(
+        snapshot: AbodeSnapshot,
+        corr: u64,
+        note: Option<String>,
+        challenge: String,
+    ) -> Envelope {
         Envelope {
             header: Header {
                 from: Address::Node(NodeId("peer".into()), CreatureId(33)),
@@ -1339,8 +1501,7 @@ mod tests {
                 commitment: None,
                 schema: SCHEMA.into(),
             },
-            payload: MigratorMsg::RestoreRequest { snapshot, note: None, challenge: String::new() }
-                .to_bytes(),
+            payload: MigratorMsg::RestoreRequest { snapshot, note, challenge }.to_bytes(),
         }
     }
 
@@ -1424,6 +1585,32 @@ mod tests {
         );
         // Migrator is now Authoritative with the unwrapped raw payload.
         assert_eq!(m.state(), &AbodeState::Authoritative { payload: b"the-self".to_vec() });
+    }
+
+    #[test]
+    fn restore_request_rejects_malformed_metadata_without_echoing_huge_challenge() {
+        let mut m = build_migrator(key(0xBA));
+        let snapshot = make_signed_snapshot(0xCA, None, b"the-self");
+        let out = m.handle(peer_restore_env_with(
+            snapshot,
+            9,
+            Some("n".repeat(MAX_MIGRATOR_NOTE_BYTES + 1)),
+            "a".repeat(MAX_MIGRATOR_CHALLENGE_BYTES + 1),
+        ));
+        let reply = MigratorMsg::parse(&out.dispatches[0].payload).unwrap();
+        match reply {
+            MigratorMsg::RestoreResponse {
+                admitted: false,
+                reason: Some(reason),
+                challenge,
+                ..
+            } => {
+                assert!(reason.contains("malformed migrator metadata"), "got: {reason}");
+                assert!(challenge.is_empty(), "malformed challenge must not be reflected");
+            }
+            other => panic!("expected RestoreResponse(admitted=false), got {other:?}"),
+        }
+        assert_eq!(m.state(), &AbodeState::Empty);
     }
 
     #[test]
@@ -1653,6 +1840,77 @@ mod tests {
         assert!(out.dispatches.is_empty(), "spurious response is silently dropped");
         assert!(m.has_pending_migration(), "pending preserved");
         assert!(matches!(m.state(), AbodeState::Authoritative { .. }));
+    }
+
+    #[test]
+    fn restore_response_with_malformed_metadata_preserves_pending() {
+        let mut m = build_migrator(key(0xD4))
+            .with_consult_corr_seed(4100)
+            .with_unsigned_responder_allowed();
+        m.handle(op_env(MigratorMsg::SetState { payload: b"S".to_vec() }, 1));
+        let mig = m.handle(op_env(
+            MigratorMsg::Migrate {
+                destination_node: NodeId("peer-B".into()),
+                destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
+            },
+            44,
+        ));
+
+        let out = m.handle(restore_response_env(
+            4100,
+            true,
+            None,
+            "f".repeat(MAX_MIGRATOR_CHALLENGE_BYTES + 1),
+            NodeId("peer-B".into()),
+        ));
+        assert!(out.dispatches.is_empty(), "malformed response metadata is dropped");
+        assert!(matches!(m.state(), AbodeState::Authoritative { .. }));
+        assert!(m.has_pending_migration(), "pending preserved for a genuine later response");
+
+        let out = m.handle(restore_response_env(
+            4100,
+            true,
+            None,
+            challenge_of(&mig),
+            NodeId("peer-B".into()),
+        ));
+        assert_eq!(m.state(), &AbodeState::Migrated { to: NodeId("peer-B".into()) });
+        assert!(!m.has_pending_migration());
+        assert!(matches!(
+            MigratorMsg::parse(&out.dispatches[0].payload).unwrap(),
+            MigratorMsg::MigrateAck { .. }
+        ));
+    }
+
+    #[test]
+    fn denied_restore_response_reason_is_bounded_before_operator_reply() {
+        let mut m = build_migrator(key(0xD5)).with_consult_corr_seed(4200);
+        m.handle(op_env(MigratorMsg::SetState { payload: b"S".to_vec() }, 1));
+        let mig = m.handle(op_env(
+            MigratorMsg::Migrate {
+                destination_node: NodeId("peer-B".into()),
+                destination_migrator: CreatureId(99),
+                expected_responder_pubkey: None,
+            },
+            45,
+        ));
+
+        let out = m.handle(restore_response_env(
+            4200,
+            false,
+            Some("x".repeat(MAX_MIGRATOR_REASON_BYTES + 1024)),
+            challenge_of(&mig),
+            NodeId("peer-B".into()),
+        ));
+        let reply = MigratorMsg::parse(&out.dispatches[0].payload).unwrap();
+        match reply {
+            MigratorMsg::MigrateFailed { reason } => {
+                assert!(reason.len() <= MAX_MIGRATOR_REASON_BYTES, "len: {}", reason.len());
+                assert!(reason.ends_with("[truncated]"), "got suffix in: {reason}");
+            }
+            other => panic!("expected MigrateFailed, got {other:?}"),
+        }
     }
 
     #[test]

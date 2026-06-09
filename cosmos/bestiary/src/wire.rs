@@ -20,6 +20,18 @@ use sigil::{Manifest, Verifier};
 
 use aether::RealmId;
 
+/// Maximum bytes retained for short registry signal key fields (`artifact_hash`, `realm`).
+///
+/// Artifact bytes have their own much larger cap; this limit is for metadata-only signal paths so a
+/// small quarantine/reputation op cannot retain a near-artifact-sized string.
+pub const MAX_REGISTRY_SIGNAL_FIELD_BYTES: usize = 512;
+/// Maximum audit-reason bytes retained in one quarantine marker.
+pub const MAX_QUARANTINE_REASON_BYTES: usize = 1024;
+/// Maximum number of peer ids retained in one quarantine marker.
+pub const MAX_QUARANTINE_ATTESTING_PEERS: usize = 64;
+/// Maximum bytes retained for one quarantine attesting-peer id.
+pub const MAX_QUARANTINE_ATTESTING_PEER_BYTES: usize = 256;
+
 /// One catalog row.
 ///
 /// Beyond `manifest` + `artifact`, an entry carries two *optional* signals the federation
@@ -158,6 +170,65 @@ pub struct QuarantineNotice {
     /// weight model decides whether the set is trustworthy enough to honor.
     #[serde(default)]
     pub attesting_peers: Vec<String>,
+}
+
+impl QuarantineNotice {
+    /// Validate a complete `MarkQuarantine` signal before any registry filling retains or persists
+    /// it. This is a shape/pressure guard only; trust and weighting remain injected policy.
+    pub fn mark_shape_error(
+        artifact_hash: &str,
+        realm: &RealmId,
+        reason: &str,
+        attesting_peers: &[String],
+    ) -> Option<String> {
+        if artifact_hash.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
+            return Some(format!(
+                "quarantine artifact_hash too large: {} bytes exceeds {} byte limit",
+                artifact_hash.len(),
+                MAX_REGISTRY_SIGNAL_FIELD_BYTES
+            ));
+        }
+        if realm.0.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
+            return Some(format!(
+                "quarantine realm too large: {} bytes exceeds {} byte limit",
+                realm.0.len(),
+                MAX_REGISTRY_SIGNAL_FIELD_BYTES
+            ));
+        }
+        Self::notice_shape_error(reason, attesting_peers)
+    }
+
+    /// Validate the marker body independent of the registry key.
+    pub fn shape_error(&self) -> Option<String> {
+        Self::notice_shape_error(&self.reason, &self.attesting_peers)
+    }
+
+    fn notice_shape_error(reason: &str, attesting_peers: &[String]) -> Option<String> {
+        if reason.len() > MAX_QUARANTINE_REASON_BYTES {
+            return Some(format!(
+                "quarantine reason too large: {} bytes exceeds {} byte limit",
+                reason.len(),
+                MAX_QUARANTINE_REASON_BYTES
+            ));
+        }
+        if attesting_peers.len() > MAX_QUARANTINE_ATTESTING_PEERS {
+            return Some(format!(
+                "quarantine attesting_peers too large: {} peers exceeds {} peer limit",
+                attesting_peers.len(),
+                MAX_QUARANTINE_ATTESTING_PEERS
+            ));
+        }
+        for peer in attesting_peers {
+            if peer.len() > MAX_QUARANTINE_ATTESTING_PEER_BYTES {
+                return Some(format!(
+                    "quarantine attesting_peer too large: {} bytes exceeds {} byte limit",
+                    peer.len(),
+                    MAX_QUARANTINE_ATTESTING_PEER_BYTES
+                ));
+            }
+        }
+        None
+    }
 }
 
 /// A self-contained entry digest for anti-entropy pull. Carries everything a peer
@@ -484,5 +555,50 @@ mod tests {
         let json = serde_json::to_string(&reply).unwrap();
         assert!(json.contains("\"reply\":\"metadata\""));
         assert!(!json.contains("\"artifact\":"), "metadata listing must not carry artifact bytes");
+    }
+
+    #[test]
+    fn quarantine_notice_shape_validator_caps_signal_fields() {
+        let peers = vec!["node-A".to_string()];
+        assert!(QuarantineNotice::mark_shape_error(
+            "h",
+            &RealmId::new("crew"),
+            "apoptosis",
+            &peers,
+        )
+        .is_none());
+
+        let long_reason = "x".repeat(MAX_QUARANTINE_REASON_BYTES + 1);
+        let err =
+            QuarantineNotice::mark_shape_error("h", &RealmId::new("crew"), &long_reason, &peers)
+                .expect("oversized reason rejected");
+        assert!(err.contains("reason too large"));
+
+        let long_peer = vec!["p".repeat(MAX_QUARANTINE_ATTESTING_PEER_BYTES + 1)];
+        let err =
+            QuarantineNotice::mark_shape_error("h", &RealmId::new("crew"), "apoptosis", &long_peer)
+                .expect("oversized peer rejected");
+        assert!(err.contains("attesting_peer too large"));
+
+        let too_many_peers: Vec<String> =
+            (0..=MAX_QUARANTINE_ATTESTING_PEERS).map(|i| format!("node-{i}")).collect();
+        let err = QuarantineNotice::mark_shape_error(
+            "h",
+            &RealmId::new("crew"),
+            "apoptosis",
+            &too_many_peers,
+        )
+        .expect("oversized peer list rejected");
+        assert!(err.contains("attesting_peers too large"));
+
+        let long_hash = "h".repeat(MAX_REGISTRY_SIGNAL_FIELD_BYTES + 1);
+        let err = QuarantineNotice::mark_shape_error(
+            &long_hash,
+            &RealmId::new("crew"),
+            "apoptosis",
+            &peers,
+        )
+        .expect("oversized key rejected");
+        assert!(err.contains("artifact_hash too large"));
     }
 }

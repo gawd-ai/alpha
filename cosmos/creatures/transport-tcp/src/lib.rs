@@ -81,6 +81,12 @@ const MAX_GOSSIP_MEMBERS: usize = 1024;
 /// frames, so a full default member table still fits under `MAX_GOSSIP_MEMBERS`. `0` in
 /// [`TransportTcp::with_max_members`] is the explicit unbounded lab/demo opt-out.
 pub const DEFAULT_MAX_MEMBERS: usize = MAX_GOSSIP_MEMBERS - 1;
+/// Maximum byte length for a cluster member's node id. Cluster node ids are operator-visible
+/// routing tokens, not payload storage; cap them before they enter the member table or sense stream.
+pub const MAX_MEMBER_NODE_ID_BYTES: usize = 256;
+/// Maximum byte length for a cluster member's dial address. The current dialer accepts IP socket
+/// addresses (`127.0.0.1:9001`, `[::1]:9001`), so this cap is intentionally roomy.
+pub const MAX_MEMBER_ADDR_BYTES: usize = 512;
 
 /// Poison-tolerant `Mutex` acquisition (R9). Every worker thread in this creature runs OUTSIDE the
 /// kernel drain's `catch_unwind`, so a panic while one holds a `TransportState` lock would poison it
@@ -267,25 +273,50 @@ impl TransportTcp {
         let self_pubkey_hex = cfg.self_key.public_hex().to_string();
         let self_node = cfg.self_node.clone();
         let listen_addr = cfg.listen_addr.clone();
-        let peers_by_pubkey: HashMap<String, NodeId> =
-            cfg.peers.iter().map(|p| (p.pubkey_hex.clone(), p.node_id.clone())).collect();
-        // Seed the member set from configured peers that advertise a dial address (the seeds): a node
-        // can dial + gossip those even before it has learned anyone else.
-        let members: HashMap<NodeId, MemberInfo> = cfg
-            .peers
-            .iter()
-            .filter_map(|p| {
-                p.dial_addr.clone().map(|addr| {
-                    (p.node_id.clone(), MemberInfo { pubkey_hex: p.pubkey_hex.clone(), addr })
-                })
-            })
-            .collect();
+        let mut peers_by_pubkey: HashMap<String, NodeId> = HashMap::new();
+        let mut members: HashMap<NodeId, MemberInfo> = HashMap::new();
+        let mut peers = Vec::new();
+        // Seed the allowlist and member set from configured peers. Peers with a dial address seed
+        // the dynamic member set (the bootstrap addresses a joining node is handed); passive peers
+        // still enter the allowlist. The stored `cfg.peers` below is the same sanitized view, so
+        // `bind()` never spawns dialers from malformed or non-canonical config.
+        for p in &cfg.peers {
+            let Some(pubkey_hex) = canonical_peer_pubkey(&p.pubkey_hex) else {
+                eprintln!("transport-tcp: ignoring configured peer with malformed ed25519 pubkey");
+                continue;
+            };
+            if let Some(reason) = validate_cluster_node_id(&p.node_id) {
+                eprintln!("transport-tcp: ignoring configured peer with {reason}");
+                continue;
+            }
+            peers_by_pubkey.insert(pubkey_hex.clone(), p.node_id.clone());
+            let mut sanitized_peer = PeerConfig {
+                node_id: p.node_id.clone(),
+                pubkey_hex: pubkey_hex.clone(),
+                dial_addr: None,
+            };
+            if let Some(addr) = p.dial_addr.as_deref() {
+                if let Some(reason) = validate_member_addr(addr) {
+                    eprintln!(
+                        "transport-tcp: peer {} stays allowlisted, but its configured dial address is ignored ({reason})",
+                        p.node_id.0
+                    );
+                } else {
+                    members.insert(
+                        p.node_id.clone(),
+                        MemberInfo { pubkey_hex, addr: addr.to_string() },
+                    );
+                    sanitized_peer.dial_addr = Some(addr.to_string());
+                }
+            }
+            peers.push(sanitized_peer);
+        }
         let state = Arc::new(TransportState {
             self_key: cfg.self_key.clone(),
             self_pubkey_hex,
-            self_node,
+            self_node: self_node.clone(),
             advertise_addr: Mutex::new(listen_addr.clone()),
-            listen_addr,
+            listen_addr: listen_addr.clone(),
             peers_by_pubkey: Mutex::new(peers_by_pubkey),
             members: Mutex::new(members),
             max_members: AtomicUsize::new(DEFAULT_MAX_MEMBERS),
@@ -298,6 +329,7 @@ impl TransportTcp {
             stop: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
         });
+        let cfg = TransportConfig { self_key: cfg.self_key, self_node, listen_addr, peers };
         TransportTcp { cfg, state }
     }
 
@@ -1118,12 +1150,72 @@ enum AdmitMemberResult {
     Refused,
 }
 
+fn validate_cluster_node_id(node_id: &NodeId) -> Option<&'static str> {
+    let s = node_id.0.as_str();
+    if s.is_empty() {
+        return Some("empty node id");
+    }
+    if s.len() > MAX_MEMBER_NODE_ID_BYTES {
+        return Some("node id exceeds transport member byte cap");
+    }
+    if !s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        return Some("node id contains characters outside [A-Za-z0-9._-]");
+    }
+    None
+}
+
+fn canonical_peer_pubkey(pubkey_hex: &str) -> Option<String> {
+    let bytes = hex_decode(pubkey_hex)?;
+    if bytes.len() != PUBKEY_BYTES {
+        return None;
+    }
+    Some(hex_encode(&bytes))
+}
+
+fn validate_member_addr(addr: &str) -> Option<&'static str> {
+    if addr.is_empty() {
+        return Some("empty dial address");
+    }
+    if addr.len() > MAX_MEMBER_ADDR_BYTES {
+        return Some("dial address exceeds transport member byte cap");
+    }
+    if addr.bytes().any(|b| b.is_ascii_control()) {
+        return Some("dial address contains control characters");
+    }
+    if addr.parse::<std::net::SocketAddr>().is_err() {
+        return Some("dial address is not an IP socket address");
+    }
+    None
+}
+
+fn validate_member_shape(
+    node_id: &NodeId,
+    pubkey_hex: &str,
+    addr: &str,
+) -> Result<String, &'static str> {
+    if let Some(reason) = validate_cluster_node_id(node_id) {
+        return Err(reason);
+    }
+    let pubkey_hex = canonical_peer_pubkey(pubkey_hex).ok_or("malformed ed25519 pubkey")?;
+    if let Some(reason) = validate_member_addr(addr) {
+        return Err(reason);
+    }
+    Ok(pubkey_hex)
+}
+
 fn admit_member(
     state: &Arc<TransportState>,
     node_id: &NodeId,
     pubkey_hex: &str,
     addr: &str,
 ) -> AdmitMemberResult {
+    let pubkey_hex = match validate_member_shape(node_id, pubkey_hex, addr) {
+        Ok(pk) => pk,
+        Err(reason) => {
+            eprintln!("transport-tcp: refusing malformed cluster member ({reason})");
+            return AdmitMemberResult::Refused;
+        }
+    };
     if *node_id == state.self_node {
         return AdmitMemberResult::Refused;
     }
@@ -1147,7 +1239,7 @@ fn admit_member(
                 }
                 members.insert(
                     node_id.clone(),
-                    MemberInfo { pubkey_hex: pubkey_hex.to_string(), addr: addr.to_string() },
+                    MemberInfo { pubkey_hex: pubkey_hex.clone(), addr: addr.to_string() },
                 );
                 AdmitMemberResult::Changed
             }
@@ -1155,7 +1247,7 @@ fn admit_member(
     };
     // Keep the handshake allowlist current (idempotent) so this peer can connect either direction.
     if result != AdmitMemberResult::Refused {
-        mlock(&state.peers_by_pubkey).insert(pubkey_hex.to_string(), node_id.clone());
+        mlock(&state.peers_by_pubkey).insert(pubkey_hex, node_id.clone());
     }
     // A newly-learned member is a graph change — surface it on the same sense stream peer_connected
     // rides, so a subscriber can observe admissions (operator-initiated and gossip-grafted alike).
@@ -1210,12 +1302,11 @@ fn ingest_gossip(state: &Arc<TransportState>, members: Vec<GossipMember>) {
         if node_id == state.self_node {
             continue;
         }
-        if admit_member(state, &node_id, &m.pubkey_hex, &m.addr) == AdmitMemberResult::Changed {
+        let admitted = admit_member(state, &node_id, &m.pubkey_hex, &m.addr);
+        if admitted == AdmitMemberResult::Changed {
+            let pubkey_hex = canonical_peer_pubkey(&m.pubkey_hex).unwrap_or(m.pubkey_hex);
             any_new = true;
-            spawn_dialer(
-                state,
-                PeerConfig { node_id, pubkey_hex: m.pubkey_hex, dial_addr: Some(m.addr) },
-            );
+            spawn_dialer(state, PeerConfig { node_id, pubkey_hex, dial_addr: Some(m.addr) });
         }
     }
     if any_new {
@@ -1238,7 +1329,7 @@ fn handle_ctl(state: &Arc<TransportState>, env: &Envelope) -> Outcome {
                     Dispatch::reply_to_env(
                         env,
                         TransportCtlReply::Rejected {
-                            reason: "transport member table at capacity or self-admission refused"
+                            reason: "transport member refused: capacity, self-admission, or malformed member shape"
                                 .into(),
                         }
                         .to_bytes(),
@@ -1248,7 +1339,11 @@ fn handle_ctl(state: &Arc<TransportState>, env: &Envelope) -> Outcome {
             }
             spawn_dialer(
                 state,
-                PeerConfig { node_id: node_id.clone(), pubkey_hex, dial_addr: Some(addr) },
+                PeerConfig {
+                    node_id: node_id.clone(),
+                    pubkey_hex: canonical_peer_pubkey(&pubkey_hex).unwrap_or(pubkey_hex),
+                    dial_addr: Some(addr),
+                },
             );
             if admitted == AdmitMemberResult::Changed {
                 gossip_broadcast(state);
@@ -1408,6 +1503,11 @@ mod tests {
         TransportTcp::new(cfg).state.clone()
     }
 
+    fn test_pubkey_hex() -> String {
+        let (k, _) = Ed25519KeyMaterial::generate().unwrap();
+        k.public_hex().to_string()
+    }
+
     #[derive(Default)]
     struct RecordingBus {
         sent: std::sync::Mutex<Vec<Dispatch>>,
@@ -1489,28 +1589,30 @@ mod tests {
     #[test]
     fn admit_member_is_idempotent_and_never_admits_self() {
         let state = test_state("me");
+        let pk_a = test_pubkey_hex();
+        let pk_me = test_pubkey_hex();
         assert_eq!(
-            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
+            admit_member(&state, &NodeId("a".into()), &pk_a, "127.0.0.1:1"),
             AdmitMemberResult::Changed,
             "first admit is a graph change"
         );
         assert_eq!(
-            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
+            admit_member(&state, &NodeId("a".into()), &pk_a, "127.0.0.1:1"),
             AdmitMemberResult::Unchanged,
             "re-admit with identical data is unchanged"
         );
         assert_eq!(
-            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:2"),
+            admit_member(&state, &NodeId("a".into()), &pk_a, "127.0.0.1:2"),
             AdmitMemberResult::Changed,
             "a changed dial addr is a graph change"
         );
         assert_eq!(
-            admit_member(&state, &NodeId("me".into()), "pk_me", "127.0.0.1:9"),
+            admit_member(&state, &NodeId("me".into()), &pk_me, "127.0.0.1:9"),
             AdmitMemberResult::Refused,
             "self is never admitted"
         );
         assert_eq!(
-            mlock(&state.peers_by_pubkey).get("pk_a"),
+            mlock(&state.peers_by_pubkey).get(&pk_a),
             Some(&NodeId("a".into())),
             "admitting a peer updates the handshake allowlist"
         );
@@ -1523,25 +1625,27 @@ mod tests {
     #[test]
     fn admit_member_refuses_new_members_at_capacity_but_updates_existing() {
         let state = test_state("me");
+        let pk_a = test_pubkey_hex();
+        let pk_b = test_pubkey_hex();
         state.max_members.store(1, Ordering::Relaxed);
 
         assert_eq!(
-            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
+            admit_member(&state, &NodeId("a".into()), &pk_a, "127.0.0.1:1"),
             AdmitMemberResult::Changed
         );
         assert_eq!(
-            admit_member(&state, &NodeId("b".into()), "pk_b", "127.0.0.1:2"),
+            admit_member(&state, &NodeId("b".into()), &pk_b, "127.0.0.1:2"),
             AdmitMemberResult::Refused,
             "new member refused at capacity"
         );
         assert!(!mlock(&state.members).contains_key(&NodeId("b".into())));
         assert!(
-            !mlock(&state.peers_by_pubkey).contains_key("pk_b"),
+            !mlock(&state.peers_by_pubkey).contains_key(&pk_b),
             "refused member must not enter the handshake allowlist"
         );
 
         assert_eq!(
-            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:3"),
+            admit_member(&state, &NodeId("a".into()), &pk_a, "127.0.0.1:3"),
             AdmitMemberResult::Changed,
             "existing member updates at capacity"
         );
@@ -1552,18 +1656,104 @@ mod tests {
 
         state.max_members.store(0, Ordering::Relaxed);
         assert_eq!(
-            admit_member(&state, &NodeId("b".into()), "pk_b", "127.0.0.1:2"),
+            admit_member(&state, &NodeId("b".into()), &pk_b, "127.0.0.1:2"),
             AdmitMemberResult::Changed,
             "0 is the explicit unbounded opt-out"
         );
     }
 
     #[test]
+    fn admit_member_refuses_malformed_shape_without_retaining_it() {
+        let state = test_state("me");
+        let pk = test_pubkey_hex();
+
+        assert_eq!(
+            admit_member(&state, &NodeId("bad space".into()), &pk, "127.0.0.1:1"),
+            AdmitMemberResult::Refused,
+            "cluster node ids are bounded printable tokens"
+        );
+        assert_eq!(
+            admit_member(&state, &NodeId("bad-pubkey".into()), "not-hex", "127.0.0.1:1"),
+            AdmitMemberResult::Refused,
+            "peer pubkeys must be 32-byte ed25519 hex"
+        );
+        assert_eq!(
+            admit_member(&state, &NodeId("bad-addr".into()), &pk, "localhost:9001"),
+            AdmitMemberResult::Refused,
+            "the dialer only accepts IP socket addresses, so reject other address shapes early"
+        );
+
+        assert!(mlock(&state.members).is_empty(), "malformed members must not be retained");
+        assert!(
+            mlock(&state.peers_by_pubkey).is_empty(),
+            "malformed members must not enter the handshake allowlist"
+        );
+    }
+
+    #[test]
+    fn configured_peers_are_shape_checked_and_pubkeys_canonicalized() {
+        let (self_key, _) = Ed25519KeyMaterial::generate().unwrap();
+        let peer_pk = test_pubkey_hex();
+        let passive_pk = test_pubkey_hex();
+        let cfg = TransportConfig {
+            self_key,
+            self_node: NodeId("me".into()),
+            listen_addr: "127.0.0.1:0".into(),
+            peers: vec![
+                PeerConfig {
+                    node_id: NodeId("peer".into()),
+                    pubkey_hex: peer_pk.to_uppercase(),
+                    dial_addr: Some("127.0.0.1:9".into()),
+                },
+                PeerConfig {
+                    node_id: NodeId("passive".into()),
+                    pubkey_hex: passive_pk.clone(),
+                    dial_addr: Some("localhost:10".into()),
+                },
+                PeerConfig {
+                    node_id: NodeId("bad peer".into()),
+                    pubkey_hex: test_pubkey_hex(),
+                    dial_addr: Some("127.0.0.1:10".into()),
+                },
+            ],
+        };
+
+        let transport = TransportTcp::new(cfg);
+        assert_eq!(transport.cfg.peers.len(), 2, "malformed configured peers are dropped");
+        assert_eq!(transport.cfg.peers[0].pubkey_hex, peer_pk);
+        assert_eq!(
+            transport.cfg.peers[1].dial_addr, None,
+            "peers with invalid dial addresses stay passive so bind() will not dial them"
+        );
+        let state = transport.state;
+        assert_eq!(mlock(&state.peers_by_pubkey).get(&peer_pk), Some(&NodeId("peer".into())));
+        assert_eq!(
+            mlock(&state.peers_by_pubkey).get(&passive_pk),
+            Some(&NodeId("passive".into())),
+            "a valid peer with a bad address can still dial us inbound"
+        );
+        assert_eq!(
+            mlock(&state.members).get(&NodeId("peer".into())).map(|m| m.pubkey_hex.clone()),
+            Some(peer_pk)
+        );
+        assert!(
+            !mlock(&state.members).contains_key(&NodeId("passive".into())),
+            "invalid dial addresses do not enter the member graph"
+        );
+        assert!(
+            !mlock(&state.members).contains_key(&NodeId("bad peer".into())),
+            "malformed configured peers are ignored before retention"
+        );
+    }
+
+    #[test]
     fn control_connect_replies_rejected_when_member_table_is_at_capacity() {
         let state = test_state("me");
+        let pk_a = test_pubkey_hex();
+        let pk_b = test_pubkey_hex();
         state.max_members.store(1, Ordering::Relaxed);
         assert_eq!(
-            admit_member(&state, &NodeId("a".into()), "pk_a", "127.0.0.1:1"),
+            admit_member(&state, &NodeId("a".into()), &pk_a, "127.0.0.1:1"),
             AdmitMemberResult::Changed
         );
         let env = Envelope {
@@ -1581,7 +1771,7 @@ mod tests {
             },
             payload: TransportCtl::Connect {
                 node_id: "b".into(),
-                pubkey_hex: "pk_b".into(),
+                pubkey_hex: pk_b.clone(),
                 addr: "127.0.0.1:2".into(),
             }
             .to_bytes(),
@@ -1596,30 +1786,32 @@ mod tests {
             other => panic!("expected Rejected, got {other:?}"),
         }
         assert!(!mlock(&state.members).contains_key(&NodeId("b".into())));
-        assert!(!mlock(&state.peers_by_pubkey).contains_key("pk_b"));
+        assert!(!mlock(&state.peers_by_pubkey).contains_key(&pk_b));
     }
 
     #[test]
     fn ingest_gossip_admits_unknown_members_and_skips_self() {
         let state = test_state("me");
+        let pk_a = test_pubkey_hex();
+        let pk_me = test_pubkey_hex();
         ingest_gossip(
             &state,
             vec![
                 GossipMember {
                     node_id: "a".into(),
-                    pubkey_hex: "pk_a".into(),
+                    pubkey_hex: pk_a.clone(),
                     addr: "127.0.0.1:1".into(),
                 },
                 GossipMember {
                     node_id: "me".into(),
-                    pubkey_hex: "pk_me".into(),
+                    pubkey_hex: pk_me,
                     addr: "127.0.0.1:2".into(),
                 },
             ],
         );
         assert!(mlock(&state.members).contains_key(&NodeId("a".into())), "learned `a` from gossip");
         assert!(!mlock(&state.members).contains_key(&NodeId("me".into())), "did not learn self");
-        assert_eq!(mlock(&state.peers_by_pubkey).get("pk_a"), Some(&NodeId("a".into())));
+        assert_eq!(mlock(&state.peers_by_pubkey).get(&pk_a), Some(&NodeId("a".into())));
         // ingest spawned a dialer for `a`; tear it down so the test process exits cleanly.
         state.stop.store(true, Ordering::Relaxed);
         let handles: Vec<_> = mlock(&state.threads).drain(..).collect();

@@ -20,7 +20,7 @@ use aether::{Bus, BusError, CreatureId, Dispatch};
 // Re-export the FFI types so the macro can reference them via `$crate::ffi::…`.
 pub use aether::ffi;
 
-pub use managed::spawn;
+pub use managed::{spawn, try_spawn};
 
 /// Creature-side bus shim for native daemons (`.so`). Wraps the host-supplied send callback so the
 /// creature uses the same [`Bus`] API in-process or across FFI. Cheap to clone (just a fn pointer +
@@ -73,10 +73,11 @@ impl Bus for NativeBus {
 /// canonical native-unload UAF.
 ///
 /// **The discipline:** use [`spawn`] (the SDK function), never `std::thread::spawn` directly. The
-/// SDK joins all spawn-registered threads in `shutdown` before returning to the host. Threads
-/// spawned via the raw stdlib path are invisible to the SDK and would UAF on unload — except the
-/// kernel's belt-and-braces *thread-count guard* notices the leak and refuses to `dlclose` (the
-/// library leaks instead — bounded, not UB; see `sanctum::run_drain`).
+/// SDK joins all spawn-registered threads in `shutdown` before returning to the host. Authors that
+/// need to fail synchronously on OS thread-limit errors can use [`try_spawn`]. Threads spawned via
+/// the raw stdlib path are invisible to the SDK and would UAF on unload — except the kernel's
+/// belt-and-braces *thread-count guard* notices the leak and refuses to `dlclose` (the library leaks
+/// instead — bounded, not UB; see `sanctum::run_drain`).
 ///
 /// **Limits to be honest about:**
 /// - Threads spawned by code reached *outside* a managed callback (`bind`/`handle`/`shutdown`) — for
@@ -90,6 +91,7 @@ impl Bus for NativeBus {
 /// gone), so this primitive is native-tier territory.
 pub mod managed {
     use std::cell::RefCell;
+    use std::io;
     use std::sync::{Arc, Mutex};
     use std::thread::{Builder, JoinHandle};
 
@@ -105,12 +107,19 @@ pub mod managed {
             Arc::new(Threads { handles: Mutex::new(Vec::new()) })
         }
 
+        pub fn try_spawn<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) -> io::Result<()> {
+            validate_thread_name(name)?;
+            let h = Builder::new().name(name.to_string()).spawn(f)?;
+            self.handles.lock().unwrap_or_else(|p| p.into_inner()).push(h);
+            Ok(())
+        }
+
         pub fn spawn<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) {
-            // A failure to spawn (rare — OS thread limit) is reported by silently falling through.
-            // The creature can detect at the call site if it needs to (Builder::spawn returns
-            // Result). For the high-level `spawn` helper, infallibility is the contract.
-            if let Ok(h) = Builder::new().name(name.to_string()).spawn(f) {
-                self.handles.lock().unwrap_or_else(|p| p.into_inner()).push(h);
+            if let Err(e) = self.try_spawn(name, f) {
+                eprintln!(
+                    "forge: failed to spawn managed thread {:?}: {e}",
+                    thread_name_for_log(name)
+                );
             }
         }
 
@@ -152,15 +161,42 @@ pub mod managed {
         ACTIVE.with(|cell| cell.borrow().clone())
     }
 
+    fn validate_thread_name(name: &str) -> io::Result<()> {
+        if name.bytes().any(|b| b == 0) {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "thread name contains NUL byte"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn thread_name_for_log(name: &str) -> String {
+        const MAX_LOG_CHARS: usize = 128;
+        let mut out: String = name.chars().take(MAX_LOG_CHARS).collect();
+        if name.chars().nth(MAX_LOG_CHARS).is_some() {
+            out.push_str("...");
+        }
+        out
+    }
+
     /// Spawn a thread registered with the active creature so the SDK joins it on `shutdown`.
     /// Outside a managed callback (e.g. from a child thread) falls back to a raw stdlib spawn — the
     /// kernel's thread-count guard catches that as a leaked thread and refuses `dlclose`, bounding
     /// the consequence to a leaked library rather than UAF.
     pub fn spawn<F: FnOnce() + Send + 'static>(name: &str, f: F) {
+        if let Err(e) = try_spawn(name, f) {
+            eprintln!("forge: failed to spawn thread {:?}: {e}", thread_name_for_log(name));
+        }
+    }
+
+    /// Fallible form of [`spawn`]. Inside a managed callback the thread is registered with the
+    /// active creature and joined on `shutdown`; outside one it falls back to a raw stdlib spawn.
+    /// Spawn failures are returned to the caller instead of being hidden.
+    pub fn try_spawn<F: FnOnce() + Send + 'static>(name: &str, f: F) -> io::Result<()> {
         match current() {
-            Some(t) => t.spawn(name, f),
+            Some(t) => t.try_spawn(name, f),
             None => {
-                let _ = Builder::new().name(name.to_string()).spawn(f);
+                validate_thread_name(name)?;
+                Builder::new().name(name.to_string()).spawn(f).map(|_| ())
             }
         }
     }
@@ -582,6 +618,33 @@ mod tests {
     }
 
     #[test]
+    fn managed_try_spawn_registers_and_surfaces_invalid_names() {
+        use std::io::ErrorKind;
+        use std::sync::atomic::AtomicUsize;
+
+        let threads = managed::Threads::new();
+        managed::set_active(threads.clone());
+        let _g = scopeguard_clear(); // ensure ACTIVE is cleared even on assertion failure
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        let before = RAN.load(Ordering::Relaxed);
+
+        managed::try_spawn("try-counter", || {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        })
+        .expect("valid managed try_spawn succeeds");
+        assert_eq!(threads.len(), 1, "try_spawn registers with the active managed set");
+        threads.join_all();
+        assert_eq!(RAN.load(Ordering::Relaxed) - before, 1);
+
+        let err = managed::try_spawn("bad\0name", || {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        })
+        .expect_err("invalid thread name returns an error instead of panicking");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(threads.is_empty(), "invalid spawn is not registered");
+    }
+
+    #[test]
     fn managed_spawn_outside_active_set_falls_back_to_raw() {
         // No `set_active` call — the spawn falls back to std::thread::spawn (fire-and-forget).
         // The kernel's thread-count guard catches these as leaked tids on a real creature; here we
@@ -601,6 +664,23 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(RAN.load(Ordering::Relaxed) > before, "raw fallback thread runs");
+    }
+
+    #[test]
+    fn unmanaged_try_spawn_surfaces_invalid_names_without_panicking() {
+        use std::io::ErrorKind;
+        use std::sync::atomic::AtomicUsize;
+
+        managed::clear(); // belt: ensure no stale ACTIVE from a parallel test
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        let before = RAN.load(Ordering::Relaxed);
+
+        let err = try_spawn("bad\0name", || {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        })
+        .expect_err("invalid raw-fallback thread name returns an error instead of panicking");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(RAN.load(Ordering::Relaxed), before, "invalid spawn does not run the worker");
     }
 
     /// Tiny drop-guard helper for tests to be panic-safe about clearing the thread-local.

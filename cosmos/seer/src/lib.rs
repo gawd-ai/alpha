@@ -328,19 +328,34 @@ pub mod topics {
     /// Placement topic — the Distributor consult.
     ///
     /// A `distributor-requirements` creature bound to
-    /// [`aether::Role::DISTRIBUTOR`] receives an [`aether::Intent`] envelope, parses its requirements
-    /// as `Predicate`s, and consults every known `embodiment-advertiser` via a
-    /// [`super::SeerEnvelope::query`] on this topic. Each advertiser checks its configured
-    /// `Embodiment` offers against the predicates and answers with the matching
-    /// `EmbodimentOffer`s. The distributor reconciles by its own model (round-robin / first-fit /
-    /// verifiable-die — operator's call, never substrate's) and routes the Intent to the picked
-    /// target.
+    /// [`aether::Role::DISTRIBUTOR`] receives an [`aether::Intent`] envelope, carries its
+    /// requirement strings into a bounded Query, and consults every known `embodiment-advertiser`
+    /// via a [`super::SeerEnvelope::query`] on this topic. Each advertiser shape-checks the Query,
+    /// parses the predicates it understands, checks its configured `Embodiment` offers against
+    /// those predicates, and answers with a bounded list of matching `EmbodimentOffer`s. The
+    /// distributor reconciles by its own model (round-robin / first-fit / verifiable-die —
+    /// operator's call, never substrate's) and routes the Intent to the picked target.
     ///
     /// **The consult fires even for an N=1 local decision** — that's the S4 mitigation. Wiring the
     /// shape early means richer or cross-node placement does not retrofit a synchronous local code
     /// path into the SEER pattern later.
     pub mod placement {
         use serde::{Deserialize, Serialize};
+
+        /// Placement outcome text retained in consult state and echoed in no-provider replies.
+        pub const MAX_QUERY_OUTCOME_BYTES: usize = 4 * 1024;
+        /// Maximum predicate strings accepted in one placement Query.
+        pub const MAX_QUERY_REQUIREMENTS: usize = 64;
+        /// Maximum bytes in one placement predicate string.
+        pub const MAX_QUERY_REQUIREMENT_BYTES: usize = 1024;
+        /// Maximum offers carried in one placement Answer.
+        pub const MAX_ANSWER_MATCHES: usize = 256;
+        /// Node ids in placement offers must be routeable through the transport convention.
+        pub const MAX_OFFER_NODE_ID_BYTES: usize = 256;
+        /// Maximum free-form labels retained per offer field (accelerators/sensors).
+        pub const MAX_OFFER_LABELS: usize = 64;
+        /// Maximum bytes in one free-form embodiment label.
+        pub const MAX_OFFER_LABEL_BYTES: usize = 256;
 
         /// One predicate the requester demands of any matched [`Embodiment`]. The language is
         /// intentionally minimal — operators extend via injected matchers or by binding a richer

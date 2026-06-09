@@ -285,13 +285,15 @@ async fn request_control(st: &Arc<SurfaceState>, verb: Verb, timeout: Duration) 
             )
         }
     };
+    let payload = match omni::control_verb_payload(&verb) {
+        Ok(payload) => payload,
+        Err(res) => return res,
+    };
     let corr = st.corr.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = oneshot::channel::<VerbResult>();
     if let Err(res) = st.register_pending(corr, tx) {
         return res;
-    }
-
-    let payload = serde_json::to_vec(&verb).unwrap_or_default();
+    };
     let d = Dispatch::to(st.target.address(), payload)
         .with_schema(CONTROL_SCHEMA)
         .with_reply_to(Address::Creature(me))
@@ -606,8 +608,8 @@ async fn h_unload(State(st): State<Arc<SurfaceState>>, Json(b): Json<UnloadReq>)
 /// The AI reports what it's doing (not allow-AI gated — the transparency channel). Surfaced live on
 /// the stream and on the operator's stdout tape; then relayed to the control plane as a verb.
 async fn h_ai_status(State(st): State<Arc<SurfaceState>>, Json(b): Json<AiStatusReq>) -> Response {
-    let activity = sanitize_status(&b.activity);
-    let message = sanitize_status(&b.message);
+    let activity = omni::sanitize_ai_status_text(&b.activity);
+    let message = omni::sanitize_ai_status_text(&b.message);
     let frame = json!({ "kind": "ai_status", "working": b.working, "activity": activity, "message": message });
     let _ = st.stream_tx.send(frame.to_string());
     if b.working {
@@ -623,12 +625,6 @@ async fn h_ai_status(State(st): State<Arc<SurfaceState>>, Json(b): Json<AiStatus
         )
         .await,
     )
-}
-
-/// Strip control characters from caller-supplied status text and bound its length (safe to write to
-/// a terminal; can't flood the operator's tape).
-fn sanitize_status(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(512).collect()
 }
 
 async fn h_cluster(State(st): State<Arc<SurfaceState>>) -> Response {
@@ -707,15 +703,24 @@ fn sense_frame(env: &Envelope) -> Value {
 }
 
 fn progress_frame(env: &Envelope) -> Value {
-    let line = if env.payload.len() <= omni::MAX_PRESENTED_PAYLOAD_BYTES {
-        serde_json::from_slice::<Value>(&env.payload)
-            .ok()
-            .and_then(|v| v.get("line").and_then(|l| l.as_str()).map(str::to_string))
-            .unwrap_or_default()
+    let progress = if env.payload.len() <= omni::MAX_PRESENTED_PAYLOAD_BYTES {
+        serde_json::from_slice::<Value>(&env.payload).ok()
     } else {
-        String::new()
+        None
     };
-    json!({ "kind": "progress", "line": line })
+    let line = progress
+        .as_ref()
+        .and_then(|v| v.get("line").and_then(|l| l.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    let mut frame = json!({ "kind": "progress", "line": line });
+    if let Some(corr) =
+        progress.as_ref().and_then(|v| v.get("corr")).and_then(Value::as_u64).or(env.header.corr)
+    {
+        if let Some(obj) = frame.as_object_mut() {
+            obj.insert("corr".to_string(), Value::Number(serde_json::Number::from(corr)));
+        }
+    }
+    frame
 }
 
 #[cfg(test)]
@@ -843,10 +848,15 @@ mod tests {
         let frame = progress_frame(&env);
         assert_eq!(frame["kind"].as_str(), Some("progress"));
         assert_eq!(frame["line"].as_str(), Some(""));
+        assert_eq!(
+            frame["corr"].as_u64(),
+            Some(11),
+            "header corr is still usable when payload decode is skipped"
+        );
     }
 
     #[test]
-    fn progress_frame_extracts_line_from_bounded_payload() {
+    fn progress_frame_extracts_line_and_corr_from_bounded_payload() {
         let env = Envelope {
             header: Header {
                 from: Address::Creature(CreatureId(7)),
@@ -866,5 +876,6 @@ mod tests {
         let frame = progress_frame(&env);
         assert_eq!(frame["kind"].as_str(), Some("progress"));
         assert_eq!(frame["line"].as_str(), Some("compiling"));
+        assert_eq!(frame["corr"].as_u64(), Some(11));
     }
 }

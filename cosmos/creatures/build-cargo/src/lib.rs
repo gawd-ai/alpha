@@ -46,12 +46,31 @@ const MAX_BUILD_OP_BYTES: usize = 8 * 1024 * 1024;
 /// The authored Rust source lands in a temp workspace and then in cargo. Keep it roomy for generated
 /// code while refusing pathological model output before any filesystem or compiler work starts.
 const MAX_AUTHORED_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// Build metadata is interpolated into paths, Cargo.toml, manifest fields, and telemetry. Keep each
+/// field small enough that a valid under-cap request cannot amplify into giant temp paths/events.
+const MAX_CARGO_NAME_BYTES: usize = 128;
+const MAX_CARGO_VERSION_BYTES: usize = 128;
+const MAX_BUILD_DEPS: usize = 64;
+const MAX_CARGO_DEP_FIELD_BYTES: usize = 4096;
+const MAX_CARGO_DEP_FEATURES: usize = 64;
+const MAX_CARGO_FEATURE_BYTES: usize = 256;
+const MAX_BUILD_EVENT_FIELD_BYTES: usize = 4 * 1024;
+pub const MAX_MANIFEST_STUB_ENTRYPOINTS: usize = 64;
+pub const MAX_MANIFEST_STUB_ENTRYPOINT_NAME_BYTES: usize = 128;
+pub const MAX_MANIFEST_STUB_ENTRYPOINT_SIGNATURE_BYTES: usize = 512;
+pub const MAX_MANIFEST_STUB_PROVIDES: usize = 64;
+pub const MAX_MANIFEST_STUB_PROVIDES_BYTES: usize = 128;
+pub const MAX_MANIFEST_STUB_CAPABILITY_ITEMS: usize = 128;
+pub const MAX_MANIFEST_STUB_CAPABILITY_FIELD_BYTES: usize = 512;
 /// A built artifact is returned as bus bytes and then often loaded directly. Keep the compiler output
 /// bounded too; a successful build that emits a giant cdylib is still not an acceptable artifact for
 /// this in-process authoring loop.
 const MAX_BUILT_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 
-use aether::{Address, Bus, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome, Topic};
+use aether::{
+    Address, Bus, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome, Topic,
+    MAX_SENSE_EVENT_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigil::crypto::Ed25519KeyMaterial;
@@ -280,6 +299,14 @@ impl BuildCargo {
             return;
         };
         let payload = aether::wire::to_bytes(&event);
+        if payload.len() > MAX_SENSE_EVENT_BYTES {
+            eprintln!(
+                "build-cargo: dropping oversized build_event proprio payload ({} bytes > {} cap)",
+                payload.len(),
+                MAX_SENSE_EVENT_BYTES
+            );
+            return;
+        }
         let _ = bus.emit(
             Dispatch::to(Address::Topic(Topic::new(Topic::PROPRIOCEPTION)), payload)
                 .with_schema("build_event"),
@@ -289,8 +316,8 @@ impl BuildCargo {
     /// Direct (non-bus) build — convenience for tests and a future "operator REPL" path. Bus callers
     /// go through [`Creature::handle`] with a [`BuildOp::Build`].
     pub fn build(&self, req: BuildRequest) -> BuildReply {
-        let crate_name = req.crate_name.clone();
-        let crate_version = req.crate_version.clone();
+        let crate_name = bounded_event_text(&req.crate_name);
+        let crate_version = bounded_event_text(&req.crate_version);
         self.publish_proprio(BuildEvent::BuildStarted {
             crate_name: crate_name.clone(),
             crate_version: crate_version.clone(),
@@ -310,7 +337,7 @@ impl BuildCargo {
                 self.publish_proprio(BuildEvent::BuildFailed {
                     crate_name,
                     kind: failure.kind.clone(),
-                    message: failure.message.clone(),
+                    message: bounded_event_text(&failure.message),
                 });
                 BuildReply::Failed {
                     kind: failure.kind,
@@ -328,12 +355,20 @@ impl BuildCargo {
         if req.crate_name.trim().is_empty() {
             return Err(BuildFailure::invalid("crate_name is empty"));
         }
+        validate_text_len("crate_name", &req.crate_name, MAX_CARGO_NAME_BYTES)?;
+        validate_text_len("manifest_stub.name", &req.manifest_stub.name, MAX_CARGO_NAME_BYTES)?;
         if req.crate_name != req.manifest_stub.name {
             return Err(BuildFailure::invalid(format!(
                 "crate_name `{}` does not match manifest_stub.name `{}`",
                 req.crate_name, req.manifest_stub.name
             )));
         }
+        validate_text_len("crate_version", &req.crate_version, MAX_CARGO_VERSION_BYTES)?;
+        validate_text_len(
+            "manifest_stub.version",
+            &req.manifest_stub.version,
+            MAX_CARGO_VERSION_BYTES,
+        )?;
         if req.crate_version != req.manifest_stub.version {
             return Err(BuildFailure::invalid(format!(
                 "crate_version `{}` does not match manifest_stub.version `{}`",
@@ -367,35 +402,8 @@ impl BuildCargo {
                 req.crate_version
             )));
         }
-        // Validate dependency names + interpolated strings BEFORE they reach Cargo.toml. The dep
-        // NAME lands in TOML *key* position UNESCAPED (`{name} = ...`), so a name containing a
-        // newline + `]` could inject a `[profile.release]` table or an extra build-dependency beyond
-        // the structured grant. Versions / paths / features pass through `toml_string` (quote +
-        // backslash escaped), but a literal control char (newline) would still break the basic
-        // string — reject those too. (T10)
-        for dep in &req.deps {
-            if !dep.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Err(BuildFailure::invalid(format!(
-                    "dependency name `{}` is not a valid cargo crate name (alphanumeric / `-` / `_`)",
-                    dep.name
-                )));
-            }
-            let no_control = |s: &str| !s.chars().any(|c| c.is_control());
-            let ok = match &dep.spec {
-                CargoDepSpec::Version(v) => no_control(v),
-                CargoDepSpec::Path(p) => no_control(&p.display().to_string()),
-                CargoDepSpec::PathFeatures { path, features } => {
-                    no_control(&path.display().to_string())
-                        && features.iter().all(|f| no_control(f))
-                }
-            };
-            if !ok {
-                return Err(BuildFailure::invalid(format!(
-                    "dependency `{}` has a version / path / feature containing control characters",
-                    dep.name
-                )));
-            }
-        }
+        validate_deps(&req.deps)?;
+        validate_manifest_stub(&req.manifest_stub)?;
 
         // 2. Pick a cargo-side crate name unique to this build. The agent-facing `req.crate_name`
         //    (e.g. `reverse-daemon`) is preserved in the manifest — that's what creatures and
@@ -825,6 +833,200 @@ fn is_cargo_package_version(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
+fn validate_deps(deps: &[CargoDep]) -> Result<(), BuildFailure> {
+    if deps.len() > MAX_BUILD_DEPS {
+        return Err(BuildFailure::invalid(format!(
+            "dependency list has {} entries, exceeds {} entry limit",
+            deps.len(),
+            MAX_BUILD_DEPS
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for dep in deps {
+        validate_text_len("dependency name", &dep.name, MAX_CARGO_NAME_BYTES)?;
+        if dep.name == "forge" {
+            return Err(BuildFailure::invalid(
+                "dependency `forge` is reserved; build-cargo injects the SDK dependency",
+            ));
+        }
+        if !seen.insert(dep.name.as_str()) {
+            return Err(BuildFailure::invalid(format!("duplicate dependency `{}`", dep.name)));
+        }
+        // Validate dependency names + interpolated strings BEFORE they reach Cargo.toml. The dep
+        // NAME lands in TOML *key* position UNESCAPED (`{name} = ...`), so a name containing a
+        // newline + `]` could inject a `[profile.release]` table or an extra build-dependency beyond
+        // the structured grant. Versions / paths / features pass through `toml_string` (quote +
+        // backslash escaped), but a literal control char (newline) would still break the basic
+        // string — reject those too. (T10)
+        if !dep.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(BuildFailure::invalid(format!(
+                "dependency name `{}` is not a valid cargo crate name (alphanumeric / `-` / `_`)",
+                dep.name
+            )));
+        }
+        match &dep.spec {
+            CargoDepSpec::Version(v) => {
+                validate_dep_text(&dep.name, "version", v, MAX_CARGO_DEP_FIELD_BYTES)?;
+            }
+            CargoDepSpec::Path(p) => {
+                validate_dep_text(
+                    &dep.name,
+                    "path",
+                    &p.display().to_string(),
+                    MAX_CARGO_DEP_FIELD_BYTES,
+                )?;
+            }
+            CargoDepSpec::PathFeatures { path, features } => {
+                validate_dep_text(
+                    &dep.name,
+                    "path",
+                    &path.display().to_string(),
+                    MAX_CARGO_DEP_FIELD_BYTES,
+                )?;
+                if features.len() > MAX_CARGO_DEP_FEATURES {
+                    return Err(BuildFailure::invalid(format!(
+                        "dependency `{}` has {} features, exceeds {} feature limit",
+                        dep.name,
+                        features.len(),
+                        MAX_CARGO_DEP_FEATURES
+                    )));
+                }
+                for feature in features {
+                    if feature.trim().is_empty() {
+                        return Err(BuildFailure::invalid(format!(
+                            "dependency `{}` has an empty feature name",
+                            dep.name
+                        )));
+                    }
+                    validate_dep_text(&dep.name, "feature", feature, MAX_CARGO_FEATURE_BYTES)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_dep_text(
+    dep_name: &str,
+    field: &str,
+    value: &str,
+    max: usize,
+) -> Result<(), BuildFailure> {
+    validate_text_len(&format!("dependency `{dep_name}` {field}"), value, max)?;
+    if value.chars().any(|c| c.is_control()) {
+        return Err(BuildFailure::invalid(format!(
+            "dependency `{dep_name}` has a {field} containing control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_text_len(label: &str, value: &str, max: usize) -> Result<(), BuildFailure> {
+    if value.len() > max {
+        Err(BuildFailure::invalid(format!(
+            "{label} is {} bytes, exceeds {} byte limit",
+            value.len(),
+            max
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_manifest_stub(stub: &ManifestStub) -> Result<(), BuildFailure> {
+    validate_manifest_stub_shape(stub, Backend::Daemon, aether::ffi::ABI_TAG, vec![host_triple()])
+        .map_err(BuildFailure::invalid)
+}
+
+/// Validate the authored manifest half before a builder performs expensive work.
+///
+/// This enforces the same structural gate as [`Manifest::validate`] plus bounded metadata/list sizes
+/// so a valid under-cap build request cannot inflate into a giant signed manifest or bus reply.
+pub fn validate_manifest_stub_shape(
+    stub: &ManifestStub,
+    backend: Backend,
+    abi_tag: &str,
+    target: Vec<String>,
+) -> Result<(), String> {
+    validate_stub_text_len("manifest_stub.name", &stub.name, MAX_CARGO_NAME_BYTES)?;
+    validate_stub_text_len("manifest_stub.version", &stub.version, MAX_CARGO_VERSION_BYTES)?;
+    validate_stub_list_len(
+        "manifest_stub.entrypoints",
+        stub.entrypoints.len(),
+        MAX_MANIFEST_STUB_ENTRYPOINTS,
+    )?;
+    for ep in &stub.entrypoints {
+        validate_stub_text_len(
+            "manifest_stub.entrypoints[].name",
+            &ep.name,
+            MAX_MANIFEST_STUB_ENTRYPOINT_NAME_BYTES,
+        )?;
+        validate_stub_text_len(
+            "manifest_stub.entrypoints[].signature",
+            &ep.signature,
+            MAX_MANIFEST_STUB_ENTRYPOINT_SIGNATURE_BYTES,
+        )?;
+    }
+    validate_stub_list_len(
+        "manifest_stub.provides",
+        stub.provides.len(),
+        MAX_MANIFEST_STUB_PROVIDES,
+    )?;
+    for role in &stub.provides {
+        validate_stub_text_len("manifest_stub.provides[]", role, MAX_MANIFEST_STUB_PROVIDES_BYTES)?;
+    }
+    validate_stub_string_list(
+        "manifest_stub.capabilities.fs",
+        &stub.capabilities.fs,
+        MAX_MANIFEST_STUB_CAPABILITY_ITEMS,
+        MAX_MANIFEST_STUB_CAPABILITY_FIELD_BYTES,
+    )?;
+    validate_stub_string_list(
+        "manifest_stub.capabilities.calls",
+        &stub.capabilities.calls,
+        MAX_MANIFEST_STUB_CAPABILITY_ITEMS,
+        MAX_MANIFEST_STUB_CAPABILITY_FIELD_BYTES,
+    )?;
+
+    let mut manifest =
+        Manifest::new(stub.name.clone(), stub.version.clone(), backend, abi_tag.to_string());
+    manifest.abi.target = target;
+    manifest.entrypoints = stub.entrypoints.clone();
+    manifest.capabilities = stub.capabilities.clone();
+    manifest.provides = stub.provides.clone();
+    manifest.validate().map_err(|e| format!("manifest_stub fails validation: {e}"))
+}
+
+fn validate_stub_string_list(
+    label: &str,
+    values: &[String],
+    max_entries: usize,
+    max_field_bytes: usize,
+) -> Result<(), String> {
+    validate_stub_list_len(label, values.len(), max_entries)?;
+    for value in values {
+        validate_stub_text_len(&format!("{label}[]"), value, max_field_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_stub_list_len(label: &str, len: usize, max: usize) -> Result<(), String> {
+    if len > max {
+        Err(format!("{label} has {len} entries, exceeds {max} entry limit"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_stub_text_len(label: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.len() > max {
+        Err(format!("{label} is {} bytes, exceeds {max} byte limit", value.len()))
+    } else {
+        Ok(())
+    }
+}
+
 /// Reap this build's UNIQUE outputs from the SHARED target dir so they don't accumulate forever.
 /// Each ephemeral build uses a unique cargo crate name and is never reused (see the
 /// fingerprint-collision note in `run_build`), so removing its outputs is safe — and the canonical
@@ -925,9 +1127,30 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+fn prefix_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+fn bounded_event_text(s: &str) -> String {
+    let prefix = prefix_on_char_boundary(s, MAX_BUILD_EVENT_FIELD_BYTES);
+    if prefix.len() == s.len() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}\n... (truncated; {} bytes total)", s.len())
+    }
+}
+
 fn truncate(mut s: String, max: usize) -> String {
     if s.len() > max {
-        s.truncate(max);
+        let cut = prefix_on_char_boundary(&s, max).len();
+        s.truncate(cut);
         s.push_str("\n... (truncated)");
     }
     s
@@ -1090,6 +1313,269 @@ mod tests {
             }
             _ => panic!("version injection should yield Invalid"),
         }
+    }
+
+    #[test]
+    fn oversized_crate_metadata_is_rejected_before_paths_or_cargo() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let long_name = "a".repeat(MAX_CARGO_NAME_BYTES + 1);
+        let reply = bc.build(BuildRequest {
+            crate_name: long_name.clone(),
+            crate_version: "0.1.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: long_name,
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![],
+        });
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("crate_name"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("oversized crate metadata should yield Invalid"),
+        }
+    }
+
+    #[test]
+    fn too_many_dependencies_are_rejected_before_cargo() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let dep = CargoDep { name: "dep".into(), spec: CargoDepSpec::Version("1".into()) };
+        let reply = bc.build(BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.1.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![dep; MAX_BUILD_DEPS + 1],
+        });
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("dependency list"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("too many dependencies should yield Invalid"),
+        }
+    }
+
+    #[test]
+    fn dependency_shape_caps_are_rejected_before_cargo() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let reply = bc.build(BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.1.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![CargoDep {
+                name: "dep".into(),
+                spec: CargoDepSpec::PathFeatures {
+                    path: PathBuf::from("/tmp/dep"),
+                    features: (0..=MAX_CARGO_DEP_FEATURES).map(|i| format!("f{i}")).collect(),
+                },
+            }],
+        });
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("features"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("too many dependency features should yield Invalid"),
+        }
+
+        let reply = bc.build(BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.1.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![CargoDep {
+                name: "dep".into(),
+                spec: CargoDepSpec::Version("1".repeat(MAX_CARGO_DEP_FIELD_BYTES + 1)),
+            }],
+        });
+        match reply {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("dependency `dep` version"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("oversized dependency version should yield Invalid"),
+        }
+    }
+
+    #[test]
+    fn duplicate_and_reserved_dependencies_are_rejected_structurally() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let base = || BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.1.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![],
+        };
+
+        let mut duplicate = base();
+        duplicate.deps = vec![
+            CargoDep { name: "dep".into(), spec: CargoDepSpec::Version("1".into()) },
+            CargoDep { name: "dep".into(), spec: CargoDepSpec::Version("2".into()) },
+        ];
+        match bc.build(duplicate) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("duplicate dependency"), "{message}");
+            }
+            _ => panic!("duplicate dependency should yield Invalid"),
+        }
+
+        let mut reserved = base();
+        reserved.deps =
+            vec![CargoDep { name: "forge".into(), spec: CargoDepSpec::Version("1".into()) }];
+        match bc.build(reserved) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("reserved"), "{message}");
+            }
+            _ => panic!("reserved forge dependency should yield Invalid"),
+        }
+    }
+
+    #[test]
+    fn invalid_manifest_stub_shape_is_rejected_before_cargo() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let base = || BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.1.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![],
+        };
+
+        let mut duplicate_ep = base();
+        duplicate_ep.manifest_stub.entrypoints = vec![
+            Entrypoint { name: "handle".into(), signature: "(Envelope) -> Outcome".into() },
+            Entrypoint { name: "handle".into(), signature: "(Envelope) -> Outcome".into() },
+        ];
+        match bc.build(duplicate_ep) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("manifest_stub"), "{message}");
+                assert!(message.contains("duplicate entrypoint"), "{message}");
+            }
+            _ => panic!("duplicate entrypoints should yield Invalid before cargo"),
+        }
+
+        let mut duplicate_provides = base();
+        duplicate_provides.manifest_stub.provides = vec!["policy".into(), "policy".into()];
+        match bc.build(duplicate_provides) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("manifest_stub"), "{message}");
+                assert!(message.contains("duplicate provides"), "{message}");
+            }
+            _ => panic!("duplicate provides should yield Invalid before cargo"),
+        }
+    }
+
+    #[test]
+    fn manifest_stub_size_caps_are_rejected_before_cargo() {
+        let bc = BuildCargo::new(BuildConfig::with_workspace_root(
+            PathBuf::from("/nonexistent"),
+            signing_key(),
+            "tester",
+        ));
+        let base = || BuildRequest {
+            crate_name: "foo".into(),
+            crate_version: "0.1.0".into(),
+            source: "// anything".into(),
+            manifest_stub: ManifestStub {
+                name: "foo".into(),
+                version: "0.1.0".into(),
+                ..Default::default()
+            },
+            deps: vec![],
+        };
+
+        let mut too_many_entrypoints = base();
+        too_many_entrypoints.manifest_stub.entrypoints = (0..=MAX_MANIFEST_STUB_ENTRYPOINTS)
+            .map(|i| Entrypoint {
+                name: format!("handle_{i}"),
+                signature: "(Envelope) -> Outcome".into(),
+            })
+            .collect();
+        match bc.build(too_many_entrypoints) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("manifest_stub.entrypoints"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("oversized entrypoint list should yield Invalid before cargo"),
+        }
+
+        let mut oversized_call_cap = base();
+        oversized_call_cap.manifest_stub.capabilities.calls =
+            vec!["role:".to_string() + &"x".repeat(MAX_MANIFEST_STUB_CAPABILITY_FIELD_BYTES + 1)];
+        match bc.build(oversized_call_cap) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("manifest_stub.capabilities.calls"), "{message}");
+                assert!(message.contains("exceeds"), "{message}");
+            }
+            _ => panic!("oversized capability call should yield Invalid before cargo"),
+        }
+    }
+
+    #[test]
+    fn build_text_truncation_respects_utf8_boundaries() {
+        let s = format!("{}é", "a".repeat(7));
+        let out = truncate(s, 8);
+        assert!(out.starts_with("aaaaaaa\n..."), "{out:?}");
+
+        let event =
+            bounded_event_text(&format!("{}é", "a".repeat(MAX_BUILD_EVENT_FIELD_BYTES - 1)));
+        assert!(event.contains("truncated"), "{event:?}");
     }
 
     #[test]

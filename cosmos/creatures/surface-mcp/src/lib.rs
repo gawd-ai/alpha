@@ -142,11 +142,24 @@ impl Creature for SurfaceMcp {
     fn shutdown(&mut self, _deadline: Deadline) {
         // Signal the stdio loop to stop after its current line. A blocking `read_line` cannot be
         // interrupted portably, so the thread exits on the next line or on EOF (the host closing
-        // stdin) — for an MCP hub the process is usually exiting anyway. Best-effort join.
+        // stdin). Join only if it already reached that point; otherwise detach the handle so
+        // shutdown cannot hang the node's teardown path waiting on open stdin.
         self.state.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.stdio_thread.take() {
-            let _ = h.join();
+            join_stdio_thread_if_finished(h);
         }
+    }
+}
+
+fn join_stdio_thread_if_finished(h: JoinHandle<()>) -> bool {
+    if h.is_finished() {
+        let _ = h.join();
+        true
+    } else {
+        eprintln!(
+            "surface-mcp: stdio thread is still blocked during shutdown; detaching until stdin closes"
+        );
+        false
     }
 }
 
@@ -331,12 +344,15 @@ fn request_control(state: &SurfaceState, verb: Verb, timeout: Duration) -> VerbR
             )
         }
     };
+    let payload = match omni::control_verb_payload(&verb) {
+        Ok(payload) => payload,
+        Err(res) => return res,
+    };
     let corr = state.corr.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = channel::<VerbResult>();
     if let Err(res) = state.register_pending(corr, tx) {
         return res;
-    }
-    let payload = serde_json::to_vec(&verb).unwrap_or_default();
+    };
     let d = Dispatch::to(state.target.address(), payload)
         .with_schema(CONTROL_SCHEMA)
         .with_reply_to(Address::Creature(me))
@@ -405,7 +421,7 @@ fn tool_list() -> Value {
         tool("alpha_bestiary_prove", "Ask the durable Bestiary for a standalone, signed EntryProof attestation over (realm, artifact_hash) — survives compaction and is independently verifiable. Only a durable bestiary-daemon answers (the in-memory stub returns an error). Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string" }, "realm": { "type": "string" } }, "required": ["artifact_hash", "realm"], "additionalProperties": false }), true),
         tool("alpha_send", "Send a text message to a creature by creature id and read its reply. Add `node` to route to a creature on a peer node over the cluster. Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" }, "text": { "type": "string" }, "node": { "type": "string", "description": "Optional peer node-id — routes the send across the cluster." } }, "required": ["id", "text"], "additionalProperties": false }), false),
         tool("alpha_intent", "Express an intent on a Role (outcome + text) and read the reply from whatever creature is bound there. Gated by allow-AI.", json!({ "type": "object", "properties": { "outcome": { "type": "string" }, "text": { "type": "string" } }, "required": ["outcome", "text"], "additionalProperties": false }), false),
-        tool("alpha_bind", "Bind a loaded creature to a Role so intents addressed to that Role route to it. Gated by allow-AI.", json!({ "type": "object", "properties": { "role": { "type": "string" }, "id": { "type": "integer" } }, "required": ["role", "id"], "additionalProperties": false }), false),
+        tool("alpha_bind", "Bind a loaded creature to a Role so intents addressed to that Role route to it. Gated by allow-AI.", json!({ "type": "object", "properties": { "role": { "type": "string", "maxLength": omni::MAX_CONTROL_ROLE_NAME_BYTES, "pattern": "^[A-Za-z0-9._-]+$" }, "id": { "type": "integer" } }, "required": ["role", "id"], "additionalProperties": false }), false),
         tool("alpha_unload", "Unload a creature by creature id (runs its orderly teardown). Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"], "additionalProperties": false }), false),
         tool("alpha_ai_status", "Announce what you (the AI) are doing on this shared node — surfaced live to the human at the node's REPL/stream so they can watch and revoke. Call it before a mutating action. Not gated.", json!({ "type": "object", "properties": { "working": { "type": "boolean" }, "activity": { "type": "string" }, "message": { "type": "string" } }, "required": ["working"], "additionalProperties": false }), false),
         tool("alpha_cluster", "Read this node's view of the cluster graph: which peer Sanctums it knows and which are connected. Read-only.", no_args(), true),
@@ -687,6 +703,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::mpsc::channel as std_channel;
+    use std::time::{Duration, Instant};
 
     fn test_state() -> SurfaceState {
         SurfaceState {
@@ -748,5 +766,24 @@ mod tests {
         let (tx, rx) = channel();
         st.register_pending(999_999, tx).expect("space reopens after one is removed");
         receivers.push(rx);
+    }
+
+    #[test]
+    fn shutdown_join_helper_does_not_wait_for_blocked_stdio_thread() {
+        let (release_tx, release_rx) = std_channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+
+        let start = Instant::now();
+        assert!(
+            !join_stdio_thread_if_finished(handle),
+            "unfinished stdio thread should be detached, not joined"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "shutdown helper must not block on an unfinished stdio thread"
+        );
+        let _ = release_tx.send(());
     }
 }

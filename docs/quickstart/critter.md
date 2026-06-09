@@ -12,7 +12,8 @@ Define `fn handle(env)`. It gets a map and returns a reply:
 ```rhai
 fn handle(env) {
     // env.payload — request bytes (a Blob)
-    // env.text    — payload as lossy UTF-8 (there is no Blob→String builtin; use this for strings)
+    // env.text    — bounded lossy UTF-8 preview (use env.payload for full bytes)
+    // env.text_truncated — true when env.text clipped the payload
     // env.schema  — the request's schema tag (a string)
     // env.from    — sender address string, e.g. "creature:7" (echo-able to emit)
     // env.corr    — int correlation id (only on correlated requests)
@@ -48,11 +49,13 @@ alpha> send 8 hello
 (A test or host can skip the manifest file: `kernel.load(critter_manifest("x"), Artifact::Bytes(src))`
 — see [`cosmos/sanctum/tests/critter_examples.rs`](../../cosmos/sanctum/tests/critter_examples.rs).)
 
-## 3. Three things that will bite you
+## 3. Four things that will bite you
 
 1. **Stateless per envelope.** Each call gets a fresh scope — no state survives between messages.
 2. **`emit` payloads are Blobs**, and `emit` is `calls`-gated — the script never holds bus authority.
-3. **No in-script JSON.** Use `split` + an object map instead. (The interpreter caps expression-nesting
+3. **`env.text` is a preview.** It is bounded by the declared/default memory cap and a 1 MiB ceiling;
+   check `env.text_truncated` when partial text is not acceptable.
+4. **No in-script JSON.** Use `split` + an object map instead. (The interpreter caps expression-nesting
    depth, but the cap is high and pinned identically in debug and release; `rot13` assigns step by step
    for readability and metering, not because the one-liner would be rejected.)
 

@@ -28,10 +28,11 @@
 //!   [`RegistryOp::AttestFitness`] onto the local registry. Reply `Ticked { evaluated, promoted }`.
 //! - `StatusQuery` — read-only dump of the watch count, per-module observation summary, threshold.
 //!
-//! The per-module observation tally is capped by default
-//! ([`DEFAULT_MAX_OBSERVED_MODULES`]) so a spray of ever-new fitness ids cannot grow memory without
-//! bound. At capacity, observations for new modules are dropped while already-tracked modules keep
-//! accumulating; operators can set `with_max_obs(0)` when they explicitly want an unbounded replay
+//! The watch map and per-module observation tally are capped by default
+//! ([`DEFAULT_MAX_WATCHED_MODULES`] / [`DEFAULT_MAX_OBSERVED_MODULES`]) so a spray of ever-new ids
+//! cannot grow memory without bound. At capacity, new watch entries are refused and observations for
+//! new modules are dropped, while already-tracked modules keep updating; operators can set
+//! `with_max_watched_modules(0)` / `with_max_obs(0)` when they explicitly want an unbounded replay
 //! or lab workload.
 //!
 //! **No automatic eviction.** A score *below* threshold simply isn't promoted — the selector never
@@ -115,6 +116,14 @@ const REGISTRY_OP_SCHEMA: &str = "registry.op";
 ///
 /// `0` is reserved as an explicit opt-out via [`FitnessSelector::with_max_obs`].
 pub const DEFAULT_MAX_OBSERVED_MODULES: usize = 4_096;
+/// Default maximum number of distinct creature ids retained in the watch map.
+///
+/// `0` is reserved as an explicit opt-out via [`FitnessSelector::with_max_watched_modules`].
+pub const DEFAULT_MAX_WATCHED_MODULES: usize = 4_096;
+/// Maximum serialized selector control bytes accepted before JSON decode.
+pub const MAX_SELECTOR_OP_BYTES: usize = MAX_SENSE_EVENT_BYTES;
+/// Maximum retained bytes for a watch-map text field (`realm`, `artifact_hash`).
+pub const MAX_WATCH_FIELD_BYTES: usize = 512;
 
 // ===================================================================================================
 // Observations — the per-creature tally the injected scorer reads
@@ -291,6 +300,11 @@ pub struct FitnessSelector {
     /// a *new* creature is dropped (tallies for already-tracked creatures always update). **`0` means
     /// unbounded** and must be selected explicitly via [`FitnessSelector::with_max_obs`].
     max_obs: usize,
+    /// Maximum number of distinct watched creatures retained at once. Existing watches can be
+    /// updated at capacity; new watches are refused with a structured reply. **`0` means
+    /// unbounded** and must be selected explicitly via
+    /// [`FitnessSelector::with_max_watched_modules`].
+    max_watch: usize,
 }
 
 impl FitnessSelector {
@@ -303,6 +317,7 @@ impl FitnessSelector {
             watch: HashMap::new(),
             obs: HashMap::new(),
             max_obs: DEFAULT_MAX_OBSERVED_MODULES,
+            max_watch: DEFAULT_MAX_WATCHED_MODULES,
         }
     }
 
@@ -313,6 +328,16 @@ impl FitnessSelector {
     /// accumulating. Pass `0` to opt out and make the tally map unbounded.
     pub fn with_max_obs(mut self, max_obs: usize) -> Self {
         self.max_obs = max_obs;
+        self
+    }
+
+    /// Cap the number of distinct watched modules retained.
+    ///
+    /// The default is [`DEFAULT_MAX_WATCHED_MODULES`]. At capacity, a watch for a *new* module is
+    /// refused rather than growing the watch map without bound; already-watched modules can still be
+    /// updated in place. Pass `0` to opt out and make the watch map unbounded.
+    pub fn with_max_watched_modules(mut self, max_watch: usize) -> Self {
+        self.max_watch = max_watch;
         self
     }
 
@@ -404,6 +429,18 @@ impl FitnessSelector {
     // ----- control plane (operator → selector) -------------------------------------------------
 
     fn on_control(&mut self, env: &Envelope) -> Outcome {
+        if env.payload.len() > MAX_SELECTOR_OP_BYTES {
+            return reply(
+                env,
+                SelectorMsg::Rejected {
+                    reason: format!(
+                        "selector op too large: {} bytes exceeds {} byte limit",
+                        env.payload.len(),
+                        MAX_SELECTOR_OP_BYTES
+                    ),
+                },
+            );
+        }
         let Ok(msg) = SelectorMsg::parse(&env.payload) else {
             return Outcome::none(); // R9: never panic on malformed input.
         };
@@ -432,7 +469,46 @@ impl FitnessSelector {
         realm: RealmId,
         artifact_hash: String,
     ) -> Outcome {
-        self.watch.insert(CreatureId(module), (realm, artifact_hash));
+        let mid = CreatureId(module);
+        if realm.0.len() > MAX_WATCH_FIELD_BYTES {
+            return reply(
+                env,
+                SelectorMsg::Rejected {
+                    reason: format!(
+                        "watch realm too large: {} bytes exceeds {} byte limit",
+                        realm.0.len(),
+                        MAX_WATCH_FIELD_BYTES
+                    ),
+                },
+            );
+        }
+        if artifact_hash.len() > MAX_WATCH_FIELD_BYTES {
+            return reply(
+                env,
+                SelectorMsg::Rejected {
+                    reason: format!(
+                        "watch artifact_hash too large: {} bytes exceeds {} byte limit",
+                        artifact_hash.len(),
+                        MAX_WATCH_FIELD_BYTES
+                    ),
+                },
+            );
+        }
+        if self.max_watch != 0
+            && self.watch.len() >= self.max_watch
+            && !self.watch.contains_key(&mid)
+        {
+            return reply(
+                env,
+                SelectorMsg::Rejected {
+                    reason: format!(
+                        "watch map at capacity ({}); refusing new module {}",
+                        self.max_watch, module
+                    ),
+                },
+            );
+        }
+        self.watch.insert(mid, (realm, artifact_hash));
         reply(env, SelectorMsg::Watching { module })
     }
 
@@ -742,6 +818,83 @@ mod tests {
     }
 
     #[test]
+    fn watch_fields_are_size_capped_before_retention() {
+        let mut s = selector(0xAC, 0.5);
+        let out = s.handle(control_env(
+            SelectorMsg::Watch {
+                module: 7,
+                realm: RealmId::new("crew"),
+                artifact_hash: "h".repeat(MAX_WATCH_FIELD_BYTES + 1),
+            },
+            4,
+        ));
+        match parse_reply(&out.dispatches[0]) {
+            SelectorMsg::Rejected { reason } => {
+                assert!(reason.contains("artifact_hash too large"), "{reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(s.watched_count(), 0, "oversized watch field is not retained");
+    }
+
+    #[test]
+    fn max_watched_modules_refuses_new_watch_but_allows_update_and_zero_opt_out() {
+        let mut s = selector(0xAD, 0.5).with_max_watched_modules(1);
+        let first = s.handle(control_env(
+            SelectorMsg::Watch {
+                module: 7,
+                realm: RealmId::new("crew"),
+                artifact_hash: "h7".into(),
+            },
+            5,
+        ));
+        assert!(matches!(parse_reply(&first.dispatches[0]), SelectorMsg::Watching { module: 7 }));
+        assert_eq!(s.watched_count(), 1);
+
+        let refused = s.handle(control_env(
+            SelectorMsg::Watch {
+                module: 8,
+                realm: RealmId::new("crew"),
+                artifact_hash: "h8".into(),
+            },
+            6,
+        ));
+        match parse_reply(&refused.dispatches[0]) {
+            SelectorMsg::Rejected { reason } => assert!(reason.contains("capacity"), "{reason}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(s.watched_count(), 1, "new watch refused at capacity");
+
+        let updated = s.handle(control_env(
+            SelectorMsg::Watch {
+                module: 7,
+                realm: RealmId::new("crew"),
+                artifact_hash: "h7b".into(),
+            },
+            7,
+        ));
+        assert!(matches!(parse_reply(&updated.dispatches[0]), SelectorMsg::Watching { module: 7 }));
+        assert_eq!(s.watch.get(&CreatureId(7)).unwrap().1, "h7b");
+
+        let mut unbounded = selector(0xAE, 0.5).with_max_watched_modules(0);
+        for module in 1..=2 {
+            let out = unbounded.handle(control_env(
+                SelectorMsg::Watch {
+                    module,
+                    realm: RealmId::new("crew"),
+                    artifact_hash: format!("h{module}"),
+                },
+                module,
+            ));
+            assert!(
+                matches!(parse_reply(&out.dispatches[0]), SelectorMsg::Watching { .. }),
+                "explicit unbounded opt-out accepts watch {module}"
+            );
+        }
+        assert_eq!(unbounded.watched_count(), 2);
+    }
+
+    #[test]
     fn status_query_reports_watch_count_observations_and_threshold() {
         let mut s = selector(0xA6, 0.7);
         s.handle(fitness_env(7, true));
@@ -1028,6 +1181,22 @@ mod tests {
             payload: b"{not json".to_vec(),
         };
         assert!(s.handle(env).dispatches.is_empty());
+    }
+
+    #[test]
+    fn oversized_control_payload_is_rejected_before_json_decode() {
+        let mut s = selector(0x04, 0.5);
+        let env = Envelope {
+            header: header(Address::Creature(ME), SCHEMA, Some(44)),
+            payload: vec![b'{'; MAX_SELECTOR_OP_BYTES + 1],
+        };
+        let out = s.handle(env);
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].corr, Some(44));
+        match parse_reply(&out.dispatches[0]) {
+            SelectorMsg::Rejected { reason } => assert!(reason.contains("too large"), "{reason}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     #[test]

@@ -46,7 +46,9 @@
 //! The in-memory catalog is bounded by default ([`DEFAULT_MAX_REGISTRY_ENTRIES`]) so a peer cannot
 //! grow this reference store indefinitely by publishing ever-new artifacts. At capacity, a new key is
 //! refused while an existing key can still be re-published; `with_max_entries(0)` is the explicit
-//! unbounded opt-out for lab or demo workloads.
+//! unbounded opt-out for lab or demo workloads. Full-artifact anti-entropy snapshots
+//! (`ListEntries`) are also source-capped by total artifact bytes so a caller cannot force the
+//! registry to clone the whole catalog into one giant reply.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -65,12 +67,22 @@ use bestiary::{
 };
 pub use bestiary::{
     CatalogEntry, Entry, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, SyncEntry,
+    MAX_QUARANTINE_ATTESTING_PEERS, MAX_QUARANTINE_ATTESTING_PEER_BYTES,
+    MAX_QUARANTINE_REASON_BYTES, MAX_REGISTRY_SIGNAL_FIELD_BYTES,
 };
 
 /// Default maximum number of distinct `(realm, artifact_hash)` entries retained by `registry-mem`.
 ///
 /// `0` is reserved as an explicit opt-out via [`RegistryMem::with_max_entries`].
 pub const DEFAULT_MAX_REGISTRY_ENTRIES: usize = 1_024;
+
+/// Default total artifact bytes cloned into one `ListEntries` anti-entropy snapshot.
+///
+/// `ListEntries` is the full-artifact replication path. The catalog entry cap bounds retained
+/// state, but without a per-snapshot cap a caller could ask the registry to clone many stored
+/// artifacts into one large reply. `0` via [`RegistryMem::with_max_snapshot_artifact_bytes`] is the
+/// explicit opt-out for lab/demo pulls that intentionally accept larger snapshots.
+pub const DEFAULT_MAX_REGISTRY_SNAPSHOT_ARTIFACT_BYTES: usize = MAX_REGISTRY_ARTIFACT_BYTES;
 
 enum PublishResult {
     Stored(String),
@@ -103,6 +115,8 @@ pub struct RegistryMem {
     max_op_bytes: usize,
     /// Maximum artifact bytes retained per publish. `0` means unbounded.
     max_artifact_bytes: usize,
+    /// Maximum total artifact bytes cloned into one `ListEntries` reply. `0` means unbounded.
+    max_snapshot_artifact_bytes: usize,
 }
 
 impl Default for RegistryMem {
@@ -118,6 +132,7 @@ impl RegistryMem {
             max_entries: DEFAULT_MAX_REGISTRY_ENTRIES,
             max_op_bytes: MAX_REGISTRY_OP_BYTES,
             max_artifact_bytes: MAX_REGISTRY_ARTIFACT_BYTES,
+            max_snapshot_artifact_bytes: DEFAULT_MAX_REGISTRY_SNAPSHOT_ARTIFACT_BYTES,
         }
     }
 
@@ -141,6 +156,14 @@ impl RegistryMem {
     /// Cap stored artifact bytes (default [`MAX_REGISTRY_ARTIFACT_BYTES`]). `0` means unbounded.
     pub fn with_max_artifact_bytes(mut self, max_artifact_bytes: usize) -> Self {
         self.max_artifact_bytes = max_artifact_bytes;
+        self
+    }
+
+    /// Cap the total artifact bytes cloned into a single `ListEntries` snapshot.
+    ///
+    /// The default is [`DEFAULT_MAX_REGISTRY_SNAPSHOT_ARTIFACT_BYTES`]. `0` disables the cap.
+    pub fn with_max_snapshot_artifact_bytes(mut self, max_snapshot_artifact_bytes: usize) -> Self {
+        self.max_snapshot_artifact_bytes = max_snapshot_artifact_bytes;
         self
     }
 
@@ -232,6 +255,18 @@ impl RegistryMem {
         artifact_hash: &str,
         notice: QuarantineNotice,
     ) -> bool {
+        if let Some(message) = QuarantineNotice::mark_shape_error(
+            artifact_hash,
+            realm,
+            &notice.reason,
+            &notice.attesting_peers,
+        ) {
+            eprintln!(
+                "registry-mem: rejected quarantine marker for {artifact_hash} in realm {}: {message}",
+                realm.0
+            );
+            return false;
+        }
         let mut g = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         match g.get_mut(&(realm.clone(), artifact_hash.to_string())) {
             Some(entry) => {
@@ -247,20 +282,45 @@ impl RegistryMem {
     /// scale (the test catalogs hold a handful of tiny artifacts); a real Bestiary would page or
     /// digest-then-fetch.
     pub fn sync_entries(&self, realm: Option<&RealmId>) -> Vec<SyncEntry> {
+        self.sync_entries_with_limit(realm, 0).unwrap_or_default()
+    }
+
+    fn sync_entries_checked(&self, realm: Option<&RealmId>) -> Result<Vec<SyncEntry>, String> {
+        self.sync_entries_with_limit(realm, self.max_snapshot_artifact_bytes)
+    }
+
+    fn sync_entries_with_limit(
+        &self,
+        realm: Option<&RealmId>,
+        max_snapshot_artifact_bytes: usize,
+    ) -> Result<Vec<SyncEntry>, String> {
+        let mut artifact_bytes = 0usize;
+        let mut entries = Vec::new();
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|((r, _), _)| realm.is_none() || realm == Some(r))
-            .map(|((r, hash), entry)| SyncEntry {
-                artifact_hash: hash.clone(),
-                realm: r.clone(),
-                manifest: entry.manifest.clone(),
-                artifact: entry.artifact.clone(),
-                reputation: entry.reputation.clone(),
-                quarantine: entry.quarantine.clone(),
-            })
-            .collect()
+            .try_for_each(|((r, hash), entry)| {
+                artifact_bytes = artifact_bytes.saturating_add(entry.artifact.len());
+                if max_snapshot_artifact_bytes != 0 && artifact_bytes > max_snapshot_artifact_bytes
+                {
+                    return Err(format!(
+                        "registry snapshot too large: {artifact_bytes} artifact bytes exceeds {} byte limit",
+                        max_snapshot_artifact_bytes
+                    ));
+                }
+                entries.push(SyncEntry {
+                    artifact_hash: hash.clone(),
+                    realm: r.clone(),
+                    manifest: entry.manifest.clone(),
+                    artifact: entry.artifact.clone(),
+                    reputation: entry.reputation.clone(),
+                    quarantine: entry.quarantine.clone(),
+                });
+                Ok(())
+            })?;
+        Ok(entries)
     }
 
     pub fn catalog_entries(&self, realm: Option<&RealmId>) -> Vec<CatalogEntry> {
@@ -429,6 +489,24 @@ impl Creature for RegistryMem {
                     reason,
                     attesting_peers,
                 }) => {
+                    if let Some(message) = QuarantineNotice::mark_shape_error(
+                        &artifact_hash,
+                        &realm,
+                        &reason,
+                        &attesting_peers,
+                    ) {
+                        eprintln!(
+                            "registry-mem: rejected MarkQuarantine for {artifact_hash} in realm {}: {message}",
+                            realm.0
+                        );
+                        return Outcome::send(
+                            aether::Dispatch::reply_to_env(
+                                &env,
+                                RegistryReply::Error { message }.to_bytes(),
+                            )
+                            .with_schema("registry.reply"),
+                        );
+                    }
                     let applied = self.mark_quarantine(
                         &realm,
                         &artifact_hash,
@@ -445,7 +523,13 @@ impl Creature for RegistryMem {
                     }
                 }
                 Ok(RegistryOp::ListEntries { realm }) => {
-                    RegistryReply::Entries { entries: self.sync_entries(realm.as_ref()) }
+                    match self.sync_entries_checked(realm.as_ref()) {
+                        Ok(entries) => RegistryReply::Entries { entries },
+                        Err(message) => {
+                            eprintln!("registry-mem: {message}");
+                            RegistryReply::Error { message }
+                        }
+                    }
                 }
                 Ok(RegistryOp::ListMetadata { realm }) => {
                     RegistryReply::Metadata { entries: self.catalog_entries(realm.as_ref()) }
@@ -869,6 +953,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quarantine_marker_shape_is_capped_before_store() {
+        let mut r = RegistryMem::new();
+        let realm = RealmId::new("crew");
+        let hash = r.publish_in(realm.clone(), manifest("q-shape"), b"q-shape".to_vec());
+
+        let oversized_reason = "x".repeat(MAX_QUARANTINE_REASON_BYTES + 1);
+        let env = op_env(
+            RegistryOp::MarkQuarantine {
+                artifact_hash: hash.clone(),
+                realm: realm.clone(),
+                reason: oversized_reason,
+                attesting_peers: vec!["node-A".into()],
+            },
+            CreatureId(1),
+        );
+        let reply: RegistryReply =
+            serde_json::from_slice(&r.handle(env).dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("reason too large"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(
+            r.fetch_in(&realm, &hash).unwrap().quarantine.is_none(),
+            "oversized quarantine reason was not retained"
+        );
+
+        let direct = r.mark_quarantine(
+            &realm,
+            &hash,
+            QuarantineNotice {
+                reason: "direct".into(),
+                attesting_peers: vec!["p".repeat(MAX_QUARANTINE_ATTESTING_PEER_BYTES + 1)],
+            },
+        );
+        assert!(!direct, "direct quarantine writes reject oversized peer ids too");
+        assert!(
+            r.fetch_in(&realm, &hash).unwrap().quarantine.is_none(),
+            "oversized direct quarantine marker was not retained"
+        );
+    }
+
     /// **Anti-entropy snapshot.** ListEntries returns self-contained SyncEntries a
     /// peer federator can merge; realm scoping filters. This is the read side of pull-based
     /// reconciliation; the federator writes back via PublishInRealm.
@@ -900,6 +1028,42 @@ mod tests {
             }
             other => panic!("expected Entries, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_entries_artifact_snapshot_is_bounded_but_scoped_pulls_still_work() {
+        let mut r = RegistryMem::new().with_max_snapshot_artifact_bytes(4);
+        r.publish_in(RealmId::new("crew"), manifest("x"), b"xxx".to_vec());
+        r.publish_in(RealmId::new("guests"), manifest("y"), b"yyy".to_vec());
+
+        let env = op_env(RegistryOp::ListEntries { realm: None }, CreatureId(1));
+        let reply: RegistryReply =
+            serde_json::from_slice(&r.handle(env).dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("snapshot too large"), "{message}");
+            }
+            other => panic!("expected Error for over-cap snapshot, got {other:?}"),
+        }
+
+        let scoped =
+            op_env(RegistryOp::ListEntries { realm: Some(RealmId::new("crew")) }, CreatureId(1));
+        let reply: RegistryReply =
+            serde_json::from_slice(&r.handle(scoped).dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Entries { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].realm, RealmId::new("crew"));
+                assert_eq!(entries[0].artifact, b"xxx");
+            }
+            other => panic!("expected scoped Entries under cap, got {other:?}"),
+        }
+
+        assert_eq!(
+            r.sync_entries(None).len(),
+            2,
+            "direct in-process snapshot helper keeps its historical unbounded behavior"
+        );
     }
 
     #[test]

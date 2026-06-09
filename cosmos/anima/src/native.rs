@@ -115,28 +115,60 @@ impl Drop for SpilledArtifact {
 fn spill_to_tempfile(bytes: &[u8], name_hint: &str) -> Result<SpilledArtifact, EngineError> {
     use sha2::Digest;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    // Filename: gawd-<pid>-<hash8>-<name>.so — pid keeps two simultaneous loads from colliding
-    // when content-addresses match (rare but possible); a short content-address prefix makes the
-    // file recognizable next to other gawd tempfiles; the manifest name is the human label.
+    static NEXT_SPILL_ID: AtomicU64 = AtomicU64::new(0);
+
+    // Filename: gawd-<pid>-<spill-id>-<hash8>-<name>.so. The monotonically increasing spill id makes
+    // two same-process loads of the same content/name distinct, while `create_new` below prevents us
+    // from ever truncating a stale or concurrently-created path.
     let mut h = sha2::Sha256::new();
     h.update(bytes);
     let digest = format!("{:x}", h.finalize());
-    let safe_name: String = name_hint
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let filename = format!("gawd-{}-{}-{}.so", std::process::id(), &digest[..8], safe_name);
-    let path = std::env::temp_dir().join(filename);
+    let safe_name = safe_temp_name_hint(name_hint);
 
-    let mut file = std::fs::File::create(&path)
-        .map_err(|e| EngineError::Load(format!("create tempfile {}: {e}", path.display())))?;
-    file.write_all(bytes)
-        .map_err(|e| EngineError::Load(format!("write tempfile {}: {e}", path.display())))?;
-    // Close the file handle (via drop) before we hand the path to dlopen — keeping the writer
-    // open through dlopen is fine on Linux but unnecessary, and we want the file's bytes flushed.
-    drop(file);
-    Ok(SpilledArtifact { path })
+    for _ in 0..1024 {
+        let spill_id = NEXT_SPILL_ID.fetch_add(1, Ordering::Relaxed);
+        let filename =
+            format!("gawd-{}-{}-{}-{}.so", std::process::id(), spill_id, &digest[..8], safe_name);
+        let path = std::env::temp_dir().join(filename);
+
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(EngineError::Load(format!("create tempfile {}: {e}", path.display())))
+            }
+        };
+        if let Err(e) = file.write_all(bytes) {
+            let _ = std::fs::remove_file(&path);
+            return Err(EngineError::Load(format!("write tempfile {}: {e}", path.display())));
+        }
+        // Close the file handle (via drop) before we hand the path to dlopen — keeping the writer
+        // open through dlopen is fine on Linux but unnecessary, and we want the file's bytes flushed.
+        drop(file);
+        return Ok(SpilledArtifact { path });
+    }
+
+    Err(EngineError::Load(
+        "could not allocate a unique native tempfile path after 1024 attempts".into(),
+    ))
+}
+
+fn safe_temp_name_hint(name_hint: &str) -> String {
+    const MAX_SAFE_NAME_BYTES: usize = 64;
+    let mut safe_name = String::new();
+    for c in name_hint.chars() {
+        if safe_name.len() >= MAX_SAFE_NAME_BYTES {
+            break;
+        }
+        safe_name.push(if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' });
+    }
+    if safe_name.is_empty() {
+        "creature".into()
+    } else {
+        safe_name
+    }
 }
 
 /// Host-side wrapper over a creature's POD vtable. Implements [`Creature`] by marshalling
@@ -265,5 +297,39 @@ impl Drop for NativeInstance {
             ((*self.vtable).destroy)((*self.vtable).data);
             drop(Box::from_raw(self.vtable));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_byte_spills_use_unique_create_new_paths() {
+        let bytes = b"not actually a shared object";
+
+        let a = spill_to_tempfile(bytes, "same/name").expect("first spill");
+        let b = spill_to_tempfile(bytes, "same/name").expect("second spill");
+
+        assert_ne!(a.path, b.path, "same content/name loads must not reuse a tempfile path");
+        assert_eq!(std::fs::read(&a.path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&b.path).unwrap(), bytes);
+
+        let a_path = a.path.clone();
+        let b_path = b.path.clone();
+        drop(a);
+        drop(b);
+        assert!(!a_path.exists(), "first spill unlinks on drop");
+        assert!(!b_path.exists(), "second spill unlinks on drop");
+    }
+
+    #[test]
+    fn native_temp_name_hint_is_bounded_and_ascii_safe() {
+        let safe = safe_temp_name_hint(&format!("bad/name:{}", "x".repeat(10_000)));
+
+        assert!(safe.len() <= 64);
+        assert!(safe.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')));
+        assert!(safe.starts_with("bad_name_"));
+        assert_eq!(safe_temp_name_hint(""), "creature");
     }
 }

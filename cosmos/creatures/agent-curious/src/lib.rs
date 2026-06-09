@@ -55,7 +55,8 @@
 //!   injected concern. agent-curious uses the cheapest of all models: ask the requester.
 //! - It doesn't multi-step Queries (one outstanding query per `corr` at a time). The wire admits
 //!   a richer dialogue (multiple `query_id`s per `corr`); a future curious agent grows into that
-//!   without a substrate change.
+//!   without a substrate change. A second ambiguous request on a parked `corr` is refused rather
+//!   than overwriting the live exchange.
 //! - It doesn't time out pending exchanges itself. *Time is injected policy, never fabric* — an
 //!   orchestrator that wants a deadline rides it on top, never inside.
 //! - It does cap the number of parked exchanges by default. That is a memory/resource floor, not a
@@ -74,6 +75,9 @@ use sigil::{Capabilities, Entrypoint, NetCapability};
 /// Default number of concurrently parked authoring consults. `0` in
 /// [`AgentCurious::with_max_pending`] means unbounded.
 pub const DEFAULT_MAX_PENDING_EXCHANGES: usize = 128;
+/// Maximum original-request bytes copied into SEER Thought/Query context. The full request is still
+/// parked for the terminal answer path; this cap bounds conversational fan-out.
+pub const MAX_REQUEST_SEER_PREVIEW_BYTES: usize = 8 * 1024;
 /// Maximum answer-content bytes scanned when mapping a SEER answer to this creature's choices.
 pub const MAX_ANSWER_CLASSIFIER_BYTES: usize = 8 * 1024;
 /// Maximum answer-content bytes echoed in an `Invalid` reply for an unrecognized answer.
@@ -247,13 +251,32 @@ impl AgentCurious {
             return reply_authored(&env, resp);
         }
 
+        // One pending exchange per corr thread. A duplicate ambiguous request is a stale/replayed
+        // or confused conversation starter; refusing it preserves the live exchange's query_id and
+        // reply target instead of overwriting pending state.
+        if self.pending.contains_key(&corr) {
+            eprintln!(
+                "agent-curious: corr {corr} already has a pending consult; refusing new consult for `{}`",
+                bounded_preview(&req.request, MAX_REQUEST_SEER_PREVIEW_BYTES)
+            );
+            return reply_failed(
+                &env,
+                AuthoringError::Invalid {
+                    message: format!(
+                        "authoring agent busy: corr {corr} already has a pending consult"
+                    ),
+                },
+            );
+        }
+
         // Pending-pressure guard (resilience): refuse a new consult at capacity rather than leak a
         // pending entry forever when an orchestrator never answers. Refuse-new keeps every in-flight
         // exchange intact (we never evict a live one). `0` disables the cap.
         if self.max_pending != 0 && self.pending.len() >= self.max_pending {
             eprintln!(
                 "agent-curious: pending table at capacity ({}); refusing new consult for `{}`",
-                self.max_pending, req.request
+                self.max_pending,
+                bounded_preview(&req.request, MAX_REQUEST_SEER_PREVIEW_BYTES)
             );
             return reply_failed(
                 &env,
@@ -270,6 +293,7 @@ impl AgentCurious {
         let query_id = self.allocate_query_id();
         let options =
             vec!["reverse".to_string(), "fetch_url_title".to_string(), "abort".to_string()];
+        let request_preview = bounded_preview(&req.request, MAX_REQUEST_SEER_PREVIEW_BYTES);
 
         let thought = SeerEnvelope::thought(
             SeerTopic::Authoring,
@@ -277,7 +301,7 @@ impl AgentCurious {
             "internal",
             &format!(
                 "no template matched the request `{}` — consulting the orchestrator",
-                req.request
+                request_preview
             ),
         );
         let progress = SeerEnvelope::progress(
@@ -288,7 +312,7 @@ impl AgentCurious {
             Some(&format!("query_id={query_id} open")),
         );
         let query_body = topics::authoring::QueryBody {
-            question: format!("no template for `{}` — which approach should I use?", req.request),
+            question: format!("no template for `{request_preview}` — which approach should I use?"),
             options: Some(options),
             deadline_ms: None,
         };
@@ -695,6 +719,87 @@ mod tests {
         }
 
         assert_eq!(a.pending_len(), 1, "parked one exchange under corr=42");
+    }
+
+    #[test]
+    fn unmatched_request_uses_bounded_seer_preview_but_parks_full_request() {
+        let mut a = AgentCurious::new();
+        let full_request =
+            format!("ambiguous {} tail-marker", "x".repeat(MAX_REQUEST_SEER_PREVIEW_BYTES + 4096));
+        let out = a.handle(request_env(43, &full_request));
+        assert_eq!(out.dispatches.len(), 3);
+
+        for d in &out.dispatches {
+            assert!(
+                d.payload.len() < seer::MAX_SEER_ENVELOPE_BYTES,
+                "SEER dispatch stayed under bounded parse cap: {}",
+                d.payload.len()
+            );
+            SeerEnvelope::parse_bounded(&d.payload).expect("bounded SEER parser accepts context");
+        }
+
+        match decode_seer(&out.dispatches[0]).kind {
+            SeerKind::Thought { content, .. } => {
+                assert!(content.contains("truncated"), "thought marks the preview: {content}");
+                assert!(
+                    !content.contains(&"x".repeat(MAX_REQUEST_SEER_PREVIEW_BYTES + 1)),
+                    "thought must not contain the full oversized request"
+                );
+            }
+            other => panic!("expected Thought, got {other:?}"),
+        }
+
+        let query_id = match decode_seer(&out.dispatches[2]).kind {
+            SeerKind::Query { query_id, body } => {
+                let q: topics::authoring::QueryBody = serde_json::from_value(body).unwrap();
+                assert!(q.question.contains("truncated"), "query marks the preview");
+                assert!(
+                    !q.question.contains(&"x".repeat(MAX_REQUEST_SEER_PREVIEW_BYTES + 1)),
+                    "query must not contain the full oversized request"
+                );
+                query_id
+            }
+            other => panic!("expected Query, got {other:?}"),
+        };
+
+        let aborted = a.handle(answer_env(43, query_id, "abort"));
+        match decode_reply(&aborted.dispatches[0]) {
+            AuthoringReply::Failed(AuthoringError::NoTemplate { request }) => {
+                assert_eq!(
+                    request, full_request,
+                    "pending exchange keeps the full original request"
+                );
+            }
+            other => panic!("expected Failed(NoTemplate), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_corr_request_is_refused_without_overwriting_pending_exchange() {
+        let mut a = AgentCurious::new();
+        let first = a.handle(request_env(44, "first ambiguous"));
+        assert_eq!(first.dispatches.len(), 3, "first request parks and emits SEER");
+        assert_eq!(a.pending_len(), 1);
+
+        let duplicate = a.handle(request_env(44, "second ambiguous"));
+        assert_eq!(a.pending_len(), 1, "duplicate corr must not overwrite the pending exchange");
+        assert_eq!(duplicate.dispatches.len(), 1, "duplicate corr gets one terminal reply");
+        assert_eq!(duplicate.dispatches[0].schema, schema::REPLY);
+        match decode_reply(&duplicate.dispatches[0]) {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("already has a pending consult"), "{message}");
+            }
+            other => panic!("expected Failed(Invalid), got {other:?}"),
+        }
+
+        let aborted = a.handle(steer_env(44, "abort"));
+        match decode_reply(&aborted.dispatches[0]) {
+            AuthoringReply::Failed(AuthoringError::NoTemplate { request }) => {
+                assert_eq!(request, "first ambiguous", "original pending request was preserved");
+            }
+            other => panic!("expected Failed(NoTemplate), got {other:?}"),
+        }
+        assert_eq!(a.pending_len(), 0);
     }
 
     #[test]

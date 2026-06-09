@@ -181,9 +181,10 @@ POD-only.
 - **`NativeBus`** — wraps the host-supplied `send` callback into the `Bus` trait;
   cheap to clone; thread-safe (single-driver — the host's drain thread calls
   `handle` serially).
-- **`managed::spawn(name, F)`** — **the thread discipline for native creatures**.
-  A creature that spawns a thread *must* go through this so the SDK joins it
-  in `shutdown` before the host `dlclose`s the library. Threads via raw
+- **`managed::spawn(name, F)` / `managed::try_spawn(name, F)`** — **the thread discipline for native creatures**.
+  A creature that spawns a thread *must* go through one of these so the SDK joins it
+  in `shutdown` before the host `dlclose`s the library; `try_spawn` exposes OS spawn
+  errors for authors that must fail synchronously. Threads via raw
   `std::thread::spawn` are invisible to the SDK and would UAF on unload — except
   the kernel's thread-count guard catches the leak and refuses `dlclose` (bounded
   library leak, not UB). Beasts have no native-unload UAF class (drop the `Store`

@@ -39,7 +39,7 @@ pub use address::{
     Address, CreatureId, Intent, NodeId, RealmId, Role, Topic, MAX_ADDRESS_NESTING_DEPTH,
 };
 pub use bus::{Bus, BusError, BusHandle, Ed25519Signer, Signer, StubSigner};
-pub use envelope::{Envelope, EnvelopeError, Header};
+pub use envelope::{Envelope, EnvelopeError, Header, MAX_ENVELOPE_HEADER_BYTES};
 pub use instance::{
     BudgetSignal, BudgetVector, Creature, CreatureCtx, Deadline, Dispatch, LimitKind, Outcome,
     SignalLevel,
@@ -71,6 +71,21 @@ mod tests {
         BusHandle::new(me, r.clone(), Arc::new(StubSigner::new("test")))
     }
 
+    #[derive(Default)]
+    struct CountingSigner {
+        calls: AtomicUsize,
+    }
+
+    impl Signer for CountingSigner {
+        fn sign(&self, _payload: &[u8]) -> String {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            "counted".to_string()
+        }
+        fn public_key(&self) -> String {
+            "counting-signer".to_string()
+        }
+    }
+
     #[test]
     fn delivers_creature_addressed_and_seals_fabric_fields() {
         let r = router();
@@ -83,6 +98,38 @@ mod tests {
         assert_eq!(env.header.from, Address::Creature(sender)); // fabric-set identity
         assert!(!env.header.sig.is_empty()); // sig present (R5)
         assert!(env.header.stamp > 0); // router-set logical time
+    }
+
+    #[test]
+    fn oversized_headers_are_refused_before_signing_or_journaling() {
+        let r = router();
+        let (target, _rx) = r.register(Capabilities::default());
+        let (sender, _s) = r.register(Capabilities::default());
+        let signer = Arc::new(CountingSigner::default());
+        let b = BusHandle::new(sender, r.clone(), signer.clone());
+
+        let err = b
+            .send(
+                Dispatch::to(Address::Creature(target), Vec::new())
+                    .with_schema("x".repeat(MAX_ENVELOPE_HEADER_BYTES + 1)),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RouteError::HeaderTooLarge {
+                    len,
+                    limit
+                } if len > MAX_ENVELOPE_HEADER_BYTES && limit == MAX_ENVELOPE_HEADER_BYTES
+            ),
+            "oversized header rejected with the dedicated route error: {err:?}"
+        );
+        assert_eq!(signer.calls.load(Ordering::SeqCst), 0, "oversized header was not signed");
+        assert!(
+            r.journal_snapshot().is_empty(),
+            "oversized header was not retained in the journal"
+        );
     }
 
     #[test]

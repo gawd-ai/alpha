@@ -74,7 +74,9 @@ contract and its durable implementation never drift.
 
 `registry-mem` is intentionally bounded by default: it refuses new `(RealmId, artifact_hash)` keys at
 `DEFAULT_MAX_REGISTRY_ENTRIES` while still allowing re-publish of an existing key. `with_max_entries(0)`
-is the explicit opt-out for demos or labs that accept unbounded in-memory catalog growth.
+is the explicit opt-out for demos or labs that accept unbounded in-memory catalog growth. Its
+full-artifact `ListEntries` anti-entropy snapshot is separately capped by total artifact bytes before
+the source clones entries into a reply; `with_max_snapshot_artifact_bytes(0)` is the explicit opt-out.
 
 - **Keyed by `(RealmId, artifact_hash)`.** `artifact_hash` is `sha256(artifact_bytes)`. Two
   creatures with identical bytes in different Realms are distinct entries by construction — Realm
@@ -89,6 +91,10 @@ is the explicit opt-out for demos or labs that accept unbounded in-memory catalo
   (`ReputationScore`) and a reversible `quarantine` (`QuarantineNotice`). Both default to `None`, so
   the wire bytes of a slot-less entry are unchanged. A (re)publish of a `(realm, artifact_hash)`
   resets both — the registry-layer form of reversibility.
+- **Signal-only metadata is separately shape-capped.** Registry op payloads allow large
+  hex-encoded artifacts, but `MarkQuarantine` keys, reasons, and attesting-peer lists are short
+  audit/control metadata. The shared `bestiary` wire contract owns those caps, and both registry
+  fillings reject malformed quarantine markers before retention or persistence.
 
 **Publish never grants trust.** The registry stores and retrieves; it does not authorize. Every byte
 arriving via `fetch` runs the *receiver's* full admission gate (provenance signature + artifact-bytes
@@ -123,9 +129,17 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
 - **Bounded by default, like the in-memory registry.** The durable store refuses new
   `(RealmId, artifact_hash)` keys past `DEFAULT_MAX_BESTIARY_ENTRIES` and rejects an artifact above the
   128 MiB ceiling, with `0` the explicit unbounded opt-out (`with_max_entries` / `with_max_artifact_bytes`);
-  `recover()` replays an existing catalogue even above the current cap. A publish past the entry cap is a
-  wire-honest error (not a false `Published`); a federation `PushEntries` of a *new* key into a full
-  catalogue is skipped (best-effort lattice merge) rather than failing the whole batch.
+  `recover()` replays an existing catalogue even above the current cap. The JSONL journal itself is
+  capped per record before append, compaction rewrite, and recovery line allocation; the advisory
+  `.head` tip hint is also read under a small cap and ignored if malformed; artifacts live in blobs,
+  never in log lines. The legacy `ListEntries` full-artifact anti-entropy reply is also capped by
+  total artifact bytes before the store reads/clones blobs into the snapshot. A `PushEntries` batch is
+  count-capped before the daemon iterates entries or calls the store; `0` in daemon config is the
+  explicit unbounded opt-out. A publish past the entry cap is a wire-honest error (not a false
+  `Published`); a federation `PushEntries` of a *new* key into a full catalogue is skipped
+  (best-effort lattice merge) rather than failing the whole batch.
+  Quarantine markers use the same shared shape caps, and the durable store refuses a sticky
+  attesting-peer union that would grow beyond the peer cap.
 - **Verifiable entry proofs.** `ProveEntry` returns a standalone `EntryProof` — the daemon signs
   `(realm, artifact_hash, manifest_hash, first_seen, attester)` with its Abode key. Anyone verifies it
   with the attester's pubkey, and because it commits to the compaction-stable `first_seen` rather than a
@@ -144,7 +158,9 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
   hasn't ruled on, and disables GC entirely until configured. An `AICurator` consults an injected
   `mind::Model` over each entry's *manifest + artifact bytes* for content-aware near-duplicate and
   anomaly judgments the deterministic one cannot make; the model call runs on the daemon's own
-  anti-entropy thread, off the synchronous catalogue path, so it never blocks a fetch. (`SeerTopic::
+  anti-entropy thread, off the synchronous catalogue path, so it never blocks a fetch. Its prompt,
+  completion parser, and retained decision cache are bounded by default; overflowing the cache fails
+  safe to `Keep`, with `with_max_cache_entries(0)` as the explicit lab/demo opt-out. (`SeerTopic::
   Curation` reserves the seam for an *external* curator creature consulted over the bus.)
 
 **Publish still grants no trust** here either: the durable store makes a creature *available and
@@ -163,15 +179,23 @@ Placement is a **consult-and-reconcile** conversation over the SEER bus, on the 
 Two creatures play it:
 
 - **`distributor-requirements`** binds `Role::DISTRIBUTOR`. Every `Intent` envelope hits its inbox.
-  It parses `Intent.requirements` as placement **predicates**, fires a SEER `Query` on the
-  `placement` topic to **every** known advertiser (local + peer) under a fresh consult `corr`, parks
-  the Intent, and accumulates `Answer`s. When the expected answers are in (or, under `FirstFit`, on
-  the first non-empty match), it reconciles and dispatches the original Intent payload to the chosen
-  target — `reply_to` / `corr` preserved.
+  It carries `Intent.requirements` as placement **predicate strings**, fires a SEER `Query` on the
+  `placement` topic to **every** known advertiser (local + peer) under a fresh consult `corr`, using
+  one `query_id` per advertiser, parks the Intent, and accumulates `Answer`s. Intent outcome and
+  requirement strings are shape-bounded before fan-out, so an oversized address header becomes a
+  bounded `IntentShapeRejected` no-provider reply instead of many large SEER queries. Duplicate or
+  out-of-range `query_id`s are dropped, so one responder cannot be counted twice. Answer bodies are
+  also shape-gated before retention: per-answer match count is capped, route node ids must be
+  bounded/canonical for transport, and free-form embodiment labels are byte-bounded; malformed
+  offers are ignored, while an over-cap answer does not consume its `query_id`. When the expected
+  answers are in (or, under `FirstFit`, on the first non-empty match), it reconciles and dispatches
+  the original Intent payload to the chosen target — `reply_to` / `corr` preserved.
 - **`embodiment-advertiser`** answers placement Queries. One per Sanctum, configured with the
   Sanctum's `NodeId` and a list of `(CreatureId, Embodiment)` *offers* — the targets the operator
   chose to expose. For each Query it checks each offer against every predicate and answers with the
-  matching `EmbodimentOffer`s. It does not introspect the kernel, does not rank, does not time out.
+  matching `EmbodimentOffer`s, capped to the shared placement answer limit. It shape-checks direct
+  Queries against the same requirement/outcome bounds the distributor uses before parsing predicates.
+  It does not introspect the kernel, does not rank, does not time out.
 
 ### Requirements as a predicate language
 
@@ -296,12 +320,14 @@ four things, and admission gates them all:
    `ReputationWeigher` (the operator's "how much does Realm X's word count?"), and writes
    `AttestFitness` tagged with the attesting Realm; the stored score is `observed_score × weight`. A
    non-finite score or weight is dropped and surfaced on a proprioception event, so a peer spraying
-   junk attestations is observable.
+   junk attestations is observable; oversized delta identity fields are dropped as malformed without
+   echoing attacker-sized audit strings.
 4. **Cross-Realm quarantine.** A `FederateQuarantine` op ships a `QuarantineNotice` to a peer
    federator, which writes a reversible `MarkQuarantine` into its local registry. The federation
    carries the *path*; what triggers a notice and how a Sanctum reacts is the immune-response
    creature's call, gated by an injected trust model (a peer cannot quarantine your creatures unless
-   you trust it).
+   you trust it). Outbound, inbound, and pulled quarantine notices are shape-checked before the
+   federator ships or forwards them.
 
 **Admission stays the only choke point.** Federation moves *bytes* into registries; loading any
 artifact still runs the operator's admission policy. A forged-signer artifact pulled from a peer is
@@ -362,5 +388,6 @@ last, it can selectively abort an unfavourable round by withholding the reveal (
 two-party commit-reveal does not close that; an operator mitigates at the policy layer
 (deadline-forfeit, reputation penalty), and a VRF closes it — a later pair on the same socket, the
 shape unchanged. The reference die still has a resource floor: commit/reveal messages are capped
-before JSON decode, and committed-but-unrevealed rounds are capped by default, with an explicit `0`
-opt-out for lab/demo deployments that accept unbounded pending state.
+before JSON decode, reveal nonces are separately capped before a pending round is consumed, rejected
+reason text is bounded before reply, and committed-but-unrevealed rounds are capped by default, with an
+explicit `0` opt-out for lab/demo deployments that accept unbounded pending state.

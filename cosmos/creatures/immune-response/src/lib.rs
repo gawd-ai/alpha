@@ -51,7 +51,8 @@
 //! control traffic cannot grow immune-response memory without bound. At capacity, a `Watch` for a
 //! new module is refused while updates to an already-watched module remain allowed. Operators can
 //! set `with_max_watched(0)` when they explicitly want an unbounded lab/replay workload; the local
-//! issued set remains bounded by the watched modules.
+//! issued set remains bounded by the watched modules. Watch fields, quarantine reasons, and inbound
+//! peer-attestation lists are also shape-capped before retention or registry/federation writes.
 //!
 //! ## What stays the substrate's, not this creature's
 //!
@@ -122,6 +123,14 @@ pub const DEFAULT_MAX_WATCHED_MODULES: usize = 4_096;
 /// Maximum serialized operator control message decoded before JSON parsing (R9 hostile-input floor).
 /// Matches the crate's other decode caps (sense + federator), so every wire decode is bounded.
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Maximum retained bytes for a watch-map text field (`realm`, `artifact_hash`).
+pub const MAX_WATCH_FIELD_BYTES: usize = 512;
+/// Maximum quarantine reason bytes written to the registry or federated onward.
+pub const MAX_QUARANTINE_REASON_BYTES: usize = 1024;
+/// Maximum peer attestations accepted on one inbound quarantine notice.
+pub const MAX_QUARANTINE_ATTESTING_PEERS: usize = 64;
+/// Maximum retained bytes for one peer id inside an inbound quarantine notice.
+pub const MAX_QUARANTINE_ATTESTING_PEER_BYTES: usize = 256;
 
 // ===================================================================================================
 // Deserialize mirrors of the kernel's proprioception-topic events (no kernel dependency)
@@ -289,7 +298,29 @@ impl ImmuneResponse {
             || self.watch.len() < self.max_watched
     }
 
+    fn watch_shape_error(realm: &RealmId, artifact_hash: &str) -> Option<String> {
+        if realm.0.len() > MAX_WATCH_FIELD_BYTES {
+            return Some(format!(
+                "watch realm too large: {} bytes exceeds {} byte limit",
+                realm.0.len(),
+                MAX_WATCH_FIELD_BYTES
+            ));
+        }
+        if artifact_hash.len() > MAX_WATCH_FIELD_BYTES {
+            return Some(format!(
+                "watch artifact_hash too large: {} bytes exceeds {} byte limit",
+                artifact_hash.len(),
+                MAX_WATCH_FIELD_BYTES
+            ));
+        }
+        None
+    }
+
     fn insert_watch(&mut self, module: CreatureId, realm: RealmId, artifact_hash: String) -> bool {
+        if let Some(reason) = Self::watch_shape_error(&realm, &artifact_hash) {
+            eprintln!("immune-response: {reason}");
+            return false;
+        }
         if !self.can_insert_watch(module) {
             eprintln!(
                 "immune-response: watch map at capacity ({}); refusing watch for new module {}",
@@ -398,6 +429,7 @@ impl ImmuneResponse {
         let Some(me) = self.me_id() else {
             return Outcome::none();
         };
+        let reason = bounded_text(&reason, MAX_QUARANTINE_REASON_BYTES);
         let op = RegistryOp::MarkQuarantine {
             artifact_hash: artifact_hash.clone(),
             realm: realm.clone(),
@@ -450,6 +482,10 @@ impl ImmuneResponse {
         reason: String,
         attesting_peers: Vec<String>,
     ) -> Outcome {
+        if !inbound_notice_shape_admits(&artifact_hash, &realm, &attesting_peers) {
+            return Outcome::none();
+        }
+        let reason = bounded_text(&reason, MAX_QUARANTINE_REASON_BYTES);
         // T2: the injected trust model is the only choke point for inbound defense. A peer we don't
         // trust gets no write — the notice is dropped silently (fire-and-forget, like the
         // federator's own inbound path; no chatty reply back to a peer we just refused).
@@ -482,16 +518,21 @@ impl ImmuneResponse {
         };
         match msg {
             ImmuneMsg::Watch { module, realm, artifact_hash } => {
-                if self.insert_watch(CreatureId(module), realm, artifact_hash) {
+                let shape_error = Self::watch_shape_error(&realm, &artifact_hash);
+                if shape_error.is_none()
+                    && self.insert_watch(CreatureId(module), realm, artifact_hash)
+                {
                     reply(env, ImmuneMsg::Watching { module })
                 } else {
                     reply(
                         env,
                         ImmuneMsg::Ignored {
-                            reason: format!(
-                                "immune-response watch map at capacity ({})",
-                                self.max_watched
-                            ),
+                            reason: shape_error.unwrap_or_else(|| {
+                                format!(
+                                    "immune-response watch map at capacity ({})",
+                                    self.max_watched
+                                )
+                            }),
                         },
                     )
                 }
@@ -508,6 +549,7 @@ impl ImmuneResponse {
 
     fn on_report(&mut self, env: &Envelope, module: u64, reason: String) -> Outcome {
         let mid = CreatureId(module);
+        let reason = bounded_text(&reason, MAX_QUARANTINE_REASON_BYTES);
         // The same self-guard the topic triggers apply in `quarantine_watched`, so the
         // "a creature is never its own immune trigger" invariant holds on EVERY path — not just the
         // kernel-sensed ones. (A `Report` is an operator control-plane op, so it cannot self-feed the
@@ -561,6 +603,35 @@ impl ImmuneResponse {
 /// Reply to the envelope's `reply_to` (or `from`) with an immune-response message + SCHEMA + corr.
 fn reply(env: &Envelope, msg: ImmuneMsg) -> Outcome {
     Outcome::send(Dispatch::reply_to_env(env, msg.to_bytes()).with_schema(SCHEMA))
+}
+
+fn inbound_notice_shape_admits(
+    artifact_hash: &str,
+    realm: &RealmId,
+    attesting_peers: &[String],
+) -> bool {
+    if artifact_hash.len() > MAX_WATCH_FIELD_BYTES || realm.0.len() > MAX_WATCH_FIELD_BYTES {
+        return false;
+    }
+    if attesting_peers.len() > MAX_QUARANTINE_ATTESTING_PEERS {
+        return false;
+    }
+    attesting_peers.iter().all(|peer| peer.len() <= MAX_QUARANTINE_ATTESTING_PEER_BYTES)
+}
+
+fn bounded_text(s: &str, max: usize) -> String {
+    prefix_on_char_boundary(s, max).to_string()
+}
+
+fn prefix_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
 }
 
 // ===================================================================================================
@@ -693,6 +764,26 @@ mod tests {
             other => panic!("expected Watching, got {other:?}"),
         }
         assert_eq!(out.dispatches[0].corr, Some(3));
+    }
+
+    #[test]
+    fn watch_fields_are_size_capped_before_retention() {
+        let mut i = immune();
+        let out = i.handle(control_env(
+            ImmuneMsg::Watch {
+                module: 7,
+                realm: RealmId::new(REALM),
+                artifact_hash: "h".repeat(MAX_WATCH_FIELD_BYTES + 1),
+            },
+            4,
+        ));
+        match parse_reply(&out.dispatches[0]) {
+            ImmuneMsg::Ignored { reason } => {
+                assert!(reason.contains("artifact_hash too large"), "reason: {reason}");
+            }
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+        assert_eq!(i.watched_count(), 0, "oversized watch field is not retained");
     }
 
     #[test]
@@ -922,6 +1013,39 @@ mod tests {
     }
 
     #[test]
+    fn report_reason_is_capped_before_registry_write_and_reply() {
+        let mut i = immune();
+        watch_target(&mut i, 7);
+        let long_reason = format!("{}tail-marker", "x".repeat(MAX_QUARANTINE_REASON_BYTES + 4096));
+        let out = i.handle(control_env(ImmuneMsg::Report { module: 7, reason: long_reason }, 5));
+        let mark =
+            out.dispatches.iter().find(|d| d.schema == REGISTRY_OP_SCHEMA).expect("registry write");
+        match parse_op(mark) {
+            RegistryOp::MarkQuarantine { reason, .. } => {
+                assert_eq!(reason.len(), MAX_QUARANTINE_REASON_BYTES);
+                assert!(!reason.contains("tail-marker"), "registry reason is bounded");
+            }
+            other => panic!("expected MarkQuarantine, got {other:?}"),
+        }
+        let ack = out.dispatches.iter().find(|d| d.schema == SCHEMA).expect("ack");
+        match parse_reply(ack) {
+            ImmuneMsg::Quarantined { reason, .. } => {
+                assert_eq!(reason.len(), MAX_QUARANTINE_REASON_BYTES);
+                assert!(!reason.contains("tail-marker"), "reply reason is bounded");
+            }
+            other => panic!("expected Quarantined, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_reason_cap_preserves_utf8_boundary() {
+        let text = "é".repeat(MAX_QUARANTINE_REASON_BYTES / 2 + 1);
+        let bounded = bounded_text(&text, MAX_QUARANTINE_REASON_BYTES + 1);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded.len(), MAX_QUARANTINE_REASON_BYTES);
+    }
+
+    #[test]
     fn report_for_own_id_is_ignored() {
         // The self-guard applies on the Report path too (uniformity with the topic triggers): even an
         // explicit operator Report naming our own id is refused, so "a creature is never its own
@@ -996,6 +1120,40 @@ mod tests {
         let mut i = immune_with(Box::new(TrustNone), None);
         let out = i.handle(notice_env(vec!["attacker".into()]));
         assert!(out.dispatches.is_empty(), "an untrusted notice produces no registry write");
+    }
+
+    #[test]
+    fn inbound_notice_with_oversized_attesting_peer_is_dropped_before_registry_write() {
+        let mut i = immune_with(Box::new(TrustAll), None);
+        let out = i.handle(notice_env(vec!["p".repeat(MAX_QUARANTINE_ATTESTING_PEER_BYTES + 1)]));
+        assert!(out.dispatches.is_empty(), "oversized peer id makes notice fail closed");
+    }
+
+    #[test]
+    fn trusted_inbound_notice_reason_is_capped_before_registry_write() {
+        let mut i = immune_with(Box::new(TrustAll), None);
+        let msg = FederatorMsg::QuarantineNotice {
+            artifact_hash: "bad".into(),
+            realm: RealmId::new(REALM),
+            reason: format!("{}tail-marker", "x".repeat(MAX_QUARANTINE_REASON_BYTES + 4096)),
+            attesting_peers: vec!["node-B".into()],
+        };
+        let out = i.handle(Envelope {
+            header: header(Address::Creature(ME), omega_federator::SCHEMA, None),
+            payload: msg.to_bytes(),
+        });
+        let mark = out
+            .dispatches
+            .iter()
+            .find(|d| d.schema == REGISTRY_OP_SCHEMA)
+            .expect("trusted notice writes quarantine");
+        match parse_op(mark) {
+            RegistryOp::MarkQuarantine { reason, .. } => {
+                assert_eq!(reason.len(), MAX_QUARANTINE_REASON_BYTES);
+                assert!(!reason.contains("tail-marker"), "registry reason is bounded");
+            }
+            other => panic!("expected MarkQuarantine, got {other:?}"),
+        }
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //!
 //! On every inbound SEER envelope on the `placement` topic, the advertiser parses the requester's
 //! requirement predicates (`cpu >= 2`, `accelerator contains nvidia`, …), checks each offer
-//! against every predicate, and emits a single SEER `Answer` carrying every matching offer.
+//! against every predicate, and emits a single SEER `Answer` carrying every matching offer up to the
+//! placement topic's shared answer cap.
 //!
 //! ## What this creature deliberately doesn't do (named, not pretended)
 //!
@@ -126,6 +127,9 @@ impl EmbodimentAdvertiser {
             // SeerEnvelope is: the substrate doesn't have a "report-back-decoder-error" channel.
             Err(_) => return Outcome::none(),
         };
+        if !query_shape_is_valid(&q) {
+            return Outcome::none();
+        }
 
         // Parse predicates. **Robustness over strict-acceptance**: a single garbage predicate
         // doesn't fail the whole query — we skip it and match against the rest. If *every*
@@ -139,7 +143,9 @@ impl EmbodimentAdvertiser {
         let matches: Vec<placement::EmbodimentOffer> = self
             .offers
             .iter()
+            .filter(|o| offer_entry_shape_is_valid(&self.self_node, o))
             .filter(|o| predicates.iter().all(|p| p.matches(&o.embodiment)))
+            .take(placement::MAX_ANSWER_MATCHES)
             .map(|o| placement::EmbodimentOffer {
                 node: self.self_node.0.clone(),
                 creature_id: o.creature_id.0,
@@ -159,6 +165,43 @@ impl EmbodimentAdvertiser {
             .with_corr(corr);
         Outcome::send(dispatch)
     }
+}
+
+fn query_shape_is_valid(q: &placement::QueryBody) -> bool {
+    q.requirements.len() <= placement::MAX_QUERY_REQUIREMENTS
+        && q.requirements
+            .iter()
+            .all(|r| label_is_bounded(r, placement::MAX_QUERY_REQUIREMENT_BYTES))
+        && q.outcome
+            .as_deref()
+            .is_none_or(|outcome| label_is_bounded(outcome, placement::MAX_QUERY_OUTCOME_BYTES))
+}
+
+fn offer_entry_shape_is_valid(self_node: &NodeId, offer: &OfferEntry) -> bool {
+    node_id_shape_is_valid(&self_node.0)
+        && bounded_labels(&offer.embodiment.accelerators)
+        && bounded_labels(&offer.embodiment.sensors)
+        && optional_label_is_bounded(offer.embodiment.jurisdiction.as_deref())
+        && optional_label_is_bounded(offer.embodiment.connectivity.as_deref())
+}
+
+fn node_id_shape_is_valid(node: &str) -> bool {
+    !node.is_empty()
+        && node.len() <= placement::MAX_OFFER_NODE_ID_BYTES
+        && node.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn bounded_labels(labels: &[String]) -> bool {
+    labels.len() <= placement::MAX_OFFER_LABELS
+        && labels.iter().all(|s| label_is_bounded(s, placement::MAX_OFFER_LABEL_BYTES))
+}
+
+fn optional_label_is_bounded(label: Option<&str>) -> bool {
+    label.is_none_or(|s| label_is_bounded(s, placement::MAX_OFFER_LABEL_BYTES))
+}
+
+fn label_is_bounded(label: &str, max_bytes: usize) -> bool {
+    !label.bytes().any(|b| b == 0) && label.len() <= max_bytes
 }
 
 // ====================================================================================================
@@ -217,10 +260,16 @@ mod tests {
     }
 
     fn query_env(corr: u64, query_id: u64, requirements: Vec<&str>) -> Envelope {
-        let body = placement::QueryBody {
-            requirements: requirements.iter().map(|s| s.to_string()).collect(),
-            outcome: None,
-        };
+        query_env_owned(corr, query_id, requirements.iter().map(|s| s.to_string()).collect(), None)
+    }
+
+    fn query_env_owned(
+        corr: u64,
+        query_id: u64,
+        requirements: Vec<String>,
+        outcome: Option<String>,
+    ) -> Envelope {
+        let body = placement::QueryBody { requirements, outcome };
         let q = SeerEnvelope::query(SeerTopic::Placement, corr, query_id, &body);
         seer_env(corr, q.to_bytes())
     }
@@ -302,6 +351,50 @@ mod tests {
         let out = a.handle(query_env(7, 1, vec![]));
         let (_, body) = decode_answer(&out.dispatches[0]);
         assert_eq!(body.matches.len(), 2, "no constraints → both offers fit");
+    }
+
+    #[test]
+    fn drops_oversized_placement_query_shape_silently() {
+        let mut a = EmbodimentAdvertiser::new(NodeId("node-A".into()), vec![nv_offer(10, 8)]);
+        let requirements = vec!["cpu >= 1".to_string(); placement::MAX_QUERY_REQUIREMENTS + 1];
+        let out = a.handle(query_env_owned(7, 1, requirements, None));
+        assert!(out.dispatches.is_empty(), "too many requirements → silent drop");
+
+        let out = a.handle(query_env_owned(
+            8,
+            1,
+            vec!["r".repeat(placement::MAX_QUERY_REQUIREMENT_BYTES + 1)],
+            None,
+        ));
+        assert!(out.dispatches.is_empty(), "oversized requirement → silent drop");
+    }
+
+    #[test]
+    fn answer_matches_are_capped_to_shared_placement_limit() {
+        let offers: Vec<_> =
+            (0..=placement::MAX_ANSWER_MATCHES).map(|i| plain_offer(1_000 + i as u64, 4)).collect();
+        let mut a = EmbodimentAdvertiser::new(NodeId("node-A".into()), offers);
+
+        let out = a.handle(query_env(7, 1, vec![]));
+
+        assert_eq!(out.dispatches.len(), 1);
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert_eq!(body.matches.len(), placement::MAX_ANSWER_MATCHES);
+    }
+
+    #[test]
+    fn malformed_configured_offer_is_not_emitted() {
+        let mut invalid = nv_offer(10, 8);
+        invalid.embodiment.accelerators = vec!["x".repeat(placement::MAX_OFFER_LABEL_BYTES + 1)];
+        let mut a =
+            EmbodimentAdvertiser::new(NodeId("node-A".into()), vec![invalid, plain_offer(11, 4)]);
+
+        let out = a.handle(query_env(7, 1, vec![]));
+
+        assert_eq!(out.dispatches.len(), 1);
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert_eq!(body.matches.len(), 1);
+        assert_eq!(body.matches[0].creature_id, 11);
     }
 
     #[test]

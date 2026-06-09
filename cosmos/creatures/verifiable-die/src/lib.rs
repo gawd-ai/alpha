@@ -65,9 +65,13 @@ use sha2::{Digest, Sha256};
 pub const SCHEMA: &str = "verifiable.die";
 /// Maximum serialized commit/reveal message bytes accepted before JSON decode.
 pub const MAX_DIE_MESSAGE_BYTES: usize = 64 * 1024;
+/// Maximum requester nonce bytes accepted for one reveal. The nonce is opaque audit material, not a
+/// state payload; keep it comfortably larger than a random token while preventing reflected bulk.
+pub const MAX_DIE_NONCE_BYTES: usize = 4 * 1024;
 /// Default cap for committed-but-unrevealed rounds. `0` in [`VerifiableDie::with_max_pending_rounds`]
 /// means unbounded.
 pub const DEFAULT_MAX_PENDING_ROUNDS: usize = 1024;
+const MAX_DIE_REJECT_REASON_BYTES: usize = 4 * 1024;
 
 // ===================================================================================================
 // Injected entropy (IoC) — substrate ships no randomness source
@@ -147,6 +151,9 @@ pub fn verify_roll(
     nonce: &str,
 ) -> Option<u32> {
     if n == 0 {
+        return None;
+    }
+    if !commitment_shape_is_valid(commitment) || nonce.len() > MAX_DIE_NONCE_BYTES {
         return None;
     }
     let seed = decode_seed(seed_hex)?;
@@ -315,6 +322,19 @@ impl VerifiableDie {
     }
 
     fn on_reveal(&mut self, env: &Envelope, round: u64, nonce: String) -> Outcome {
+        if nonce.len() > MAX_DIE_NONCE_BYTES {
+            return reply(
+                env,
+                DieMsg::Rejected {
+                    reason: format!(
+                        "nonce {} bytes exceeds max {} bytes",
+                        nonce.len(),
+                        MAX_DIE_NONCE_BYTES
+                    ),
+                },
+                None,
+            );
+        }
         let Some((seed, n)) = self.pending.remove(&round) else {
             return reply(
                 env,
@@ -338,6 +358,10 @@ impl VerifiableDie {
 // ----- helpers --------------------------------------------------------------------------------
 
 fn reply(env: &Envelope, msg: DieMsg, commitment: Option<String>) -> Outcome {
+    let msg = match msg {
+        DieMsg::Rejected { reason } => DieMsg::Rejected { reason: bounded_reason(reason) },
+        other => other,
+    };
     let mut d = Dispatch::reply_to_env(env, msg.to_bytes()).with_schema(SCHEMA);
     if let Some(commit) = commitment {
         d = d.with_commitment(commit);
@@ -364,6 +388,28 @@ fn decode_seed(seed_hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn commitment_shape_is_valid(commitment: &str) -> bool {
+    commitment.len() == 64 && commitment.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn bounded_reason(reason: String) -> String {
+    bounded_string(reason, MAX_DIE_REJECT_REASON_BYTES)
+}
+
+fn bounded_string(mut value: String, max_bytes: usize) -> String {
+    const TRUNCATED_SUFFIX: &str = "...[truncated]";
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut keep = max_bytes.saturating_sub(TRUNCATED_SUFFIX.len());
+    while keep > 0 && !value.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    value.truncate(keep);
+    value.push_str(TRUNCATED_SUFFIX);
+    value
+}
+
 // ===================================================================================================
 // Tests
 // ===================================================================================================
@@ -385,6 +431,13 @@ mod tests {
     impl EntropySource for FailingEntropy {
         fn fresh_seed(&self) -> Result<[u8; 32], String> {
             Err("rng offline".into())
+        }
+    }
+
+    struct HugeFailingEntropy;
+    impl EntropySource for HugeFailingEntropy {
+        fn fresh_seed(&self) -> Result<[u8; 32], String> {
+            Err("x".repeat(MAX_DIE_REJECT_REASON_BYTES + 1024))
         }
     }
 
@@ -529,6 +582,20 @@ mod tests {
     }
 
     #[test]
+    fn entropy_failure_reason_is_bounded_before_reply() {
+        let mut d = VerifiableDie::new(Box::new(HugeFailingEntropy));
+        d.set_me_for_tests(ME);
+        match parse(&d.handle(env(DieMsg::Commit { round: 7, n: 6 }, 1)).dispatches[0]) {
+            DieMsg::Rejected { reason } => {
+                assert!(reason.len() <= MAX_DIE_REJECT_REASON_BYTES, "len: {}", reason.len());
+                assert!(reason.ends_with("[truncated]"), "got suffix in: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(d.pending_count(), 0, "failed entropy must not leave an unrevealable commit");
+    }
+
+    #[test]
     fn re_committing_a_pending_round_is_rejected_not_overwritten() {
         let mut d = die_with([0x66; 32]);
         d.handle(env(DieMsg::Commit { round: 1, n: 6 }, 1));
@@ -588,9 +655,45 @@ mod tests {
     }
 
     #[test]
+    fn oversized_nonce_is_rejected_without_consuming_pending_round() {
+        let mut d = die_with([0x78; 32]);
+        let committed = d.handle(env(DieMsg::Commit { round: 9, n: 6 }, 1));
+        assert!(matches!(parse(&committed.dispatches[0]), DieMsg::Committed { round: 9, .. }));
+        assert_eq!(d.pending_count(), 1);
+
+        let rejected = d.handle(env(
+            DieMsg::Reveal { round: 9, nonce: "n".repeat(MAX_DIE_NONCE_BYTES + 1) },
+            2,
+        ));
+        match parse(&rejected.dispatches[0]) {
+            DieMsg::Rejected { reason } => {
+                assert!(reason.contains("nonce"), "reason: {reason}");
+                assert!(reason.contains("exceeds max"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(d.pending_count(), 1, "malformed reveal must not consume the commitment");
+
+        let reveal = d.handle(env(DieMsg::Reveal { round: 9, nonce: "nonce".into() }, 3));
+        assert!(matches!(parse(&reveal.dispatches[0]), DieMsg::Revealed { round: 9, .. }));
+        assert_eq!(d.pending_count(), 0);
+    }
+
+    #[test]
     fn verify_roll_rejects_zero_n_and_malformed_seed() {
         assert_eq!(verify_roll(&commitment_of(1, 0, &[0; 32]), 1, 0, &hex(&[0; 32]), "x"), None);
         assert_eq!(verify_roll("deadbeef", 1, 4, "not-hex-and-wrong-length", "x"), None);
+        assert_eq!(
+            verify_roll(
+                &commitment_of(1, 4, &[0; 32]),
+                1,
+                4,
+                &hex(&[0; 32]),
+                &"n".repeat(MAX_DIE_NONCE_BYTES + 1)
+            ),
+            None,
+            "auditing rejects nonce input this die would never reveal"
+        );
     }
 
     #[test]

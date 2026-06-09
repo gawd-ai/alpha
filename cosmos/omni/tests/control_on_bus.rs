@@ -15,7 +15,8 @@ use sigil::{Backend, Capabilities, Manifest};
 
 use omni::{
     boot_control, boot_organs_with_monitor, recv_corr, AiControl, Verb, VerbResult,
-    CONTROL_RESULT_SCHEMA, CONTROL_SCHEMA, CONTROL_WORKER_QUEUE_CAP, MAX_CONTROL_VERB_BYTES,
+    CONTROL_RESULT_SCHEMA, CONTROL_SCHEMA, CONTROL_WORKER_QUEUE_CAP, MAX_AI_STATUS_TEXT_CHARS,
+    MAX_CONTROL_RESULT_BYTES, MAX_CONTROL_ROLE_NAME_BYTES, MAX_CONTROL_VERB_BYTES,
     MAX_PRESENTED_PAYLOAD_BYTES,
 };
 
@@ -167,6 +168,66 @@ fn the_allow_ai_gate_holds_over_the_bus() {
 }
 
 #[test]
+fn ai_status_over_the_bus_is_sanitized_before_storage_and_display() {
+    let (kernel, _ai) = node(false);
+    let set = control(
+        &kernel,
+        70,
+        &Verb::AiStatus {
+            working: true,
+            activity: "write\n\x1b[2J".into(),
+            message: format!("{}\rhidden", "m".repeat(MAX_AI_STATUS_TEXT_CHARS + 16)),
+        },
+    );
+
+    assert!(set.ok, "ai-status is not allow-AI gated: {:?}", set.json);
+    assert!(set.human.starts_with("[ai] write[2J: "));
+    assert!(set.human.chars().all(|c| !c.is_control()));
+
+    let status = control(&kernel, 71, &Verb::Status);
+    let ai_status = &status.json["ai_status"];
+    assert_eq!(ai_status["activity"].as_str(), Some("write[2J"));
+    let msg = ai_status["message"].as_str().expect("message string");
+    assert_eq!(msg.len(), MAX_AI_STATUS_TEXT_CHARS);
+    assert!(msg.chars().all(|c| !c.is_control()));
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
+fn bind_over_the_bus_rejects_malformed_role_names_before_retention() {
+    let (kernel, _ai) = node(true);
+
+    let valid = control(&kernel, 72, &Verb::Bind { role: "custom-role_1".into(), id: 1 });
+    assert!(valid.ok, "bounded token role binds: {:?}", valid.json);
+
+    for (corr, role) in [(73, ""), (74, "bad role"), (75, "bad\nrole")] {
+        let rejected = control(&kernel, corr, &Verb::Bind { role: role.into(), id: 1 });
+        assert!(!rejected.ok, "malformed role should be rejected: {role:?}");
+        assert_eq!(rejected.json.get("error").and_then(|v| v.as_str()), Some("invalid-role-name"));
+    }
+
+    let oversized_role = "r".repeat(MAX_CONTROL_ROLE_NAME_BYTES + 1);
+    let rejected = control(&kernel, 76, &Verb::Bind { role: oversized_role.clone(), id: 1 });
+    assert!(!rejected.ok, "oversized role should be rejected");
+    assert_eq!(rejected.json.get("error").and_then(|v| v.as_str()), Some("invalid-role-name"));
+    assert_eq!(
+        rejected.json.get("limit").and_then(|v| v.as_u64()),
+        Some(MAX_CONTROL_ROLE_NAME_BYTES as u64)
+    );
+
+    let status = control(&kernel, 77, &Verb::Status);
+    let roles = status.json["roles"].as_array().expect("roles array");
+    assert!(roles.iter().any(|r| r["role"] == "custom-role_1"));
+    assert!(
+        !roles.iter().any(|r| r["role"].as_str() == Some(oversized_role.as_str())),
+        "rejected oversized role was not retained"
+    );
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
 fn oversized_control_verb_payload_is_rejected_before_json_parse() {
     let (kernel, _ai) = node(true);
     let (probe_id, bus, rx) = kernel.open_endpoint(Capabilities::default());
@@ -179,6 +240,29 @@ fn oversized_control_verb_payload_is_rejected_before_json_parse() {
 
     let read = control(&kernel, 78, &Verb::Status);
     assert!(read.ok, "node still answers after an oversized control verb");
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
+fn oversized_control_result_is_replaced_before_emission() {
+    let (kernel, _ai) = node(true);
+    for i in 0..24u64 {
+        let role = format!("{}-{i}", "role".repeat(16 * 1024));
+        kernel.bind_role(Role::new(role), aether::CreatureId(1));
+    }
+
+    let status = control(&kernel, 120, &Verb::Status);
+    assert!(!status.ok, "status result should be replaced with a bounded error before emission");
+    assert_eq!(status.json.get("error").and_then(|v| v.as_str()), Some("control-result-too-large"));
+    assert_eq!(
+        status.json.get("limit").and_then(|v| v.as_u64()),
+        Some(MAX_CONTROL_RESULT_BYTES as u64)
+    );
+    assert!(
+        status.json.get("bytes").and_then(|v| v.as_u64()).unwrap()
+            > MAX_CONTROL_RESULT_BYTES as u64
+    );
 
     kernel.shutdown_all(aether::Deadline::default());
 }

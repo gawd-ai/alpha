@@ -125,10 +125,14 @@ intent ──▶ AUTHORING ──▶ source + manifest stub ──▶ BUILD ─�
   `BuildReply::Failed { kind, message, stderr, stdout }`. The reference `build-cargo` materializes a
   fresh temp workspace (path-dep on `forge` so the authored crate inherits the FFI macro), runs
   `cargo build --release` into a shared cache, hashes the resulting `.so`, populates and ed25519-signs
-  the manifest with the operator's Abode key, and returns the pair. `build-critter` is the sibling
-  on the same socket for the scripted tier — it validates that Rhai source compiles and defines
-  `fn handle(env)`, then signs the source bytes themselves as the artifact under
-  `abi_tag = gawd_critter_v1`. Native daemons carry `gawd_creature_v1`. Cross-compile, AOT-from-WASM,
+  the manifest with the operator's Abode key, and returns the pair. It bounds the incoming build
+  payload, authored source, generated dependency list/features, Cargo metadata fields, manifest-stub
+  shape, compiler output capture, telemetry event text, and produced artifact bytes before those can
+  amplify into filesystem writes, Cargo.toml generation, expensive compiler work, or bus replies.
+  `build-critter` is the sibling on the same socket for the scripted tier — it validates that Rhai
+  source compiles and defines `fn handle(env)`, reuses the same manifest-stub shape gate before
+  compiling, then signs the source bytes themselves as the artifact under `abi_tag = gawd_critter_v1`.
+  Native daemons carry `gawd_creature_v1`. Cross-compile, AOT-from-WASM,
   and remote build farms are the same socket, a different bindee.
 
 The loop is **just composition of existing sockets** — admission and safe-load are unchanged, and
@@ -183,7 +187,10 @@ envelopes; they never decide topic semantics. The wire format is identical acros
 topic — `placement`, `policy`, `budget`, `fitness`, `consensus` reserve the same shape — so a
 consensus / VRF / weight model lands as another `seer` consumer, never as a new bus contract.
 The reference `agent-curious` bounds its parked authoring Query state by default as a resource
-floor; liveness/deadline policy still belongs to the orchestrator.
+floor, refuses a duplicate live `corr` rather than overwriting the parked exchange, and copies only a
+bounded preview of the original request into Thought/Query context so one near-limit authoring
+request cannot fan out into oversized SEER envelopes; liveness/deadline policy still belongs to the
+orchestrator.
 
 ### Single-shot is the reduced case
 

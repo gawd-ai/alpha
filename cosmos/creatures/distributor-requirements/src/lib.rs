@@ -8,23 +8,28 @@
 //!
 //! Bound to `Role::DISTRIBUTOR`: every [`Intent`] envelope hits its inbox. On receipt:
 //!
-//! 1. Parse `Intent.requirements` as [`placement::Predicate`] strings (the minimal predicate language).
-//!    A predicate that fails to parse is dropped silently — a single garbage predicate doesn't
-//!    sink the whole placement; advertisers see the surviving subset.
+//! 1. Carry `Intent.requirements` as [`placement::Predicate`] strings (the minimal predicate
+//!    language). The distributor deliberately does not parse them; advertisers own predicate
+//!    semantics, and a richer advertiser can understand a richer vocabulary without a distributor
+//!    change. It does shape-bound the outcome and requirement strings before fan-out so one
+//!    tiny-payload Intent cannot amplify a huge address header into many SEER queries.
 //! 2. Build a `corr` for this placement consult — distinct from the Intent's own `corr`, which
 //!    belongs to the *original* requester's reply tracking. The placement consult is its own
 //!    fire-and-correlate thread.
 //! 3. Emit a `SeerEnvelope::Query` on [`SeerTopic::Placement`] to **every** known advertiser
-//!    (local + peer). The Query's `reply_to` is set to this distributor, so answers come back
-//!    here regardless of how many hops they crossed.
+//!    (local + peer), with one `query_id` per advertiser. The Query's `reply_to` is set to this
+//!    distributor, so answers come back here regardless of how many hops they crossed.
 //! 4. Park the Intent in a pending table keyed by the consult `corr`, tracking how many answers
 //!    are still expected.
-//! 5. As answers arrive (subsequent `handle()` calls): accumulate the offers, decrement the
-//!    expected count. **When all expected answers have arrived** (or when the
+//! 5. As answers arrive (subsequent `handle()` calls): accumulate the offers, count each
+//!    `query_id` once, and ignore duplicate/out-of-range answers. **When all expected answers have
+//!    arrived** (or when the
 //!    `PickModel::FirstFit` model fires early on the first match), reconcile: apply the
 //!    [`PickModel`], route the Intent to the picked target, drop the pending entry. If no offer
 //!    matched after every answer: emit a structured "no provider" reply to the Intent's
 //!    `reply_to` (NOT a panic, NOT a silent drop — see [`NoProviderReply`]).
+//!    Answer shapes are bounded before accumulation: over-cap match lists are dropped without
+//!    consuming their `query_id`, and malformed offers are filtered out.
 //!
 //! ## Why the consult fires even for N=1 local
 //!
@@ -50,7 +55,7 @@
 //! - **It doesn't introspect the kernel.** Local advertisers, peer advertisers, and the model are
 //!   all operator-supplied at construction. The distributor adds no kernel responsibility.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aether::{
@@ -67,6 +72,26 @@ pub const SCHEMA_SEER: &str = SEER_SCHEMA;
 /// finds no match. Distinct from SEER — this isn't an in-conversation envelope, it's the closing
 /// reply to the *Intent's* originator.
 pub const SCHEMA_NO_PROVIDER: &str = "distributor.no_provider";
+
+/// Maximum offers accepted from one placement Answer. `0` is not a runtime option here: placement
+/// answers are direct bus input, so the reference distributor keeps a structural floor.
+pub const MAX_PLACEMENT_ANSWER_MATCHES: usize = placement::MAX_ANSWER_MATCHES;
+/// Node ids in placement offers must be routeable through the transport convention.
+pub const MAX_PLACEMENT_OFFER_NODE_ID_BYTES: usize = placement::MAX_OFFER_NODE_ID_BYTES;
+/// Free-form embodiment labels (accelerators, sensors, jurisdiction, connectivity) are retained in
+/// pending state and can feed richer pick models, so bound each retained string.
+pub const MAX_PLACEMENT_OFFER_LABEL_BYTES: usize = placement::MAX_OFFER_LABEL_BYTES;
+/// Bound retained free-form label lists per offer.
+pub const MAX_PLACEMENT_OFFER_LABELS: usize = placement::MAX_OFFER_LABELS;
+/// Placement outcome text retained in pending state and echoed in no-provider replies.
+pub const MAX_PLACEMENT_INTENT_OUTCOME_BYTES: usize = placement::MAX_QUERY_OUTCOME_BYTES;
+/// Maximum predicate strings accepted from an `Address::Intent`.
+pub const MAX_PLACEMENT_INTENT_REQUIREMENTS: usize = placement::MAX_QUERY_REQUIREMENTS;
+/// Maximum bytes in one predicate string accepted from an `Address::Intent`.
+pub const MAX_PLACEMENT_INTENT_REQUIREMENT_BYTES: usize = placement::MAX_QUERY_REQUIREMENT_BYTES;
+/// Rejected-intent replies echo only a small preview of requirements, never the whole hostile shape.
+const MAX_REJECTED_INTENT_REQUIREMENT_ECHOES: usize = 4;
+const MAX_REJECTED_INTENT_ECHO_BYTES: usize = 256;
 
 /// Structured reason for a [`NoProviderReply`] — an orchestrator dispatches on the variant, not
 /// on a substring of free-form prose. Adding a variant is a one-line change here + a producing
@@ -98,6 +123,10 @@ pub enum NoProviderReason {
     /// than panic on the missing bind (the fabric-integrity floor would catch that via unload, but
     /// the originator would then silently lose the work), it replies with this reason.
     NotReady,
+    /// The `Address::Intent` header shape exceeded the distributor's structural floor. The
+    /// distributor rejects before fan-out so one tiny-payload Intent cannot amplify into many large
+    /// SEER queries or no-provider echoes.
+    IntentShapeRejected,
 }
 
 /// The reply emitted to the Intent's `reply_to` when reconciliation finds no matching embodiment.
@@ -165,6 +194,10 @@ struct Pending {
     /// Accumulated offers across every answer. The reconciliation model decides what to do with the
     /// full set.
     offers: Vec<placement::EmbodimentOffer>,
+    /// Which per-advertiser query ids have already answered. The distributor cannot rely on
+    /// `Envelope.header.from` here: cross-node transport deliberately re-seals it to the local
+    /// transport creature, so the SEER `query_id` is the stable respondent key.
+    answered_query_ids: HashSet<u64>,
 }
 
 /// The distributor creature itself.
@@ -272,6 +305,19 @@ impl Distributor {
         // predicate vocabulary works without a distributor change.
         let (outcome, requirements) = match &env.header.to {
             Address::Intent(Intent { outcome, requirements }) => {
+                if let Err(reason) = validate_intent_shape(outcome, requirements) {
+                    let (outcome_echo, requirement_echo) =
+                        rejected_intent_echo(outcome, requirements);
+                    return Outcome::send(self.build_no_provider(
+                        &env,
+                        &outcome_echo,
+                        &requirement_echo,
+                        0,
+                        0,
+                        NoProviderReason::IntentShapeRejected,
+                        Some(reason),
+                    ));
+                }
                 (outcome.clone(), requirements.clone())
             }
             // Defensive — `handle` already gated on Address::Intent, so this branch is dead.
@@ -335,14 +381,15 @@ impl Distributor {
         // guarded above) so answers come back here regardless of how many transport hops they crossed.
         let reply_to_addr = Address::Creature(me_id);
 
-        // Fan out: one Query per advertiser. All on the same consult corr / query_id=1 (the
-        // model: Intent → one round of asks → reconcile; a future multi-round consultor allocates
-        // more query_ids per corr).
+        // Fan out: one Query per advertiser. All on the same consult corr, but each gets a unique
+        // query_id so duplicate answers cannot be counted as distinct respondents. Cross-node
+        // transport re-seals `from`, so `query_id` is the identity that survives every hop.
         let mut expected: u32 = 0;
 
         // Local advertisers
         for adv in &self.local_advertisers {
-            let q = SeerEnvelope::query(SeerTopic::Placement, consult_corr, 1, &query_body);
+            let query_id = u64::from(expected) + 1;
+            let q = SeerEnvelope::query(SeerTopic::Placement, consult_corr, query_id, &query_body);
             dispatches.push(
                 Dispatch::to(Address::Creature(*adv), q.to_bytes())
                     .with_schema(SCHEMA_SEER)
@@ -353,7 +400,8 @@ impl Distributor {
         }
         // Peer advertisers
         for (peer, adv) in &self.peer_advertisers {
-            let q = SeerEnvelope::query(SeerTopic::Placement, consult_corr, 1, &query_body);
+            let query_id = u64::from(expected) + 1;
+            let q = SeerEnvelope::query(SeerTopic::Placement, consult_corr, query_id, &query_body);
             dispatches.push(
                 Dispatch::to(Address::Node(peer.clone(), *adv), q.to_bytes())
                     .with_schema(SCHEMA_SEER)
@@ -381,7 +429,13 @@ impl Distributor {
         // Park the Intent for resumption when answers arrive.
         self.pending.insert(
             consult_corr,
-            Pending { intent_env: env, expected, answered: 0, offers: Vec::new() },
+            Pending {
+                intent_env: env,
+                expected,
+                answered: 0,
+                offers: Vec::new(),
+                answered_query_ids: HashSet::new(),
+            },
         );
 
         Outcome { dispatches, budget_signal: None }
@@ -407,13 +461,25 @@ impl Distributor {
     }
 
     fn on_answer(&mut self, corr: u64, query_id: u64, body: serde_json::Value) -> Outcome {
-        // query_id mismatch: stale or spoofed; ignore. (We always use query_id=1.)
-        if query_id != 1 {
-            return Outcome::none();
+        {
+            let Some(p) = self.pending.get(&corr) else {
+                // Late answer for an already-reconciled or never-started consult; drop silently.
+                return Outcome::none();
+            };
+            if query_id == 0 || query_id > u64::from(p.expected) {
+                return Outcome::none();
+            }
+            if p.answered_query_ids.contains(&query_id) {
+                return Outcome::none();
+            }
         }
+
         let answer: placement::AnswerBody = match serde_json::from_value(body) {
             Ok(b) => b,
             Err(_) => return Outcome::none(),
+        };
+        let Some(matches) = retain_valid_answer_matches(answer.matches) else {
+            return Outcome::none();
         };
 
         // Accumulate into the pending consult *in place* (no remove+reinsert churn on
@@ -423,8 +489,14 @@ impl Distributor {
                 // Late answer for an already-reconciled or never-started consult; drop silently.
                 return Outcome::none();
             };
+            if query_id == 0 || query_id > u64::from(p.expected) {
+                return Outcome::none();
+            }
+            if !p.answered_query_ids.insert(query_id) {
+                return Outcome::none();
+            }
             p.answered = p.answered.saturating_add(1);
-            p.offers.extend(answer.matches);
+            p.offers.extend(matches);
             // FirstFit fires on the first offer; every other model waits for all expected answers.
             (matches!(self.model, PickModel::FirstFit) && !p.offers.is_empty())
                 || p.answered >= p.expected
@@ -536,6 +608,95 @@ fn intent_fields(env: &Envelope) -> (String, Vec<String>) {
     }
 }
 
+fn validate_intent_shape(outcome: &str, requirements: &[String]) -> Result<(), &'static str> {
+    if outcome.len() > MAX_PLACEMENT_INTENT_OUTCOME_BYTES {
+        return Err("intent outcome exceeds placement byte limit");
+    }
+    if has_nul(outcome) {
+        return Err("intent outcome contains NUL byte");
+    }
+    if requirements.len() > MAX_PLACEMENT_INTENT_REQUIREMENTS {
+        return Err("intent requirements exceed placement count limit");
+    }
+    for requirement in requirements {
+        if requirement.len() > MAX_PLACEMENT_INTENT_REQUIREMENT_BYTES {
+            return Err("intent requirement exceeds placement byte limit");
+        }
+        if has_nul(requirement) {
+            return Err("intent requirement contains NUL byte");
+        }
+    }
+    Ok(())
+}
+
+fn rejected_intent_echo(outcome: &str, requirements: &[String]) -> (String, Vec<String>) {
+    let mut echoed_requirements: Vec<String> = requirements
+        .iter()
+        .take(MAX_REJECTED_INTENT_REQUIREMENT_ECHOES)
+        .map(|s| bounded_preview(s, MAX_REJECTED_INTENT_ECHO_BYTES))
+        .collect();
+    if requirements.len() > MAX_REJECTED_INTENT_REQUIREMENT_ECHOES {
+        echoed_requirements.push(format!(
+            "<{} more requirements elided>",
+            requirements.len() - MAX_REJECTED_INTENT_REQUIREMENT_ECHOES
+        ));
+    }
+    (bounded_preview(outcome, MAX_REJECTED_INTENT_ECHO_BYTES), echoed_requirements)
+}
+
+fn bounded_preview(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("...");
+    out
+}
+
+fn retain_valid_answer_matches(
+    matches: Vec<placement::EmbodimentOffer>,
+) -> Option<Vec<placement::EmbodimentOffer>> {
+    if matches.len() > MAX_PLACEMENT_ANSWER_MATCHES {
+        return None;
+    }
+    Some(matches.into_iter().filter(placement_offer_shape_is_valid).collect())
+}
+
+fn placement_offer_shape_is_valid(offer: &placement::EmbodimentOffer) -> bool {
+    node_id_shape_is_valid(&offer.node)
+        && bounded_labels(&offer.embodiment.accelerators)
+        && bounded_labels(&offer.embodiment.sensors)
+        && optional_label_is_bounded(offer.embodiment.jurisdiction.as_deref())
+        && optional_label_is_bounded(offer.embodiment.connectivity.as_deref())
+}
+
+fn node_id_shape_is_valid(node: &str) -> bool {
+    !node.is_empty()
+        && node.len() <= MAX_PLACEMENT_OFFER_NODE_ID_BYTES
+        && node.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn bounded_labels(labels: &[String]) -> bool {
+    labels.len() <= MAX_PLACEMENT_OFFER_LABELS
+        && labels.iter().all(|s| label_is_bounded(s.as_str()))
+}
+
+fn optional_label_is_bounded(label: Option<&str>) -> bool {
+    label.is_none_or(label_is_bounded)
+}
+
+fn label_is_bounded(label: &str) -> bool {
+    !label.bytes().any(|b| b == 0) && label.len() <= MAX_PLACEMENT_OFFER_LABEL_BYTES
+}
+
+fn has_nul(s: &str) -> bool {
+    s.bytes().any(|b| b == 0)
+}
+
 #[cfg(test)]
 impl Distributor {
     /// For tests that drive `handle` directly (no kernel bind), set the `me` slot manually.
@@ -555,13 +716,24 @@ mod tests {
     use aether::{CreatureId, Header};
 
     fn intent_env(corr: u64, outcome: &str, requirements: Vec<&str>, payload: &[u8]) -> Envelope {
+        intent_env_owned(
+            corr,
+            outcome.to_string(),
+            requirements.iter().map(|s| s.to_string()).collect(),
+            payload,
+        )
+    }
+
+    fn intent_env_owned(
+        corr: u64,
+        outcome: String,
+        requirements: Vec<String>,
+        payload: &[u8],
+    ) -> Envelope {
         Envelope {
             header: Header {
                 from: Address::Creature(CreatureId(100)),
-                to: Address::Intent(Intent {
-                    outcome: outcome.to_string(),
-                    requirements: requirements.iter().map(|s| s.to_string()).collect(),
-                }),
+                to: Address::Intent(Intent { outcome, requirements }),
                 reply_to: Some(Address::Creature(CreatureId(100))),
                 seq: 0,
                 causal: vec![],
@@ -630,12 +802,17 @@ mod tests {
 
         let out = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"hi"));
         assert_eq!(out.dispatches.len(), 3, "two local + one peer queries");
-        // All are SEER, all on the same consult corr.
-        for q in &out.dispatches {
+        // All are SEER, all on the same consult corr, each with a distinct per-advertiser query_id.
+        for (idx, q) in out.dispatches.iter().enumerate() {
             assert_eq!(q.schema, SCHEMA_SEER);
             assert_eq!(q.corr, Some(10_000));
             // reply_to must point at the distributor so peer answers come back here.
             assert_eq!(q.reply_to, Some(Address::Creature(CreatureId(7))));
+            let seer = SeerEnvelope::parse(&q.payload).expect("placement query parses");
+            match seer.kind {
+                SeerKind::Query { query_id, .. } => assert_eq!(query_id, idx as u64 + 1),
+                other => panic!("expected Query, got {other:?}"),
+            }
         }
         // First two go to local creature ids; third is a peer Node address.
         assert_eq!(out.dispatches[0].to, Address::Creature(CreatureId(50)));
@@ -672,6 +849,37 @@ mod tests {
         assert_eq!(reply.advertisers_consulted, 0);
         assert_eq!(reply.advertisers_answered, 0);
         assert_eq!(reply.reason, NoProviderReason::NoAdvertisers);
+    }
+
+    #[test]
+    fn oversized_intent_shape_replies_without_fanout_or_pending() {
+        let mut d = make_dist(PickModel::FirstFit);
+        let requirements = vec!["cpu >= 4".to_string(); MAX_PLACEMENT_INTENT_REQUIREMENTS + 1];
+
+        let out = d.handle(intent_env_owned(1, "reverse".into(), requirements, b"hi"));
+
+        assert_eq!(out.dispatches.len(), 1, "reject reply only; no placement query fan-out");
+        assert_eq!(out.dispatches[0].schema, SCHEMA_NO_PROVIDER);
+        let reply = NoProviderReply::parse(&out.dispatches[0].payload).unwrap();
+        assert_eq!(reply.reason, NoProviderReason::IntentShapeRejected);
+        assert_eq!(reply.advertisers_consulted, 0);
+        assert_eq!(reply.advertisers_answered, 0);
+        assert_eq!(d.pending_consults(), 0, "rejected Intent is not parked");
+    }
+
+    #[test]
+    fn rejected_intent_echo_is_bounded() {
+        let mut d = make_dist(PickModel::FirstFit);
+        let huge_outcome = "o".repeat(MAX_PLACEMENT_INTENT_OUTCOME_BYTES + 1);
+        let huge_requirement = "r".repeat(MAX_PLACEMENT_INTENT_REQUIREMENT_BYTES + 1);
+
+        let out = d.handle(intent_env_owned(1, huge_outcome, vec![huge_requirement], b"hi"));
+
+        assert_eq!(out.dispatches.len(), 1);
+        let reply = NoProviderReply::parse(&out.dispatches[0].payload).unwrap();
+        assert_eq!(reply.reason, NoProviderReason::IntentShapeRejected);
+        assert!(reply.outcome.len() <= MAX_REJECTED_INTENT_ECHO_BYTES + 3);
+        assert!(reply.requirements[0].len() <= MAX_REJECTED_INTENT_ECHO_BYTES + 3);
     }
 
     #[test]
@@ -763,17 +971,88 @@ mod tests {
         assert!(out_a.dispatches.is_empty(), "RoundRobin must wait for all expected answers");
         assert_eq!(d.pending_consults(), 1, "still parked after partial answers");
 
-        // Second answer triggers reconciliation. RoundRobin cursor=0 → pick first.
-        let out_b = d.handle(answer_env(10_000, 1, vec![offer("node-A", 99, 8)]));
+        // Second advertiser's answer triggers reconciliation. RoundRobin cursor=0 → pick first.
+        let out_b = d.handle(answer_env(10_000, 2, vec![offer("node-A", 99, 8)]));
         assert_eq!(out_b.dispatches.len(), 1);
         assert_eq!(out_b.dispatches[0].to, Address::Creature(CreatureId(42)));
 
         // Re-issue: cursor advances. New consult corr.
         let _ = d.handle(intent_env(2, "reverse", vec!["cpu >= 4"], b"abc"));
         let _ = d.handle(answer_env(10_001, 1, vec![offer("node-A", 42, 8)]));
-        let out_c = d.handle(answer_env(10_001, 1, vec![offer("node-A", 99, 8)]));
+        let out_c = d.handle(answer_env(10_001, 2, vec![offer("node-A", 99, 8)]));
         // Cursor was 0 last time, so this is 1 → second offer.
         assert_eq!(out_c.dispatches[0].to, Address::Creature(CreatureId(99)));
+    }
+
+    #[test]
+    fn duplicate_answer_query_id_is_silently_dropped() {
+        let mut d = Distributor::new(
+            NodeId("node-A".into()),
+            vec![CreatureId(50), CreatureId(51)],
+            vec![],
+            PickModel::RoundRobin,
+            10_000,
+            1024,
+        );
+        d.set_me_for_tests(CreatureId(7));
+        let _ = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"abc"));
+
+        let out_a = d.handle(answer_env(10_000, 1, vec![offer("node-A", 42, 8)]));
+        assert!(out_a.dispatches.is_empty(), "first of two RoundRobin answers only accumulates");
+
+        let dup = d.handle(answer_env(10_000, 1, vec![offer("node-A", 99, 8)]));
+        assert!(dup.dispatches.is_empty(), "duplicate query_id is not counted as a second answer");
+        assert_eq!(d.pending_consults(), 1, "consult stays pending until query_id=2 answers");
+
+        let out_b = d.handle(answer_env(10_000, 2, vec![offer("node-A", 77, 8)]));
+        assert_eq!(out_b.dispatches.len(), 1);
+        assert_eq!(
+            out_b.dispatches[0].to,
+            Address::Creature(CreatureId(42)),
+            "duplicate offer was not accumulated into reconciliation"
+        );
+    }
+
+    #[test]
+    fn malformed_answer_offers_are_filtered_before_reconcile() {
+        let mut d = make_dist(PickModel::FirstFit);
+        let _ = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"abc"));
+
+        let mut empty_node = offer("", 42, 8);
+        empty_node.embodiment.accelerators = vec!["nvidia-a100".into()];
+        let mut overlong_label = offer("node-A", 43, 8);
+        overlong_label.embodiment.accelerators =
+            vec!["x".repeat(MAX_PLACEMENT_OFFER_LABEL_BYTES + 1)];
+
+        let out = d.handle(answer_env(
+            10_000,
+            1,
+            vec![empty_node, overlong_label, offer("node-A", 77, 8)],
+        ));
+
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(
+            out.dispatches[0].to,
+            Address::Creature(CreatureId(77)),
+            "invalid offers are not route candidates"
+        );
+    }
+
+    #[test]
+    fn oversized_answer_is_dropped_without_consuming_query_id() {
+        let mut d = make_dist(PickModel::FirstFit);
+        let _ = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"abc"));
+
+        let too_many: Vec<_> = (0..=MAX_PLACEMENT_ANSWER_MATCHES)
+            .map(|i| offer("node-A", 1_000 + i as u64, 8))
+            .collect();
+        let out = d.handle(answer_env(10_000, 1, too_many));
+        assert!(out.dispatches.is_empty(), "over-cap answer is dropped");
+        assert_eq!(d.pending_consults(), 1, "query_id remains available for a valid answer");
+
+        let out = d.handle(answer_env(10_000, 1, vec![offer("node-A", 77, 8)]));
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].to, Address::Creature(CreatureId(77)));
     }
 
     #[test]
@@ -794,12 +1073,8 @@ mod tests {
     fn answer_with_mismatched_query_id_is_silently_dropped() {
         let mut d = make_dist(PickModel::FirstFit);
         let _ = d.handle(intent_env(7, "reverse", vec!["cpu >= 4"], b"abc"));
-        // query_id=999 doesn't match our query_id=1.
-        let mut env = answer_env(10_000, 999, vec![offer("node-A", 42, 8)]);
-        // Repack the payload with a different query_id.
-        let body = placement::AnswerBody { matches: vec![offer("node-A", 42, 8)] };
-        let seer = SeerEnvelope::answer(SeerTopic::Placement, 10_000, 999, &body);
-        env.payload = seer.to_bytes();
+        // query_id=999 is outside the query ids allocated for this one-advertiser consult.
+        let env = answer_env(10_000, 999, vec![offer("node-A", 42, 8)]);
 
         let out = d.handle(env);
         assert!(out.dispatches.is_empty(), "mismatched query_id → silent drop");

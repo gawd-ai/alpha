@@ -18,7 +18,7 @@
 //! parse and reply `Failed{Invalid}` — never a panic, never a bad artifact.
 
 use aether::{Creature, CreatureCtx, Dispatch, Envelope, Outcome};
-use build_cargo::{BuildErrorKind, BuildReply, ManifestStub};
+use build_cargo::{validate_manifest_stub_shape, BuildErrorKind, BuildReply, ManifestStub};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sigil::crypto::hex_encode;
@@ -91,6 +91,11 @@ impl BuildCritter {
                     MAX_CRITTER_SOURCE_BYTES
                 ),
             );
+        }
+        if let Err(e) =
+            validate_manifest_stub_shape(stub, Backend::Critter, CRITTER_ABI_TAG, Vec::new())
+        {
+            return failed(BuildErrorKind::Invalid, e);
         }
 
         // 1. Compile gate. A bare engine resolves the same syntax the runtime loader will; a parse
@@ -289,6 +294,21 @@ mod tests {
                 assert!(message.contains("exceeds"), "{message}");
             }
             BuildReply::Built { .. } => panic!("oversized source must not build"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_manifest_stub_before_rhai_compile() {
+        let bc = BuildCritter::new(key(), "author");
+        let mut stub = stub();
+        stub.provides = vec!["policy".into(), "policy".into()];
+        match bc.author("this is not valid rhai either", &stub) {
+            BuildReply::Failed { kind, message, .. } => {
+                assert_eq!(kind, BuildErrorKind::Invalid);
+                assert!(message.contains("manifest_stub"), "{message}");
+                assert!(message.contains("duplicate provides"), "{message}");
+            }
+            BuildReply::Built { .. } => panic!("invalid manifest stub must not build"),
         }
     }
 

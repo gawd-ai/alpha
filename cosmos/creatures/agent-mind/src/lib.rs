@@ -25,6 +25,8 @@
 //! `.so` FFI path, so an in-process `forge::spawn` would leak a never-joined thread. `handle`
 //! assembles the request, spawns a worker via `std::thread::Builder`, and returns immediately; the
 //! worker performs the blocking call and emits the reply off-drain through the captured bus.
+//! The in-flight worker set is capped by default; `with_max_in_flight_model_requests(0)` is the
+//! explicit lab/demo opt-out for deployments that intentionally accept unbounded blocking calls.
 //!
 //! ## Shutdown is honest best-effort
 //!
@@ -58,12 +60,35 @@ pub use mind::{
 /// uses).
 const AUTHORING_REPLY_SCHEMA: &str = "authoring.reply";
 
+/// Default number of concurrently blocking model calls accepted by the model-backed author.
+///
+/// The model seam is explicitly blocking, so this is the resource floor that prevents a burst of
+/// valid authoring requests from turning into an unbounded thread set. `0` via
+/// [`AgentMind::with_max_in_flight_model_requests`] is the explicit lab/demo opt-out.
+pub const DEFAULT_MAX_IN_FLIGHT_MODEL_REQUESTS: usize = 32;
+
 /// Poison-tolerant `Mutex` acquisition: a worker panicking while holding a lock must not wedge the
 /// drain thread on the next acquire. Each lock guards a plain `Option`/`Vec` with no half-broken
 /// invariant, so recovering the guard is sound (mirrors `transport-tcp::mlock`).
 #[inline]
 fn mlock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Join finished workers and return the number still in flight.
+fn reap_finished_workers(workers: &Mutex<Vec<JoinHandle<()>>>) -> usize {
+    let mut guard = mlock(workers);
+    let mut remaining = Vec::with_capacity(guard.len());
+    for h in std::mem::take(&mut *guard) {
+        if h.is_finished() {
+            let _ = h.join();
+        } else {
+            remaining.push(h);
+        }
+    }
+    let len = remaining.len();
+    *guard = remaining;
+    len
 }
 
 /// The model-backed author.
@@ -76,6 +101,8 @@ pub struct AgentMind {
     stop: Arc<AtomicBool>,
     /// In-flight worker handles, joined (best-effort, deadline-bounded) at shutdown.
     workers: Mutex<Vec<JoinHandle<()>>>,
+    /// Maximum concurrently blocking model calls. `0` means unbounded.
+    max_in_flight: usize,
     /// The creature's bus authority, captured at bind. Cloned out (guard dropped) before any emit.
     bus: Mutex<Option<Arc<dyn Bus>>>,
 }
@@ -89,6 +116,7 @@ impl AgentMind {
             seer_to: None,
             stop: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT_MODEL_REQUESTS,
             bus: Mutex::new(None),
         }
     }
@@ -103,6 +131,18 @@ impl AgentMind {
     pub fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self {
         self.stop = stop;
         self
+    }
+
+    /// Cap concurrently blocking model requests. `0` disables the cap and should be reserved for
+    /// labs/demos that accept unbounded in-process worker state.
+    pub fn with_max_in_flight_model_requests(mut self, max_in_flight: usize) -> Self {
+        self.max_in_flight = max_in_flight;
+        self
+    }
+
+    /// Reap finished workers and report the number still in flight.
+    pub fn in_flight_model_requests(&self) -> usize {
+        reap_finished_workers(&self.workers)
     }
 
     /// A hermetic always-good author for tests (no real model).
@@ -135,6 +175,23 @@ impl Creature for AgentMind {
             return Outcome::none();
         }
 
+        let in_flight = reap_finished_workers(&self.workers);
+        if self.max_in_flight != 0 && in_flight >= self.max_in_flight {
+            eprintln!(
+                "agent-mind: in-flight model worker cap reached ({in_flight}/{}); refusing new authoring request",
+                self.max_in_flight
+            );
+            let reply = AuthoringReply::Failed(AuthoringError::Invalid {
+                message: format!(
+                    "authoring agent busy: {in_flight} in-flight model requests (limit {})",
+                    self.max_in_flight
+                ),
+            });
+            return Outcome::send(
+                Dispatch::reply_to_env(&env, reply.to_bytes()).with_schema(AUTHORING_REPLY_SCHEMA),
+            );
+        }
+
         // Capture the reply target + corr now so the worker never needs the (otherwise moved)
         // envelope — mirrors `Dispatch::reply_to_env` semantics (reply_to, else from; preserve corr).
         let reply_addr = env.header.reply_to.clone().unwrap_or_else(|| env.header.from.clone());
@@ -156,9 +213,6 @@ impl Creature for AgentMind {
                 Dispatch::reply_to_env(&env, reply.to_bytes()).with_schema(AUTHORING_REPLY_SCHEMA),
             );
         };
-
-        // Reap finished workers so the set doesn't grow unbounded under sustained authoring.
-        mlock(&self.workers).retain(|h| !h.is_finished());
 
         let spawn = Builder::new().name("agent-mind-worker".to_string()).spawn(move || {
             run_worker(
@@ -510,5 +564,80 @@ mod tests {
         // Give the worker a beat to (not) emit.
         std::thread::sleep(Duration::from_millis(30));
         assert!(mlock(&bus.sent).is_empty(), "a stopped worker drops its reply");
+    }
+
+    #[test]
+    fn in_flight_model_requests_are_bounded() {
+        let slow = Arc::new(SlowModel::new());
+        let mut agent = AgentMind::new(slow.clone()).with_max_in_flight_model_requests(1);
+        let bus = bind_with_mock(&mut agent);
+        let payload = serde_json::to_vec(&agent_templated::AuthoringRequest {
+            request: "reverse".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let first = agent.handle(request_env(payload.clone(), 10));
+        assert!(first.dispatches.is_empty(), "first request starts a worker");
+        for _ in 0..400 {
+            if slow.has_entered() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slow.has_entered());
+        assert_eq!(agent.in_flight_model_requests(), 1);
+
+        let second = agent.handle(request_env(payload, 11));
+        assert_eq!(second.dispatches.len(), 1, "over-cap request fails synchronously");
+        assert_eq!(second.dispatches[0].schema, AUTHORING_REPLY_SCHEMA);
+        assert_eq!(second.dispatches[0].corr, Some(11));
+        let reply: AuthoringReply = serde_json::from_slice(&second.dispatches[0].payload).unwrap();
+        match reply {
+            AuthoringReply::Failed(AuthoringError::Invalid { message }) => {
+                assert!(message.contains("in-flight model requests"), "{message}");
+                assert!(message.contains("limit 1"), "{message}");
+            }
+            other => panic!("expected Failed(Invalid), got {other:?}"),
+        }
+        assert!(mlock(&bus.sent).is_empty(), "over-cap request must not start another worker");
+
+        agent.shutdown(Deadline::from_millis(150));
+        slow.release();
+        for _ in 0..400 {
+            if slow.has_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slow.has_finished());
+    }
+
+    #[test]
+    fn zero_in_flight_cap_is_explicit_unbounded_opt_out() {
+        let slow = Arc::new(SlowModel::new());
+        let mut agent = AgentMind::new(slow.clone()).with_max_in_flight_model_requests(0);
+        let _bus = bind_with_mock(&mut agent);
+        let payload = serde_json::to_vec(&agent_templated::AuthoringRequest {
+            request: "reverse".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let first = agent.handle(request_env(payload.clone(), 20));
+        let second = agent.handle(request_env(payload, 21));
+        assert!(first.dispatches.is_empty());
+        assert!(second.dispatches.is_empty(), "zero cap accepts another in-flight request");
+        assert_eq!(agent.in_flight_model_requests(), 2);
+
+        agent.shutdown(Deadline::from_millis(150));
+        slow.release();
+        for _ in 0..400 {
+            if slow.has_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(slow.has_finished());
     }
 }

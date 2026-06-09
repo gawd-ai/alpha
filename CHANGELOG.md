@@ -92,6 +92,27 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   `RegistryReply::{FetchedMetadata, Metadata}` over a new `CatalogEntry` (artifact-carrying `Fetch` /
   `ListEntries` stay for load and anti-entropy). A publish into a full catalogue is a wire-honest error,
   not a false `Published`.
+- A second pass tightens **per-field shape caps** on top of the size caps, each rejecting a hostile
+  shape before it amplifies into paths, replies, or retained state (and each with a paired test):
+  envelope *header* bytes (bounded before signing/journaling), the critter `env.text` preview, the
+  AI-curator decision cache, durable-Bestiary log-record and head-tip reads, quarantine reason /
+  attesting-peer counts and sizes, `agent-mind`'s in-flight model-call set, the `PushEntries` batch
+  count and the `ListEntries` snapshot artifact-byte total, the authored manifest-stub shape, placement
+  query/answer/offer fields, the fitness/immune watch maps, cluster member ids + dial addresses, the
+  verifiable-die nonce, AI-status text, and the control `bind` role name.
+- Correctness fixes ride along: native byte-spilled `.so` tempfiles take unique `create_new` paths (two
+  same-content loads never truncate each other); `forge::try_spawn` surfaces OS thread-spawn errors
+  instead of swallowing them; the placement distributor gives each advertiser a distinct `query_id` so
+  duplicate answers can't be double-counted; the abode reconciler refuses to merge forks whose signed
+  `requires`/`realm` disagree (those fields ride outside the merge lattice); the TCP transport
+  canonicalizes peer pubkeys and rejects malformed member ids/addresses before retention; the MCP
+  surface detaches a still-blocked stdin reader at shutdown rather than hanging teardown; and the OpenAI
+  usage parser rejects out-of-range token counts instead of wrapping.
+- Anti-entropy stays live under the new source-side caps: the Omega federator reclaims a parked pull
+  slot when a source registry answers a pull with a snapshot-cap `Error` (not only on an oversized
+  payload), and a `PushEntries` merge that must drop an over-cap quarantine signal keeps the membership
+  + reputation it already persisted and logs the dropped marker — never miscounting the landed entry as
+  rejected.
 
 ## 0.4.0 - 2026-06-04
 

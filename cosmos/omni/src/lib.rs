@@ -81,6 +81,18 @@ pub const MAX_CONTROL_RESULT_BYTES: usize = MAX_CONTROL_VERB_BYTES;
 /// Control is an operator/API surface, not a bulk-data transport. Small replies stay exact; larger
 /// replies are returned as a lossy UTF-8 preview with byte counts and a truncation flag.
 pub const MAX_PRESENTED_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Maximum Unicode scalar values retained in AI activity/status text.
+///
+/// These strings are written to operator-facing terminals and live streams. Strip control
+/// characters and bound their displayed length at the shared control layer so every surface gets the
+/// same safe text.
+pub const MAX_AI_STATUS_TEXT_CHARS: usize = 512;
+/// Maximum bytes in a role name accepted by the public control `bind` verb.
+///
+/// `Role` remains an open socket type for in-process boot/composition, but public control input is
+/// operator-visible retained metadata. Keep it a bounded ASCII token before inserting into the
+/// router's role table.
+pub const MAX_CONTROL_ROLE_NAME_BYTES: usize = 256;
 /// The control worker runs slow request/reply orchestration off the kernel drain thread. Bound its
 /// queue so a slow `author`/`send` cannot accumulate unbounded pending jobs.
 pub const CONTROL_WORKER_QUEUE_CAP: usize = 64;
@@ -140,13 +152,35 @@ impl AiControl {
     }
     pub fn set_status(&self, working: bool, activity: String, message: String) {
         if let Ok(mut g) = self.status.lock() {
-            *g = AiStatus { working, activity, message };
+            *g = AiStatus {
+                working,
+                activity: sanitize_ai_status_text(&activity),
+                message: sanitize_ai_status_text(&message),
+            };
         }
     }
     fn status_json(&self) -> Value {
         let s = self.status();
         json!({ "working": s.working, "activity": s.activity, "message": s.message })
     }
+}
+
+/// Strip terminal control characters from caller-supplied AI status text and bound displayed length.
+pub fn sanitize_ai_status_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(MAX_AI_STATUS_TEXT_CHARS).collect()
+}
+
+fn validate_control_role_name(role: &str) -> Result<(), &'static str> {
+    if role.is_empty() {
+        return Err("role name must not be empty");
+    }
+    if role.len() > MAX_CONTROL_ROLE_NAME_BYTES {
+        return Err("role name exceeds control byte limit");
+    }
+    if !role.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) {
+        return Err("role name must be ASCII [A-Za-z0-9._-]");
+    }
+    Ok(())
 }
 
 impl Default for AiControl {
@@ -332,6 +366,46 @@ pub fn parse_control_result(payload: &[u8]) -> Result<VerbResult, ControlResultD
         });
     }
     serde_json::from_slice(payload).map_err(|e| ControlResultDecodeError::Json(e.to_string()))
+}
+
+/// Serialize a [`Verb`] for a `control_verb` envelope under the control-plane byte ceiling.
+///
+/// Surfaces call this before parking a corr or emitting onto the bus; [`ControlCore`] repeats the
+/// same cap on receive so remote or non-standard senders cannot bypass it.
+pub fn control_verb_payload(verb: &Verb) -> Result<Vec<u8>, VerbResult> {
+    let payload = serde_json::to_vec(verb).map_err(|e| {
+        VerbResult::err(
+            json!({ "error": "control-verb-encode-failed", "detail": e.to_string() }),
+            format!("control: could not encode the verb: {e}"),
+        )
+    })?;
+    if payload.len() > MAX_CONTROL_VERB_BYTES {
+        return Err(VerbResult::err(
+            json!({
+                "error": "control-verb-too-large",
+                "bytes": payload.len(),
+                "limit": MAX_CONTROL_VERB_BYTES
+            }),
+            format!(
+                "control: verb payload is {} bytes, exceeds {} byte limit",
+                payload.len(),
+                MAX_CONTROL_VERB_BYTES
+            ),
+        ));
+    }
+    Ok(payload)
+}
+
+pub(crate) fn control_result_payload(res: VerbResult) -> Vec<u8> {
+    let payload = serde_json::to_vec(&res).unwrap_or_else(|_| b"{}".to_vec());
+    if payload.len() <= MAX_CONTROL_RESULT_BYTES {
+        return payload;
+    }
+    serde_json::to_vec(&control_result_decode_failure(ControlResultDecodeError::TooLarge {
+        len: payload.len(),
+        limit: MAX_CONTROL_RESULT_BYTES,
+    }))
+    .unwrap_or_else(|_| b"{}".to_vec())
 }
 
 pub fn control_result_decode_failure(err: ControlResultDecodeError) -> VerbResult {
@@ -630,6 +704,8 @@ pub fn run_verb(verb: Verb, ctx: &mut VerbCtx, progress: &mut dyn FnMut(&str)) -
             VerbResult::ok(json!({ "ok": true, "ai_allowed": allowed }), human)
         }
         Verb::AiStatus { working, activity, message } => {
+            let activity = sanitize_ai_status_text(&activity);
+            let message = sanitize_ai_status_text(&message);
             ctx.ai.set_status(working, activity.clone(), message.clone());
             let human = if working {
                 format!("[ai] {activity}: {message}")
@@ -639,6 +715,16 @@ pub fn run_verb(verb: Verb, ctx: &mut VerbCtx, progress: &mut dyn FnMut(&str)) -
             VerbResult::ok(json!({ "ok": true }), human)
         }
         Verb::Bind { role, id } => {
+            if let Err(reason) = validate_control_role_name(&role) {
+                return VerbResult::err(
+                    json!({
+                        "error": "invalid-role-name",
+                        "reason": reason,
+                        "limit": MAX_CONTROL_ROLE_NAME_BYTES
+                    }),
+                    format!("invalid role name: {reason}"),
+                );
+            }
             ctx.kernel.bind_role(Role::new(&role), CreatureId(id));
             VerbResult::ok(
                 json!({ "ok": true, "role": role, "id": id }),
@@ -1720,6 +1806,79 @@ mod tests {
         assert!(parsed.ok);
         assert_eq!(parsed.json, json!({ "ok": true }));
         assert_eq!(parsed.human, "ready");
+    }
+
+    #[test]
+    fn control_verb_payload_accepts_bounded_verb() {
+        let payload = control_verb_payload(&Verb::Status).unwrap();
+
+        let parsed: Verb = serde_json::from_slice(&payload).unwrap();
+        assert!(matches!(parsed, Verb::Status));
+    }
+
+    #[test]
+    fn control_verb_payload_rejects_oversized_verb_before_surface_emit() {
+        let err =
+            control_verb_payload(&Verb::Author { request: "x".repeat(MAX_CONTROL_VERB_BYTES) })
+                .unwrap_err();
+
+        assert!(!err.ok);
+        assert_eq!(err.json["error"].as_str(), Some("control-verb-too-large"));
+        assert!(err.json["bytes"].as_u64().unwrap() > MAX_CONTROL_VERB_BYTES as u64);
+        assert_eq!(err.json["limit"].as_u64(), Some(MAX_CONTROL_VERB_BYTES as u64));
+    }
+
+    #[test]
+    fn ai_status_text_is_sanitized_and_bounded_at_shared_state() {
+        let ai = AiControl::new(false);
+        ai.set_status(
+            true,
+            "read\n\x1b[2J".to_string(),
+            format!("{}\rhidden", "m".repeat(MAX_AI_STATUS_TEXT_CHARS + 16)),
+        );
+
+        let status = ai.status();
+        assert!(status.working);
+        assert_eq!(status.activity, "read[2J");
+        assert_eq!(status.message.len(), MAX_AI_STATUS_TEXT_CHARS);
+        assert!(status.message.chars().all(|c| !c.is_control()));
+    }
+
+    #[test]
+    fn control_role_names_are_bounded_ascii_tokens() {
+        assert!(validate_control_role_name("distributor").is_ok());
+        assert!(validate_control_role_name("realm-gateway.v2_test").is_ok());
+
+        assert_eq!(validate_control_role_name("").unwrap_err(), "role name must not be empty");
+        assert_eq!(
+            validate_control_role_name(&"r".repeat(MAX_CONTROL_ROLE_NAME_BYTES + 1)).unwrap_err(),
+            "role name exceeds control byte limit"
+        );
+        assert_eq!(
+            validate_control_role_name("bad role").unwrap_err(),
+            "role name must be ASCII [A-Za-z0-9._-]"
+        );
+        assert_eq!(
+            validate_control_role_name("bad\nrole").unwrap_err(),
+            "role name must be ASCII [A-Za-z0-9._-]"
+        );
+    }
+
+    #[test]
+    fn control_result_payload_replaces_oversized_result_with_small_error() {
+        let original =
+            VerbResult::ok(json!({ "blob": "x".repeat(MAX_CONTROL_RESULT_BYTES) }), "huge result");
+
+        let payload = control_result_payload(original);
+
+        assert!(
+            payload.len() <= MAX_CONTROL_RESULT_BYTES,
+            "control_result emission must stay under the surface-side decode cap"
+        );
+        let parsed = parse_control_result(&payload).unwrap();
+        assert!(!parsed.ok);
+        assert_eq!(parsed.json["error"].as_str(), Some("control-result-too-large"));
+        assert!(parsed.json["bytes"].as_u64().unwrap() > MAX_CONTROL_RESULT_BYTES as u64);
     }
 
     #[test]

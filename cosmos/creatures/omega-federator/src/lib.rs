@@ -19,11 +19,14 @@
 //!    [`Consensus`](seer::SeerTopic::Consensus)-topic envelope to a peer federator. The
 //!    receiver verifies the signature, applies its **injected** [`ReputationWeigher`] (the weight
 //!    model — substrate ships none; see `cosmos/creatures/prototypes/reputation/reputation-roundrobin`), and writes
-//!    [`RegistryOp::AttestFitness`] tagged with the attesting Realm.
+//!    [`RegistryOp::AttestFitness`] tagged with the attesting Realm. Oversized identity fields are
+//!    dropped as malformed before the federator can echo them into audit events or registry writes.
 //! 4. **Cross-Realm quarantine path.** On a `FederateQuarantine` control op the federator ships a
 //!    [`FederatorMsg::QuarantineNotice`] to a peer federator, which writes
 //!    [`RegistryOp::MarkQuarantine`] (reversible — T5) into its local registry. The federator ships
-//!    the *path*; the immune-response creature decides what triggers a notice and how to react.
+//!    the *path*; the immune-response creature decides what triggers a notice and how to react. The
+//!    federator rejects oversized quarantine keys, reasons, and attesting-peer lists on outbound,
+//!    inbound, and pulled anti-entropy paths before forwarding them.
 //!
 //! ## What stays the substrate's, not the federator's
 //!
@@ -51,6 +54,7 @@ use std::collections::HashMap;
 use aether::{
     Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, NodeId, Outcome, RealmId, Topic,
 };
+use bestiary::{QuarantineNotice, MAX_REGISTRY_SIGNAL_FIELD_BYTES};
 use registry_mem::{RegistryOp, RegistryReply};
 use seer::{SeerEnvelope, SeerKind, SeerTopic};
 use serde::{Deserialize, Serialize};
@@ -564,6 +568,9 @@ impl OmegaFederator {
         let Some(me) = self.me_id() else {
             return reply(env, FederatorMsg::Rejected { reason: "federator not bound yet".into() });
         };
+        if let Some(message) = federation_endpoint_shape_error(&source_realm, &peer_node) {
+            return reply(env, FederatorMsg::Rejected { reason: message });
+        }
         // Pending-pressure guard (resilience): refuse a new pull at capacity rather than leak a
         // pending entry forever when a peer registry never answers. Refuse-new keeps every in-flight
         // pull intact. `0` disables the cap.
@@ -608,6 +615,15 @@ impl OmegaFederator {
         let Some(me) = self.me_id() else {
             return reply(env, FederatorMsg::Rejected { reason: "federator not bound yet".into() });
         };
+        if let Some(message) = registry_key_shape_error(&artifact_hash, &realm) {
+            return reply(env, FederatorMsg::Rejected { reason: message });
+        }
+        if !score.is_finite() {
+            return reply(
+                env,
+                FederatorMsg::Rejected { reason: "reputation score must be finite".into() },
+            );
+        }
         // Build + sign the delta with our Abode key (T3). observer_realm = our Realm.
         let mut delta = ReputationDelta {
             artifact_hash,
@@ -649,6 +665,14 @@ impl OmegaFederator {
         let Some(me) = self.me_id() else {
             return reply(env, FederatorMsg::Rejected { reason: "federator not bound yet".into() });
         };
+        if let Some(message) = QuarantineNotice::mark_shape_error(
+            &artifact_hash,
+            &realm,
+            &reason,
+            std::slice::from_ref(&self.cfg.self_node.0),
+        ) {
+            return reply(env, FederatorMsg::Rejected { reason: message });
+        }
         // Ship the notice to the peer federator. attesting_peers seeded with our own node id.
         let notice = FederatorMsg::QuarantineNotice {
             artifact_hash,
@@ -674,6 +698,15 @@ impl OmegaFederator {
         reason: String,
         attesting_peers: Vec<String>,
     ) -> Outcome {
+        if let Some(message) =
+            QuarantineNotice::mark_shape_error(&artifact_hash, &realm, &reason, &attesting_peers)
+        {
+            eprintln!(
+                "omega-federator: dropped inbound quarantine notice for {artifact_hash} in realm {}: {message}",
+                realm.0
+            );
+            return Outcome::none();
+        }
         // Write the quarantine into the local registry (reversible — T5). No reply to the peer:
         // fire-and-forget defense signal. The local immune-response creature acts on it.
         let op = RegistryOp::MarkQuarantine { artifact_hash, realm, reason, attesting_peers };
@@ -708,6 +741,11 @@ impl OmegaFederator {
             self.ingest_rejections.malformed += 1;
             return Outcome::none();
         };
+        if let Some(message) = reputation_delta_shape_error(&delta) {
+            self.ingest_rejections.malformed += 1;
+            eprintln!("omega-federator: dropped malformed reputation delta: {message}");
+            return Outcome::none();
+        }
 
         // R9 / adversarial-numeric guard. `score: f32` is attacker-controlled wire
         // data: JSON has no NaN/∞ literals, but an out-of-range magnitude (`{"score": 1e400}`)
@@ -819,8 +857,24 @@ impl OmegaFederator {
         let Some(reply) = parse_registry_reply(&env.payload) else {
             return Outcome::none();
         };
-        let RegistryReply::Entries { entries } = reply else {
-            return Outcome::none();
+        let entries = match reply {
+            RegistryReply::Entries { entries } => entries,
+            // A corr-matching non-Entries reply is the *terminal* answer to a pull that cannot be
+            // merged — most importantly the source registry's `RegistryReply::Error` when its own
+            // `ListEntries` snapshot artifact-byte cap refuses an over-cap pull. Reclaim the parked
+            // slot (mirroring the oversized-payload path above) or anti-entropy wedges after the pull
+            // cap fills. Our own merge-write acks carry no corr, so they never match a parked pull.
+            other => {
+                if let Some(corr) = env.header.corr {
+                    if self.pending_pulls.remove(&corr).is_some() {
+                        eprintln!(
+                            "omega-federator: pull reply for corr {corr} was {other:?}, not Entries; \
+                             slot reclaimed — retry with a narrower Realm scope"
+                        );
+                    }
+                }
+                return Outcome::none();
+            }
         };
         // Match the pull by corr; a reply with no matching pending is stale/duplicate — drop.
         let Some(corr) = env.header.corr else {
@@ -899,17 +953,29 @@ impl OmegaFederator {
                 }
             }
             if let Some(q) = e.quarantine {
-                let mark = RegistryOp::MarkQuarantine {
-                    artifact_hash: e.artifact_hash.clone(),
-                    realm: realm.clone(),
-                    reason: q.reason,
-                    attesting_peers: q.attesting_peers,
-                };
-                out.dispatches.push(
-                    Dispatch::to(Address::Creature(self.cfg.local_registry), mark.to_bytes())
-                        .with_schema("registry.op")
-                        .with_reply_to(Address::Creature(me)),
-                );
+                if let Some(message) = QuarantineNotice::mark_shape_error(
+                    &e.artifact_hash,
+                    &realm,
+                    &q.reason,
+                    &q.attesting_peers,
+                ) {
+                    eprintln!(
+                        "omega-federator: dropped pulled quarantine marker for {} in realm {}: {message}",
+                        e.artifact_hash, realm.0
+                    );
+                } else {
+                    let mark = RegistryOp::MarkQuarantine {
+                        artifact_hash: e.artifact_hash.clone(),
+                        realm: realm.clone(),
+                        reason: q.reason,
+                        attesting_peers: q.attesting_peers,
+                    };
+                    out.dispatches.push(
+                        Dispatch::to(Address::Creature(self.cfg.local_registry), mark.to_bytes())
+                            .with_schema("registry.op")
+                            .with_reply_to(Address::Creature(me)),
+                    );
+                }
             }
         }
         out
@@ -938,6 +1004,42 @@ fn parse_registry_reply_with_limit(payload: &[u8], limit: usize) -> Option<Regis
     serde_json::from_slice(payload).ok()
 }
 
+fn field_shape_error(scope: &str, field: &str, value: &str) -> Option<String> {
+    if value.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
+        Some(format!(
+            "{scope} {field} too large: {} bytes exceeds {} byte limit",
+            value.len(),
+            MAX_REGISTRY_SIGNAL_FIELD_BYTES
+        ))
+    } else {
+        None
+    }
+}
+
+fn registry_key_shape_error(artifact_hash: &str, realm: &RealmId) -> Option<String> {
+    field_shape_error("federator", "artifact_hash", artifact_hash)
+        .or_else(|| field_shape_error("federator", "realm", &realm.0))
+}
+
+fn federation_endpoint_shape_error(source_realm: &RealmId, peer_node: &NodeId) -> Option<String> {
+    field_shape_error("federator", "source_realm", &source_realm.0)
+        .or_else(|| field_shape_error("federator", "peer_node", &peer_node.0))
+}
+
+fn reputation_delta_shape_error(delta: &ReputationDelta) -> Option<String> {
+    registry_key_shape_error(&delta.artifact_hash, &delta.realm)
+        .or_else(|| {
+            field_shape_error("reputation delta", "observer_realm", &delta.observer_realm.0)
+        })
+        .or_else(|| field_shape_error("reputation delta", "observer_key", &delta.observer_key))
+        .or_else(|| {
+            delta
+                .signature
+                .as_deref()
+                .and_then(|signature| field_shape_error("reputation delta", "signature", signature))
+        })
+}
+
 /// Reply to the envelope's `reply_to` (or `from`) with a federator message + SCHEMA + corr.
 fn reply(env: &Envelope, msg: FederatorMsg) -> Outcome {
     Outcome::send(Dispatch::reply_to_env(env, msg.to_bytes()).with_schema(SCHEMA))
@@ -951,6 +1053,7 @@ fn reply(env: &Envelope, msg: FederatorMsg) -> Outcome {
 mod tests {
     use super::*;
     use aether::Header;
+    use bestiary::{MAX_QUARANTINE_ATTESTING_PEER_BYTES, MAX_QUARANTINE_REASON_BYTES};
     use registry_mem::ReputationScore;
 
     const SELF_NODE: &str = "node-A";
@@ -1384,6 +1487,97 @@ mod tests {
             if *realm == RealmId::new("guests") && reason == "peer flagged"));
     }
 
+    #[test]
+    fn registry_entries_reply_drops_oversized_quarantine_signal_before_forwarding() {
+        let mut f = fed(0xC6).with_consult_corr_seed(830_000);
+        let out = f.handle(control_env(
+            FederatorMsg::PullFrom {
+                source_realm: RealmId::new("guests"),
+                peer_node: NodeId(PEER_NODE.into()),
+                peer_registry: CreatureId(60),
+            },
+            1,
+        ));
+        let corr = out
+            .dispatches
+            .iter()
+            .find(|d| matches!(d.to, Address::Node(..)))
+            .unwrap()
+            .corr
+            .unwrap();
+
+        let sync = registry_mem::SyncEntry {
+            artifact_hash: "zhash".into(),
+            realm: RealmId::new("guests"),
+            manifest: sigil::Manifest::new(
+                "z",
+                "0.1.0",
+                sigil::Backend::Daemon,
+                "gawd_creature_v1",
+            ),
+            artifact: b"z-bytes".to_vec(),
+            reputation: None,
+            quarantine: Some(registry_mem::QuarantineNotice {
+                reason: "x".repeat(MAX_QUARANTINE_REASON_BYTES + 1),
+                attesting_peers: vec!["node-B".into()],
+            }),
+        };
+        let reply_env = Envelope {
+            header: header(Address::Creature(ME), REGISTRY_REPLY_SCHEMA, Some(corr)),
+            payload: RegistryReply::Entries { entries: vec![sync] }.to_bytes(),
+        };
+        let ops: Vec<_> = f.handle(reply_env).dispatches.iter().map(parse_op).collect();
+
+        assert_eq!(ops.len(), 1, "only PublishInRealm is forwarded for a malformed marker");
+        assert!(
+            matches!(&ops[0], RegistryOp::PublishInRealm { realm, .. } if *realm == RealmId::new("guests"))
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, RegistryOp::MarkQuarantine { .. })),
+            "oversized pulled quarantine signal was not forwarded to the registry"
+        );
+    }
+
+    #[test]
+    fn pull_answered_with_a_registry_error_reclaims_its_parked_slot() {
+        // A source registry whose `ListEntries` snapshot artifact-byte cap refuses an over-cap pull
+        // answers with `RegistryReply::Error`, not `Entries`. That terminal reply cannot be merged,
+        // but it must free the parked pull or anti-entropy wedges after the pull cap fills.
+        let mut f = fed(0xC7).with_consult_corr_seed(840_000);
+        let out = f.handle(control_env(
+            FederatorMsg::PullFrom {
+                source_realm: RealmId::new("guests"),
+                peer_node: NodeId(PEER_NODE.into()),
+                peer_registry: CreatureId(60),
+            },
+            1,
+        ));
+        let corr = out
+            .dispatches
+            .iter()
+            .find(|d| matches!(d.to, Address::Node(..)))
+            .unwrap()
+            .corr
+            .unwrap();
+        assert_eq!(f.pending_pull_count(), 1, "pull is parked awaiting its Entries reply");
+
+        let error_reply = Envelope {
+            header: header(Address::Creature(ME), REGISTRY_REPLY_SCHEMA, Some(corr)),
+            payload: RegistryReply::Error {
+                message: "registry snapshot too large: 9000 artifact bytes exceeds 4 byte limit"
+                    .into(),
+            }
+            .to_bytes(),
+        };
+        let out = f.handle(error_reply);
+        assert!(out.dispatches.is_empty(), "an Error pull reply forwards nothing");
+        assert_eq!(
+            f.pending_pull_count(),
+            0,
+            "the parked pull slot is reclaimed on a non-Entries terminal reply"
+        );
+    }
+
     /// A pull resolves on the first matching
     /// Entries reply; a duplicate carrying the same (now-popped) corr is a replay and must be a
     /// silent no-op — `pending_pulls.remove` returns `None`, no second merge fires.
@@ -1496,6 +1690,26 @@ mod tests {
         let out = f.handle(env);
         assert!(out.dispatches.is_empty(), "oversized consensus SEER must not write registry");
         assert_eq!(f.ingest_rejections().malformed, 1);
+    }
+
+    #[test]
+    fn oversized_reputation_delta_field_is_malformed_without_echo_event() {
+        let mut f = fed(0xD0);
+        let mut delta = signed_delta(0xEE, 0.95);
+        delta.observer_key = "k".repeat(MAX_REGISTRY_SIGNAL_FIELD_BYTES + 1);
+
+        let out = f.handle(seer_consensus_env(&delta, 1));
+
+        assert!(
+            out.dispatches.is_empty(),
+            "oversized claimed key must not be echoed to registry or proprioception"
+        );
+        assert_eq!(f.ingest_rejections().malformed, 1);
+        assert_eq!(
+            f.ingest_rejections().bad_signature,
+            0,
+            "shape rejection happens before the signature gate"
+        );
     }
 
     #[test]
@@ -1690,6 +1904,54 @@ mod tests {
             }
             other => panic!("expected MarkQuarantine, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn federate_quarantine_rejects_oversized_reason_before_ship() {
+        let mut f = fed(0xAA);
+        let out = f.handle(control_env(
+            FederatorMsg::FederateQuarantine {
+                artifact_hash: "bad".into(),
+                realm: RealmId::new("crew"),
+                reason: "x".repeat(MAX_QUARANTINE_REASON_BYTES + 1),
+                peer_node: NodeId(PEER_NODE.into()),
+                peer_federator: CreatureId(70),
+            },
+            4,
+        ));
+
+        assert!(
+            !out.dispatches
+                .iter()
+                .any(|d| d.to == Address::Node(NodeId(PEER_NODE.into()), CreatureId(70))),
+            "oversized quarantine control is not shipped to the peer"
+        );
+        match FederatorMsg::parse(&out.dispatches[0].payload) {
+            Ok(FederatorMsg::Rejected { reason }) => {
+                assert!(reason.contains("reason too large"), "{reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_quarantine_with_oversized_peer_is_dropped_before_registry_write() {
+        let mut f = fed(0xAB);
+        let inbound = Envelope {
+            header: header(Address::Creature(ME), SCHEMA, None),
+            payload: FederatorMsg::QuarantineNotice {
+                artifact_hash: "bad".into(),
+                realm: RealmId::new("crew"),
+                reason: "apoptosis on peer".into(),
+                attesting_peers: vec!["p".repeat(MAX_QUARANTINE_ATTESTING_PEER_BYTES + 1)],
+            }
+            .to_bytes(),
+        };
+
+        assert!(
+            f.handle(inbound).dispatches.is_empty(),
+            "oversized inbound quarantine marker must not reach the registry"
+        );
     }
 
     // ----- hostile / misbind ----

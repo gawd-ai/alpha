@@ -85,6 +85,10 @@ the node:
   refuse a billion-byte-prefix attack.)
 - A single gossip frame is capped at **1024 members** and rejected whole if it exceeds that — a
   ceiling on how many dialer threads one message can spawn, not a topology limit.
+- Each admitted cluster member is shape-checked before retention or allowlisting: node ids are
+  bounded printable routing tokens (256 bytes, `[A-Za-z0-9._-]`), pubkeys must decode to a 32-byte
+  ed25519 key and are stored as canonical lowercase hex, and dial addresses are bounded IP socket
+  addresses (`127.0.0.1:9001`, `[::1]:9001`).
 - Per-peer outbound queues are bounded and **shed on overflow** (`try_send`), so a slow peer
   applies backpressure instead of growing memory without bound. A shed frame is surfaced as a
   `peer_send_dropped` event rather than vanishing silently.

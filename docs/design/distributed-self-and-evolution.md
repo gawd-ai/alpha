@@ -79,7 +79,11 @@ one Abode through a three-state machine:
 
 Migrator messages are bounded before JSON decode. The default cap allows one max-sized state/snapshot
 payload at worst-case JSON `Vec<u8>` expansion plus metadata overhead, and `SetState` rejects local
-state whose `v3.0`-wrapped snapshot would exceed this migrator's configured snapshot ceiling.
+state whose `v3.0`-wrapped snapshot would exceed this migrator's configured snapshot ceiling. The
+migrator also applies field-level bounds before parking or echoing control metadata: node ids must
+fit the same ASCII shape used by the transport membership gate, challenges/ed25519 witness fields
+must fit their hex shapes, notes are capped, and human-readable refusal reasons are truncated before
+being relayed to peers or operators.
 
 A `Migrate { destination_node, destination_migrator }` op orchestrates the hand-off: take a snapshot →
 wrap it with the migrator's own version-magic (`b"v3.0"`) → sign with the Abode key → ship a
@@ -141,7 +145,9 @@ it ships the socket and the verify/sign envelope, and the **lattice is injected*
 `Reconcile { fork_a, fork_b }` by:
 
 1. **bounding the reconcile message before JSON decode**; the default cap allows two max-sized fork
-   payloads at worst-case JSON `Vec<u8>` expansion plus metadata overhead.
+   payloads at worst-case JSON `Vec<u8>` expansion plus metadata overhead. Snapshot metadata is also
+   shape-capped before signature-payload construction: Abode keys, state hashes, signatures,
+   requirements, and Realm assertions must fit bounded wire forms.
 2. **gating both forks** through the same substrate snapshot primitives — size (a tighter per-fork
    ceiling, since a reconcile admits several forks at once), signature, integrity. A failed gate is a
    `Rejected { reason }`, never a panic.
@@ -151,7 +157,9 @@ it ships the socket and the verify/sign envelope, and the **lattice is injected*
    `MergeModel::merge(state_a, state_b)`, and **re-wrapping** the result.
 5. **re-signing** the merged snapshot with the Abode key (carrying `requires` + `realm` forward) and
    replying `Reconciled { merged }` — a fresh authoritative snapshot that re-enters the
-   migration/restore path unchanged.
+   migration/restore path unchanged. Because those metadata fields are outside the injected state
+   lattice, the two forks must agree on `requires` and `realm`; otherwise the reconciler rejects
+   instead of letting argument order choose signed metadata.
 
 The injected lattice is `MergeModel::merge(a, b) -> Result<Vec<u8>, String>`. Its obligation, stated
 in the trait docs: it **must** be commutative, associative, and idempotent — a CRDT — or
@@ -210,9 +218,11 @@ field, since the kernel is model-free and names only an id) and a per-creature `
   `(artifact_hash, realm, score, attesting_realm)` tuple — with the Abode key and writes
   `RegistryOp::AttestFitness { …, signed_by, signature }` onto the registry's reputation slot.
 
-The observation tally is bounded by default (`DEFAULT_MAX_OBSERVED_MODULES`). At capacity, a new
-creature id's observation is dropped while already-tracked ids keep accumulating; `with_max_obs(0)` is
-the explicit opt-out for unbounded replay or lab workloads.
+Selector control messages are capped before JSON decode. The watch map and observation tally are
+bounded by default (`DEFAULT_MAX_WATCHED_MODULES`, `DEFAULT_MAX_OBSERVED_MODULES`). At capacity, a new
+watch is refused and a new creature id's observation is dropped while already-tracked ids keep
+updating; `with_max_watched_modules(0)` / `with_max_obs(0)` are the explicit opt-outs for unbounded
+replay or lab workloads.
 
 That signature **is heredity made checkable** — the Baldwin effect made concrete. A bare score is an
 *assertion* anyone who can write the registry could fabricate; a *signed* promotion is a verifiable
@@ -263,7 +273,11 @@ A quarantine writes `RegistryOp::MarkQuarantine { …, attesting_peers: [self_no
 registry; if a `PropagationConfig` is wired, the same quarantine federates outward via the federation
 wire (no edit to the federator). As defense-in-depth the creature drops any event naming its own id (a
 creature is never its own immune trigger; self-apoptosis on budget is the budget policy's job, a
-different role).
+different role). Its own control payloads are bounded before JSON decode; watch fields, quarantine
+reasons, and inbound notice attesting-peer lists are shape-capped before retention or
+registry/federation writes. The lower registry/federator path repeats the pressure guard: shared
+`QuarantineNotice` caps reject oversized keys, reasons, and peer lists before a registry filling
+stores the marker or a federator forwards it.
 
 Two properties are load-bearing. **Decentralized and trust-gated:** there is no central authority that
 can quarantine your creatures. An inbound cross-Realm `QuarantineNotice` is honored only if an

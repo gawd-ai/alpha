@@ -406,10 +406,12 @@ fn read_error_body_bounded(resp: ureq::Response) -> String {
 
 #[cfg(feature = "openai")]
 fn parse_usage(v: &serde_json::Value) -> Option<TokenUsage> {
-    let prompt_tokens = v["prompt_tokens"].as_u64()? as u32;
-    let completion_tokens = v["completion_tokens"].as_u64()? as u32;
-    let total_tokens =
-        v["total_tokens"].as_u64().map(|x| x as u32).unwrap_or(prompt_tokens + completion_tokens);
+    let prompt_tokens = u32::try_from(v["prompt_tokens"].as_u64()?).ok()?;
+    let completion_tokens = u32::try_from(v["completion_tokens"].as_u64()?).ok()?;
+    let total_tokens = match v["total_tokens"].as_u64() {
+        Some(total) => u32::try_from(total).ok()?,
+        None => prompt_tokens.checked_add(completion_tokens)?,
+    };
     Some(TokenUsage { prompt_tokens, completion_tokens, total_tokens })
 }
 
@@ -583,5 +585,40 @@ mod tests {
     #[test]
     fn model_error_display_is_structured() {
         assert!(ModelError::Http { status: 401, body: "no".into() }.to_string().contains("401"));
+    }
+
+    #[cfg(feature = "openai")]
+    #[test]
+    fn openai_usage_parser_rejects_out_of_range_counts() {
+        let huge = serde_json::json!({
+            "prompt_tokens": (u32::MAX as u64) + 1,
+            "completion_tokens": 1,
+            "total_tokens": (u32::MAX as u64) + 2,
+        });
+        assert_eq!(parse_usage(&huge), None, "oversized counters must not wrap");
+
+        let overflowing_sum = serde_json::json!({
+            "prompt_tokens": u32::MAX,
+            "completion_tokens": 1,
+        });
+        assert_eq!(
+            parse_usage(&overflowing_sum),
+            None,
+            "missing total_tokens must not overflow prompt+completion"
+        );
+    }
+
+    #[cfg(feature = "openai")]
+    #[test]
+    fn openai_usage_parser_accepts_bounded_counts() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 12,
+            "completion_tokens": 34,
+            "total_tokens": 46,
+        });
+        assert_eq!(
+            parse_usage(&usage),
+            Some(TokenUsage { prompt_tokens: 12, completion_tokens: 34, total_tokens: 46 })
+        );
     }
 }

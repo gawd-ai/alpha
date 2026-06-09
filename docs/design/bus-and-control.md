@@ -43,9 +43,12 @@ contract:
 The payload is opaque bytes — the *same type* local and remote, so a sandboxed
 native creature is a natural bus citizen rather than a special case. On the wire
 the payload serializes as a hex string, not a JSON array of numbers, which keeps
-an 8 MB shipped artifact a single fast-parsing token. `Envelope::parse` never
-panics on hostile input and rejects a pathologically deep federation-grain
-address before any gateway tries to unwrap it.
+an 8 MB shipped artifact a single fast-parsing token. Header metadata has a
+separate serialized-byte cap before signing, routing, journaling, or remote
+gateway use; payload-sized domains keep their own caps. `Envelope::parse` never
+panics on hostile input and rejects either an oversized header or a
+pathologically deep federation-grain address before any gateway tries to unwrap
+it.
 
 ### Identity is fabric-set: the reseal of `from`
 
@@ -110,7 +113,9 @@ bound".
 The router appends every routed envelope to an in-memory, append-only history
 journal — `from`, `to`, `seq`, `stamp`, `corr` — bounded as a drop-oldest ring.
 It is an audit and proprioception *window*, never durable storage, so a
-long-lived node's journal memory stays O(cap), not O(envelopes-ever-routed).
+long-lived node's journal memory stays O(cap), not O(envelopes-ever-routed);
+the header-byte cap also prevents one row from carrying unbounded routing
+metadata.
 Because control, authoring, sense, and federation are *all* bus traffic, the
 journal is one stream where the whole node's behavior is legible — and a
 `corr`-correlated conversation can be reconstructed from it after the fact.
@@ -225,6 +230,14 @@ serialized `Verb`, runs it against the live node via the shared `run_verb`, and
 replies with a `control_result` envelope correlated by `corr` — the same relay
 discipline a gateway uses. A `Verb` and a `VerbResult` are plain bus payloads,
 so a control command is plain bus traffic between a surface and `ControlCore`.
+`control_verb` payloads are bounded before decode; the HTTP and MCP surfaces use
+the same cap before they park a corr or emit the envelope, while `ControlCore`
+repeats the check for remote or non-standard senders. `control_result` payloads
+are capped before emission; an oversized result is replaced with a small
+structured error instead of crossing the bus and failing only at a surface.
+Public `bind` verbs also shape-check the role name as a bounded ASCII socket
+token before inserting it into the router's retained role table; in-process boot
+composition can still bind richer internal roles directly.
 Re-binding the socket swaps the whole control core.
 
 It holds a `Weak<Kernel>`, not an `Arc` — so the control organ, which lives
@@ -329,7 +342,8 @@ drain-less** sense endpoint kept off the surface's own inbox, so a fitness burst
 can never shed a control reply under backpressure. (Separately — and not a surface
 property — the sense-topic *consumer creatures* such as `immune-response`,
 `monitor`, and `fitness-selector` cap their own JSON parsing at 1 MiB
-(`aether::MAX_SENSE_EVENT_BYTES`) before decoding a topic body.) The surface holds no kernel:
+(`aether::MAX_SENSE_EVENT_BYTES`) before decoding a topic body.) Progress frames preserve the
+originating command `corr`, so clients can attach `"compiling…"` to the right request. The surface holds no kernel:
 every verb, including reads, is a `Role::CONTROL` round-trip, answered inline by
 the co-located `ControlCore`. Its pending `corr → oneshot` table is bounded too:
 if too many HTTP requests are already waiting on control replies, the surface
@@ -346,6 +360,9 @@ and turns each tool call into a `Verb` envelope on the node's own bus. The MCP
 server *is* a bus citizen, not an HTTP client. Like the HTTP surface, it bounds
 its parked `corr → reply` table and returns a structured `surface-busy` result
 inside the tool response instead of allocating unbounded waiters.
+On shutdown it asks the stdio loop to stop, joins it if stdin has reached EOF, and
+otherwise detaches the still-blocked reader rather than hanging node teardown on
+an uninterruptible `read_line`.
 
 The server id is `alpha-mcp` and the tool verbs are `alpha_*` —
 `alpha_status` / `alpha_list` / `alpha_journal` / `alpha_watch` /
@@ -396,7 +413,10 @@ mutating verbs (`author`, `author --critter`, `load`, `registry publish`, `send`
 `allow-ai` itself
 is REPL-only — a gated caller cannot flip its own gate. The AI announces what it
 is doing through `alpha_ai_status`, surfaced live on the operator's tape and the
-WebSocket stream, so a human can watch the AI work and revoke mid-flight.
+WebSocket stream, so a human can watch the AI work and revoke mid-flight. The
+activity/message text is stripped of terminal control characters and bounded in
+the shared `omni` state, so HTTP, MCP, and direct bus control all store and
+display the same safe text.
 
 The allow-AI gate and a surface's capability scope are two independent levers.
 Each surface emits under its own id, so the router's `calls` allowlist — the

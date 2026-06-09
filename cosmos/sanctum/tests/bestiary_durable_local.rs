@@ -494,6 +494,91 @@ fn daemon_rejects_oversized_registry_publish_artifact() {
 }
 
 #[test]
+fn daemon_bounds_full_artifact_list_entries_snapshots() {
+    let root = TempRoot::new("list-entries-cap");
+    let node_key = Ed25519KeyMaterial::from_seed([0x71; 32]).unwrap();
+    let abode = Ed25519KeyMaterial::from_seed([0x72; 32]).unwrap();
+    let mut cfg = BestiaryConfig::local();
+    cfg.max_snapshot_artifact_bytes = 4;
+    let (k, id) = boot_daemon_with_config(&root.0, &node_key, abode, cfg);
+    let (probe, bus, rx) = k.open_endpoint(Capabilities::default());
+
+    let publish_a = registry_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        RegistryOp::PublishInRealm {
+            manifest: Manifest::new("a", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            artifact: b"aaa".to_vec(),
+            realm: RealmId::new("crew"),
+        },
+        1,
+    );
+    assert!(matches!(publish_a, RegistryReply::PublishedInRealm { .. }));
+    let publish_b = registry_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        RegistryOp::PublishInRealm {
+            manifest: Manifest::new("b", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            artifact: b"bbb".to_vec(),
+            realm: RealmId::new("guests"),
+        },
+        2,
+    );
+    assert!(matches!(publish_b, RegistryReply::PublishedInRealm { .. }));
+
+    let over_cap = registry_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        RegistryOp::ListEntries { realm: None },
+        3,
+    );
+    match over_cap {
+        RegistryReply::Error { message } => {
+            assert!(message.contains("snapshot too large"), "unexpected error: {message}");
+        }
+        other => panic!("expected Error for over-cap ListEntries, got {other:?}"),
+    }
+
+    let scoped = registry_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        RegistryOp::ListEntries { realm: Some(RealmId::new("crew")) },
+        4,
+    );
+    match scoped {
+        RegistryReply::Entries { entries } => {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].realm, RealmId::new("crew"));
+            assert_eq!(entries[0].artifact, b"aaa");
+        }
+        other => panic!("expected scoped Entries under cap, got {other:?}"),
+    }
+
+    let metadata = registry_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        RegistryOp::ListMetadata { realm: None },
+        5,
+    );
+    match metadata {
+        RegistryReply::Metadata { entries } => assert_eq!(entries.len(), 2),
+        other => panic!("expected metadata list to stay byte-light, got {other:?}"),
+    }
+
+    k.shutdown_all(Deadline::from_millis(1500));
+}
+
+#[test]
 fn daemon_rejects_oversized_bestiary_payload_before_json_parse() {
     let root = TempRoot::new("bestiary-op-cap");
     let node_key = Ed25519KeyMaterial::from_seed([0x59; 32]).unwrap();
@@ -559,6 +644,69 @@ fn daemon_rejects_oversized_push_entry_artifacts() {
         matches!(reply, BestiaryReply::PushAck { accepted: 0, rejected: 1 }),
         "oversized pushed artifact must be rejected, got {reply:?}"
     );
+
+    k.shutdown_all(Deadline::from_millis(1500));
+}
+
+#[test]
+fn daemon_rejects_oversized_push_entry_batches_before_store_merge() {
+    let root = TempRoot::new("push-entry-count-cap");
+    let src_root = TempRoot::new("push-entry-count-cap-src");
+    let node_key = Ed25519KeyMaterial::from_seed([0x5E; 32]).unwrap();
+    let abode = Ed25519KeyMaterial::from_seed([0x5F; 32]).unwrap();
+    let src_abode = Ed25519KeyMaterial::from_seed([0x60; 32]).unwrap();
+    let mut cfg = BestiaryConfig::local();
+    cfg.max_push_entries = 1;
+    let (k, id) = boot_daemon_with_config(&root.0, &node_key, abode, cfg);
+    let (probe, bus, rx) = k.open_endpoint(Capabilities::default());
+
+    let src = FsBestiaryStore::new(&src_root.0, src_abode).unwrap();
+    let realm = RealmId::new("crew");
+    let h1 = src
+        .put(
+            &realm,
+            Manifest::new("pushed-one", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            b"one".to_vec(),
+        )
+        .unwrap();
+    let h2 = src
+        .put(
+            &realm,
+            Manifest::new("pushed-two", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            b"two".to_vec(),
+        )
+        .unwrap();
+    let entries = src.signed_entries(Some(&realm)).unwrap();
+    assert_eq!(entries.len(), 2, "source produced a valid over-cap batch");
+
+    let reply = bestiary_op(
+        &bus,
+        &rx,
+        probe,
+        Address::Creature(id),
+        BestiaryOp::PushEntries { entries },
+        1,
+    );
+    match reply {
+        BestiaryReply::Error { message } => {
+            assert!(message.contains("push batch too large"), "got: {message}");
+            assert!(message.contains("2 entries"), "got: {message}");
+            assert!(message.contains("limit 1"), "got: {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    for (corr, hash) in [(2, h1), (3, h2)] {
+        let reply = registry_op(
+            &bus,
+            &rx,
+            probe,
+            Address::Creature(id),
+            RegistryOp::FetchInRealm { artifact_hash: hash, realm: realm.clone() },
+            corr,
+        );
+        assert!(matches!(reply, RegistryReply::NotFound), "over-cap batch must not merge entries");
+    }
 
     k.shutdown_all(Deadline::from_millis(1500));
 }

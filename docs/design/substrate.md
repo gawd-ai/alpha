@@ -129,7 +129,8 @@ drops the **instance** (the native `destroy` runs while the library is still map
 declares `instance` before `resources`, and struct fields drop in declaration order, so even an
 implicit drop tears down in the right sequence. When a native artifact arrived as in-memory bytes,
 the resources also hold a tempfile guard that unlinks the spilled `.so` *after* the library unmaps —
-declared after the library, so it drops second.
+declared after the library, so it drops second. Spilled paths are per-load unique and opened with
+`create_new`, so two same-content loads in one process never truncate or reuse the same `.so` path.
 
 **Creatures do no self-teardown.** The kernel owns the drain. Unload deregisters the creature from
 the router (no new envelopes reach it), the drain thread reads the disconnect, the creature's
@@ -142,8 +143,9 @@ happens.
 joins every registered thread **before** returning to the host — so the drain proceeds to `dlclose`
 only after every disciplined thread is reaped. A thread that outlives `dlclose` would dereference
 now-unmapped code through a dangling vtable: the canonical native-unload use-after-free. The SDK
-ships a *discipline*, not a contract — `forge::spawn` is the right path; a raw `std::thread::spawn`
-is documented as "you're on your own."
+ships a *discipline*, not a contract — `forge::spawn` is the compatible fire-and-report helper,
+`forge::try_spawn` returns OS spawn errors to authors that must fail synchronously, and a raw
+`std::thread::spawn` is documented as "you're on your own."
 
 **The kernel's thread-count guard is the floor.** A creature that bypasses the discipline (a raw or
 detached thread) is caught by a `/proc/self/task` snapshot diff — tids before `bind` versus after
@@ -159,18 +161,20 @@ unload in reverse-chronological order so a still-running neighbor's threads aren
 
 **Off-drain workers honor the same floor.** A creature whose `handle` must do something slow — a
 model call in `agent-mind`, say — runs that work on a self-owned worker thread and emits the reply
-through its captured bus, so the drain thread is never blocked. Its `shutdown` sets a stop flag (which
-suppresses a stopped worker's reply) and joins, **deadline-bounded by polling** so it returns inside
-the kernel's unload budget; a worker still blocked in its call at the deadline is detached. This is
-sound only for an **in-process** creature — the one place an emitting worker is safe, since there is
-no `.so` FFI bus shim on that path — where a detached worker returns into no unmapped code: it
-finishes its now-stopped call, drops its reply, and exits. The residual is a bounded, in-process
+through its captured bus, so the drain thread is never blocked. `agent-mind` caps the in-flight model
+worker set by default (`DEFAULT_MAX_IN_FLIGHT_MODEL_REQUESTS`), with `0` as the explicit lab/demo
+opt-out for deployments that accept unbounded blocking model calls. Its `shutdown` sets a stop flag
+(which suppresses a stopped worker's reply) and joins, **deadline-bounded by polling** so it returns
+inside the kernel's unload budget; a worker still blocked in its call at the deadline is detached.
+This is sound only for an **in-process** creature — the one place an emitting worker is safe, since
+there is no `.so` FFI bus shim on that path — where a detached worker returns into no unmapped code:
+it finishes its now-stopped call, drops its reply, and exits. The residual is a bounded, in-process
 thread that lingers for the call's duration — never a use-after-free, the same floor a `.so` leak
 converges on. (Clamping the call's *own* timeout low enough to fit a 1 s deadline would make a real
-model call impossible, so the call timeout stays generous and the **join** is what's bounded.) When
-a worker is still blocked at the deadline, the thread-count guard logs its generic "leaking
-resources" line for the detached tid — but for an in-process creature the resources it would leak are
-empty, so that diagnostic is conservative (no library is actually leaked); detach is the *expected*
+model call impossible, so the call timeout stays generous and the **join** is what's bounded.) When a
+worker is still blocked at the deadline, the thread-count guard logs its generic "leaking resources"
+line for the detached tid — but for an in-process creature the resources it would leak are empty, so
+that diagnostic is conservative (no library is actually leaked); detach is the *expected*
 in-flight-unload path under this no-clamp choice, not a fault.
 
 **Beast and critter unload trivially.** A beast's unload drops the `wasmtime` store; linear memory,
@@ -205,7 +209,9 @@ and its `mem_bytes` is a real byte-exact cap. A critter is contained the same wa
 function, `emit`, only parks a dispatch the kernel routes through the gated bus path; it holds no bus
 authority itself, and `no_module` plus a disabled `eval` make it exactly its signed, static source.
 Its `cpu_ms` is a real operation budget; its `mem_bytes` is honestly best-effort (structural counts,
-with a bounded default backstop so one bulk-allocating builtin can't OOM the host).
+with a bounded default backstop so one bulk-allocating builtin can't OOM the host). The loader also
+keeps the convenience string view honest: `env.text` is a lossy UTF-8 preview capped by the effective
+memory cap and a 1 MiB ceiling, while `env.payload` remains the full byte-exact `Blob`.
 
 **The beast tier also bounds wall time.** `capabilities.wall_ms` is an opt-in per-envelope ceiling on
 *elapsed* time — the backstop for work that consumes little fuel but still blocks or spins. It is

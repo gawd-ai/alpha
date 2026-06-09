@@ -39,6 +39,8 @@ mod wire;
 
 pub use wire::{
     CatalogEntry, Entry, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, SyncEntry,
+    MAX_QUARANTINE_ATTESTING_PEERS, MAX_QUARANTINE_ATTESTING_PEER_BYTES,
+    MAX_QUARANTINE_REASON_BYTES, MAX_REGISTRY_SIGNAL_FIELD_BYTES,
 };
 
 pub use curator::{AICurator, CurationContext, CurationDecision, Curator, DeterministicCurator};

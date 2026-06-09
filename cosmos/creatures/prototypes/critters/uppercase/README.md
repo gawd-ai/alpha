@@ -6,8 +6,9 @@ The first step past `echo`: read the payload as text and upper-case it.
 fn handle(env) { env.text.to_upper() }
 ```
 
-`env.text` is the payload decoded as lossy UTF-8 — the engine has no Blob→String builtin, so this is
-how a critter does string work. Returning a string replies with its UTF-8 bytes.
+`env.text` is a bounded lossy UTF-8 preview — the engine has no Blob→String builtin, so this is how a
+critter does string work. Check `env.text_truncated` if partial input is not acceptable. Returning a
+string replies with its UTF-8 bytes.
 
 ```
 send <id> "hello, world!"   →   "HELLO, WORLD!"

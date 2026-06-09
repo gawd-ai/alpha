@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -43,13 +43,29 @@ use sha2::{Digest, Sha256};
 use sigil::{Ed25519KeyMaterial, Ed25519Verifier, Manifest, RealmId, Verifier};
 
 use crate::curator::{CurationContext, CurationDecision, Curator};
-use crate::wire::{CatalogEntry, Entry, QuarantineNotice, ReputationScore, SyncEntry};
+use crate::wire::{
+    CatalogEntry, Entry, QuarantineNotice, ReputationScore, SyncEntry,
+    MAX_QUARANTINE_ATTESTING_PEERS,
+};
 use crate::{registry_artifact_too_large_message, MAX_REGISTRY_ARTIFACT_BYTES};
 
 /// Default maximum number of live `(realm, artifact_hash)` entries retained by [`FsBestiaryStore`].
 ///
 /// `0` is reserved as an explicit opt-out via [`FsBestiaryStore::with_max_entries`].
 pub const DEFAULT_MAX_BESTIARY_ENTRIES: usize = 1_024;
+
+/// Maximum serialized bytes for one durable Bestiary log record line.
+///
+/// Artifact bytes live in content-addressed blobs, not in the JSONL journal. This cap is therefore
+/// sized for a large manifest plus signature/chain metadata, and is enforced both when appending and
+/// before `recover()` allocates a full line from disk.
+pub const MAX_BESTIARY_LOG_RECORD_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum bytes read from the advisory `<realm_hash>.head` tip hint.
+///
+/// The JSONL chain is authoritative; the head file is only a crash/truncation hint containing
+/// `"<next_seq> <64-byte-tip>"`, so oversized or malformed hints are ignored during recovery.
+pub const MAX_BESTIARY_HEAD_BYTES: usize = 512;
 
 /// 4-byte format tag, woven into the genesis chain root so a log can't be confused with another
 /// line-oriented file and so the chain's first link is anchored to this format.
@@ -79,6 +95,77 @@ fn invalid_artifact_hash(hash: &str) -> StoreError {
         "invalid artifact_hash (len {}, expected 64 lowercase hex chars)",
         hash.len()
     ))
+}
+
+fn read_log_line_bounded<R: BufRead>(
+    reader: &mut R,
+    realm_hash: &str,
+) -> Result<Option<String>, StoreError> {
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(|e| StoreError::Io(e.to_string()))?;
+        if available.is_empty() {
+            if out.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        let take = available.iter().position(|&b| b == b'\n').map_or(available.len(), |i| i + 1);
+        if out.len().saturating_add(take) > MAX_BESTIARY_LOG_RECORD_BYTES {
+            return Err(StoreError::Limit(format!(
+                "{realm_hash}.jsonl log record exceeds {} byte limit",
+                MAX_BESTIARY_LOG_RECORD_BYTES
+            )));
+        }
+        let found_newline = available[..take].ends_with(b"\n");
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if found_newline {
+            break;
+        }
+    }
+
+    if out.ends_with(b"\n") {
+        out.pop();
+        if out.ends_with(b"\r") {
+            out.pop();
+        }
+    }
+    String::from_utf8(out).map(Some).map_err(|e| {
+        StoreError::Corrupt(format!("{realm_hash}.jsonl log record is not UTF-8: {e}"))
+    })
+}
+
+fn encode_log_record_line(rec: &LogRecord) -> Result<Vec<u8>, StoreError> {
+    let mut line = serde_json::to_vec(rec).map_err(|e| StoreError::Io(e.to_string()))?;
+    line.push(b'\n');
+    if line.len() > MAX_BESTIARY_LOG_RECORD_BYTES {
+        return Err(StoreError::Limit(format!(
+            "bestiary log record too large: {} bytes exceeds {} byte limit",
+            line.len(),
+            MAX_BESTIARY_LOG_RECORD_BYTES
+        )));
+    }
+    Ok(line)
+}
+
+fn read_head_tip_bounded(path: &Path, realm_hash: &str) -> Option<String> {
+    let f = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    let mut limited = f.take(MAX_BESTIARY_HEAD_BYTES as u64 + 1);
+    if limited.read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    if bytes.len() > MAX_BESTIARY_HEAD_BYTES {
+        eprintln!(
+            "bestiary: {realm_hash}.head exceeds {} byte limit (using the log)",
+            MAX_BESTIARY_HEAD_BYTES
+        );
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    text.split_whitespace().nth(1).map(str::to_string)
 }
 
 /// Structured failure modes for the durable store. Distinct from a creature's admission/policy
@@ -311,6 +398,12 @@ pub trait BestiaryStore: Send + Sync {
     ) -> Result<Option<(CatalogEntry, usize)>, StoreError>;
     /// Snapshot live entries as [`SyncEntry`]s for anti-entropy pull. `realm: None` = all Realms.
     fn list(&self, realm: Option<&RealmId>) -> Result<Vec<SyncEntry>, StoreError>;
+    /// Snapshot live entries under a total artifact-byte cap. `0` means unbounded.
+    fn list_bounded(
+        &self,
+        realm: Option<&RealmId>,
+        max_artifact_bytes: usize,
+    ) -> Result<Vec<SyncEntry>, StoreError>;
     /// Snapshot live entry metadata for control/catalog listing. Does not read artifact blobs.
     fn list_metadata(&self, realm: Option<&RealmId>) -> Result<Vec<CatalogEntry>, StoreError>;
     /// Attach/replace a reputation score on an existing entry. `false` if absent/tombstoned or the
@@ -531,8 +624,7 @@ impl FsBestiaryStore {
         rec.signature = self.abode_key.sign(&rec.signing_payload());
         let rec_hash = rec.hash();
 
-        let mut line = serde_json::to_vec(&rec).map_err(|e| StoreError::Io(e.to_string()))?;
-        line.push(b'\n');
+        let line = encode_log_record_line(&rec)?;
         let log_path = self.log_path(&realm_hash);
         {
             let mut f = OpenOptions::new()
@@ -724,6 +816,14 @@ impl BestiaryStore for FsBestiaryStore {
     }
 
     fn list(&self, realm: Option<&RealmId>) -> Result<Vec<SyncEntry>, StoreError> {
+        self.list_bounded(realm, 0)
+    }
+
+    fn list_bounded(
+        &self,
+        realm: Option<&RealmId>,
+        max_artifact_bytes: usize,
+    ) -> Result<Vec<SyncEntry>, StoreError> {
         let rows: Vec<((RealmId, String), Live)> = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             inner
@@ -734,7 +834,21 @@ impl BestiaryStore for FsBestiaryStore {
                 .collect()
         };
         let mut out = Vec::with_capacity(rows.len());
+        let mut artifact_bytes = 0usize;
         for ((r, hash), live) in rows {
+            if max_artifact_bytes != 0 {
+                let meta = fs::metadata(self.blob_path(&hash))
+                    .map_err(|e| StoreError::Corrupt(format!("blob {hash} unreadable: {e}")))?;
+                let len = usize::try_from(meta.len()).map_err(|_| {
+                    StoreError::Corrupt(format!("blob {hash} length does not fit usize"))
+                })?;
+                artifact_bytes = artifact_bytes.saturating_add(len);
+                if artifact_bytes > max_artifact_bytes {
+                    return Err(StoreError::Limit(format!(
+                        "bestiary snapshot too large: {artifact_bytes} artifact bytes exceeds {max_artifact_bytes} byte limit"
+                    )));
+                }
+            }
             let artifact = self.read_blob(&hash)?;
             out.push(SyncEntry {
                 artifact_hash: hash,
@@ -802,6 +916,14 @@ impl BestiaryStore for FsBestiaryStore {
         if !is_artifact_hash(artifact_hash) {
             return Ok(false);
         }
+        if let Some(message) = QuarantineNotice::mark_shape_error(
+            artifact_hash,
+            realm,
+            &notice.reason,
+            &notice.attesting_peers,
+        ) {
+            return Err(StoreError::Limit(message));
+        }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let Some(live) = inner.entries.get(&key) else {
@@ -812,9 +934,19 @@ impl BestiaryStore for FsBestiaryStore {
         if let Some(existing) = &live.quarantine {
             for p in &existing.attesting_peers {
                 if !merged.attesting_peers.contains(p) {
+                    if merged.attesting_peers.len() >= MAX_QUARANTINE_ATTESTING_PEERS {
+                        return Err(StoreError::Limit(format!(
+                            "quarantine attesting_peers too large after merge: {} peers exceeds {} peer limit",
+                            merged.attesting_peers.len() + 1,
+                            MAX_QUARANTINE_ATTESTING_PEERS
+                        )));
+                    }
                     merged.attesting_peers.push(p.clone());
                 }
             }
+        }
+        if let Some(message) = merged.shape_error() {
+            return Err(StoreError::Limit(message));
         }
         let first_seen = live.first_seen;
         let op = LogOp::Quarantine {
@@ -950,10 +1082,24 @@ impl BestiaryStore for FsBestiaryStore {
                         }
                     }
                 }
-                // Quarantine: sticky union (never cleared by a push).
+                // Quarantine: sticky union (never cleared by a push). A shape/peer-cap rejection here
+                // must not discard the membership + reputation we already persisted above: the cap
+                // check returns *before* any apply, so the existing local marker is untouched. Log the
+                // dropped defense signal and keep the rest of the merge — mirrors the best-effort
+                // `put` Capacity skip above rather than failing the whole entry (which the daemon would
+                // miscount as a generic `rejected` even though membership + reputation landed).
                 if let Some(q) = &sync.quarantine {
-                    if self.quarantine(&realm, &hash, q.clone())? {
-                        outcome.quarantine_updated = true;
+                    match self.quarantine(&realm, &hash, q.clone()) {
+                        Ok(true) => outcome.quarantine_updated = true,
+                        Ok(false) => {}
+                        Err(StoreError::Limit(msg)) => {
+                            eprintln!(
+                                "bestiary: pushed entry {hash} in realm {} merged, but its quarantine \
+                                 signal was dropped over a shape cap: {msg}",
+                                realm.0
+                            );
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 Ok(outcome)
@@ -1036,8 +1182,8 @@ impl BestiaryStore for FsBestiaryStore {
             let f = File::open(&path).map_err(|e| StoreError::Io(e.to_string()))?;
             let mut tip = genesis_prev();
             let mut expect_seq = 0u64;
-            for line in BufReader::new(f).lines() {
-                let line = line.map_err(|e| StoreError::Io(e.to_string()))?;
+            let mut reader = BufReader::new(f);
+            while let Some(line) = read_log_line_bounded(&mut reader, &realm_hash)? {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -1083,13 +1229,11 @@ impl BestiaryStore for FsBestiaryStore {
             }
             // Advisory head cross-check — a mismatch means a crash between append and head-write, or a
             // truncated tail. The jsonl chain is authoritative; warn, don't fail.
-            if let Ok(head_txt) = fs::read_to_string(self.head_path(&realm_hash)) {
-                if let Some(want) = head_txt.split_whitespace().nth(1) {
-                    if want != tip {
-                        eprintln!(
-                            "bestiary: {realm_hash}.head tip {want} != replayed tip {tip} (using the log)"
-                        );
-                    }
+            if let Some(want) = read_head_tip_bounded(&self.head_path(&realm_hash), &realm_hash) {
+                if want != tip {
+                    eprintln!(
+                        "bestiary: {realm_hash}.head tip {want} != replayed tip {tip} (using the log)"
+                    );
                 }
             }
             inner.heads.insert(realm_hash, Head { next_seq: expect_seq, tip_hash: tip });
@@ -1274,10 +1418,7 @@ impl BestiaryStore for FsBestiaryStore {
             // Atomically replace the realm chain.
             let mut buf = Vec::new();
             for rec in &records {
-                buf.extend_from_slice(
-                    &serde_json::to_vec(rec).map_err(|e| StoreError::Io(e.to_string()))?,
-                );
-                buf.push(b'\n');
+                buf.extend_from_slice(&encode_log_record_line(rec)?);
             }
             self.atomic_write(&self.log_path(&realm_hash), &buf)?;
             let _ = self
@@ -1386,6 +1527,21 @@ mod tests {
     }
 
     #[test]
+    fn recover_ignores_oversized_advisory_head_hint_and_replays_log() {
+        let root = TempRoot::new("head-cap");
+        let realm = RealmId::new("crew");
+        let s = store(&root);
+        let hash = s.put(&realm, manifest("c"), b"artifact-bytes".to_vec()).unwrap();
+        let realm_hash = FsBestiaryStore::realm_hash(&realm);
+        fs::write(s.head_path(&realm_hash), vec![b'x'; MAX_BESTIARY_HEAD_BYTES + 1]).unwrap();
+
+        let s2 = store(&root);
+        let replayed = s2.recover().unwrap();
+        assert_eq!(replayed, 1, "oversized head hint is ignored; log still replays");
+        assert!(s2.get(&realm, &hash).unwrap().is_some());
+    }
+
+    #[test]
     fn metadata_list_does_not_read_artifact_blobs() {
         let root = TempRoot::new("metadata-no-blob");
         let s = store(&root);
@@ -1410,6 +1566,29 @@ mod tests {
 
         let full = s.list(Some(&realm)).expect_err("full anti-entropy listing needs the blob");
         assert!(matches!(full, StoreError::Corrupt(_)), "missing blob is detected: {full:?}");
+    }
+
+    #[test]
+    fn list_bounded_refuses_oversized_artifact_snapshot_before_blob_read() {
+        let root = TempRoot::new("list-bounded");
+        let s = store(&root);
+        let realm_a = RealmId::new("crew");
+        let realm_b = RealmId::new("guests");
+        s.put(&realm_a, manifest("a"), b"aaa".to_vec()).unwrap();
+        s.put(&realm_b, manifest("b"), b"bbb".to_vec()).unwrap();
+
+        let err = s.list_bounded(None, 4).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Limit(_)),
+            "over-cap all-realm snapshot refused: {err:?}"
+        );
+
+        let scoped = s.list_bounded(Some(&realm_a), 4).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].realm, realm_a);
+        assert_eq!(scoped[0].artifact, b"aaa");
+
+        assert_eq!(s.list(None).unwrap().len(), 2, "unbounded list remains available to callers");
     }
 
     #[test]
@@ -1448,6 +1627,22 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_store_refuses_oversized_log_records_before_append() {
+        let root = TempRoot::new("log-record-cap");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let mut m = manifest("oversized");
+        m.name = "n".repeat(MAX_BESTIARY_LOG_RECORD_BYTES + 1);
+
+        let err = s.put(&realm, m, b"artifact-bytes".to_vec()).unwrap_err();
+        assert!(matches!(err, StoreError::Limit(_)), "oversized log record refused: {err:?}");
+        assert!(
+            !s.log_path(&FsBestiaryStore::realm_hash(&realm)).exists(),
+            "oversized record was not appended to the journal"
+        );
+    }
+
+    #[test]
     fn merge_push_rejects_malformed_tombstone_hashes() {
         let root_a = TempRoot::new("bad-tomb-a");
         let root_b = TempRoot::new("bad-tomb-b");
@@ -1477,6 +1672,18 @@ mod tests {
 
         let err = s.recover().unwrap_err();
         assert!(matches!(err, StoreError::Corrupt(_)), "bad log hash rejected: {err:?}");
+    }
+
+    #[test]
+    fn recover_rejects_oversized_log_record_lines_before_json_parse() {
+        let root = TempRoot::new("oversized-log-line");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let realm_hash = FsBestiaryStore::realm_hash(&realm);
+        fs::write(s.log_path(&realm_hash), vec![b'x'; MAX_BESTIARY_LOG_RECORD_BYTES + 1]).unwrap();
+
+        let err = s.recover().unwrap_err();
+        assert!(matches!(err, StoreError::Limit(_)), "oversized line rejected: {err:?}");
     }
 
     #[test]
@@ -1618,6 +1825,81 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_notice_shape_is_capped_before_store() {
+        let root = TempRoot::new("quarantine-shape");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let hash = s.put(&realm, manifest("q"), b"q".to_vec()).unwrap();
+
+        let err = s
+            .quarantine(
+                &realm,
+                &hash,
+                QuarantineNotice {
+                    reason: "x".repeat(crate::MAX_QUARANTINE_REASON_BYTES + 1),
+                    attesting_peers: vec!["node-A".into()],
+                },
+            )
+            .expect_err("oversized quarantine reason is rejected");
+        assert!(err.to_string().contains("reason too large"), "{err}");
+        assert!(
+            s.get(&realm, &hash).unwrap().unwrap().quarantine.is_none(),
+            "oversized marker was not retained"
+        );
+
+        let err = s
+            .quarantine(
+                &realm,
+                &hash,
+                QuarantineNotice {
+                    reason: "peer-shape".into(),
+                    attesting_peers: vec![
+                        "p".repeat(crate::MAX_QUARANTINE_ATTESTING_PEER_BYTES + 1)
+                    ],
+                },
+            )
+            .expect_err("oversized peer id is rejected");
+        assert!(err.to_string().contains("attesting_peer too large"), "{err}");
+        assert!(
+            s.get(&realm, &hash).unwrap().unwrap().quarantine.is_none(),
+            "oversized peer id was not retained"
+        );
+    }
+
+    #[test]
+    fn quarantine_sticky_peer_union_is_bounded() {
+        let root = TempRoot::new("quarantine-peer-cap");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let hash = s.put(&realm, manifest("q"), b"q".to_vec()).unwrap();
+        let cap_peers: Vec<String> =
+            (0..crate::MAX_QUARANTINE_ATTESTING_PEERS).map(|i| format!("node-{i}")).collect();
+
+        assert!(s
+            .quarantine(
+                &realm,
+                &hash,
+                QuarantineNotice { reason: "first".into(), attesting_peers: cap_peers.clone() },
+            )
+            .unwrap());
+        let err = s
+            .quarantine(
+                &realm,
+                &hash,
+                QuarantineNotice {
+                    reason: "overflow".into(),
+                    attesting_peers: vec!["new-node".into()],
+                },
+            )
+            .expect_err("sticky union over the peer cap is rejected");
+        assert!(err.to_string().contains("after merge"), "{err}");
+
+        let q = s.get(&realm, &hash).unwrap().unwrap().quarantine.unwrap();
+        assert_eq!(q.reason, "first", "rejected overflow leaves existing marker untouched");
+        assert_eq!(q.attesting_peers, cap_peers);
+    }
+
+    #[test]
     fn merge_push_round_trips_and_rejects_tamper() {
         let root_a = TempRoot::new("push-a");
         let root_b = TempRoot::new("push-b");
@@ -1643,6 +1925,32 @@ mod tests {
         }
         let err = dst.merge_push(bad).unwrap_err();
         assert!(matches!(err, StoreError::Integrity(_)), "tampered push rejected, got {err:?}");
+    }
+
+    #[test]
+    fn merge_push_drops_an_over_cap_quarantine_signal_but_keeps_the_membership() {
+        // A conforming source can never produce an over-cap quarantine (its own `quarantine` gates
+        // it), so this models a NON-conforming/hostile peer: take a genuine signed push (the record
+        // signs the Put, not the quarantine signal) and graft an oversized quarantine reason onto its
+        // SyncEntry. The membership + reputation that already landed must survive — only the malformed
+        // defense signal is dropped (logged), not the whole entry.
+        let root_src = TempRoot::new("merge-q-src");
+        let root_dst = TempRoot::new("merge-q-dst");
+        let src = FsBestiaryStore::new(&root_src.0, key()).unwrap();
+        let dst = FsBestiaryStore::new(&root_dst.0, key()).unwrap();
+        let realm = RealmId::new("crew");
+        let hash = src.put(&realm, manifest("c"), b"shared-bytes".to_vec()).unwrap();
+
+        let mut push = src.signed_entries(Some(&realm)).unwrap().remove(0);
+        push.sync.as_mut().unwrap().quarantine = Some(QuarantineNotice {
+            reason: "x".repeat(crate::MAX_QUARANTINE_REASON_BYTES + 1),
+            attesting_peers: vec!["node-B".into()],
+        });
+
+        let outcome = dst.merge_push(push).expect("entry merges despite the over-cap quarantine");
+        assert!(outcome.membership_changed, "membership still lands");
+        let entry = dst.get(&realm, &hash).unwrap().expect("pushed entry is present");
+        assert!(entry.quarantine.is_none(), "the over-cap defense signal was dropped, not applied");
     }
 
     #[test]

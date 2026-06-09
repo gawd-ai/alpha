@@ -7,6 +7,13 @@ use sigil::crypto::{hex_decode, hex_encode};
 
 use crate::address::Address;
 
+/// Maximum serialized bytes in an envelope header.
+///
+/// Payload bytes carry the bulk data and are governed by domain-specific caps. Header fields are
+/// routing/control metadata (`Address`, `schema`, `commitment`, etc.) and are cloned into the
+/// bounded journal and signed on every send, so they need their own resource floor.
+pub const MAX_ENVELOPE_HEADER_BYTES: usize = 128 * 1024;
+
 /// The trust + routing header. The *fabric-set* fields (`from`, `seq`, `sig`, `stamp`) cannot be
 /// forged by a creature — creatures emit a [`Dispatch`](crate::Dispatch) and the bus seals these in.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +94,9 @@ impl Envelope {
     pub fn parse(bytes: &[u8]) -> Result<Envelope, EnvelopeError> {
         let env: Envelope =
             serde_json::from_slice(bytes).map_err(|e| EnvelopeError::Parse(e.to_string()))?;
+        if let Some((len, limit)) = header_size_error(&env.header) {
+            return Err(EnvelopeError::HeaderTooLarge { len, limit });
+        }
         let depth = env.header.to.nesting_depth().max(env.header.from.nesting_depth());
         if depth > crate::address::MAX_ADDRESS_NESTING_DEPTH {
             return Err(EnvelopeError::TooDeep {
@@ -162,10 +172,20 @@ impl Envelope {
     }
 }
 
+pub(crate) fn header_size_error(header: &Header) -> Option<(usize, usize)> {
+    let len = serde_json::to_vec(header)
+        .map(|bytes| bytes.len())
+        .unwrap_or(MAX_ENVELOPE_HEADER_BYTES + 1);
+    (len > MAX_ENVELOPE_HEADER_BYTES).then_some((len, MAX_ENVELOPE_HEADER_BYTES))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeError {
     #[error("envelope parse error: {0}")]
     Parse(String),
+    /// The serialized header exceeded [`MAX_ENVELOPE_HEADER_BYTES`].
+    #[error("envelope header is {len} bytes, exceeds {limit} byte limit")]
+    HeaderTooLarge { len: usize, limit: usize },
     /// The address nesting depth exceeded [`MAX_ADDRESS_NESTING_DEPTH`](crate::MAX_ADDRESS_NESTING_DEPTH)
     /// — a pathological `Realm`/`Omega` wrapper chain rejected before any gateway unwraps it (R9).
     #[error("envelope address nesting depth {depth} exceeds max {max} (R9 federation-grain cap)")]
@@ -223,6 +243,21 @@ mod tests {
                 assert_eq!(max, MAX_ADDRESS_NESTING_DEPTH);
             }
             other => panic!("expected TooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_oversized_headers_before_gateway_use() {
+        let mut header = header_to(Address::Kernel);
+        header.schema = "x".repeat(MAX_ENVELOPE_HEADER_BYTES + 1);
+        let bytes = Envelope { header, payload: vec![] }.to_bytes();
+
+        match Envelope::parse(&bytes) {
+            Err(EnvelopeError::HeaderTooLarge { len, limit }) => {
+                assert!(len > MAX_ENVELOPE_HEADER_BYTES);
+                assert_eq!(limit, MAX_ENVELOPE_HEADER_BYTES);
+            }
+            other => panic!("expected HeaderTooLarge, got {other:?}"),
         }
     }
 

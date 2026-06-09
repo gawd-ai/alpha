@@ -25,8 +25,8 @@ Or author one live (no cargo) through `Role::BUILD` with the `build-critter` cre
 
 ## The contract
 
-`fn handle(env)` receives a map (`env.payload` Blob, `env.text` the payload as lossy UTF-8 — the engine
-has no Blob→String builtin, so string-oriented critters read this — `env.schema`, `env.from`, `env.corr`) and:
+`fn handle(env)` receives a map (`env.payload` Blob, `env.text` a bounded lossy UTF-8 preview,
+`env.text_truncated` when that preview clipped the body, `env.schema`, `env.from`, `env.corr`) and:
 
 - **returns a Blob or string** (or any other non-unit value, best-effort stringified) → the engine
   replies to the envelope's reply target;

@@ -47,10 +47,22 @@ use bestiary::{
     bestiary_op_too_large_message, registry_artifact_too_large_message,
     registry_op_too_large_message, BestiaryOp, BestiaryReply, BestiaryStore, CurationContext,
     Curator, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, BESTIARY_OP_SCHEMA,
-    BESTIARY_REPLY_SCHEMA, MAX_BESTIARY_OP_BYTES, MAX_REGISTRY_ARTIFACT_BYTES,
-    MAX_REGISTRY_OP_BYTES, REGISTRY_REPLY_SCHEMA,
+    BESTIARY_REPLY_SCHEMA, DEFAULT_MAX_BESTIARY_ENTRIES, MAX_BESTIARY_OP_BYTES,
+    MAX_REGISTRY_ARTIFACT_BYTES, MAX_REGISTRY_OP_BYTES, REGISTRY_REPLY_SCHEMA,
 };
 use sigil::RealmId;
+
+/// Default maximum number of self-verifying entries accepted in one `PushEntries` batch. A normal
+/// full push can include live entries plus tombstones, so allow twice the default live catalog cap.
+/// `0` in [`BestiaryConfig::max_push_entries`] means unbounded.
+pub const DEFAULT_MAX_PUSH_ENTRIES: usize = DEFAULT_MAX_BESTIARY_ENTRIES * 2;
+
+/// Default total artifact bytes read into one `ListEntries` anti-entropy snapshot.
+///
+/// This mirrors `registry-mem`'s source-side snapshot cap: full fetches can still return one large
+/// artifact, but a catalog-wide pull cannot force the daemon to clone the whole live set into one
+/// reply. `0` in [`BestiaryConfig::max_snapshot_artifact_bytes`] means unbounded.
+pub const DEFAULT_MAX_SNAPSHOT_ARTIFACT_BYTES: usize = MAX_REGISTRY_ARTIFACT_BYTES;
 
 /// A peer this daemon PUSHes its catalog to.
 #[derive(Clone, Debug)]
@@ -79,6 +91,10 @@ pub struct BestiaryConfig {
     pub max_bestiary_op_bytes: usize,
     /// Maximum artifact bytes retained per registry publish or pushed entry. `0` means unbounded.
     pub max_artifact_bytes: usize,
+    /// Maximum total artifact bytes read into one `ListEntries` reply. `0` means unbounded.
+    pub max_snapshot_artifact_bytes: usize,
+    /// Maximum self-verifying entries accepted in one `PushEntries` batch. `0` means unbounded.
+    pub max_push_entries: usize,
 }
 
 impl BestiaryConfig {
@@ -91,6 +107,8 @@ impl BestiaryConfig {
             max_registry_op_bytes: MAX_REGISTRY_OP_BYTES,
             max_bestiary_op_bytes: MAX_BESTIARY_OP_BYTES,
             max_artifact_bytes: MAX_REGISTRY_ARTIFACT_BYTES,
+            max_snapshot_artifact_bytes: DEFAULT_MAX_SNAPSHOT_ARTIFACT_BYTES,
+            max_push_entries: DEFAULT_MAX_PUSH_ENTRIES,
         }
     }
 }
@@ -216,6 +234,24 @@ impl BestiaryDaemon {
                     reason,
                     attesting_peers,
                 }) => {
+                    if let Some(message) = QuarantineNotice::mark_shape_error(
+                        &artifact_hash,
+                        &realm,
+                        &reason,
+                        &attesting_peers,
+                    ) {
+                        eprintln!(
+                            "bestiary-daemon: rejected MarkQuarantine for {artifact_hash} in realm {}: {message}",
+                            realm.0
+                        );
+                        return Outcome::send(
+                            Dispatch::reply_to_env(
+                                env,
+                                RegistryReply::Error { message }.to_bytes(),
+                            )
+                            .with_schema(REGISTRY_REPLY_SCHEMA),
+                        );
+                    }
                     let notice = QuarantineNotice { reason, attesting_peers };
                     match self.store.quarantine(&realm, &artifact_hash, notice) {
                         Ok(true) => RegistryReply::Quarantined { artifact_hash, realm },
@@ -229,10 +265,15 @@ impl BestiaryDaemon {
                         Err(e) => RegistryReply::Error { message: e.to_string() },
                     }
                 }
-                Ok(RegistryOp::ListEntries { realm }) => match self.store.list(realm.as_ref()) {
-                    Ok(entries) => RegistryReply::Entries { entries },
-                    Err(e) => RegistryReply::Error { message: e.to_string() },
-                },
+                Ok(RegistryOp::ListEntries { realm }) => {
+                    match self
+                        .store
+                        .list_bounded(realm.as_ref(), self.cfg.max_snapshot_artifact_bytes)
+                    {
+                        Ok(entries) => RegistryReply::Entries { entries },
+                        Err(e) => RegistryReply::Error { message: e.to_string() },
+                    }
+                }
                 Ok(RegistryOp::ListMetadata { realm }) => {
                     match self.store.list_metadata(realm.as_ref()) {
                         Ok(entries) => RegistryReply::Metadata { entries },
@@ -319,24 +360,36 @@ impl BestiaryDaemon {
                     }
                 }
                 Ok(BestiaryOp::PushEntries { entries }) => {
-                    let (mut accepted, mut rejected) = (0usize, 0usize);
-                    for entry in entries {
-                        if let Some(sync) = &entry.sync {
-                            if let Some(message) = self.artifact_too_large(sync.artifact.len()) {
-                                rejected += 1;
-                                eprintln!("bestiary-daemon: rejected a pushed entry: {message}");
-                                continue;
+                    if self.cfg.max_push_entries != 0 && entries.len() > self.cfg.max_push_entries {
+                        BestiaryReply::Error {
+                            message: bestiary_push_too_many_entries_message(
+                                entries.len(),
+                                self.cfg.max_push_entries,
+                            ),
+                        }
+                    } else {
+                        let (mut accepted, mut rejected) = (0usize, 0usize);
+                        for entry in entries {
+                            if let Some(sync) = &entry.sync {
+                                if let Some(message) = self.artifact_too_large(sync.artifact.len())
+                                {
+                                    rejected += 1;
+                                    eprintln!(
+                                        "bestiary-daemon: rejected a pushed entry: {message}"
+                                    );
+                                    continue;
+                                }
+                            }
+                            match self.store.merge_push(entry) {
+                                Ok(_) => accepted += 1,
+                                Err(e) => {
+                                    rejected += 1;
+                                    eprintln!("bestiary-daemon: rejected a pushed entry: {e}");
+                                }
                             }
                         }
-                        match self.store.merge_push(entry) {
-                            Ok(_) => accepted += 1,
-                            Err(e) => {
-                                rejected += 1;
-                                eprintln!("bestiary-daemon: rejected a pushed entry: {e}");
-                            }
-                        }
+                        BestiaryReply::PushAck { accepted, rejected }
                     }
-                    BestiaryReply::PushAck { accepted, rejected }
                 }
                 Err(e) => BestiaryReply::Error { message: format!("malformed bestiary op: {e}") },
             }
@@ -345,6 +398,10 @@ impl BestiaryDaemon {
             Dispatch::reply_to_env(env, reply.to_bytes()).with_schema(BESTIARY_REPLY_SCHEMA),
         )
     }
+}
+
+fn bestiary_push_too_many_entries_message(len: usize, limit: usize) -> String {
+    format!("bestiary push batch too large: {len} entries (limit {limit})")
 }
 
 impl Creature for BestiaryDaemon {

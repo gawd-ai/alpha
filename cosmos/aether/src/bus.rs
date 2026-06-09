@@ -6,7 +6,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::address::{Address, CreatureId};
-use crate::envelope::{Envelope, Header};
+use crate::envelope::{header_size_error, Envelope, Header};
 use crate::instance::Dispatch;
 use crate::router::{RouteError, Router};
 
@@ -114,6 +114,9 @@ impl BusHandle {
             commitment: d.commitment,
             schema: d.schema,
         };
+        if let Some((len, limit)) = header_size_error(&header) {
+            return Err(RouteError::HeaderTooLarge { len, limit });
+        }
         let mut env = Envelope { header, payload: d.payload };
         env.header.sig = self.signer.sign(&env.signing_payload());
         self.router.route(env)

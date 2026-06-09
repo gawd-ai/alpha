@@ -36,8 +36,8 @@ use sigil::Capabilities;
 use serde_json::json;
 
 use crate::{
-    run_verb, AiControl, Verb, VerbCtx, VerbResult, CONTROL_WORKER_QUEUE_CAP,
-    MAX_CONTROL_VERB_BYTES,
+    control_result_payload, run_verb, AiControl, Verb, VerbCtx, VerbResult,
+    CONTROL_WORKER_QUEUE_CAP, MAX_CONTROL_VERB_BYTES,
 };
 
 /// Schema of an inbound control envelope: its payload is a JSON [`Verb`]. A surface addresses these
@@ -147,7 +147,7 @@ fn needs_probe(verb: &Verb) -> bool {
 /// Build the `control_result` reply Outcome for an inline verb: reply to the request's
 /// `reply_target` (preserving `corr`), tagged so the surface can tell a result from a sense frame.
 fn reply(env: &Envelope, res: VerbResult) -> Outcome {
-    let payload = serde_json::to_vec(&res).unwrap_or_else(|_| b"{}".to_vec());
+    let payload = control_result_payload(res);
     Outcome::send(Dispatch::reply_to_env(env, payload).with_schema(CONTROL_RESULT_SCHEMA))
 }
 
@@ -198,7 +198,7 @@ impl Creature for ControlCore {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let payload = serde_json::to_vec(&res).unwrap_or_else(|_| b"{}".to_vec());
+                let payload = control_result_payload(res);
                 let mut d = Dispatch::to(reply_to, payload).with_schema(CONTROL_RESULT_SCHEMA);
                 if let Some(c) = corr {
                     d = d.with_corr(c);

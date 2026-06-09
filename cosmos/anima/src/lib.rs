@@ -393,6 +393,43 @@ mod tests {
     }
 
     #[test]
+    fn script_env_text_is_bounded_by_declared_mem_cap() {
+        let src = r#"fn handle(env) { if env.text_truncated { env.text } else { "x" } }"#;
+        let (e, mut m, art) = critter(src, 0);
+        m.capabilities.mem_bytes = 8;
+        let mut loaded = e.load(&art, &m).expect("critter loads");
+        let out = loaded.instance.handle(test_envelope(b"abcdefghijk"));
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].payload, b"abcdefgh");
+        e.unload(loaded, Deadline::default()).expect("unloads");
+    }
+
+    #[test]
+    fn script_env_text_truncates_on_a_utf8_boundary() {
+        let src = r#"fn handle(env) { if env.text_truncated { env.text } else { "x" } }"#;
+        let (e, mut m, art) = critter(src, 0);
+        m.capabilities.mem_bytes = 5;
+        let mut loaded = e.load(&art, &m).expect("critter loads");
+        let out = loaded.instance.handle(test_envelope("ééé".as_bytes()));
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].payload, "éé".as_bytes());
+        e.unload(loaded, Deadline::default()).expect("unloads");
+    }
+
+    #[test]
+    fn script_env_text_truncation_does_not_clip_payload_blob() {
+        let src = r#"fn handle(env) { if env.text_truncated { env.payload } else { "x" } }"#;
+        let (e, mut m, art) = critter(src, 0);
+        m.capabilities.mem_bytes = 8;
+        let mut loaded = e.load(&art, &m).expect("critter loads");
+        let payload = b"abcdefghijk";
+        let out = loaded.instance.handle(test_envelope(payload));
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].payload, payload);
+        e.unload(loaded, Deadline::default()).expect("unloads");
+    }
+
+    #[test]
     fn script_default_structural_cap_stops_bulk_allocation_with_memory_signal() {
         use aether::SignalLevel;
         // mem_bytes unset + cpu_ms=0 (op budget unlimited): the ONLY backstop is the always-on

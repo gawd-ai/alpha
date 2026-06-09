@@ -16,10 +16,10 @@
 //!   [`observe`](Curator::observe), off the synchronous decide path — the daemon's compaction worker
 //!   calls `observe` before `compact`, never under the store lock.
 //!
-//! The AI curator's prompt and completion parser bound untrusted text crossing the model seam:
-//! catalog metadata is previewed before it enters the prompt, and the returned completion/reason is
-//! capped before parsing so an injected or remote-backed model cannot force unbounded parser
-//! allocation.
+//! The AI curator's prompt, completion parser, and decision cache bound untrusted text/state crossing
+//! the model seam: catalog metadata is previewed before it enters the prompt, the returned
+//! completion/reason is capped before parsing, and new cache keys are capped by default so an
+//! injected or remote-backed model cannot force unbounded parser allocation or retained decisions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,9 @@ pub const MAX_AI_CURATOR_FIELD_BYTES: usize = 4 * 1024;
 pub const MAX_AI_CURATOR_COMPLETION_BYTES: usize = 16 * 1024;
 /// Maximum audit-reason bytes retained from a model curation verdict.
 pub const MAX_AI_CURATOR_REASON_BYTES: usize = 1024;
+/// Maximum AI-curator decisions retained by default. This matches the durable store's default live
+/// catalog cap; `0` in [`AICurator::with_max_cache_entries`] is the explicit unbounded opt-out.
+pub const DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES: usize = 1_024;
 
 /// What a [`Curator`] decides about one catalog entry.
 #[derive(Clone, Debug, PartialEq)]
@@ -144,17 +147,38 @@ impl Curator for DeterministicCurator {
 pub struct AICurator {
     model: Arc<dyn mind::Model>,
     cache: Mutex<HashMap<(RealmId, String), CurationDecision>>,
+    max_cache_entries: usize,
 }
 
 impl AICurator {
     /// Build an AI curator over an injected model.
     pub fn new(model: Arc<dyn mind::Model>) -> Self {
-        AICurator { model, cache: Mutex::new(HashMap::new()) }
+        AICurator {
+            model,
+            cache: Mutex::new(HashMap::new()),
+            max_cache_entries: DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES,
+        }
+    }
+
+    /// Cap retained AI-curator decisions.
+    ///
+    /// The default is [`DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES`]. At capacity, observing a *new*
+    /// `(realm, artifact_hash)` key is skipped before the model is called, and [`decide`](Curator::decide)
+    /// will keep that entry on its cache miss. Re-observing an already-cached key is still allowed so
+    /// a curator pass can refresh a previous decision. `0` is the explicit unbounded lab/demo opt-out.
+    pub fn with_max_cache_entries(mut self, max_cache_entries: usize) -> Self {
+        self.max_cache_entries = max_cache_entries;
+        self
     }
 
     /// The model id the curator consults (telemetry).
     pub fn model_label(&self) -> String {
         self.model.describe()
+    }
+
+    /// Number of cached model decisions. Useful for tests and local observability; not wire state.
+    pub fn cache_len(&self) -> usize {
+        self.cache.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     /// Build the curation prompt for one entry. The model is asked for a single decision token over
@@ -207,6 +231,24 @@ impl AICurator {
             CurationDecision::Keep
         }
     }
+
+    fn cache_admits(&self, key: &(RealmId, String)) -> bool {
+        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        self.max_cache_entries == 0
+            || cache.contains_key(key)
+            || cache.len() < self.max_cache_entries
+    }
+
+    fn cache_decision(&self, key: (RealmId, String), decision: CurationDecision) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if self.max_cache_entries != 0
+            && cache.len() >= self.max_cache_entries
+            && !cache.contains_key(&key)
+        {
+            return;
+        }
+        cache.insert(key, decision);
+    }
 }
 
 fn prefix_on_char_boundary(s: &str, max: usize) -> &str {
@@ -235,6 +277,10 @@ fn bounded_reason(s: &str) -> String {
 
 impl Curator for AICurator {
     fn observe(&self, ctx: &CurationContext) {
+        let key = (ctx.realm.clone(), ctx.artifact_hash.to_string());
+        if !self.cache_admits(&key) {
+            return;
+        }
         let decision = match self.model.complete(Self::prompt_for(ctx)) {
             Ok(completion) => Self::parse_decision(&completion.content),
             Err(e) => {
@@ -246,10 +292,7 @@ impl Curator for AICurator {
                 CurationDecision::Keep
             }
         };
-        self.cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert((ctx.realm.clone(), ctx.artifact_hash.to_string()), decision);
+        self.cache_decision(key, decision);
     }
 
     fn decide(&self, ctx: &CurationContext) -> CurationDecision {
@@ -285,6 +328,14 @@ mod tests {
         head: u64,
     ) -> CurationContext<'a> {
         CurationContext { realm, artifact_hash: "h", entry: e, first_seen, head_first_seen: head }
+    }
+
+    fn ctx_with_hash<'a>(
+        realm: &'a RealmId,
+        artifact_hash: &'a str,
+        e: &'a Entry,
+    ) -> CurationContext<'a> {
+        CurationContext { realm, artifact_hash, entry: e, first_seen: 0, head_first_seen: 0 }
     }
 
     #[test]
@@ -415,6 +466,45 @@ mod tests {
         }
     }
 
+    struct SequenceModel {
+        completions: Mutex<Vec<&'static str>>,
+    }
+
+    impl SequenceModel {
+        fn new(completions: Vec<&'static str>) -> Self {
+            SequenceModel { completions: Mutex::new(completions) }
+        }
+    }
+
+    impl Model for SequenceModel {
+        fn complete(&self, _req: Prompt) -> Result<mind::Completion, mind::ModelError> {
+            let content = self.completions.lock().unwrap().remove(0).to_string();
+            Ok(mind::Completion { content, model: "sequence".into(), usage: None })
+        }
+        fn describe(&self) -> String {
+            "sequence-model".into()
+        }
+    }
+
+    struct CountingModel {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        completion: &'static str,
+    }
+
+    impl Model for CountingModel {
+        fn complete(&self, _req: Prompt) -> Result<mind::Completion, mind::ModelError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(mind::Completion {
+                content: self.completion.to_string(),
+                model: "counting".into(),
+                usage: None,
+            })
+        }
+        fn describe(&self) -> String {
+            "counting-model".into()
+        }
+    }
+
     #[test]
     fn ai_curator_caches_a_gc_verdict() {
         let c = AICurator::new(Arc::new(VerbModel("GC duplicate")));
@@ -422,5 +512,83 @@ mod tests {
         let e = entry(None);
         c.observe(&ctx(&realm, &e, 0, 0));
         assert!(matches!(c.decide(&ctx(&realm, &e, 0, 0)), CurationDecision::Gc { .. }));
+    }
+
+    #[test]
+    fn ai_curator_cache_cap_skips_new_keys_before_model_call() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = AICurator::new(Arc::new(CountingModel {
+            calls: calls.clone(),
+            completion: "GC duplicate",
+        }))
+        .with_max_cache_entries(1);
+        let realm = RealmId::local();
+        let e = entry(None);
+
+        c.observe(&ctx_with_hash(&realm, "h1", &e));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(c.cache_len(), 1);
+
+        c.observe(&ctx_with_hash(&realm, "h2", &e));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "new key at capacity should not invoke the model"
+        );
+        assert_eq!(c.cache_len(), 1);
+        assert_eq!(
+            c.decide(&ctx_with_hash(&realm, "h2", &e)),
+            CurationDecision::Keep,
+            "uncached overflow entries fail safe to Keep"
+        );
+    }
+
+    #[test]
+    fn ai_curator_cache_cap_still_allows_existing_key_refresh() {
+        let c = AICurator::new(Arc::new(SequenceModel::new(vec![
+            "GC duplicate",
+            "QUARANTINE suspicious",
+        ])))
+        .with_max_cache_entries(1);
+        let realm = RealmId::local();
+        let e = entry(None);
+
+        c.observe(&ctx_with_hash(&realm, "h1", &e));
+        assert!(matches!(c.decide(&ctx_with_hash(&realm, "h1", &e)), CurationDecision::Gc { .. }));
+
+        c.observe(&ctx_with_hash(&realm, "h1", &e));
+        assert_eq!(c.cache_len(), 1);
+        assert!(matches!(
+            c.decide(&ctx_with_hash(&realm, "h1", &e)),
+            CurationDecision::Quarantine { .. }
+        ));
+    }
+
+    #[test]
+    fn ai_curator_default_cache_is_bounded_and_zero_opt_out_is_unbounded() {
+        let bounded = AICurator::new(Arc::new(VerbModel("GC duplicate")));
+        let realm = RealmId::local();
+        let e = entry(None);
+        for i in 0..DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES {
+            let hash = format!("h{i}");
+            bounded.observe(&ctx_with_hash(&realm, &hash, &e));
+        }
+        assert_eq!(bounded.cache_len(), DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES);
+
+        let overflow_hash = format!("h{DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES}");
+        bounded.observe(&ctx_with_hash(&realm, &overflow_hash, &e));
+        assert_eq!(bounded.cache_len(), DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES);
+        assert_eq!(
+            bounded.decide(&ctx_with_hash(&realm, &overflow_hash, &e)),
+            CurationDecision::Keep
+        );
+
+        let unbounded =
+            AICurator::new(Arc::new(VerbModel("GC duplicate"))).with_max_cache_entries(0);
+        for i in 0..=DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES {
+            let hash = format!("h{i}");
+            unbounded.observe(&ctx_with_hash(&realm, &hash, &e));
+        }
+        assert_eq!(unbounded.cache_len(), DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES + 1);
     }
 }

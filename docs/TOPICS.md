@@ -40,8 +40,14 @@ The substrate publishes; what the signal *means for action* is the subscribing c
 
 Sense-topic consumers bound JSON parsing with `aether::MAX_SENSE_EVENT_BYTES` (1 MiB) before
 decoding `proprioception`, `fitness`, or `budget_signal` payloads.
-The reference `fitness-selector` also bounds its distinct observed-module tally by default; operators
-can explicitly opt out with `with_max_obs(0)` for unbounded replay or lab workloads.
+The reference `fitness-selector` also bounds selector control payloads, its distinct watch map, and
+its observed-module tally by default; operators can explicitly opt out of retained-state caps with
+`with_max_watched_modules(0)` / `with_max_obs(0)` for unbounded replay or lab workloads.
+The reference `immune-response` bounds its control payloads, watch map, retained watch fields,
+quarantine reasons, and inbound notice peer lists before writing registry/federation markers.
+Registry fillings and the Omega federator also reject oversized quarantine keys/reasons/peer lists
+at the shared `QuarantineNotice` wire shape, so malformed defense markers are not retained just
+because they bypassed the reference immune-response creature.
 The reference `policy-budget` bounds its tracked-module grace/decision state by default; operators can
 explicitly opt out with `with_max_tracked_modules(0)`.
 
@@ -104,7 +110,8 @@ before a consumer pins them).
 - **Bounded hostile-input parsing.** Live consumers use `SeerEnvelope::parse_bounded`, whose default
   cap is `seer::MAX_SEER_ENVELOPE_BYTES` (1 MiB), before decoding the opaque JSON body.
 - **Bounded parked state is a consumer floor.** Reference consumers that park SEER exchanges, such
-  as `agent-curious`, cap their pending tables by default; `0` is an explicit lab/demo opt-out.
+  as `agent-curious`, cap their pending tables by default and refuse a duplicate live `corr` rather
+  than overwrite the parked exchange; `0` is an explicit lab/demo opt-out for the count cap.
 - **`Steer` is generic** and **time is injected.** Whether a creature honors a steer is its model;
   `deadline_ms` (where a body has it) is **advisory** — the substrate ships no clock and enforces no
   timeout.
