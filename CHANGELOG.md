@@ -113,6 +113,33 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   payload), and a `PushEntries` merge that must drop an over-cap quarantine signal keeps the membership
   + reputation it already persisted and logs the dropped marker — never miscounting the landed entry as
   rejected.
+- A third pass hardens the **front door and the contract layer**: `Manifest::parse` caps wire bytes at
+  1 MiB and `Manifest::validate` bounds every metadata string and list (`MAX_MANIFEST_*`, mirrored as
+  `maxLength`/`maxItems` in `manifest.schema.json` — the schema's `$comment` notes the node enforces
+  UTF-8 *bytes*); the registry and durable Bestiary re-validate published manifests before retention
+  (recovery of an existing journal never re-validates — old entries still load). The envelope
+  address-depth gate now also runs at `BusHandle::send` (before signing) and `Router::route`, ahead of
+  the serializing header-size gate, and `Router::subscribe` is idempotent (duplicate subscription no
+  longer duplicates fan-out). Authoring text gets per-field caps (request 64 KiB / retry context
+  128 KiB / `NoTemplate` echo a bounded preview) enforced by every AUTHORING bindee. The HTTP/MCP
+  surfaces byte-cap each string argument before `Verb` construction and bound error-token echoes; the
+  MCP tool schemas advertise the caps they enforce. `alpha` bounds its own local inputs (REPL line,
+  `--script`, demo manifest at 1 MiB; `--author-api-key-file` at 8 KiB), and `anima` caps every
+  byte-materializing artifact load at 128 MiB — including the native ship→spill path. Transport
+  `transport.ctl` requests/replies are capped before decode (oversized ops get a wire-honest
+  `Rejected`), outbound frames over the wire cap are shed loudly at the sender, and a gossip advertise
+  address is shape-checked with an honest boot-time warning when the effective address would be refused
+  by peers.
+- Review fixes on that pass: admission's `build_hash` integrity gate now **streams** a path-backed
+  artifact through the hasher (`Artifact::sha256_hex`) instead of materializing it — O(1) memory, and
+  a large-but-legit native `.so` loaded by path is never refused by the artifact cap; the bounded
+  front-door reader accepts FIFO/process-substitution inputs again (`--script <(...)`,
+  `--author-api-key-file <(...)`) while still streaming under the cap; the author verbs and both
+  surfaces share one operator-facing request cap (`omni::MAX_CONTROL_AUTHOR_REQUEST_BYTES` — the
+  AUTHORING contract's own field cap, so the advertised limit is the enforced one and `author
+  --critter` reports its effective limit honestly); and a native load fails loudly when the manifest
+  would exceed the guest's re-parse cap after JSON escaping, rather than silently binding a creature
+  with a placeholder self-view.
 
 ## 0.4.0 - 2026-06-04
 

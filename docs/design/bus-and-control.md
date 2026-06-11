@@ -45,10 +45,10 @@ native creature is a natural bus citizen rather than a special case. On the wire
 the payload serializes as a hex string, not a JSON array of numbers, which keeps
 an 8 MB shipped artifact a single fast-parsing token. Header metadata has a
 separate serialized-byte cap before signing, routing, journaling, or remote
-gateway use; payload-sized domains keep their own caps. `Envelope::parse` never
-panics on hostile input and rejects either an oversized header or a
-pathologically deep federation-grain address before any gateway tries to unwrap
-it.
+gateway use; payload-sized domains keep their own caps. `Envelope::parse`,
+`BusHandle::send`, and `Router::route` share the same hostile-input gates: no
+panic on malformed bytes, reject oversized headers, and reject a pathologically
+deep federation-grain address before any gateway tries to unwrap it.
 
 ### Identity is fabric-set: the reseal of `from`
 
@@ -322,7 +322,13 @@ The `alpha` (α) front door is the surfaces' host. `alpha node` boots a sanctum
 with an optional HTTP/WS surface; `alpha http` serves a headless node plus the
 HTTP surface; `alpha mcp` boots the MCP control-hub. Loading a privileged surface
 is itself a privileged act — the bootstrap is the trusted REPL seat or boot
-config, never a restricted remote caller.
+config, never a restricted remote caller. Local text inputs that the front door
+ingests before control dispatch are bounded too: interactive `alpha node` REPL
+lines, `alpha node --script`, and the external `alpha demo` registry manifest
+are capped at 1 MiB, while `--author-api-key-file` is capped at 8 KiB before
+UTF-8, JSON, or verb parsing. Control composition also probes ancestor
+`Cargo.toml` files under a 1 MiB cap when locating the workspace root for build
+path dependencies.
 
 ### surface-http — the HTTP/WS plane
 
@@ -344,7 +350,11 @@ property — the sense-topic *consumer creatures* such as `immune-response`,
 `monitor`, and `fitness-selector` cap their own JSON parsing at 1 MiB
 (`aether::MAX_SENSE_EVENT_BYTES`) before decoding a topic body.) Progress frames preserve the
 originating command `corr`, so clients can attach `"compiling…"` to the right request. The surface holds no kernel:
-every verb, including reads, is a `Role::CONTROL` round-trip, answered inline by
+HTTP JSON bodies and protected raw query strings are capped before typed
+extraction, and body/query string fields are byte-capped before `Verb`
+construction, so one request cannot turn into oversized retained command
+metadata. The public WebSocket upgrade scans only a bounded raw `token` query.
+Every verb, including reads, is a `Role::CONTROL` round-trip, answered inline by
 the co-located `ControlCore`. Its pending `corr → oneshot` table is bounded too:
 if too many HTTP requests are already waiting on control replies, the surface
 returns `503` with `surface-busy` instead of allocating another parked request
@@ -360,6 +370,11 @@ and turns each tool call into a `Verb` envelope on the node's own bus. The MCP
 server *is* a bus citizen, not an HTTP client. Like the HTTP surface, it bounds
 its parked `corr → reply` table and returns a structured `surface-busy` result
 inside the tool response instead of allocating unbounded waiters.
+Tool-call arguments are validated against the advertised schema before `Verb`
+construction, with byte caps on string fields and bounded previews for unknown
+method/tool/parameter names, so a hostile stdio peer cannot turn one line into
+retained command metadata or an attacker-sized error response. The initialize
+handshake also caps any client-supplied `protocolVersion` before reflecting it.
 On shutdown it asks the stdio loop to stop, joins it if stdin has reached EOF, and
 otherwise detaches the still-blocked reader rather than hanging node teardown on
 an uninterruptible `read_line`.

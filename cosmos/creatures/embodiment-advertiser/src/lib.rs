@@ -42,6 +42,15 @@ use seer::{topics::placement, SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_
 /// discriminates. Mirrors the convention in `agent-curious::schema::SEER`.
 pub const SCHEMA_SEER: &str = SEER_SCHEMA;
 
+/// Default maximum valid offers retained by one advertiser.
+///
+/// A placement answer is separately capped to [`placement::MAX_ANSWER_MATCHES`], but the configured
+/// offer table is retained for the advertiser's lifetime and scanned on every Query. This default
+/// leaves headroom for many local targets without letting a malformed config become permanent
+/// unbounded state. Pass `0` to [`EmbodimentAdvertiser::with_max_offers`] for the explicit
+/// lab/demo opt-out.
+pub const DEFAULT_MAX_ADVERTISED_OFFERS: usize = 4096;
+
 /// One offer the advertiser knows about — a target plus its embodiment metadata. The
 /// `creature_id` is local to *this* advertiser's Sanctum; the advertiser tags it with its `self_node`
 /// when answering so the distributor can map local-vs-peer addressing.
@@ -67,6 +76,10 @@ impl EmbodimentAdvertiser {
     /// Construct an advertiser. `self_node` tags every answered offer so the distributor can map
     /// local-vs-peer addressing on receipt.
     ///
+    /// Retains only shape-valid offers, up to [`DEFAULT_MAX_ADVERTISED_OFFERS`]. Invalid configured
+    /// offers were never emitted; dropping them here keeps hostile or stale config from becoming
+    /// long-lived retained state.
+    ///
     /// **Colocation contract (backlog X-2).** A distributor that lists *this* advertiser in its
     /// `local_advertisers` MUST be constructed with the *same* `self_node`. The distributor collapses
     /// `offer.node == its self_node` to a local `Address::Creature`; a mismatch makes it treat a
@@ -74,6 +87,16 @@ impl EmbodimentAdvertiser {
     /// then drops it, having no such peer). See `distributor-requirements`'s `self_node` field doc
     /// for the full rationale.
     pub fn new(self_node: NodeId, offers: Vec<OfferEntry>) -> Self {
+        Self::with_max_offers(self_node, offers, DEFAULT_MAX_ADVERTISED_OFFERS)
+    }
+
+    /// Construct an advertiser with an explicit retained-offer cap.
+    ///
+    /// `max_offers == 0` is the deliberate unbounded opt-out for lab/demo workloads. Invalid offer
+    /// shapes are always dropped, because they cannot be routed safely and would otherwise remain in
+    /// memory forever.
+    pub fn with_max_offers(self_node: NodeId, offers: Vec<OfferEntry>, max_offers: usize) -> Self {
+        let offers = retain_configured_offers(&self_node, offers, max_offers);
         EmbodimentAdvertiser { self_node, offers }
     }
 
@@ -202,6 +225,19 @@ fn optional_label_is_bounded(label: Option<&str>) -> bool {
 
 fn label_is_bounded(label: &str, max_bytes: usize) -> bool {
     !label.bytes().any(|b| b == 0) && label.len() <= max_bytes
+}
+
+fn retain_configured_offers(
+    self_node: &NodeId,
+    offers: Vec<OfferEntry>,
+    max_offers: usize,
+) -> Vec<OfferEntry> {
+    let valid = offers.into_iter().filter(|offer| offer_entry_shape_is_valid(self_node, offer));
+    if max_offers == 0 {
+        valid.collect()
+    } else {
+        valid.take(max_offers).collect()
+    }
 }
 
 // ====================================================================================================
@@ -395,6 +431,39 @@ mod tests {
         let (_, body) = decode_answer(&out.dispatches[0]);
         assert_eq!(body.matches.len(), 1);
         assert_eq!(body.matches[0].creature_id, 11);
+    }
+
+    #[test]
+    fn configured_offers_are_sanitized_and_bounded_by_default() {
+        let mut invalid = nv_offer(9, 8);
+        invalid.embodiment.accelerators = vec!["x".repeat(placement::MAX_OFFER_LABEL_BYTES + 1)];
+        let mut offers = vec![invalid];
+        offers
+            .extend((0..=DEFAULT_MAX_ADVERTISED_OFFERS).map(|i| plain_offer(10_000 + i as u64, 4)));
+
+        let mut a = EmbodimentAdvertiser::new(NodeId("node-A".into()), offers);
+
+        assert_eq!(
+            a.offer_count(),
+            DEFAULT_MAX_ADVERTISED_OFFERS,
+            "invalid offer is dropped and valid retained offers stop at the default cap"
+        );
+
+        let out = a.handle(query_env(7, 1, vec![]));
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert_eq!(body.matches.len(), placement::MAX_ANSWER_MATCHES);
+        assert_eq!(body.matches[0].creature_id, 10_000);
+    }
+
+    #[test]
+    fn zero_offer_cap_is_explicit_unbounded_opt_out() {
+        let offers: Vec<_> = (0..=DEFAULT_MAX_ADVERTISED_OFFERS)
+            .map(|i| plain_offer(20_000 + i as u64, 4))
+            .collect();
+
+        let a = EmbodimentAdvertiser::with_max_offers(NodeId("node-A".into()), offers, 0);
+
+        assert_eq!(a.offer_count(), DEFAULT_MAX_ADVERTISED_OFFERS + 1);
     }
 
     #[test]

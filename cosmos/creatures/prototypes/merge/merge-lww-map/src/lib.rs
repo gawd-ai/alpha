@@ -23,6 +23,13 @@ use std::collections::BTreeMap;
 use abode_reconciler::MergeModel;
 use serde::{Deserialize, Serialize};
 
+/// Maximum bytes accepted for each LWW fork before JSON decode.
+///
+/// This mirrors the reference reconciler's default per-fork snapshot ceiling. The reconciler already
+/// gates snapshots before invoking the model; this keeps the reference model safe when it is tested or
+/// embedded directly.
+pub const MAX_LWW_STATE_BYTES: usize = abode_reconciler::DEFAULT_MAX_PAYLOAD_BYTES;
+
 /// A timestamped register: a value plus the logical time it was written. `ts` is a logical clock the
 /// operator advances (time is *a change of state*, never a wall clock the substrate reads).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -58,6 +65,8 @@ impl LwwMapMerge {
 
 impl MergeModel for LwwMapMerge {
     fn merge(&self, a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+        reject_oversized_state("fork_a", a)?;
+        reject_oversized_state("fork_b", b)?;
         // A `BTreeMap` parse gives stable key ordering, so the serialized merge is byte-deterministic
         // (the same property the reconciler's re-hash relies on).
         let map_a: BTreeMap<String, Lww> =
@@ -72,6 +81,18 @@ impl MergeModel for LwwMapMerge {
             merged.insert(k, winner);
         }
         serde_json::to_vec(&merged).map_err(|e| format!("serialize merged map: {e}"))
+    }
+}
+
+fn reject_oversized_state(which: &str, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_LWW_STATE_BYTES {
+        Err(format!(
+            "{which} LWW state {} bytes exceeds {} byte limit",
+            bytes.len(),
+            MAX_LWW_STATE_BYTES
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -198,5 +219,16 @@ mod tests {
     fn malformed_state_is_a_structured_error_not_a_panic() {
         assert!(LwwMapMerge.merge(b"{not json", b"{}").is_err());
         assert!(LwwMapMerge.merge(b"{}", b"[1,2,3]").is_err());
+    }
+
+    #[test]
+    fn oversized_state_is_rejected_before_json_decode() {
+        let too_large = vec![b'{'; MAX_LWW_STATE_BYTES + 1];
+        let err = LwwMapMerge.merge(&too_large, b"{}").expect_err("fork_a over cap rejects");
+        assert!(err.contains("fork_a LWW state"), "{err}");
+        assert!(err.contains(&MAX_LWW_STATE_BYTES.to_string()), "{err}");
+
+        let err = LwwMapMerge.merge(b"{}", &too_large).expect_err("fork_b over cap rejects");
+        assert!(err.contains("fork_b LWW state"), "{err}");
     }
 }

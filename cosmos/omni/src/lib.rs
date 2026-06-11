@@ -24,7 +24,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -33,7 +33,7 @@ use aether::{
     Address, BusHandle, CreatureId, Deadline, Dispatch, Envelope, InboxReceiver, Intent, NodeId,
     RealmId, Role, RouteError, Topic,
 };
-use anima::Artifact;
+use anima::{Artifact, MAX_ARTIFACT_BYTES};
 use sanctum::Kernel;
 use sigil::{Backend, Capabilities, Ed25519KeyMaterial, Manifest};
 
@@ -68,7 +68,7 @@ pub const MAX_CONTROL_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// Artifact bytes may cross the bus for registry publish, and beast/critter path-loads are read into
 /// memory by their engines. Native daemons still load by path for `dlopen`, but bus-carried artifacts
 /// and non-native path loads get this hard ceiling.
-pub const MAX_CONTROL_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_CONTROL_ARTIFACT_BYTES: u64 = MAX_ARTIFACT_BYTES;
 /// A `control_verb` is a command envelope, not an artifact carrier. Bound it before JSON parsing so
 /// remote/bus control cannot spend unbounded memory deserializing a command body.
 pub const MAX_CONTROL_VERB_BYTES: usize = 1024 * 1024;
@@ -93,6 +93,16 @@ pub const MAX_AI_STATUS_TEXT_CHARS: usize = 512;
 /// operator-visible retained metadata. Keep it a bounded ASCII token before inserting into the
 /// router's role table.
 pub const MAX_CONTROL_ROLE_NAME_BYTES: usize = 256;
+/// Maximum bytes of natural-language request text in one `author`/`author --critter` verb.
+///
+/// This is the AUTHORING contract's own field cap surfaced at the control plane, so every surface
+/// advertises and enforces the limit the authoring bindees actually apply in
+/// `decode_authoring_request` — a request that passes the front door never fails the same size
+/// check deeper in the pipeline.
+pub const MAX_CONTROL_AUTHOR_REQUEST_BYTES: usize =
+    agent_templated::MAX_AUTHORING_REQUEST_TEXT_BYTES;
+/// Maximum bytes read while probing ancestor `Cargo.toml` files for `[workspace]`.
+const MAX_WORKSPACE_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// The control worker runs slow request/reply orchestration off the kernel drain thread. Bound its
 /// queue so a slow `author`/`send` cannot accumulate unbounded pending jobs.
 pub const CONTROL_WORKER_QUEUE_CAP: usize = 64;
@@ -1173,6 +1183,13 @@ fn authoring_reply_budget() -> Duration {
 
 fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str)) -> VerbResult {
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
+    if request.len() > MAX_CONTROL_AUTHOR_REQUEST_BYTES {
+        return author_err(format!(
+            "author request is {} bytes, exceeds {} byte limit",
+            request.len(),
+            MAX_CONTROL_AUTHOR_REQUEST_BYTES
+        ));
+    }
     let c1 = ctx.next_corr();
     let payload = match serde_json::to_vec(&AuthoringRequest {
         request: request.into(),
@@ -1278,15 +1295,23 @@ fn verb_author_critter(
         );
     };
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
-    // Nudge the templated agent toward its critter template (its matcher is keyword-based).
+    // Nudge the templated agent toward its critter template (its matcher is keyword-based). The
+    // nudged form is what the AUTHORING bindee decodes, so the size check covers it — the error
+    // reports the *effective* operator-facing limit rather than a size the operator never sent.
+    let nudged = format!("{request} critter");
+    if nudged.len() > MAX_CONTROL_AUTHOR_REQUEST_BYTES {
+        return author_err(format!(
+            "author --critter request is {} bytes, exceeds {} byte limit",
+            request.len(),
+            MAX_CONTROL_AUTHOR_REQUEST_BYTES - (nudged.len() - request.len())
+        ));
+    }
     let c1 = ctx.next_corr();
-    let payload = match serde_json::to_vec(&AuthoringRequest {
-        request: format!("{request} critter"),
-        ..Default::default()
-    }) {
-        Ok(p) => p,
-        Err(e) => return author_err(format!("author failed: {e}")),
-    };
+    let payload =
+        match serde_json::to_vec(&AuthoringRequest { request: nudged, ..Default::default() }) {
+            Ok(p) => p,
+            Err(e) => return author_err(format!("author failed: {e}")),
+        };
     let env = match request_reply(
         bus,
         rx,
@@ -1774,16 +1799,36 @@ pub fn boot_control(
 pub fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for dir in manifest_dir.ancestors() {
-        let is_workspace = std::fs::read_to_string(dir.join("Cargo.toml"))
-            .map(|c| c.lines().any(|l| l.trim() == "[workspace]"))
-            .unwrap_or(false);
-        if is_workspace {
+        if cargo_manifest_has_workspace_table(dir) {
             return dir.to_path_buf();
         }
     }
     // Fallback (e.g. a packaged single-crate build with no workspace manifest): two parents up,
     // which is `cosmos/omni` → root under the workspace layout.
     manifest_dir.parent().and_then(|p| p.parent()).map(PathBuf::from).unwrap_or(manifest_dir)
+}
+
+fn cargo_manifest_has_workspace_table(dir: &Path) -> bool {
+    let path = dir.join("Cargo.toml");
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > MAX_WORKSPACE_MANIFEST_BYTES {
+        return false;
+    }
+    let Ok(file) = File::open(&path) else {
+        return false;
+    };
+    let mut reader = file.take(MAX_WORKSPACE_MANIFEST_BYTES.saturating_add(1));
+    let mut bytes = Vec::with_capacity(metadata.len().min(1024 * 1024) as usize);
+    if reader.read_to_end(&mut bytes).is_err()
+        || u64::try_from(bytes.len()).map_or(true, |len| len > MAX_WORKSPACE_MANIFEST_BYTES)
+    {
+        return false;
+    }
+    String::from_utf8(bytes)
+        .map(|text| text.lines().any(|line| line.trim() == "[workspace]"))
+        .unwrap_or(false)
 }
 
 /// Open a fresh probe endpoint with default capabilities (the unrestricted `calls` gate a control
@@ -1924,6 +1969,29 @@ mod tests {
                 limit
             } if len == payload.len() && limit == payload.len() - 1
         ));
+    }
+
+    #[test]
+    fn workspace_manifest_probe_is_bounded() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "alpha-omni-workspace-probe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\nmembers = []\n").unwrap();
+
+        assert!(cargo_manifest_has_workspace_table(&root));
+
+        std::fs::File::create(&manifest)
+            .unwrap()
+            .set_len(MAX_WORKSPACE_MANIFEST_BYTES + 1)
+            .unwrap();
+        assert!(!cargo_manifest_has_workspace_table(&root));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

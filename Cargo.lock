@@ -1411,6 +1411,7 @@ dependencies = [
  "abode",
  "abode-migrator",
  "aether",
+ "sigil",
 ]
 
 [[package]]

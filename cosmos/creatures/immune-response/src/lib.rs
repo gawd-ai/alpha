@@ -85,7 +85,7 @@ use aether::{
     MAX_SENSE_EVENT_BYTES,
 };
 use omega_federator::FederatorMsg;
-use registry_mem::RegistryOp;
+use registry_mem::{QuarantineNotice, RegistryOp};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Wire schema for the immune-response's own control ops + replies. Single schema + a `kind`-tagged
@@ -482,10 +482,10 @@ impl ImmuneResponse {
         reason: String,
         attesting_peers: Vec<String>,
     ) -> Outcome {
-        if !inbound_notice_shape_admits(&artifact_hash, &realm, &attesting_peers) {
+        let reason = bounded_text(&reason, MAX_QUARANTINE_REASON_BYTES);
+        if !inbound_notice_shape_admits(&artifact_hash, &realm, &reason, &attesting_peers) {
             return Outcome::none();
         }
-        let reason = bounded_text(&reason, MAX_QUARANTINE_REASON_BYTES);
         // T2: the injected trust model is the only choke point for inbound defense. A peer we don't
         // trust gets no write — the notice is dropped silently (fire-and-forget, like the
         // federator's own inbound path; no chatty reply back to a peer we just refused).
@@ -608,15 +608,10 @@ fn reply(env: &Envelope, msg: ImmuneMsg) -> Outcome {
 fn inbound_notice_shape_admits(
     artifact_hash: &str,
     realm: &RealmId,
+    reason: &str,
     attesting_peers: &[String],
 ) -> bool {
-    if artifact_hash.len() > MAX_WATCH_FIELD_BYTES || realm.0.len() > MAX_WATCH_FIELD_BYTES {
-        return false;
-    }
-    if attesting_peers.len() > MAX_QUARANTINE_ATTESTING_PEERS {
-        return false;
-    }
-    attesting_peers.iter().all(|peer| peer.len() <= MAX_QUARANTINE_ATTESTING_PEER_BYTES)
+    QuarantineNotice::mark_shape_error(artifact_hash, realm, reason, attesting_peers).is_none()
 }
 
 fn bounded_text(s: &str, max: usize) -> String {
@@ -1127,6 +1122,45 @@ mod tests {
         let mut i = immune_with(Box::new(TrustAll), None);
         let out = i.handle(notice_env(vec!["p".repeat(MAX_QUARANTINE_ATTESTING_PEER_BYTES + 1)]));
         assert!(out.dispatches.is_empty(), "oversized peer id makes notice fail closed");
+    }
+
+    #[test]
+    fn inbound_notice_with_malformed_short_fields_is_dropped_before_registry_write() {
+        let mut i = immune_with(Box::new(TrustAll), None);
+        let cases = [
+            FederatorMsg::QuarantineNotice {
+                artifact_hash: "bad\0hash".into(),
+                realm: RealmId::new(REALM),
+                reason: "peer apoptosis".into(),
+                attesting_peers: vec!["node-B".into()],
+            },
+            FederatorMsg::QuarantineNotice {
+                artifact_hash: "bad".into(),
+                realm: RealmId::new("bad:realm"),
+                reason: "peer apoptosis".into(),
+                attesting_peers: vec!["node-B".into()],
+            },
+            FederatorMsg::QuarantineNotice {
+                artifact_hash: "bad".into(),
+                realm: RealmId::new(REALM),
+                reason: "bad\0reason".into(),
+                attesting_peers: vec!["node-B".into()],
+            },
+            FederatorMsg::QuarantineNotice {
+                artifact_hash: "bad".into(),
+                realm: RealmId::new(REALM),
+                reason: "peer apoptosis".into(),
+                attesting_peers: vec!["node\0B".into()],
+            },
+        ];
+
+        for msg in cases {
+            let out = i.handle(Envelope {
+                header: header(Address::Creature(ME), omega_federator::SCHEMA, None),
+                payload: msg.to_bytes(),
+            });
+            assert!(out.dispatches.is_empty(), "malformed notice should fail closed");
+        }
     }
 
     #[test]

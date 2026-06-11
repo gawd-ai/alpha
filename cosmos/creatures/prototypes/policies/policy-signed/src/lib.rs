@@ -8,8 +8,9 @@
 //!   from the manifest body (`content_address_matches == Some(true)`). Mismatch = the producer's
 //!   claim about *what manifest this is* doesn't match the bytes the receiver sees → reject. This
 //!   gate binds the whole manifest body, so differently-capable manifests can't share an address;
-//! - if `allowed_authors` is non-empty, the manifest's `provenance.author` must be in it (the
-//!   Abode-key allowlist — the *root model* the verifier deliberately doesn't own).
+//! - the manifest's `provenance.author` must be in the retained author allowlist unless the policy
+//!   was explicitly constructed with [`SignedPolicy::any_signed_author`] (the Abode-key allowlist —
+//!   the *root model* the verifier deliberately doesn't own).
 //!
 //! This is the contract for "the AI didn't sneak in unauthored bytes," which also
 //! means "the manifest the producer signed is the manifest the receiver got." It is an
@@ -20,27 +21,60 @@
 use sanctum::{Admission, Policy};
 use sigil::Manifest;
 
+/// Default maximum retained author roots in the reference allowlist.
+pub const DEFAULT_MAX_ALLOWED_AUTHORS: usize = 1024;
+/// Maximum bytes in an allowlisted author key. Mirrors the manifest provenance field cap.
+pub const MAX_ALLOWED_AUTHOR_BYTES: usize = sigil::MAX_MANIFEST_PROVENANCE_FIELD_BYTES;
+
 /// The signed admission policy.
+///
+/// Prefer the constructors: they sanitize and cap the retained author list. Direct struct literals
+/// remain available for custom test/lab postures, but callers that use them own the shape of the
+/// retained `allowed_authors` vector.
 pub struct SignedPolicy {
-    /// Hex-encoded Abode pubkeys this operator trusts. Empty = accept any well-formed signature
-    /// regardless of which key signed (still rejects unsigned and integrity-failed loads — only
-    /// the *root-list* check is disabled).
+    /// Hex-encoded Abode pubkeys this operator trusts. The strict constructors fail closed even if
+    /// this list is empty after sanitization; [`SignedPolicy::any_signed_author`] is the explicit
+    /// opt-out that accepts any well-formed signature while still rejecting unsigned and
+    /// integrity-failed loads.
     pub allowed_authors: Vec<String>,
     /// When `true`, the manifest must declare a `build_hash` and the hash must match. Default true;
     /// flip to `false` for an operator who explicitly wants integrity off for a test environment.
     pub require_artifact_hash: bool,
+    /// Explicitly disables the author-root allowlist check while keeping the signature and integrity
+    /// gates. Prefer [`SignedPolicy::any_signed_author`] over setting this field directly.
+    pub allow_any_author: bool,
 }
 
 impl SignedPolicy {
-    /// Strict default: an allowlist of trusted authors, integrity check on.
+    /// Strict default: a bounded allowlist of trusted authors, integrity check on. Use
+    /// [`SignedPolicy::any_signed_author`] for the explicit open-author development posture.
     pub fn new(allowed_authors: Vec<String>) -> Self {
-        SignedPolicy { allowed_authors, require_artifact_hash: true }
+        Self::new_with_author_limit(allowed_authors, DEFAULT_MAX_ALLOWED_AUTHORS)
+    }
+
+    /// Construct with an explicit retained-author cap. `max_allowed_authors == 0` disables the cap
+    /// for lab/demo configurations.
+    pub fn new_with_author_limit(allowed_authors: Vec<String>, max_allowed_authors: usize) -> Self {
+        SignedPolicy {
+            allowed_authors: retain_allowed_author_keys(allowed_authors, max_allowed_authors),
+            require_artifact_hash: true,
+            allow_any_author: false,
+        }
     }
 
     /// "Any well-formed signature": integrity on, but anyone may author. The right shape for a
     /// development node that still wants the bytes-and-sigs gates honored.
     pub fn any_signed_author() -> Self {
-        SignedPolicy { allowed_authors: vec![], require_artifact_hash: true }
+        SignedPolicy {
+            allowed_authors: vec![],
+            require_artifact_hash: true,
+            allow_any_author: true,
+        }
+    }
+
+    /// Number of retained author roots after constructor sanitization.
+    pub fn allowed_author_count(&self) -> usize {
+        self.allowed_authors.len()
     }
 }
 
@@ -85,7 +119,7 @@ impl Policy for SignedPolicy {
                     .into(),
             );
         }
-        if !self.allowed_authors.is_empty() {
+        if !self.allow_any_author {
             match &manifest.provenance.author {
                 Some(a) if self.allowed_authors.iter().any(|p| p == a) => {}
                 Some(a) => return Err(format!("author `{a}` is not in the trust allowlist")),
@@ -94,6 +128,40 @@ impl Policy for SignedPolicy {
         }
         Ok(())
     }
+}
+
+fn retain_allowed_author_keys(keys: Vec<String>, max_keys: usize) -> Vec<String> {
+    let mut retained = Vec::new();
+    for key in keys {
+        insert_allowed_author_key(&mut retained, key, max_keys);
+    }
+    retained
+}
+
+fn insert_allowed_author_key(retained: &mut Vec<String>, key: String, max_keys: usize) {
+    if let Some(reason) = allowed_author_key_shape_error(&key) {
+        eprintln!("policy-signed: {reason}");
+        return;
+    }
+    if retained.iter().any(|existing| existing == &key) {
+        return;
+    }
+    if max_keys != 0 && retained.len() >= max_keys {
+        eprintln!(
+            "policy-signed: author allowlist at capacity ({max_keys}); refusing additional key"
+        );
+        return;
+    }
+    retained.push(key);
+}
+
+fn allowed_author_key_shape_error(key: &str) -> Option<String> {
+    if key.is_empty() || key.len() > MAX_ALLOWED_AUTHOR_BYTES || key.contains('\0') {
+        return Some(format!(
+            "allowed author must be 1..={MAX_ALLOWED_AUTHOR_BYTES} bytes and NUL-free"
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -213,5 +281,42 @@ mod tests {
         assert!(p.admit(&m(Some("abode-alex")), &ev(true, true, true, Some(true))).is_ok());
         assert!(p.admit(&m(Some("abode-mallory")), &ev(true, true, true, Some(true))).is_err());
         assert!(p.admit(&m(None), &ev(true, true, true, Some(true))).is_err());
+    }
+
+    #[test]
+    fn empty_constructor_allowlist_fails_closed() {
+        let p = SignedPolicy::new(vec![]);
+        assert!(p.admit(&m(Some("abode-alex")), &ev(true, true, true, Some(true))).is_err());
+        assert!(p.admit(&m(None), &ev(true, true, true, Some(true))).is_err());
+    }
+
+    #[test]
+    fn constructor_sanitizes_deduplicates_and_bounds_allowlist() {
+        let oversized = "a".repeat(MAX_ALLOWED_AUTHOR_BYTES + 1);
+        let p = SignedPolicy::new_with_author_limit(
+            vec![
+                "abode-alex".into(),
+                "".into(),
+                "bad\0key".into(),
+                oversized,
+                "abode-alex".into(),
+                "abode-bob".into(),
+            ],
+            1,
+        );
+
+        assert_eq!(p.allowed_author_count(), 1);
+        assert!(p.admit(&m(Some("abode-alex")), &ev(true, true, true, Some(true))).is_ok());
+        assert!(p.admit(&m(Some("abode-bob")), &ev(true, true, true, Some(true))).is_err());
+    }
+
+    #[test]
+    fn zero_author_limit_is_explicit_unbounded_opt_out() {
+        let p =
+            SignedPolicy::new_with_author_limit(vec!["abode-alex".into(), "abode-bob".into()], 0);
+
+        assert_eq!(p.allowed_author_count(), 2);
+        assert!(p.admit(&m(Some("abode-alex")), &ev(true, true, true, Some(true))).is_ok());
+        assert!(p.admit(&m(Some("abode-bob")), &ev(true, true, true, Some(true))).is_ok());
     }
 }

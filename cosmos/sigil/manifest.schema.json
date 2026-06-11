@@ -3,15 +3,17 @@
   "$id": "https://raw.githubusercontent.com/gawd-ai/alpha/master/cosmos/sigil/manifest.schema.json",
   "title": "GAWD Manifest",
   "description": "The GAWD creature contract at rest / in transit: the sole metadata + permission source for a creature. Maintained and drift-guarded against the `sigil::Manifest` Rust type by cosmos/sigil/tests/manifest_schema.rs. See cosmos/sigil/README.md for prose and a minimal valid manifest per tier.",
+  "$comment": "maxLength/maxItems mirror sigil's MAX_MANIFEST_* caps. The node enforces string limits in UTF-8 BYTES while JSON Schema maxLength counts code points, so a multibyte string can be refused by the node even when it satisfies maxLength here — treat the numbers as byte budgets.",
   "type": "object",
   "required": ["name", "version", "abi"],
   "additionalProperties": false,
   "properties": {
-    "name": { "type": "string", "description": "Creature name." },
-    "version": { "type": "string", "description": "Semver string (validated non-empty)." },
+    "name": { "type": "string", "maxLength": 128, "description": "Creature name." },
+    "version": { "type": "string", "maxLength": 128, "description": "Semver string (validated non-empty)." },
     "abi": { "$ref": "#/$defs/Abi" },
     "entrypoints": {
       "type": "array",
+      "maxItems": 64,
       "description": "Advertised typed entries the creature exposes (e.g. `handle`).",
       "items": { "$ref": "#/$defs/Entrypoint" }
     },
@@ -20,12 +22,14 @@
     "provenance": { "$ref": "#/$defs/Provenance" },
     "content_address": {
       "type": ["string", "null"],
+      "maxLength": 128,
       "description": "`sha256:<hex>` over the manifest's identity shape. Set by the producer and re-derived + asserted by admission. Null/absent before it is stamped."
     },
     "provides": {
       "type": "array",
+      "maxItems": 64,
       "description": "Which inversion-of-control roles this creature can fill (e.g. `[\"distributor\", \"policy\"]`).",
-      "items": { "type": "string" }
+      "items": { "type": "string", "maxLength": 128 }
     }
   },
   "$defs": {
@@ -41,12 +45,14 @@
         },
         "abi_tag": {
           "type": "string",
+          "maxLength": 128,
           "description": "Entry-boundary compatibility tag. `gawd_creature_v1` for daemon and beast; `gawd_critter_v1` for critter."
         },
         "target": {
           "type": "array",
+          "maxItems": 64,
           "description": "Opaque target labels (arch-os triples, `wasm32-unknown-unknown`, robot/satellite/edge embodiments). The fabric assigns no meaning; an injected matcher weighs them. Empty = unspecified/portable.",
-          "items": { "type": "string" }
+          "items": { "type": "string", "maxLength": 256 }
         }
       }
     },
@@ -56,8 +62,8 @@
       "required": ["name", "signature"],
       "additionalProperties": false,
       "properties": {
-        "name": { "type": "string", "description": "Entry name, e.g. `handle`. Non-empty; unique within the manifest." },
-        "signature": { "type": "string", "description": "Typed descriptor, e.g. `(Envelope) -> Outcome`. Non-empty." }
+        "name": { "type": "string", "maxLength": 128, "description": "Entry name, e.g. `handle`. Non-empty; unique within the manifest." },
+        "signature": { "type": "string", "maxLength": 512, "description": "Typed descriptor, e.g. `(Envelope) -> Outcome`. Non-empty." }
       }
     },
     "Capabilities": {
@@ -67,8 +73,9 @@
       "properties": {
         "fs": {
           "type": "array",
+          "maxItems": 128,
           "description": "Filesystem paths the creature may touch.",
-          "items": { "type": "string" }
+          "items": { "type": "string", "maxLength": 4096 }
         },
         "net": {
           "description": "Declared network reach. `none` is the safe default.",
@@ -78,8 +85,9 @@
         "mem_bytes": { "type": "integer", "minimum": 0, "description": "Soft memory budget (bytes); 0 = unset." },
         "calls": {
           "type": "array",
+          "maxItems": 128,
           "description": "Which addresses / intents / roles this creature may send to. Empty = unrestricted (dev default).",
-          "items": { "type": "string" }
+          "items": { "type": "string", "maxLength": 512 }
         },
         "budget_warn_at": {
           "type": "integer",
@@ -99,11 +107,11 @@
       "description": "What a host must offer for this creature to run. The Distributor matches these against a node's advertised embodiment.",
       "additionalProperties": false,
       "properties": {
-        "accelerators": { "type": "array", "items": { "type": "string" } },
-        "sensors": { "type": "array", "items": { "type": "string" } },
+        "accelerators": { "type": "array", "maxItems": 128, "items": { "type": "string", "maxLength": 256 } },
+        "sensors": { "type": "array", "maxItems": 128, "items": { "type": "string", "maxLength": 256 } },
         "min_mem_bytes": { "type": "integer", "minimum": 0 },
-        "connectivity": { "type": ["string", "null"] },
-        "jurisdiction": { "type": ["string", "null"] }
+        "connectivity": { "type": ["string", "null"], "maxLength": 256 },
+        "jurisdiction": { "type": ["string", "null"], "maxLength": 256 }
       }
     },
     "Provenance": {
@@ -111,11 +119,11 @@
       "description": "Authorship + integrity. `author` is the Abode key (the distributed self), not the node key. Verification is a mechanism; which roots to trust is injected policy.",
       "additionalProperties": false,
       "properties": {
-        "author": { "type": ["string", "null"], "description": "The Abode public key (authorship identity), encoded." },
-        "source_hash": { "type": ["string", "null"] },
-        "build_hash": { "type": ["string", "null"] },
-        "signature": { "type": ["string", "null"], "description": "Signature over the signing payload (the manifest with `signature` cleared). Set `content_address` BEFORE signing — it rides inside the signature." },
-        "realm": { "type": "string", "description": "Optional Realm the author asserts this creature belongs to. Signed alongside the rest. Absent = no claim." }
+        "author": { "type": ["string", "null"], "maxLength": 512, "description": "The Abode public key (authorship identity), encoded." },
+        "source_hash": { "type": ["string", "null"], "maxLength": 512 },
+        "build_hash": { "type": ["string", "null"], "maxLength": 512 },
+        "signature": { "type": ["string", "null"], "maxLength": 512, "description": "Signature over the signing payload (the manifest with `signature` cleared). Set `content_address` BEFORE signing — it rides inside the signature." },
+        "realm": { "type": "string", "maxLength": 256, "description": "Optional Realm the author asserts this creature belongs to. Signed alongside the rest. Absent = no claim." }
       }
     }
   }

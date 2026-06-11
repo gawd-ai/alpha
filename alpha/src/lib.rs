@@ -28,6 +28,131 @@ pub mod http;
 pub mod mcp;
 pub mod node;
 
+use std::io::Read;
+use std::path::Path;
+
+/// Maximum bytes read from `alpha node --script`.
+///
+/// Non-interactive scripts are local operator files, but they are still front-door control input:
+/// keep them bounded before allocating or splitting into commands.
+pub const MAX_ALPHA_SCRIPT_BYTES: u64 = 1024 * 1024;
+/// Maximum bytes accepted for one interactive `alpha node` REPL line.
+pub const MAX_ALPHA_REPL_LINE_BYTES: usize = 1024 * 1024;
+/// Maximum bytes read from the external `alpha demo` registry manifest.
+pub const MAX_ALPHA_DEMO_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// Maximum bytes read from `--author-api-key-file`.
+pub const MAX_AUTHOR_API_KEY_FILE_BYTES: u64 = 8 * 1024;
+
+fn read_text_file_bounded(
+    path: impl AsRef<Path>,
+    max_bytes: u64,
+    label: &str,
+) -> Result<String, String> {
+    let path = path.as_ref();
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("{label} {}: {e}", path.display()))?;
+    // Regular files get a cheap size fast-path. Non-regular paths (FIFOs, `/dev/fd/N` process
+    // substitution — `--script <(...)`, `--author-api-key-file <(pass show ...)`) report no
+    // meaningful length; they read through the same bounded stream below instead of being refused.
+    if metadata.is_file() && metadata.len() > max_bytes {
+        return Err(format!(
+            "{label} {} is {} bytes, exceeds {} byte limit",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        ));
+    }
+
+    let file = std::fs::File::open(path).map_err(|e| format!("{label} {}: {e}", path.display()))?;
+    let cap = if metadata.is_file() {
+        usize::try_from(metadata.len())
+            .unwrap_or(usize::MAX)
+            .min(usize::try_from(max_bytes).unwrap_or(usize::MAX))
+    } else {
+        0 // unknown length — the bounded read grows the buffer as bytes arrive
+    };
+    let mut bytes = Vec::with_capacity(cap);
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    reader.read_to_end(&mut bytes).map_err(|e| format!("{label} {}: {e}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("{label} {} exceeds {} byte limit", path.display(), max_bytes));
+    }
+    String::from_utf8(bytes).map_err(|e| format!("{label} {} is not UTF-8: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempFile(PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp_file(label: &str) -> TempFile {
+        let n = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        TempFile(
+            std::env::temp_dir().join(format!("alpha-bounded-{label}-{}-{n}", std::process::id())),
+        )
+    }
+
+    #[test]
+    fn bounded_text_reader_accepts_exact_cap() {
+        let file = temp_file("exact");
+        std::fs::write(&file.0, "abcd").unwrap();
+
+        assert_eq!(read_text_file_bounded(&file.0, 4, "test file").unwrap(), "abcd");
+    }
+
+    #[test]
+    fn bounded_text_reader_rejects_oversized_metadata() {
+        let file = temp_file("oversized");
+        std::fs::File::create(&file.0).unwrap().set_len(5).unwrap();
+
+        let err = read_text_file_bounded(&file.0, 4, "test file").unwrap_err();
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bounded_text_reader_rejects_non_utf8() {
+        let file = temp_file("utf8");
+        std::fs::write(&file.0, [0xff]).unwrap();
+
+        let err = read_text_file_bounded(&file.0, 4, "test file").unwrap_err();
+        assert!(err.contains("not UTF-8"), "unexpected error: {err}");
+    }
+
+    /// Non-regular paths (FIFOs, `/dev/fd/N` process substitution) carry no meaningful metadata
+    /// length; they must stream through the bounded reader, not be refused — `--script <(...)`
+    /// and `--author-api-key-file <(pass show ...)` are supported operator patterns.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_text_reader_streams_non_regular_files() {
+        assert_eq!(read_text_file_bounded("/dev/null", 4, "test file").unwrap(), "");
+    }
+
+    #[cfg(feature = "openai")]
+    #[test]
+    fn oversized_author_api_key_file_does_not_fallback_to_inline_key() {
+        let file = temp_file("api-key");
+        std::fs::File::create(&file.0).unwrap().set_len(MAX_AUTHOR_API_KEY_FILE_BYTES + 1).unwrap();
+        let flags = AuthorFlags {
+            api_key: Some("inline-key".to_string()),
+            api_key_file: Some(file.0.display().to_string()),
+            ..AuthorFlags::default()
+        };
+
+        assert_eq!(flags.resolve_api_key(), None);
+    }
+}
+
 /// Operator-supplied model selection for the AUTHORING author, collected from the `--author-*` CLI
 /// flags on `alpha node` / `alpha mcp`. **The model is configured per node instance at the operator
 /// surface — never from the environment**, so two instances on one host (and, later, different realms
@@ -93,7 +218,8 @@ impl AuthorFlags {
     /// set → `None` (the keyless local-server case).
     fn resolve_api_key(&self) -> Option<String> {
         if let Some(path) = self.api_key_file.as_deref().filter(|s| !s.is_empty()) {
-            match std::fs::read_to_string(path) {
+            match read_text_file_bounded(path, MAX_AUTHOR_API_KEY_FILE_BYTES, "author API key file")
+            {
                 Ok(s) => return Some(s.trim().to_string()).filter(|s| !s.is_empty()),
                 Err(e) => {
                     eprintln!("alpha: could not read --author-api-key-file {path}: {e}");

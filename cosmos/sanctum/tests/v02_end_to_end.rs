@@ -694,7 +694,6 @@ fn v02_end_to_end_loop_proves_v01_plus_m6_m7_m8_compose() {
         vec![(NodeId(NODE_B.into()), advertiser_b_id)],
         PickModel::FirstFit,
         20_000, // consult corr seed (distinct from Phase-1's small ints)
-        1024,   // max pending consults
     );
     let distributor_id = a
         .kernel

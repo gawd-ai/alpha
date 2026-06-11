@@ -94,15 +94,13 @@ impl Envelope {
     pub fn parse(bytes: &[u8]) -> Result<Envelope, EnvelopeError> {
         let env: Envelope =
             serde_json::from_slice(bytes).map_err(|e| EnvelopeError::Parse(e.to_string()))?;
+        // Depth before size, matching the send/route gates: refuse an overdeep address before
+        // the size gate re-serializes the header.
+        if let Some((depth, max)) = address_depth_error(&env.header) {
+            return Err(EnvelopeError::TooDeep { depth, max });
+        }
         if let Some((len, limit)) = header_size_error(&env.header) {
             return Err(EnvelopeError::HeaderTooLarge { len, limit });
-        }
-        let depth = env.header.to.nesting_depth().max(env.header.from.nesting_depth());
-        if depth > crate::address::MAX_ADDRESS_NESTING_DEPTH {
-            return Err(EnvelopeError::TooDeep {
-                depth,
-                max: crate::address::MAX_ADDRESS_NESTING_DEPTH,
-            });
         }
         Ok(env)
     }
@@ -177,6 +175,12 @@ pub(crate) fn header_size_error(header: &Header) -> Option<(usize, usize)> {
         .map(|bytes| bytes.len())
         .unwrap_or(MAX_ENVELOPE_HEADER_BYTES + 1);
     (len > MAX_ENVELOPE_HEADER_BYTES).then_some((len, MAX_ENVELOPE_HEADER_BYTES))
+}
+
+pub(crate) fn address_depth_error(header: &Header) -> Option<(usize, usize)> {
+    let depth = header.to.nesting_depth().max(header.from.nesting_depth());
+    (depth > crate::address::MAX_ADDRESS_NESTING_DEPTH)
+        .then_some((depth, crate::address::MAX_ADDRESS_NESTING_DEPTH))
 }
 
 #[derive(Debug, thiserror::Error)]

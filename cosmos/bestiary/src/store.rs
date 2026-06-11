@@ -434,7 +434,16 @@ pub trait BestiaryStore: Send + Sync {
     fn merge_push(&self, entry: SignedSyncEntry) -> Result<MergeOutcome, StoreError>;
     /// Build the self-verifying push payload for live entries + tombstones (the PUSH replication
     /// diff). `realm: None` = all Realms.
-    fn signed_entries(&self, realm: Option<&RealmId>) -> Result<Vec<SignedSyncEntry>, StoreError>;
+    fn signed_entries(&self, realm: Option<&RealmId>) -> Result<Vec<SignedSyncEntry>, StoreError> {
+        self.signed_entries_bounded(realm, 0, 0)
+    }
+    /// Build a self-verifying push payload under snapshot caps. `0` means unbounded for either cap.
+    fn signed_entries_bounded(
+        &self,
+        realm: Option<&RealmId>,
+        max_artifact_bytes: usize,
+        max_entries: usize,
+    ) -> Result<Vec<SignedSyncEntry>, StoreError>;
     /// Replay + verify the on-disk log at bind; returns the number of records replayed.
     fn recover(&self) -> Result<usize, StoreError>;
     /// Flush durable state (fsync) at shutdown.
@@ -443,7 +452,14 @@ pub trait BestiaryStore: Send + Sync {
     fn prove(&self, realm: &RealmId, artifact_hash: &str)
         -> Result<Option<EntryProof>, StoreError>;
     /// Snapshot live entries (with bytes) for an off-lock curator [`observe`](Curator::observe) pass.
-    fn snapshot_for_curation(&self) -> Result<Vec<CurationSnapshot>, StoreError>;
+    fn snapshot_for_curation(&self) -> Result<Vec<CurationSnapshot>, StoreError> {
+        self.snapshot_for_curation_bounded(0)
+    }
+    /// Snapshot live entries for curation under a total artifact-byte cap. `0` means unbounded.
+    fn snapshot_for_curation_bounded(
+        &self,
+        max_artifact_bytes: usize,
+    ) -> Result<Vec<CurationSnapshot>, StoreError>;
     /// Run a GC pass: apply the curator's decision per entry, rewrite the genesis chains (preserving
     /// `first_seen`), and unlink orphan blobs (global union across all realms).
     fn compact(&self, curator: &dyn Curator) -> Result<CompactStats, StoreError>;
@@ -608,6 +624,17 @@ impl FsBestiaryStore {
             .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))
     }
 
+    fn blob_len(&self, artifact_hash: &str) -> Result<usize, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Err(invalid_artifact_hash(artifact_hash));
+        }
+        let meta = fs::metadata(self.blob_path(artifact_hash))
+            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
+        usize::try_from(meta.len()).map_err(|_| {
+            StoreError::Corrupt(format!("blob {artifact_hash} length does not fit usize"))
+        })
+    }
+
     /// Append a record for `op`/`first_seen` to its realm chain (sign, write, advance the head).
     /// Caller holds the inner lock and has already updated the in-memory state.
     fn append(&self, inner: &mut Inner, op: LogOp, first_seen: u64) -> Result<(), StoreError> {
@@ -722,6 +749,7 @@ impl BestiaryStore for FsBestiaryStore {
                 self.max_artifact_bytes,
             )));
         }
+        manifest.validate().map_err(|e| StoreError::Limit(format!("invalid manifest: {e}")))?;
         let hash = sha256_hex(&artifact);
         let key = (realm.clone(), hash.clone());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -798,11 +826,7 @@ impl BestiaryStore for FsBestiaryStore {
         let Some(live) = live else {
             return Ok(None);
         };
-        let meta = fs::metadata(self.blob_path(artifact_hash))
-            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
-        let artifact_len = usize::try_from(meta.len()).map_err(|_| {
-            StoreError::Corrupt(format!("blob {artifact_hash} length does not fit usize"))
-        })?;
+        let artifact_len = self.blob_len(artifact_hash)?;
         Ok(Some((
             CatalogEntry {
                 artifact_hash: artifact_hash.to_string(),
@@ -837,11 +861,7 @@ impl BestiaryStore for FsBestiaryStore {
         let mut artifact_bytes = 0usize;
         for ((r, hash), live) in rows {
             if max_artifact_bytes != 0 {
-                let meta = fs::metadata(self.blob_path(&hash))
-                    .map_err(|e| StoreError::Corrupt(format!("blob {hash} unreadable: {e}")))?;
-                let len = usize::try_from(meta.len()).map_err(|_| {
-                    StoreError::Corrupt(format!("blob {hash} length does not fit usize"))
-                })?;
+                let len = self.blob_len(&hash)?;
                 artifact_bytes = artifact_bytes.saturating_add(len);
                 if artifact_bytes > max_artifact_bytes {
                     return Err(StoreError::Limit(format!(
@@ -1108,7 +1128,12 @@ impl BestiaryStore for FsBestiaryStore {
         }
     }
 
-    fn signed_entries(&self, realm: Option<&RealmId>) -> Result<Vec<SignedSyncEntry>, StoreError> {
+    fn signed_entries_bounded(
+        &self,
+        realm: Option<&RealmId>,
+        max_artifact_bytes: usize,
+        max_entries: usize,
+    ) -> Result<Vec<SignedSyncEntry>, StoreError> {
         let (live_rows, tombstones): (Vec<LiveRow>, Vec<(RealmId, String)>) = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let live = inner
@@ -1125,7 +1150,25 @@ impl BestiaryStore for FsBestiaryStore {
                 .collect();
             (live, tomb)
         };
-        let mut out = Vec::new();
+        let total_entries = live_rows.len().saturating_add(tombstones.len());
+        if max_entries != 0 && total_entries > max_entries {
+            return Err(StoreError::Limit(format!(
+                "bestiary push snapshot too many entries: {total_entries} entries exceeds {max_entries} entry limit"
+            )));
+        }
+        let mut artifact_bytes = 0usize;
+        if max_artifact_bytes != 0 {
+            for ((_, hash), _) in &live_rows {
+                let len = self.blob_len(hash)?;
+                artifact_bytes = artifact_bytes.saturating_add(len);
+                if artifact_bytes > max_artifact_bytes {
+                    return Err(StoreError::Limit(format!(
+                        "bestiary push snapshot too large: {artifact_bytes} artifact bytes exceeds {max_artifact_bytes} byte limit"
+                    )));
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(total_entries);
         for ((r, hash), live) in live_rows {
             let artifact = self.read_blob(&hash)?;
             let sync = SyncEntry {
@@ -1285,12 +1328,27 @@ impl BestiaryStore for FsBestiaryStore {
         }))
     }
 
-    fn snapshot_for_curation(&self) -> Result<Vec<CurationSnapshot>, StoreError> {
+    fn snapshot_for_curation_bounded(
+        &self,
+        max_artifact_bytes: usize,
+    ) -> Result<Vec<CurationSnapshot>, StoreError> {
         let rows: Vec<((RealmId, String), Live)> = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             inner.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
         let head_first_seen = rows.iter().map(|(_, l)| l.first_seen).max().unwrap_or(0);
+        let mut artifact_bytes = 0usize;
+        if max_artifact_bytes != 0 {
+            for ((_, hash), _) in &rows {
+                let len = self.blob_len(hash)?;
+                artifact_bytes = artifact_bytes.saturating_add(len);
+                if artifact_bytes > max_artifact_bytes {
+                    return Err(StoreError::Limit(format!(
+                        "bestiary curation snapshot too large: {artifact_bytes} artifact bytes exceeds {max_artifact_bytes} byte limit"
+                    )));
+                }
+            }
+        }
         let mut out = Vec::with_capacity(rows.len());
         for ((r, hash), live) in rows {
             let artifact = self.read_blob(&hash)?;
@@ -1472,7 +1530,7 @@ impl FsBestiaryStore {
 mod tests {
     use super::*;
     use crate::curator::DeterministicCurator;
-    use sigil::Backend;
+    use sigil::{Backend, MAX_MANIFEST_NAME_BYTES};
 
     /// A temp directory that cleans itself up on drop (no external tempdir dep).
     struct TempRoot(PathBuf);
@@ -1592,6 +1650,73 @@ mod tests {
     }
 
     #[test]
+    fn signed_entries_bounded_refuses_oversized_artifact_snapshot_before_blob_read() {
+        let root = TempRoot::new("push-bounded-bytes");
+        let s = store(&root);
+        let realm_a = RealmId::new("crew");
+        let realm_b = RealmId::new("guests");
+        s.put(&realm_a, manifest("a"), b"aaa".to_vec()).unwrap();
+        s.put(&realm_b, manifest("b"), b"bbb".to_vec()).unwrap();
+
+        let err = s.signed_entries_bounded(None, 4, 0).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Limit(_)),
+            "over-cap all-realm push snapshot refused: {err:?}"
+        );
+
+        let scoped = s.signed_entries_bounded(Some(&realm_a), 4, 0).unwrap();
+        assert_eq!(scoped.len(), 1);
+        let sync = scoped[0].sync.as_ref().expect("live entry carries sync bytes");
+        assert_eq!(sync.realm, realm_a);
+        assert_eq!(sync.artifact, b"aaa");
+
+        assert_eq!(
+            s.signed_entries(None).unwrap().len(),
+            2,
+            "unbounded push snapshot remains available to callers"
+        );
+    }
+
+    #[test]
+    fn signed_entries_bounded_refuses_entry_count_before_touching_blobs() {
+        let root = TempRoot::new("push-bounded-count");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let first = s.put(&realm, manifest("a"), b"aaa".to_vec()).unwrap();
+        s.put(&realm, manifest("b"), b"bbb".to_vec()).unwrap();
+        fs::remove_file(s.blob_path(&first)).unwrap();
+
+        let err = s.signed_entries_bounded(None, 0, 1).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Limit(_)),
+            "entry cap must fire before blob metadata/read: {err:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_for_curation_bounded_refuses_oversized_artifact_snapshot_before_blob_read() {
+        let root = TempRoot::new("curation-bounded");
+        let s = store(&root);
+        let realm_a = RealmId::new("crew");
+        let realm_b = RealmId::new("guests");
+        s.put(&realm_a, manifest("a"), b"aaa".to_vec()).unwrap();
+        s.put(&realm_b, manifest("b"), b"bbb".to_vec()).unwrap();
+
+        let err = match s.snapshot_for_curation_bounded(4) {
+            Ok(_) => panic!("over-cap curation snapshot should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StoreError::Limit(_)), "over-cap curation snapshot refused: {err:?}");
+
+        let snapshots = s.snapshot_for_curation_bounded(6).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots.iter().any(|snap| snap.entry.artifact == b"aaa"),
+            "bounded curation snapshot still carries artifact bytes under cap"
+        );
+    }
+
+    #[test]
     fn filesystem_store_refuses_non_canonical_artifact_hashes() {
         let root = TempRoot::new("hash-shape");
         let s = store(&root);
@@ -1627,14 +1752,32 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_store_rejects_invalid_manifest_before_blob_or_journal_write() {
+        let root = TempRoot::new("invalid-manifest");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let bytes = b"artifact-bytes".to_vec();
+        let hash = sha256_hex(&bytes);
+        let mut m = manifest("invalid");
+        m.name = "n".repeat(MAX_MANIFEST_NAME_BYTES + 1);
+
+        let err = s.put(&realm, m, bytes).unwrap_err();
+        assert!(matches!(err, StoreError::Limit(_)), "invalid manifest rejected: {err:?}");
+        assert!(s.get(&realm, &hash).unwrap().is_none(), "invalid manifest was not stored");
+        assert!(!s.blob_path(&hash).exists(), "invalid manifest did not write a blob");
+        assert!(
+            !s.log_path(&FsBestiaryStore::realm_hash(&realm)).exists(),
+            "invalid manifest was not appended to the journal"
+        );
+    }
+
+    #[test]
     fn filesystem_store_refuses_oversized_log_records_before_append() {
         let root = TempRoot::new("log-record-cap");
         let s = store(&root);
-        let realm = RealmId::new("crew");
-        let mut m = manifest("oversized");
-        m.name = "n".repeat(MAX_BESTIARY_LOG_RECORD_BYTES + 1);
+        let realm = RealmId::new("r".repeat(MAX_BESTIARY_LOG_RECORD_BYTES + 1));
 
-        let err = s.put(&realm, m, b"artifact-bytes".to_vec()).unwrap_err();
+        let err = s.put(&realm, manifest("c"), b"artifact-bytes".to_vec()).unwrap_err();
         assert!(matches!(err, StoreError::Limit(_)), "oversized log record refused: {err:?}");
         assert!(
             !s.log_path(&FsBestiaryStore::realm_hash(&realm)).exists(),

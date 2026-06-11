@@ -341,6 +341,47 @@ impl FitnessSelector {
         self
     }
 
+    fn can_insert_watch(&self, module: CreatureId) -> bool {
+        self.max_watch == 0 || self.watch.contains_key(&module) || self.watch.len() < self.max_watch
+    }
+
+    fn watch_shape_error(realm: &RealmId, artifact_hash: &str) -> Option<String> {
+        if realm.0.len() > MAX_WATCH_FIELD_BYTES {
+            return Some(format!(
+                "watch realm too large: {} bytes exceeds {} byte limit",
+                realm.0.len(),
+                MAX_WATCH_FIELD_BYTES
+            ));
+        }
+        if artifact_hash.len() > MAX_WATCH_FIELD_BYTES {
+            return Some(format!(
+                "watch artifact_hash too large: {} bytes exceeds {} byte limit",
+                artifact_hash.len(),
+                MAX_WATCH_FIELD_BYTES
+            ));
+        }
+        None
+    }
+
+    fn insert_watch(
+        &mut self,
+        module: CreatureId,
+        realm: RealmId,
+        artifact_hash: String,
+    ) -> Result<(), String> {
+        if let Some(reason) = Self::watch_shape_error(&realm, &artifact_hash) {
+            return Err(reason);
+        }
+        if !self.can_insert_watch(module) {
+            return Err(format!(
+                "watch map at capacity ({}); refusing new module {}",
+                self.max_watch, module.0
+            ));
+        }
+        self.watch.insert(module, (realm, artifact_hash));
+        Ok(())
+    }
+
     /// Return a mutable tally for `mid`, creating it only if under the `max_obs` cap. Returns `None`
     /// when the cap is reached and `mid` is not already tracked (the caller drops the observation).
     fn obs_entry_capped(&mut self, mid: CreatureId) -> Option<&mut Observations> {
@@ -361,7 +402,9 @@ impl FitnessSelector {
         realm: RealmId,
         artifact_hash: impl Into<String>,
     ) -> Self {
-        self.watch.insert(module, (realm, artifact_hash.into()));
+        if let Err(reason) = self.insert_watch(module, realm, artifact_hash.into()) {
+            eprintln!("fitness-selector: {reason}");
+        }
         self
     }
 
@@ -470,45 +513,9 @@ impl FitnessSelector {
         artifact_hash: String,
     ) -> Outcome {
         let mid = CreatureId(module);
-        if realm.0.len() > MAX_WATCH_FIELD_BYTES {
-            return reply(
-                env,
-                SelectorMsg::Rejected {
-                    reason: format!(
-                        "watch realm too large: {} bytes exceeds {} byte limit",
-                        realm.0.len(),
-                        MAX_WATCH_FIELD_BYTES
-                    ),
-                },
-            );
+        if let Err(reason) = self.insert_watch(mid, realm, artifact_hash) {
+            return reply(env, SelectorMsg::Rejected { reason });
         }
-        if artifact_hash.len() > MAX_WATCH_FIELD_BYTES {
-            return reply(
-                env,
-                SelectorMsg::Rejected {
-                    reason: format!(
-                        "watch artifact_hash too large: {} bytes exceeds {} byte limit",
-                        artifact_hash.len(),
-                        MAX_WATCH_FIELD_BYTES
-                    ),
-                },
-            );
-        }
-        if self.max_watch != 0
-            && self.watch.len() >= self.max_watch
-            && !self.watch.contains_key(&mid)
-        {
-            return reply(
-                env,
-                SelectorMsg::Rejected {
-                    reason: format!(
-                        "watch map at capacity ({}); refusing new module {}",
-                        self.max_watch, module
-                    ),
-                },
-            );
-        }
-        self.watch.insert(mid, (realm, artifact_hash));
         reply(env, SelectorMsg::Watching { module })
     }
 
@@ -892,6 +899,30 @@ mod tests {
             );
         }
         assert_eq!(unbounded.watched_count(), 2);
+    }
+
+    #[test]
+    fn construction_watch_seed_uses_same_shape_and_table_caps() {
+        let capped = selector(0xAF, 0.5)
+            .with_max_watched_modules(1)
+            .watching(CreatureId(7), RealmId::new("crew"), "h7")
+            .watching(CreatureId(8), RealmId::new("crew"), "h8");
+        assert_eq!(capped.watched_count(), 1, "construction seed honors the watch cap");
+        assert!(capped.watch.contains_key(&CreatureId(7)));
+        assert!(!capped.watch.contains_key(&CreatureId(8)));
+
+        let malformed = selector(0xB0, 0.5).watching(
+            CreatureId(9),
+            RealmId::new("crew"),
+            "h".repeat(MAX_WATCH_FIELD_BYTES + 1),
+        );
+        assert_eq!(malformed.watched_count(), 0, "oversized seed field is not retained");
+
+        let unbounded = selector(0xB1, 0.5)
+            .with_max_watched_modules(0)
+            .watching(CreatureId(10), RealmId::new("crew"), "h10")
+            .watching(CreatureId(11), RealmId::new("crew"), "h11");
+        assert_eq!(unbounded.watched_count(), 2, "zero remains the explicit opt-out");
     }
 
     #[test]

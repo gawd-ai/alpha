@@ -28,15 +28,7 @@ use aether::{
 };
 use anima::{Artifact, BudgetControl, Engine, EngineError, LoadedModule};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sigil::{Backend, Capabilities, Manifest, ManifestError};
-
-/// Hex sha256 — the artifact-bytes hash format we store in `provenance.build_hash`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
-}
 
 /// Poison-tolerant `Mutex` acquisition (R9 fabric-integrity floor): recover the guard instead of
 /// cascading one panic into permanent kernel-wide lock failure. Sound for the kernel's locks — they
@@ -327,14 +319,14 @@ impl Kernel {
         // **Artifact integrity gate.** Hash the actual bytes (file or in-memory) and compare to
         // the manifest's declared `provenance.build_hash`. A bit-flip anywhere in flight produces
         // a mismatch; the policy then rejects. We do this BEFORE engine `load` — the artifact
-        // bytes never reach `dlopen` if the hash doesn't match.
+        // bytes never reach `dlopen` if the hash doesn't match. The hash STREAMS a path-backed
+        // artifact (O(1) memory) rather than reading it whole, so the integrity gate neither
+        // materializes an attacker-sized file nor refuses a large-but-legit native `.so` that
+        // `anima::MAX_ARTIFACT_BYTES` would bound on a byte-materializing load.
         let artifact_hash_declared = manifest.provenance.build_hash.is_some();
         let artifact_hash_matches = match (artifact, &manifest.provenance.build_hash) {
-            (Some(art), Some(expected)) => match art.read_bytes() {
-                Ok(bytes) => {
-                    let actual = sha256_hex(&bytes);
-                    Some(&actual == expected)
-                }
+            (Some(art), Some(expected)) => match art.sha256_hex() {
+                Ok(actual) => Some(&actual == expected),
                 // Read failure surfaces as a structural admission failure ("can't compute the
                 // hash → can't admit"), not as "policy decided." The policy never sees half-truths.
                 Err(e) => {

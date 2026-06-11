@@ -18,6 +18,18 @@ use sigil::{Backend, Manifest};
 
 use crate::{Artifact, Engine, EngineError, LoadedModule};
 
+/// Serialized `Dispatch` bytes accepted from a native creature's FFI send callback.
+///
+/// `Dispatch::payload` still uses serde_json's ordinary byte-array representation at the FFI seam, so
+/// a max-sized artifact payload can expand to roughly four bytes of JSON per byte plus commas and
+/// routing fields. Keep the ceiling large enough for that worst-case legitimate local dispatch while
+/// still refusing unbounded guest-provided lengths before we build a slice or deserialize.
+const MAX_NATIVE_DISPATCH_BYTES: usize = (crate::MAX_ARTIFACT_BYTES as usize * 5) + (1024 * 1024);
+
+fn native_dispatch_len_is_valid(len: usize) -> bool {
+    len <= MAX_NATIVE_DISPATCH_BYTES
+}
+
 pub struct NativeEngine;
 
 impl Engine for NativeEngine {
@@ -38,15 +50,35 @@ impl Engine for NativeEngine {
                 got: manifest.abi.abi_tag.clone(),
             });
         }
+        // The guest re-parses the manifest at bind through `Manifest::parse`, whose pre-decode cap
+        // is `sigil::MAX_MANIFEST_BYTES`. JSON escaping can expand a validate-passing manifest past
+        // that wire cap (control chars serialize 6x), and a failed guest-side parse would silently
+        // bind the creature with a placeholder self-view — fail the load loudly here instead.
+        let manifest_wire_len = serde_json::to_vec(manifest).map(|b| b.len()).unwrap_or(usize::MAX);
+        if manifest_wire_len > sigil::MAX_MANIFEST_BYTES {
+            return Err(EngineError::Load(format!(
+                "manifest serializes to {manifest_wire_len} bytes, exceeds the {} byte guest \
+                 re-parse limit",
+                sigil::MAX_MANIFEST_BYTES
+            )));
+        }
         // **Native-from-bytes.** When the substrate ships a creature over the wire (an
         // `Artifact::Bytes`), we spill it to a unique temp file and `dlopen` that — `dlopen`'s
         // entrypoint requires a path. The temp file's lifetime is bound to the resources so it
         // is removed when (and only after) the library unmaps on the safe unload path. The
         // leak path (`Box::leak` on resources) consequently leaks both library and tempfile
-        // together — a consistent bounded leak.
+        // together — a consistent bounded leak. The shipped bytes are capped like every other
+        // byte-materializing load — a local *path* load stays uncapped (`dlopen` maps it).
         let (path, tempfile) = match artifact {
             Artifact::Path(p) => (p.clone(), None),
             Artifact::Bytes(bytes) => {
+                if crate::artifact_len_exceeds_limit(bytes.len(), crate::MAX_ARTIFACT_BYTES) {
+                    return Err(EngineError::Load(format!(
+                        "shipped native artifact is {} bytes, exceeds {} byte limit",
+                        bytes.len(),
+                        crate::MAX_ARTIFACT_BYTES
+                    )));
+                }
                 let spilled = spill_to_tempfile(bytes, &manifest.name)?;
                 let path = spilled.path.clone();
                 (path, Some(spilled))
@@ -199,6 +231,9 @@ extern "C" fn host_bus_send(host_ctx: *mut c_void, ptr: *const u8, len: usize) -
     if host_ctx.is_null() || ptr.is_null() {
         return RC_INVALID_ARG;
     }
+    if !native_dispatch_len_is_valid(len) {
+        return RC_DESERIALIZE;
+    }
     let result = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: `host_ctx` is the pointer we handed the creature at bind; it points at a live
         // `HostSendCtx` (kept in `NativeInstance.host_ctx`). `ptr/len` describe the creature buffer.
@@ -331,5 +366,12 @@ mod tests {
         assert!(safe.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')));
         assert!(safe.starts_with("bad_name_"));
         assert_eq!(safe_temp_name_hint(""), "creature");
+    }
+
+    #[test]
+    fn native_dispatch_length_gate_is_large_but_finite() {
+        assert!(native_dispatch_len_is_valid(0));
+        assert!(native_dispatch_len_is_valid(MAX_NATIVE_DISPATCH_BYTES));
+        assert!(!native_dispatch_len_is_valid(MAX_NATIVE_DISPATCH_BYTES + 1));
     }
 }

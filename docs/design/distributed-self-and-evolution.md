@@ -230,7 +230,9 @@ fact. The shared payload shape and verify live in the registry (the mechanism), 
 commit to identical bytes; binding `artifact_hash` + `realm` stops a signature being replayed onto
 another entry. *Which key to trust* stays the policy's — the registry owns the payload shape, never the
 trust root. An admission policy, `policy-prefer-promoted`, admits a creature only when its entry carries
-a verified at-threshold promotion; bind `AllowAll` instead and the same un-promoted manifest admits.
+a verified at-threshold promotion, and can be bound with a retained allowlist of trusted selector
+Abode keys for production trust roots; its default constructor remains the historical lab posture that
+accepts any valid promotion signer. Bind `AllowAll` instead and the same un-promoted manifest admits.
 **Selection pressure is a policy choice, not a substrate gate.**
 
 A selector **must not subscribe to `FITNESS`**: the kernel emits a fitness event after *every* handle,
@@ -274,10 +276,11 @@ registry; if a `PropagationConfig` is wired, the same quarantine federates outwa
 wire (no edit to the federator). As defense-in-depth the creature drops any event naming its own id (a
 creature is never its own immune trigger; self-apoptosis on budget is the budget policy's job, a
 different role). Its own control payloads are bounded before JSON decode; watch fields, quarantine
-reasons, and inbound notice attesting-peer lists are shape-capped before retention or
-registry/federation writes. The lower registry/federator path repeats the pressure guard: shared
-`QuarantineNotice` caps reject oversized keys, reasons, and peer lists before a registry filling
-stores the marker or a federator forwards it.
+reasons, inbound notice keys, and inbound notice attesting-peer lists are shape-capped and
+NUL-rejected before retention, registry writes, federation writes, or trust-model calls. The lower
+registry/federator path repeats the pressure guard: shared `QuarantineNotice` caps reject oversized
+or malformed keys, reasons, and peer lists before a registry filling stores the marker or a federator
+forwards it.
 
 Two properties are load-bearing. **Decentralized and trust-gated:** there is no central authority that
 can quarantine your creatures. An inbound cross-Realm `QuarantineNotice` is honored only if an

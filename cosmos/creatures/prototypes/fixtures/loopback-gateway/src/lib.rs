@@ -12,6 +12,13 @@ use std::os::unix::net::UnixStream;
 
 use aether::{Address, Creature, CreatureCtx, Dispatch, Envelope, Outcome};
 
+/// Match `transport-tcp`'s per-frame ceiling while keeping this fixture dependency-free.
+const MAX_LOOPBACK_FRAME_BYTES: usize = 128 * 1024 * 1024;
+
+fn frame_len_is_valid(n: usize) -> bool {
+    n > 0 && n <= MAX_LOOPBACK_FRAME_BYTES && n <= u32::MAX as usize
+}
+
 pub struct LoopbackGateway {
     write_end: UnixStream,
     read_end: UnixStream,
@@ -37,6 +44,9 @@ impl Creature for LoopbackGateway {
 
         // Serialize and physically push bytes through the socket — *that* is the boundary proof.
         let bytes = env.to_bytes();
+        if !frame_len_is_valid(bytes.len()) {
+            return Outcome::none();
+        }
         let len = (bytes.len() as u32).to_le_bytes();
         if self.write_end.write_all(&len).is_err() || self.write_end.write_all(&bytes).is_err() {
             return Outcome::none();
@@ -48,6 +58,9 @@ impl Creature for LoopbackGateway {
             return Outcome::none();
         }
         let n = u32::from_le_bytes(len_buf) as usize;
+        if !frame_len_is_valid(n) {
+            return Outcome::none();
+        }
         let mut buf = vec![0u8; n];
         if self.read_end.read_exact(&mut buf).is_err() {
             return Outcome::none();
@@ -96,6 +109,16 @@ mod tests {
                 schema: "text".into(),
             },
             payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn frame_length_gate_rejects_zero_oversized_and_u32_overflow() {
+        assert!(!frame_len_is_valid(0));
+        assert!(frame_len_is_valid(MAX_LOOPBACK_FRAME_BYTES));
+        assert!(!frame_len_is_valid(MAX_LOOPBACK_FRAME_BYTES + 1));
+        if let Some(over_u32) = (u32::MAX as usize).checked_add(1) {
+            assert!(!frame_len_is_valid(over_u32));
         }
     }
 

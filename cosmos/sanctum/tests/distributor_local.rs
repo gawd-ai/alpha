@@ -150,7 +150,6 @@ fn boot_local(offers: Vec<(u32, &'static str)>, model: PickModel) -> LocalSetup 
         vec![],
         model,
         10_000, // consult corr seed — distinct from test-chosen Intent corrs
-        1024,   // max_pending — generous; integration tests don't exercise eviction
     );
     let distributor_id = k
         .load_instance(boot_manifest("distributor-requirements"), Box::new(distributor))

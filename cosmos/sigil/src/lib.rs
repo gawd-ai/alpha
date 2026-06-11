@@ -16,6 +16,29 @@ use sha2::{Digest, Sha256};
 pub mod crypto;
 pub use crypto::{Ed25519KeyMaterial, Ed25519Verifier};
 
+/// Maximum JSON bytes accepted by [`Manifest::parse`] before decoding.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+/// Manifest metadata caps. These are intentionally generous for real manifests and small enough that
+/// manifests remain metadata, not a bulk-data carrier or retained-memory amplifier.
+pub const MAX_MANIFEST_NAME_BYTES: usize = 128;
+pub const MAX_MANIFEST_VERSION_BYTES: usize = 128;
+pub const MAX_MANIFEST_ABI_TAG_BYTES: usize = 128;
+pub const MAX_MANIFEST_TARGETS: usize = 64;
+pub const MAX_MANIFEST_TARGET_BYTES: usize = 256;
+pub const MAX_MANIFEST_ENTRYPOINTS: usize = 64;
+pub const MAX_MANIFEST_ENTRYPOINT_NAME_BYTES: usize = 128;
+pub const MAX_MANIFEST_ENTRYPOINT_SIGNATURE_BYTES: usize = 512;
+pub const MAX_MANIFEST_PROVIDES: usize = 64;
+pub const MAX_MANIFEST_PROVIDES_BYTES: usize = 128;
+pub const MAX_MANIFEST_CAPABILITY_ITEMS: usize = 128;
+pub const MAX_MANIFEST_FS_PATH_BYTES: usize = 4096;
+pub const MAX_MANIFEST_CALL_BYTES: usize = 512;
+pub const MAX_MANIFEST_REQUIREMENT_ITEMS: usize = 128;
+pub const MAX_MANIFEST_REQUIREMENT_FIELD_BYTES: usize = 256;
+pub const MAX_MANIFEST_PROVENANCE_FIELD_BYTES: usize = 512;
+pub const MAX_MANIFEST_REALM_BYTES: usize = 256;
+pub const MAX_MANIFEST_CONTENT_ADDRESS_BYTES: usize = 128;
+
 /// A **Realm** — a collective of Sanctums under shared trust (a distributed-self collective).
 /// The same type appears in two places:
 ///
@@ -282,6 +305,13 @@ impl Manifest {
     /// Parse a manifest from JSON bytes. **Never panics** on hostile input — malformed bytes
     /// or an unknown `abi.backend` become a structured error (R9 fabric-integrity floor).
     pub fn parse(bytes: &[u8]) -> Result<Manifest, ManifestError> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(ManifestError::Invalid(format!(
+                "manifest JSON is {} bytes, exceeds {} byte limit",
+                bytes.len(),
+                MAX_MANIFEST_BYTES
+            )));
+        }
         let m: Manifest =
             serde_json::from_slice(bytes).map_err(|e| ManifestError::Parse(e.to_string()))?;
         m.validate()?;
@@ -302,34 +332,65 @@ impl Manifest {
         if self.version.trim().is_empty() {
             return Err(ManifestError::Invalid("missing `version`".into()));
         }
+        validate_text_len("name", &self.name, MAX_MANIFEST_NAME_BYTES)?;
+        validate_text_len("version", &self.version, MAX_MANIFEST_VERSION_BYTES)?;
+        validate_text_len("abi.abi_tag", &self.abi.abi_tag, MAX_MANIFEST_ABI_TAG_BYTES)?;
+        if self.abi.abi_tag.trim().is_empty() {
+            return Err(ManifestError::Invalid("abi.abi_tag must not be empty".into()));
+        }
+        validate_string_list(
+            "abi.target",
+            &self.abi.target,
+            MAX_MANIFEST_TARGETS,
+            MAX_MANIFEST_TARGET_BYTES,
+        )?;
         // Entrypoint catalog: each entry must have a non-empty name + signature, no duplicates.
         // We do not require any specific name (`handle`) — the kernel's `handle(Envelope)` ABI is
         // the wire; entrypoints are advertised metadata an injected matcher/typer reads.
+        validate_list_len("entrypoints", self.entrypoints.len(), MAX_MANIFEST_ENTRYPOINTS)?;
         let mut seen_entry: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for ep in &self.entrypoints {
             if ep.name.trim().is_empty() {
                 return Err(ManifestError::Invalid("entrypoint has empty `name`".into()));
             }
+            validate_text_len("entrypoint.name", &ep.name, MAX_MANIFEST_ENTRYPOINT_NAME_BYTES)?;
             if ep.signature.trim().is_empty() {
                 return Err(ManifestError::Invalid(format!(
                     "entrypoint `{}` has empty `signature`",
                     ep.name
                 )));
             }
+            validate_text_len(
+                "entrypoint.signature",
+                &ep.signature,
+                MAX_MANIFEST_ENTRYPOINT_SIGNATURE_BYTES,
+            )?;
             if !seen_entry.insert(ep.name.as_str()) {
                 return Err(ManifestError::Invalid(format!("duplicate entrypoint `{}`", ep.name)));
             }
         }
+        validate_capabilities_shape(&self.capabilities)?;
+        validate_requirements_shape(&self.requirements)?;
         // `provides[]` is an IoC role advertisement; duplicates and empty strings make the binder's
         // job ambiguous and signal an authoring bug — fail loudly here, not silently at bind time.
+        validate_list_len("provides", self.provides.len(), MAX_MANIFEST_PROVIDES)?;
         let mut seen_role: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for r in &self.provides {
             if r.trim().is_empty() {
                 return Err(ManifestError::Invalid("`provides` contains empty role".into()));
             }
+            validate_text_len("provides[]", r, MAX_MANIFEST_PROVIDES_BYTES)?;
             if !seen_role.insert(r.as_str()) {
                 return Err(ManifestError::Invalid(format!("duplicate provides role `{r}`")));
             }
+        }
+        validate_provenance_shape(&self.provenance)?;
+        if let Some(content_address) = &self.content_address {
+            validate_text_len(
+                "content_address",
+                content_address,
+                MAX_MANIFEST_CONTENT_ADDRESS_BYTES,
+            )?;
         }
         // A declared Realm must be well-formed: `provenance.realm` flows into the bus capability key
         // as `realm:{name}` / `omega:{name}`, so a name containing `:` or whitespace would produce
@@ -399,6 +460,119 @@ impl Manifest {
     pub fn provides_role(&self, role: &str) -> bool {
         self.provides.iter().any(|r| r == role)
     }
+}
+
+fn validate_capabilities_shape(cap: &Capabilities) -> Result<(), ManifestError> {
+    validate_string_list(
+        "capabilities.fs",
+        &cap.fs,
+        MAX_MANIFEST_CAPABILITY_ITEMS,
+        MAX_MANIFEST_FS_PATH_BYTES,
+    )?;
+    validate_string_list(
+        "capabilities.calls",
+        &cap.calls,
+        MAX_MANIFEST_CAPABILITY_ITEMS,
+        MAX_MANIFEST_CALL_BYTES,
+    )?;
+    Ok(())
+}
+
+fn validate_requirements_shape(req: &Requirements) -> Result<(), ManifestError> {
+    validate_string_list(
+        "requirements.accelerators",
+        &req.accelerators,
+        MAX_MANIFEST_REQUIREMENT_ITEMS,
+        MAX_MANIFEST_REQUIREMENT_FIELD_BYTES,
+    )?;
+    validate_string_list(
+        "requirements.sensors",
+        &req.sensors,
+        MAX_MANIFEST_REQUIREMENT_ITEMS,
+        MAX_MANIFEST_REQUIREMENT_FIELD_BYTES,
+    )?;
+    validate_optional_text_len(
+        "requirements.connectivity",
+        req.connectivity.as_deref(),
+        MAX_MANIFEST_REQUIREMENT_FIELD_BYTES,
+    )?;
+    validate_optional_text_len(
+        "requirements.jurisdiction",
+        req.jurisdiction.as_deref(),
+        MAX_MANIFEST_REQUIREMENT_FIELD_BYTES,
+    )?;
+    Ok(())
+}
+
+fn validate_provenance_shape(prov: &Provenance) -> Result<(), ManifestError> {
+    validate_optional_text_len(
+        "provenance.author",
+        prov.author.as_deref(),
+        MAX_MANIFEST_PROVENANCE_FIELD_BYTES,
+    )?;
+    validate_optional_text_len(
+        "provenance.source_hash",
+        prov.source_hash.as_deref(),
+        MAX_MANIFEST_PROVENANCE_FIELD_BYTES,
+    )?;
+    validate_optional_text_len(
+        "provenance.build_hash",
+        prov.build_hash.as_deref(),
+        MAX_MANIFEST_PROVENANCE_FIELD_BYTES,
+    )?;
+    validate_optional_text_len(
+        "provenance.signature",
+        prov.signature.as_deref(),
+        MAX_MANIFEST_PROVENANCE_FIELD_BYTES,
+    )?;
+    if let Some(realm) = &prov.realm {
+        validate_text_len("provenance.realm", &realm.0, MAX_MANIFEST_REALM_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_string_list(
+    label: &str,
+    values: &[String],
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<(), ManifestError> {
+    validate_list_len(label, values.len(), max_items)?;
+    let item_label = format!("{label}[]");
+    for value in values {
+        validate_text_len(&item_label, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_text_len(
+    label: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), ManifestError> {
+    if let Some(value) = value {
+        validate_text_len(label, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_list_len(label: &str, len: usize, max: usize) -> Result<(), ManifestError> {
+    if len > max {
+        return Err(ManifestError::Invalid(format!(
+            "{label} has {len} entries, exceeds {max} entry limit"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_text_len(label: &str, value: &str, max: usize) -> Result<(), ManifestError> {
+    if value.len() > max {
+        return Err(ManifestError::Invalid(format!(
+            "{label} is {} bytes, exceeds {max} byte limit",
+            value.len()
+        )));
+    }
+    Ok(())
 }
 
 /// The signature-verification **mechanism**. The *model* — which keys are trust roots — is
@@ -499,6 +673,81 @@ mod tests {
     fn rejects_malformed_json_without_panic() {
         assert!(matches!(Manifest::parse(b"{ not json"), Err(ManifestError::Parse(_))));
         assert!(matches!(Manifest::parse(&[0xff, 0xfe, 0x00]), Err(ManifestError::Parse(_))));
+    }
+
+    #[test]
+    fn rejects_oversized_manifest_before_json_parse() {
+        let bytes = vec![b' '; MAX_MANIFEST_BYTES + 1];
+        let err = Manifest::parse(&bytes).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(m) if m.contains("manifest JSON") && m.contains("exceeds")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_manifest_metadata_fields_and_lists() {
+        let mut m = Manifest::new(
+            "n".repeat(MAX_MANIFEST_NAME_BYTES + 1),
+            "0.1.0",
+            Backend::Daemon,
+            "gawd_creature_v1",
+        );
+        let err = m.validate().unwrap_err();
+        assert!(matches!(&err, ManifestError::Invalid(msg) if msg.contains("name")), "{err:?}");
+
+        m = Manifest::new("n", "0.1.0", Backend::Daemon, "gawd_creature_v1");
+        m.abi.target = vec!["x86_64-unknown-linux-gnu".into(); MAX_MANIFEST_TARGETS + 1];
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(msg) if msg.contains("abi.target")),
+            "{err:?}"
+        );
+
+        m = Manifest::new("n", "0.1.0", Backend::Daemon, "gawd_creature_v1");
+        m.entrypoints =
+            vec![
+                Entrypoint { name: "handle".into(), signature: "(Envelope) -> Outcome".into() };
+                MAX_MANIFEST_ENTRYPOINTS + 1
+            ];
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(msg) if msg.contains("entrypoints")),
+            "{err:?}"
+        );
+
+        m = Manifest::new("n", "0.1.0", Backend::Daemon, "gawd_creature_v1");
+        m.capabilities.calls = vec!["creature:*".into(); MAX_MANIFEST_CAPABILITY_ITEMS + 1];
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(msg) if msg.contains("capabilities.calls")),
+            "{err:?}"
+        );
+
+        m = Manifest::new("n", "0.1.0", Backend::Daemon, "gawd_creature_v1");
+        m.requirements.connectivity = Some("c".repeat(MAX_MANIFEST_REQUIREMENT_FIELD_BYTES + 1));
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(msg) if msg.contains("requirements.connectivity")),
+            "{err:?}"
+        );
+
+        m = Manifest::new("n", "0.1.0", Backend::Daemon, "gawd_creature_v1");
+        m.provenance.author = Some("a".repeat(MAX_MANIFEST_PROVENANCE_FIELD_BYTES + 1));
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(msg) if msg.contains("provenance.author")),
+            "{err:?}"
+        );
+
+        m = Manifest::new("n", "0.1.0", Backend::Daemon, "gawd_creature_v1");
+        m.content_address =
+            Some("sha256:".to_string() + &"a".repeat(MAX_MANIFEST_CONTENT_ADDRESS_BYTES));
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(msg) if msg.contains("content_address")),
+            "{err:?}"
+        );
     }
 
     // Entrypoint validation. The kernel's admission *mechanism* consults

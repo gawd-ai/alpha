@@ -188,6 +188,12 @@ impl QuarantineNotice {
                 MAX_REGISTRY_SIGNAL_FIELD_BYTES
             ));
         }
+        if artifact_hash.contains('\0') {
+            return Some("quarantine artifact_hash contains NUL byte".to_string());
+        }
+        if !realm.is_valid() || realm.0.contains('\0') {
+            return Some("quarantine realm is not a valid RealmId".to_string());
+        }
         if realm.0.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
             return Some(format!(
                 "quarantine realm too large: {} bytes exceeds {} byte limit",
@@ -211,6 +217,9 @@ impl QuarantineNotice {
                 MAX_QUARANTINE_REASON_BYTES
             ));
         }
+        if reason.contains('\0') {
+            return Some("quarantine reason contains NUL byte".to_string());
+        }
         if attesting_peers.len() > MAX_QUARANTINE_ATTESTING_PEERS {
             return Some(format!(
                 "quarantine attesting_peers too large: {} peers exceeds {} peer limit",
@@ -219,6 +228,9 @@ impl QuarantineNotice {
             ));
         }
         for peer in attesting_peers {
+            if peer.contains('\0') {
+                return Some("quarantine attesting_peer contains NUL byte".to_string());
+            }
             if peer.len() > MAX_QUARANTINE_ATTESTING_PEER_BYTES {
                 return Some(format!(
                     "quarantine attesting_peer too large: {} bytes exceeds {} byte limit",
@@ -600,5 +612,37 @@ mod tests {
         )
         .expect("oversized key rejected");
         assert!(err.contains("artifact_hash too large"));
+
+        let err = QuarantineNotice::mark_shape_error(
+            "bad\0hash",
+            &RealmId::new("crew"),
+            "apoptosis",
+            &peers,
+        )
+        .expect("NUL hash rejected");
+        assert!(err.contains("artifact_hash contains NUL"));
+
+        let err = QuarantineNotice::mark_shape_error(
+            "h",
+            &RealmId::new("bad:realm"),
+            "apoptosis",
+            &peers,
+        )
+        .expect("invalid realm rejected");
+        assert!(err.contains("realm is not a valid RealmId"));
+
+        let err =
+            QuarantineNotice::mark_shape_error("h", &RealmId::new("crew"), "bad\0reason", &peers)
+                .expect("NUL reason rejected");
+        assert!(err.contains("reason contains NUL"));
+
+        let err = QuarantineNotice::mark_shape_error(
+            "h",
+            &RealmId::new("crew"),
+            "apoptosis",
+            &["node\0A".into()],
+        )
+        .expect("NUL peer rejected");
+        assert!(err.contains("attesting_peer contains NUL"));
     }
 }

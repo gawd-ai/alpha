@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use sigil::{Capabilities, Verifier};
 
 use crate::address::{Address, CreatureId, Role, Topic};
-use crate::envelope::{header_size_error, Envelope};
+use crate::envelope::{address_depth_error, header_size_error, Envelope};
 
 /// The kernel's reserved routing handle. [`Address::Kernel`] resolves here.
 pub const KERNEL_ID: CreatureId = CreatureId(0);
@@ -76,6 +76,8 @@ pub enum RouteError {
     Denied { from: CreatureId },
     #[error("envelope header is {len} bytes, exceeds {limit} byte limit")]
     HeaderTooLarge { len: usize, limit: usize },
+    #[error("envelope address nesting depth {depth} exceeds max {max}")]
+    TooDeep { depth: usize, max: usize },
 }
 
 pub struct Router {
@@ -161,7 +163,11 @@ impl Router {
 
     /// Subscribe a creature to a topic (fan-out target).
     pub fn subscribe(&self, topic: Topic, id: CreatureId) {
-        wlock(&self.topics).entry(topic).or_default().push(id);
+        let mut topics = wlock(&self.topics);
+        let subs = topics.entry(topic).or_default();
+        if !subs.contains(&id) {
+            subs.push(id);
+        }
     }
 
     /// Whether any creature is subscribed to `topic`. Lets a hot-path publisher (the kernel's
@@ -185,6 +191,11 @@ impl Router {
     /// The one delivery method — every interaction flows through here, the single choke point for
     /// time (`stamp`), permission (verify), history (journal), and the bus-level capability check.
     pub fn route(&self, mut env: Envelope) -> Result<(), RouteError> {
+        // Depth before size: the depth walk is iterative and cheap; the size gate serializes the
+        // header, so an overdeep address must be refused before it can reach the serializer.
+        if let Some((depth, max)) = address_depth_error(&env.header) {
+            return Err(RouteError::TooDeep { depth, max });
+        }
         if let Some((len, limit)) = header_size_error(&env.header) {
             return Err(RouteError::HeaderTooLarge { len, limit });
         }

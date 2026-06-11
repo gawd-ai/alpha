@@ -10,7 +10,8 @@ mod native;
 mod script;
 mod wasm;
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -20,6 +21,16 @@ use sigil::{Backend, Manifest};
 pub use native::NativeEngine;
 pub use script::ScriptEngine;
 pub use wasm::WasmEngine;
+
+/// Maximum bytes a byte-loaded artifact may occupy at the loader boundary.
+///
+/// The daemon/native tier can still load a trusted local `.so` by path for `dlopen` with no size
+/// cap — admission's integrity hash *streams* a path-backed artifact ([`Artifact::sha256_hex`]),
+/// so a large-but-legit native creature is never refused by this constant. The cap applies
+/// wherever a tier materializes artifact bytes in memory: `beast`/`critter` path loads, any
+/// in-memory `Artifact::Bytes` (including the native ship→spill path). Keep this in `anima` so
+/// direct engine callers get the same defense-in-depth boundary as the `omni` control surface.
+pub const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// What to load: a path on disk (native needs this — `dlopen` takes a path) or raw bytes (a shipped
 /// artifact; beasts compile straight from bytes).
@@ -34,12 +45,91 @@ pub enum Artifact {
 
 impl Artifact {
     pub fn read_bytes(&self) -> Result<Vec<u8>, EngineError> {
+        self.read_bytes_bounded(MAX_ARTIFACT_BYTES)
+    }
+
+    fn read_bytes_bounded(&self, max_bytes: u64) -> Result<Vec<u8>, EngineError> {
         match self {
-            Artifact::Path(p) => std::fs::read(p)
-                .map_err(|e| EngineError::Load(format!("read {}: {e}", p.display()))),
-            Artifact::Bytes(b) => Ok(b.clone()),
+            Artifact::Path(p) => read_artifact_path_bounded(p, max_bytes),
+            Artifact::Bytes(b) => {
+                if artifact_len_exceeds_limit(b.len(), max_bytes) {
+                    return Err(EngineError::Load(format!(
+                        "artifact bytes are {} bytes, exceeds {} byte limit",
+                        b.len(),
+                        max_bytes
+                    )));
+                }
+                Ok(b.clone())
+            }
         }
     }
+
+    /// Content hash of the artifact bytes **without materializing a path-backed artifact in
+    /// memory**: a file streams through the hasher in fixed-size chunks; in-memory bytes hash
+    /// directly. Admission's `provenance.build_hash` integrity gate uses this, so hashing is
+    /// O(1) memory and a large-but-legit native `.so` loaded by local path is never refused by
+    /// [`MAX_ARTIFACT_BYTES`] — that cap bounds *byte-materializing* loads, not integrity reads.
+    pub fn sha256_hex(&self) -> Result<String, EngineError> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        match self {
+            Artifact::Path(p) => {
+                let mut file = std::fs::File::open(p)
+                    .map_err(|e| EngineError::Load(format!("read {}: {e}", p.display())))?;
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = file
+                        .read(&mut buf)
+                        .map_err(|e| EngineError::Load(format!("read {}: {e}", p.display())))?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+            }
+            Artifact::Bytes(b) => hasher.update(b),
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+}
+
+pub(crate) fn artifact_len_exceeds_limit(len: usize, max_bytes: u64) -> bool {
+    u64::try_from(len).map_or(true, |len| len > max_bytes)
+}
+
+fn read_artifact_path_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, EngineError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())))?;
+    if !metadata.is_file() {
+        return Err(EngineError::Load(format!("read {}: not a regular file", path.display())));
+    }
+    if metadata.len() > max_bytes {
+        return Err(EngineError::Load(format!(
+            "read {}: file is {} bytes, exceeds {} byte limit",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        )));
+    }
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())))?;
+    let cap = usize::try_from(metadata.len())
+        .unwrap_or(usize::MAX)
+        .min(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+    let mut bytes = Vec::with_capacity(cap);
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())))?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > max_bytes) {
+        return Err(EngineError::Load(format!(
+            "read {}: file grew past {} byte limit while reading",
+            path.display(),
+            max_bytes
+        )));
+    }
+    Ok(bytes)
 }
 
 /// A handle to a loaded creature's **live per-handle fuel ceiling**. It exists so the
@@ -166,10 +256,29 @@ pub enum EngineError {
 mod tests {
     use super::*;
     use sigil::{Abi, Backend, Manifest};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64 as TestAtomicU64, Ordering as TestOrdering};
     use std::sync::{Mutex, OnceLock};
 
     fn manifest(backend: Backend, abi_tag: &str) -> Manifest {
         Manifest::new("t", "0.1.0", backend, abi_tag)
+    }
+
+    static NEXT_TEMP_ARTIFACT: TestAtomicU64 = TestAtomicU64::new(0);
+
+    struct TempArtifactFile(PathBuf);
+
+    impl Drop for TempArtifactFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn temp_artifact_file(label: &str) -> TempArtifactFile {
+        let n = NEXT_TEMP_ARTIFACT.fetch_add(1, TestOrdering::Relaxed);
+        TempArtifactFile(
+            std::env::temp_dir().join(format!("anima-artifact-{label}-{}-{n}", std::process::id())),
+        )
     }
 
     /// Tests that deliberately burn fuel/ops should not run in parallel under libtest's default
@@ -184,6 +293,44 @@ mod tests {
         assert_eq!(NativeEngine.backend(), Backend::Daemon);
         assert_eq!(WasmEngine::new().backend(), Backend::Beast);
         assert_eq!(ScriptEngine.backend(), Backend::Critter);
+    }
+
+    #[test]
+    fn artifact_path_reader_accepts_exact_cap() {
+        let file = temp_artifact_file("exact");
+        std::fs::write(&file.0, b"abcd").unwrap();
+
+        assert_eq!(Artifact::Path(file.0.clone()).read_bytes_bounded(4).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn artifact_path_reader_rejects_oversized_metadata() {
+        let file = temp_artifact_file("oversized");
+        std::fs::File::create(&file.0).unwrap().set_len(5).unwrap();
+
+        let Err(EngineError::Load(err)) = Artifact::Path(file.0.clone()).read_bytes_bounded(4)
+        else {
+            panic!("oversized artifact path should fail as a load error");
+        };
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn artifact_bytes_reader_rejects_oversized_in_memory_artifact() {
+        let Err(EngineError::Load(err)) = Artifact::Bytes(vec![0; 5]).read_bytes_bounded(4) else {
+            panic!("oversized in-memory artifact should fail as a load error");
+        };
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn artifact_length_limit_predicate_handles_edges_without_allocating() {
+        assert!(!artifact_len_exceeds_limit(4, 4), "exact cap is accepted");
+        assert!(artifact_len_exceeds_limit(5, 4), "one byte over cap is rejected");
+        assert!(
+            artifact_len_exceeds_limit(usize::MAX, 0),
+            "absurd lengths fail closed under a zero-byte cap"
+        );
     }
 
     // ---- critter (script) tier — the Rhai engine, mirroring the beast suite below ----

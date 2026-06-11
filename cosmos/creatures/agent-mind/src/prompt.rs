@@ -9,7 +9,10 @@
 //! native trusted-by-admission creature). The parser also caps the raw completion before scanning
 //! fenced blocks so an injected model cannot force unbounded parser allocation.
 
-use agent_templated::{AuthoringError, AuthoringRequest, AuthoringResponse};
+use agent_templated::{
+    bounded_authoring_text, AuthoringError, AuthoringRequest, AuthoringResponse,
+    MAX_AUTHORING_PREV_ERROR_BYTES, MAX_AUTHORING_REQUEST_TEXT_BYTES,
+};
 use build_cargo::ManifestStub;
 use mind::{Prompt, RETRY_MARKER};
 
@@ -127,8 +130,9 @@ pub fn build_request(req: &AuthoringRequest) -> Prompt {
         Tier::Critter => CRITTER_SYSTEM_PROMPT,
     }
     .to_string();
-    let mut user_prompt = req.request.clone();
+    let mut user_prompt = bounded_authoring_text(&req.request, MAX_AUTHORING_REQUEST_TEXT_BYTES);
     if let Some(prev) = &req.prev_error {
+        let prev = bounded_authoring_text(prev, MAX_AUTHORING_PREV_ERROR_BYTES);
         user_prompt.push_str(&format!(
             "\n\n{RETRY_MARKER} (your previous attempt failed to compile — read the error and fix it):\n{prev}"
         ));
@@ -268,6 +272,27 @@ mod tests {
         });
         assert!(retry.user_prompt.contains(RETRY_MARKER));
         assert!(retry.user_prompt.contains("E0601"));
+    }
+
+    #[test]
+    fn build_request_bounds_request_and_retry_text_before_prompting() {
+        let request = format!("reverse {}", "x".repeat(MAX_AUTHORING_REQUEST_TEXT_BYTES + 4096));
+        let prev_error = format!("error {}", "e".repeat(MAX_AUTHORING_PREV_ERROR_BYTES + 4096));
+        let prompt = build_request(&AuthoringRequest {
+            request: request.clone(),
+            prev_error: Some(prev_error.clone()),
+        });
+
+        assert!(prompt.user_prompt.contains("truncated"), "prompt marks truncation");
+        assert!(
+            !prompt.user_prompt.contains(&"x".repeat(MAX_AUTHORING_REQUEST_TEXT_BYTES + 1)),
+            "request text is bounded before prompt assembly"
+        );
+        assert!(
+            !prompt.user_prompt.contains(&"e".repeat(MAX_AUTHORING_PREV_ERROR_BYTES + 1)),
+            "retry context is bounded before prompt assembly"
+        );
+        assert!(prompt.user_prompt.len() < request.len() + prev_error.len());
     }
 
     #[test]

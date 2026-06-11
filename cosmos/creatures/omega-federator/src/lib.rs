@@ -5,7 +5,10 @@
 //! 1. **Cross-Realm routing.** An [`Address::Omega { realm, target }`](aether::Address::Omega)
 //!    envelope is resolved by looking up the peer Sanctum mapped to `realm` and re-routing
 //!    `Node(peer, target)` — the bus then carries it via the bound `Role::TRANSPORT`. Same
-//!    composition-by-depth discipline as `cosmos/creatures/prototypes/gateways/realm-gateway`.
+//!    composition-by-depth discipline as `cosmos/creatures/prototypes/gateways/realm-gateway`. The
+//!    retained Realm→peer map is bounded and shape-checked at construction; use
+//!    [`OmegaFederator::new_with_realm_peer_limit`] with `0` only for lab/demo configs that
+//!    intentionally accept an unbounded route table.
 //! 2. **Pull-based anti-entropy.** On a `PullFrom` control op the federator asks a peer Realm's
 //!    `registry-mem` for its catalog ([`RegistryOp::ListEntries`]) and merges every entry into the
 //!    *local* registry via the [`RegistryOp::PublishInRealm`] write path (tagged with the
@@ -80,6 +83,12 @@ pub const MAX_FEDERATOR_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Default cap for in-flight anti-entropy pulls. `0` in
 /// [`OmegaFederator::with_max_pending_pulls`] means unbounded.
 pub const DEFAULT_MAX_PENDING_PULLS: usize = 128;
+/// Default maximum Realm→peer mappings retained for Omega routing.
+pub const DEFAULT_MAX_FEDERATOR_REALM_PEERS: usize = 1024;
+/// Maximum bytes in a Realm name retained in the route table.
+pub const MAX_FEDERATOR_REALM_BYTES: usize = sigil::MAX_MANIFEST_REALM_BYTES;
+/// Maximum bytes in a peer node id retained in the route table.
+pub const MAX_FEDERATOR_NODE_ID_BYTES: usize = 256;
 
 /// Proprioception event the federator emits when it drops a **malformed reputation attestation** —
 /// a non-finite score or a delta whose observer signature didn't verify. Lets the
@@ -357,6 +366,13 @@ pub struct OmegaFederator {
 
 impl OmegaFederator {
     pub fn new(cfg: FederatorConfig) -> Self {
+        Self::new_with_realm_peer_limit(cfg, DEFAULT_MAX_FEDERATOR_REALM_PEERS)
+    }
+
+    /// Construct with an explicit Realm→peer route-table cap. `max_realm_peers == 0` disables the
+    /// cap for lab/demo configurations.
+    pub fn new_with_realm_peer_limit(mut cfg: FederatorConfig, max_realm_peers: usize) -> Self {
+        cfg.realm_to_peer = retain_valid_realm_peers(cfg.realm_to_peer, max_realm_peers);
         OmegaFederator {
             cfg,
             me: None,
@@ -366,6 +382,11 @@ impl OmegaFederator {
             ingest_rejections: IngestRejections::default(),
             max_pending_pulls: DEFAULT_MAX_PENDING_PULLS,
         }
+    }
+
+    /// Number of retained Realm→peer mappings. Exposed for tests and diagnostics.
+    pub fn realm_peer_count(&self) -> usize {
+        self.cfg.realm_to_peer.len()
     }
 
     /// Cap the number of concurrently in-flight anti-entropy pulls. `0` disables the cap. At
@@ -1026,6 +1047,58 @@ fn federation_endpoint_shape_error(source_realm: &RealmId, peer_node: &NodeId) -
         .or_else(|| field_shape_error("federator", "peer_node", &peer_node.0))
 }
 
+fn retain_valid_realm_peers(
+    mappings: HashMap<RealmId, NodeId>,
+    max_mappings: usize,
+) -> HashMap<RealmId, NodeId> {
+    let mut retained = HashMap::new();
+    for (realm, peer) in mappings {
+        insert_realm_peer_mapping(&mut retained, realm, peer, max_mappings);
+    }
+    retained
+}
+
+fn insert_realm_peer_mapping(
+    mappings: &mut HashMap<RealmId, NodeId>,
+    realm: RealmId,
+    peer: NodeId,
+    max_mappings: usize,
+) {
+    if let Some(reason) = realm_peer_mapping_shape_error(&realm, &peer) {
+        eprintln!("omega-federator: {reason}");
+        return;
+    }
+    if max_mappings != 0 && !mappings.contains_key(&realm) && mappings.len() >= max_mappings {
+        eprintln!(
+            "omega-federator: realm_to_peer table at capacity ({max_mappings}); refusing realm {}",
+            realm.0
+        );
+        return;
+    }
+    mappings.insert(realm, peer);
+}
+
+fn realm_peer_mapping_shape_error(realm: &RealmId, peer: &NodeId) -> Option<String> {
+    if !realm.is_valid() || realm.0.len() > MAX_FEDERATOR_REALM_BYTES || realm.0.contains('\0') {
+        return Some(format!(
+            "realm_to_peer realm must be valid, NUL-free, and <= {MAX_FEDERATOR_REALM_BYTES} bytes"
+        ));
+    }
+    if !node_id_shape_is_valid(peer) {
+        return Some(format!(
+            "realm_to_peer peer_node must be 1..={MAX_FEDERATOR_NODE_ID_BYTES} ASCII [A-Za-z0-9._-] bytes"
+        ));
+    }
+    None
+}
+
+fn node_id_shape_is_valid(node: &NodeId) -> bool {
+    let s = node.0.as_str();
+    !s.is_empty()
+        && s.len() <= MAX_FEDERATOR_NODE_ID_BYTES
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 fn reputation_delta_shape_error(delta: &ReputationDelta) -> Option<String> {
     registry_key_shape_error(&delta.artifact_hash, &delta.realm)
         .or_else(|| {
@@ -1188,6 +1261,92 @@ mod tests {
         let reply: NoOmegaRouteReply = serde_json::from_slice(&d.payload).unwrap();
         assert_eq!(reply.reason, NoOmegaRouteReason::UnmappedRealm);
         assert_eq!(reply.realm, RealmId::new("unknown"));
+    }
+
+    #[test]
+    fn route_table_config_is_sanitized_at_construction() {
+        let mut map = HashMap::new();
+        map.insert(RealmId::new("guests"), NodeId(PEER_NODE.into()));
+        map.insert(RealmId::new("bad:realm"), NodeId("node-C".into()));
+        map.insert(RealmId::new("bad-peer"), NodeId("bad peer".into()));
+        map.insert(RealmId::new("bad-nul\0"), NodeId("node-D".into()));
+        let mut f = OmegaFederator::new(FederatorConfig {
+            self_node: NodeId(SELF_NODE.into()),
+            self_realm: RealmId::new(SELF_REALM),
+            local_registry: REGISTRY,
+            abode_key: key(0xB4),
+            realm_to_peer: map,
+            weigher: Box::new(UnitWeigher),
+        });
+        f.set_me_for_tests(ME);
+
+        assert_eq!(f.realm_peer_count(), 1);
+
+        let routed = f.handle(Envelope {
+            header: header(
+                Address::Omega {
+                    realm: RealmId::new("guests"),
+                    target: Box::new(Address::Creature(CreatureId(42))),
+                },
+                "seer",
+                Some(8),
+            ),
+            payload: b"x".to_vec(),
+        });
+        assert_eq!(
+            routed.dispatches[0].to,
+            Address::Node(NodeId(PEER_NODE.into()), CreatureId(42))
+        );
+
+        let refused = f.handle(Envelope {
+            header: header(
+                Address::Omega {
+                    realm: RealmId::new("bad:realm"),
+                    target: Box::new(Address::Creature(CreatureId(42))),
+                },
+                "seer",
+                Some(9),
+            ),
+            payload: b"x".to_vec(),
+        });
+        let reply: NoOmegaRouteReply =
+            serde_json::from_slice(&refused.dispatches[0].payload).unwrap();
+        assert_eq!(reply.reason, NoOmegaRouteReason::UnmappedRealm);
+    }
+
+    #[test]
+    fn route_table_cap_is_bounded_and_zero_opt_out_is_unbounded() {
+        let mut capped_map = HashMap::new();
+        capped_map.insert(RealmId::new("a"), NodeId("node-a".into()));
+        capped_map.insert(RealmId::new("b"), NodeId("node-b".into()));
+        let capped = OmegaFederator::new_with_realm_peer_limit(
+            FederatorConfig {
+                self_node: NodeId(SELF_NODE.into()),
+                self_realm: RealmId::new(SELF_REALM),
+                local_registry: REGISTRY,
+                abode_key: key(0xB5),
+                realm_to_peer: capped_map,
+                weigher: Box::new(UnitWeigher),
+            },
+            1,
+        );
+        assert_eq!(capped.realm_peer_count(), 1);
+
+        let mut unbounded_map = HashMap::new();
+        unbounded_map.insert(RealmId::new("a"), NodeId("node-a".into()));
+        unbounded_map.insert(RealmId::new("b"), NodeId("node-b".into()));
+        let unbounded = OmegaFederator::new_with_realm_peer_limit(
+            FederatorConfig {
+                self_node: NodeId(SELF_NODE.into()),
+                self_realm: RealmId::new(SELF_REALM),
+                local_registry: REGISTRY,
+                abode_key: key(0xB6),
+                realm_to_peer: unbounded_map,
+                weigher: Box::new(UnitWeigher),
+            },
+            0,
+        );
+        assert_eq!(unbounded.realm_peer_count(), 2);
     }
 
     #[test]

@@ -15,8 +15,6 @@ sigil = { path = "../sigil" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# Hashing the artifact bytes for the admission integrity gate.
-sha2 = { workspace = true }
 
 [dev-dependencies]
 # `tests/m0_integration.rs` exercises the walking skeleton end-to-end and needs the skeleton creatures

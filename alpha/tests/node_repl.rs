@@ -67,3 +67,26 @@ fn node_load_with_a_bad_path_is_a_clean_error_not_a_crash() {
     assert!(stdout.contains("load failed"), "structured error reported");
     assert!(stdout.contains("bye."));
 }
+
+#[test]
+fn oversized_repl_line_is_rejected_and_repl_continues() {
+    let mut child = node_cmd()
+        .arg("--minimal")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&vec![b'x'; alpha::MAX_ALPHA_REPL_LINE_BYTES + 1]).unwrap();
+    stdin.write_all(b"\nstatus\nquit\n").unwrap();
+    drop(stdin);
+
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "oversized REPL line must not crash alpha node");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("input line exceeds"), "oversized line was rejected: {stdout:?}");
+    assert!(stdout.contains("allow-ai"), "REPL kept processing later commands: {stdout:?}");
+    assert!(stdout.contains("bye."), "quit still shut down cleanly: {stdout:?}");
+}

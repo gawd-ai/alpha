@@ -284,7 +284,11 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         return Ok(());
     }
     if let Some(path) = opts.script.clone() {
-        let body = match std::fs::read_to_string(&path) {
+        let body = match crate::read_text_file_bounded(
+            &path,
+            crate::MAX_ALPHA_SCRIPT_BYTES,
+            "alpha node script",
+        ) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("alpha node: --script {path}: {e}");
@@ -326,10 +330,21 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 
     let mut ctx = VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, critter_builder, &ai, false);
     ctx.transport = cluster_transport;
-    for line in std::io::stdin().lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        let line = match read_repl_line_capped(&mut reader, crate::MAX_ALPHA_REPL_LINE_BYTES) {
+            Ok(ReplLine::Line(line)) => line,
+            Ok(ReplLine::TooLong) => {
+                writeln!(
+                    out,
+                    "input line exceeds {} byte limit; skipped",
+                    crate::MAX_ALPHA_REPL_LINE_BYTES
+                )?;
+                prompt(&mut out)?;
+                continue;
+            }
+            Ok(ReplLine::Eof) | Err(_) => break,
         };
         if !run_line(&line, &mut ctx, opts.json, &mut out)? {
             // `quit`/`exit` — shutdown already requested below.
@@ -342,6 +357,65 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     // EOF on stdin — clean shutdown for piped use.
     kernel.shutdown_all(Deadline::default());
     Ok(())
+}
+
+enum ReplLine {
+    Line(String),
+    Eof,
+    TooLong,
+}
+
+fn read_repl_line_capped<R: BufRead>(reader: &mut R, max: usize) -> std::io::Result<ReplLine> {
+    let mut out = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if out.is_empty() { Ok(ReplLine::Eof) } else { bytes_to_repl_line(out) };
+        }
+
+        let newline = available.iter().position(|b| *b == b'\n');
+        let take = newline.map_or(available.len(), |i| i + 1);
+        if out.len().saturating_add(take) > max {
+            reader.consume(take);
+            if newline.is_none() {
+                drain_repl_line(reader)?;
+            }
+            return Ok(ReplLine::TooLong);
+        }
+
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return bytes_to_repl_line(out);
+        }
+    }
+}
+
+fn drain_repl_line<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let take = newline.map_or(available.len(), |i| i + 1);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(());
+        }
+    }
+}
+
+fn bytes_to_repl_line(mut bytes: Vec<u8>) -> std::io::Result<ReplLine> {
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+        if bytes.ends_with(b"\r") {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map(ReplLine::Line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Parse + run one line against `ctx`, render the result (human text or `--json`). Returns

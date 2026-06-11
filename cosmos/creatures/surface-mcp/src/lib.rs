@@ -30,9 +30,33 @@ use serde_json::{json, Value};
 const SERVER_NAME: &str = "alpha-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "2025-11-25";
+/// Maximum bytes of a client-supplied MCP protocolVersion reflected in initialize.
+const MAX_PROTOCOL_VERSION_BYTES: usize = 64;
 /// Bound one JSON-RPC input line. MCP requests are small JSON objects; a 1 MiB line is roomy for
 /// authoring prompts and prevents one hostile stdio peer from growing this process without bound.
 const MAX_JSON_RPC_LINE_BYTES: usize = 1024 * 1024;
+/// Maximum bytes copied into an error token preview (unknown method/tool/parameter names).
+const MAX_ERROR_TOKEN_BYTES: usize = 256;
+/// Maximum bytes for MCP text-like payload arguments. The whole JSON-RPC line is capped at 1 MiB;
+/// this per-field guard rejects oversized strings before `Verb` construction.
+const MAX_TEXT_ARG_BYTES: usize = omni::MAX_CONTROL_VERB_BYTES;
+/// Maximum bytes for an authoring request — the AUTHORING contract's own field cap, so the
+/// advertised tool schema promises exactly what the authoring bindees downstream accept.
+const MAX_AUTHOR_ARG_BYTES: usize = omni::MAX_CONTROL_AUTHOR_REQUEST_BYTES;
+/// Maximum bytes for node-local path strings accepted by MCP tools.
+const MAX_PATH_ARG_BYTES: usize = 4096;
+/// Maximum bytes for artifact hashes accepted by MCP tools.
+const MAX_HASH_ARG_BYTES: usize = 128;
+/// Maximum bytes for Realm id strings accepted by MCP tools.
+const MAX_REALM_ARG_BYTES: usize = 256;
+/// Maximum bytes for peer node ids accepted by MCP tools.
+const MAX_NODE_ARG_BYTES: usize = 256;
+/// Maximum bytes for peer dial addresses accepted by MCP tools.
+const MAX_ADDR_ARG_BYTES: usize = 512;
+/// Maximum bytes for peer pubkeys accepted by MCP tools.
+const MAX_PUBKEY_ARG_BYTES: usize = 128;
+/// Maximum bytes for AI status text before the shared control layer sanitizes/truncates it further.
+const MAX_AI_STATUS_ARG_BYTES: usize = 4096;
 /// Bound in-flight control requests parked by the MCP bridge. The stdio loop is synchronous, but a
 /// bounded table keeps the surface robust if that bridge grows concurrent request handling later or
 /// stale replies accumulate under unusual host behavior.
@@ -228,7 +252,7 @@ fn run_stdio(state: Arc<SurfaceState>) {
                 let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
                 result(id, call_tool(&state, &params))
             }
-            other => error(id, -32601, &format!("Method not found: {other}")),
+            other => error(id, -32601, &format!("Method not found: {}", preview_token(other))),
         };
         write_msg(&mut stdout, &response);
     }
@@ -293,7 +317,7 @@ fn initialize_result(params: &Value) -> Value {
     let version = params
         .get("protocolVersion")
         .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty() && v.len() <= MAX_PROTOCOL_VERSION_BYTES)
         .unwrap_or(PROTOCOL_VERSION);
     json!({
         "protocolVersion": version,
@@ -329,6 +353,23 @@ fn write_msg(stdout: &mut std::io::Stdout, msg: &Value) {
     s.push('\n');
     let _ = stdout.write_all(s.as_bytes());
     let _ = stdout.flush();
+}
+
+fn preview_bounded(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = s[..cut].to_string();
+    out.push_str("...");
+    out
+}
+
+fn preview_token(s: &str) -> String {
+    preview_bounded(s, MAX_ERROR_TOKEN_BYTES)
 }
 
 // ---- the async↔bus bridge (synchronous: the stdio loop is one blocking stream) -----------------
@@ -412,20 +453,20 @@ fn tool_list() -> Value {
         tool("alpha_list", "List the creatures currently loaded on the node (the roster): creature id, name, backend tier (daemon/beast/critter).", no_args(), true),
         tool("alpha_journal", "Recent bus journal entries (the node's short-term memory of routed envelopes). Read-only.", json!({ "type": "object", "properties": { "limit": { "type": "integer", "description": "How many recent entries to return (default 20)." } }, "additionalProperties": false }), true),
         tool("alpha_watch", "A combined glance: current status plus the last 10 journal entries. Read-only.", no_args(), true),
-        tool("alpha_author", "Author a NEW daemon-tier (native .so) creature from a natural-language request. Triggers a real cargo build and CAN TAKE MINUTES (the call blocks). Prefer alpha_author_critter. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": { "type": "string", "description": "What the creature should do, in plain language." } }, "required": ["request"], "additionalProperties": false }), false),
-        tool("alpha_author_critter", "Author a NEW critter-tier (Rhai script) creature from a natural-language request. No compiler — returns in milliseconds. The preferred authoring path. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": { "type": "string", "description": "What the critter should do, in plain language." } }, "required": ["request"], "additionalProperties": false }), false),
-        tool("alpha_load", "Load a creature from a manifest + artifact already on the node's filesystem. Gated by allow-AI.", json!({ "type": "object", "properties": { "manifest_path": { "type": "string" }, "artifact_path": { "type": "string" } }, "required": ["manifest_path", "artifact_path"], "additionalProperties": false }), false),
-        tool("alpha_registry_publish", "Publish a creature into the catalogue (the Bestiary) from a manifest + artifact already on the NODE's filesystem (same node-local caveat as alpha_load — not a client upload). Optional `realm` scopes the catalogue. Gated by allow-AI.", json!({ "type": "object", "properties": { "manifest_path": { "type": "string" }, "artifact_path": { "type": "string" }, "realm": { "type": "string", "description": "Optional Realm name; omit for the local Realm." } }, "required": ["manifest_path", "artifact_path"], "additionalProperties": false }), false),
-        tool("alpha_registry_fetch", "Look up a catalogue entry by artifact hash and return its manifest metadata (name, version, content_address) plus the artifact length — NOT the raw bytes. Optional `realm`. Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string" }, "realm": { "type": "string", "description": "Optional Realm name; omit for the local Realm." } }, "required": ["artifact_hash"], "additionalProperties": false }), true),
-        tool("alpha_registry_list", "Snapshot the catalogue (the Bestiary): each entry's artifact hash, name, version, Realm, reputation, and quarantine flag. Optional `realm` scopes to one Realm; omit to list all. Read-only.", json!({ "type": "object", "properties": { "realm": { "type": "string", "description": "Optional Realm name; omit to list every Realm." } }, "additionalProperties": false }), true),
-        tool("alpha_bestiary_prove", "Ask the durable Bestiary for a standalone, signed EntryProof attestation over (realm, artifact_hash) — survives compaction and is independently verifiable. Only a durable bestiary-daemon answers (the in-memory stub returns an error). Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string" }, "realm": { "type": "string" } }, "required": ["artifact_hash", "realm"], "additionalProperties": false }), true),
-        tool("alpha_send", "Send a text message to a creature by creature id and read its reply. Add `node` to route to a creature on a peer node over the cluster. Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" }, "text": { "type": "string" }, "node": { "type": "string", "description": "Optional peer node-id — routes the send across the cluster." } }, "required": ["id", "text"], "additionalProperties": false }), false),
-        tool("alpha_intent", "Express an intent on a Role (outcome + text) and read the reply from whatever creature is bound there. Gated by allow-AI.", json!({ "type": "object", "properties": { "outcome": { "type": "string" }, "text": { "type": "string" } }, "required": ["outcome", "text"], "additionalProperties": false }), false),
+        tool("alpha_author", "Author a NEW daemon-tier (native .so) creature from a natural-language request. Triggers a real cargo build and CAN TAKE MINUTES (the call blocks). Prefer alpha_author_critter. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": { "type": "string", "maxLength": MAX_AUTHOR_ARG_BYTES, "description": "What the creature should do, in plain language." } }, "required": ["request"], "additionalProperties": false }), false),
+        tool("alpha_author_critter", "Author a NEW critter-tier (Rhai script) creature from a natural-language request. No compiler — returns in milliseconds. The preferred authoring path. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": { "type": "string", "maxLength": MAX_AUTHOR_ARG_BYTES, "description": "What the critter should do, in plain language." } }, "required": ["request"], "additionalProperties": false }), false),
+        tool("alpha_load", "Load a creature from a manifest + artifact already on the node's filesystem. Gated by allow-AI.", json!({ "type": "object", "properties": { "manifest_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES }, "artifact_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES } }, "required": ["manifest_path", "artifact_path"], "additionalProperties": false }), false),
+        tool("alpha_registry_publish", "Publish a creature into the catalogue (the Bestiary) from a manifest + artifact already on the NODE's filesystem (same node-local caveat as alpha_load — not a client upload). Optional `realm` scopes the catalogue. Gated by allow-AI.", json!({ "type": "object", "properties": { "manifest_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES }, "artifact_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit for the local Realm." } }, "required": ["manifest_path", "artifact_path"], "additionalProperties": false }), false),
+        tool("alpha_registry_fetch", "Look up a catalogue entry by artifact hash and return its manifest metadata (name, version, content_address) plus the artifact length — NOT the raw bytes. Optional `realm`. Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string", "maxLength": MAX_HASH_ARG_BYTES }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit for the local Realm." } }, "required": ["artifact_hash"], "additionalProperties": false }), true),
+        tool("alpha_registry_list", "Snapshot the catalogue (the Bestiary): each entry's artifact hash, name, version, Realm, reputation, and quarantine flag. Optional `realm` scopes to one Realm; omit to list all. Read-only.", json!({ "type": "object", "properties": { "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit to list every Realm." } }, "additionalProperties": false }), true),
+        tool("alpha_bestiary_prove", "Ask the durable Bestiary for a standalone, signed EntryProof attestation over (realm, artifact_hash) — survives compaction and is independently verifiable. Only a durable bestiary-daemon answers (the in-memory stub returns an error). Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string", "maxLength": MAX_HASH_ARG_BYTES }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES } }, "required": ["artifact_hash", "realm"], "additionalProperties": false }), true),
+        tool("alpha_send", "Send a text message to a creature by creature id and read its reply. Add `node` to route to a creature on a peer node over the cluster. Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" }, "text": { "type": "string", "maxLength": MAX_TEXT_ARG_BYTES }, "node": { "type": "string", "maxLength": MAX_NODE_ARG_BYTES, "description": "Optional peer node-id — routes the send across the cluster." } }, "required": ["id", "text"], "additionalProperties": false }), false),
+        tool("alpha_intent", "Express an intent on a Role (outcome + text) and read the reply from whatever creature is bound there. Gated by allow-AI.", json!({ "type": "object", "properties": { "outcome": { "type": "string", "maxLength": omni::MAX_CONTROL_ROLE_NAME_BYTES }, "text": { "type": "string", "maxLength": MAX_TEXT_ARG_BYTES } }, "required": ["outcome", "text"], "additionalProperties": false }), false),
         tool("alpha_bind", "Bind a loaded creature to a Role so intents addressed to that Role route to it. Gated by allow-AI.", json!({ "type": "object", "properties": { "role": { "type": "string", "maxLength": omni::MAX_CONTROL_ROLE_NAME_BYTES, "pattern": "^[A-Za-z0-9._-]+$" }, "id": { "type": "integer" } }, "required": ["role", "id"], "additionalProperties": false }), false),
         tool("alpha_unload", "Unload a creature by creature id (runs its orderly teardown). Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"], "additionalProperties": false }), false),
-        tool("alpha_ai_status", "Announce what you (the AI) are doing on this shared node — surfaced live to the human at the node's REPL/stream so they can watch and revoke. Call it before a mutating action. Not gated.", json!({ "type": "object", "properties": { "working": { "type": "boolean" }, "activity": { "type": "string" }, "message": { "type": "string" } }, "required": ["working"], "additionalProperties": false }), false),
+        tool("alpha_ai_status", "Announce what you (the AI) are doing on this shared node — surfaced live to the human at the node's REPL/stream so they can watch and revoke. Call it before a mutating action. Not gated.", json!({ "type": "object", "properties": { "working": { "type": "boolean" }, "activity": { "type": "string", "maxLength": MAX_AI_STATUS_ARG_BYTES }, "message": { "type": "string", "maxLength": MAX_AI_STATUS_ARG_BYTES } }, "required": ["working"], "additionalProperties": false }), false),
         tool("alpha_cluster", "Read this node's view of the cluster graph: which peer Sanctums it knows and which are connected. Read-only.", no_args(), true),
-        tool("alpha_cluster_connect", "Admit + dial a cluster peer (the cluster join); gossip then spreads it across the mesh. Gated by allow-AI.", json!({ "type": "object", "properties": { "node_id": { "type": "string" }, "addr": { "type": "string" }, "pubkey": { "type": "string" } }, "required": ["node_id", "addr", "pubkey"], "additionalProperties": false }), false),
+        tool("alpha_cluster_connect", "Admit + dial a cluster peer (the cluster join); gossip then spreads it across the mesh. Gated by allow-AI.", json!({ "type": "object", "properties": { "node_id": { "type": "string", "maxLength": MAX_NODE_ARG_BYTES }, "addr": { "type": "string", "maxLength": MAX_ADDR_ARG_BYTES }, "pubkey": { "type": "string", "maxLength": MAX_PUBKEY_ARG_BYTES } }, "required": ["node_id", "addr", "pubkey"], "additionalProperties": false }), false),
     ])
 }
 
@@ -445,7 +486,7 @@ fn call_tool(state: &SurfaceState, params: &Value) -> Value {
 /// Map a tool name + args to a [`Verb`], run it over the bus, and normalize to `(is_error, body)`.
 fn dispatch(state: &SurfaceState, name: &str, args: &Value) -> (bool, Value) {
     if !known_tool(name) {
-        return (true, json!({ "error": format!("unknown tool: {name}") }));
+        return (true, json!({ "error": format!("unknown tool: {}", preview_token(name)) }));
     }
     if let Err(e) = validate_args(name, args) {
         return (true, json!({ "error": e }));
@@ -575,7 +616,66 @@ struct ArgSpec {
     name: &'static str,
     ty: ArgType,
     required: bool,
+    max_bytes: Option<usize>,
 }
+
+impl ArgSpec {
+    const fn string(name: &'static str, required: bool, max_bytes: usize) -> Self {
+        Self { name, ty: ArgType::String, required, max_bytes: Some(max_bytes) }
+    }
+
+    const fn u64(name: &'static str, required: bool) -> Self {
+        Self { name, ty: ArgType::U64, required, max_bytes: None }
+    }
+
+    const fn bool(name: &'static str, required: bool) -> Self {
+        Self { name, ty: ArgType::Bool, required, max_bytes: None }
+    }
+}
+
+const ARGS_NONE: &[ArgSpec] = &[];
+const ARGS_JOURNAL: &[ArgSpec] = &[ArgSpec::u64("limit", false)];
+const ARGS_AUTHOR: &[ArgSpec] = &[ArgSpec::string("request", true, MAX_AUTHOR_ARG_BYTES)];
+const ARGS_LOAD: &[ArgSpec] = &[
+    ArgSpec::string("manifest_path", true, MAX_PATH_ARG_BYTES),
+    ArgSpec::string("artifact_path", true, MAX_PATH_ARG_BYTES),
+];
+const ARGS_REGISTRY_PUBLISH: &[ArgSpec] = &[
+    ArgSpec::string("manifest_path", true, MAX_PATH_ARG_BYTES),
+    ArgSpec::string("artifact_path", true, MAX_PATH_ARG_BYTES),
+    ArgSpec::string("realm", false, MAX_REALM_ARG_BYTES),
+];
+const ARGS_REGISTRY_FETCH: &[ArgSpec] = &[
+    ArgSpec::string("artifact_hash", true, MAX_HASH_ARG_BYTES),
+    ArgSpec::string("realm", false, MAX_REALM_ARG_BYTES),
+];
+const ARGS_REGISTRY_LIST: &[ArgSpec] = &[ArgSpec::string("realm", false, MAX_REALM_ARG_BYTES)];
+const ARGS_BESTIARY_PROVE: &[ArgSpec] = &[
+    ArgSpec::string("artifact_hash", true, MAX_HASH_ARG_BYTES),
+    ArgSpec::string("realm", true, MAX_REALM_ARG_BYTES),
+];
+const ARGS_SEND: &[ArgSpec] = &[
+    ArgSpec::u64("id", true),
+    ArgSpec::string("text", true, MAX_TEXT_ARG_BYTES),
+    ArgSpec::string("node", false, MAX_NODE_ARG_BYTES),
+];
+const ARGS_INTENT: &[ArgSpec] = &[
+    ArgSpec::string("outcome", true, omni::MAX_CONTROL_ROLE_NAME_BYTES),
+    ArgSpec::string("text", true, MAX_TEXT_ARG_BYTES),
+];
+const ARGS_BIND: &[ArgSpec] =
+    &[ArgSpec::string("role", true, omni::MAX_CONTROL_ROLE_NAME_BYTES), ArgSpec::u64("id", true)];
+const ARGS_UNLOAD: &[ArgSpec] = &[ArgSpec::u64("id", true)];
+const ARGS_CLUSTER_CONNECT: &[ArgSpec] = &[
+    ArgSpec::string("node_id", true, MAX_NODE_ARG_BYTES),
+    ArgSpec::string("addr", true, MAX_ADDR_ARG_BYTES),
+    ArgSpec::string("pubkey", true, MAX_PUBKEY_ARG_BYTES),
+];
+const ARGS_AI_STATUS: &[ArgSpec] = &[
+    ArgSpec::bool("working", true),
+    ArgSpec::string("activity", false, MAX_AI_STATUS_ARG_BYTES),
+    ArgSpec::string("message", false, MAX_AI_STATUS_ARG_BYTES),
+];
 
 fn known_tool(name: &str) -> bool {
     matches!(
@@ -603,53 +703,20 @@ fn known_tool(name: &str) -> bool {
 
 fn arg_specs(name: &str) -> &'static [ArgSpec] {
     match name {
-        "alpha_journal" => &[ArgSpec { name: "limit", ty: ArgType::U64, required: false }],
-        "alpha_author" | "alpha_author_critter" => {
-            &[ArgSpec { name: "request", ty: ArgType::String, required: true }]
-        }
-        "alpha_load" => &[
-            ArgSpec { name: "manifest_path", ty: ArgType::String, required: true },
-            ArgSpec { name: "artifact_path", ty: ArgType::String, required: true },
-        ],
-        "alpha_registry_publish" => &[
-            ArgSpec { name: "manifest_path", ty: ArgType::String, required: true },
-            ArgSpec { name: "artifact_path", ty: ArgType::String, required: true },
-            ArgSpec { name: "realm", ty: ArgType::String, required: false },
-        ],
-        "alpha_registry_fetch" => &[
-            ArgSpec { name: "artifact_hash", ty: ArgType::String, required: true },
-            ArgSpec { name: "realm", ty: ArgType::String, required: false },
-        ],
-        "alpha_registry_list" => &[ArgSpec { name: "realm", ty: ArgType::String, required: false }],
-        "alpha_bestiary_prove" => &[
-            ArgSpec { name: "artifact_hash", ty: ArgType::String, required: true },
-            ArgSpec { name: "realm", ty: ArgType::String, required: true },
-        ],
-        "alpha_send" => &[
-            ArgSpec { name: "id", ty: ArgType::U64, required: true },
-            ArgSpec { name: "text", ty: ArgType::String, required: true },
-            ArgSpec { name: "node", ty: ArgType::String, required: false },
-        ],
-        "alpha_intent" => &[
-            ArgSpec { name: "outcome", ty: ArgType::String, required: true },
-            ArgSpec { name: "text", ty: ArgType::String, required: true },
-        ],
-        "alpha_bind" => &[
-            ArgSpec { name: "role", ty: ArgType::String, required: true },
-            ArgSpec { name: "id", ty: ArgType::U64, required: true },
-        ],
-        "alpha_unload" => &[ArgSpec { name: "id", ty: ArgType::U64, required: true }],
-        "alpha_cluster_connect" => &[
-            ArgSpec { name: "node_id", ty: ArgType::String, required: true },
-            ArgSpec { name: "addr", ty: ArgType::String, required: true },
-            ArgSpec { name: "pubkey", ty: ArgType::String, required: true },
-        ],
-        "alpha_ai_status" => &[
-            ArgSpec { name: "working", ty: ArgType::Bool, required: true },
-            ArgSpec { name: "activity", ty: ArgType::String, required: false },
-            ArgSpec { name: "message", ty: ArgType::String, required: false },
-        ],
-        _ => &[],
+        "alpha_journal" => ARGS_JOURNAL,
+        "alpha_author" | "alpha_author_critter" => ARGS_AUTHOR,
+        "alpha_load" => ARGS_LOAD,
+        "alpha_registry_publish" => ARGS_REGISTRY_PUBLISH,
+        "alpha_registry_fetch" => ARGS_REGISTRY_FETCH,
+        "alpha_registry_list" => ARGS_REGISTRY_LIST,
+        "alpha_bestiary_prove" => ARGS_BESTIARY_PROVE,
+        "alpha_send" => ARGS_SEND,
+        "alpha_intent" => ARGS_INTENT,
+        "alpha_bind" => ARGS_BIND,
+        "alpha_unload" => ARGS_UNLOAD,
+        "alpha_cluster_connect" => ARGS_CLUSTER_CONNECT,
+        "alpha_ai_status" => ARGS_AI_STATUS,
+        _ => ARGS_NONE,
     }
 }
 
@@ -660,7 +727,7 @@ fn validate_args(name: &str, args: &Value) -> Result<(), String> {
     let specs = arg_specs(name);
     for key in obj.keys() {
         if !specs.iter().any(|s| s.name == key) {
-            return Err(format!("unknown parameter `{key}` for {name}"));
+            return Err(format!("unknown parameter `{}` for {name}", preview_token(key)));
         }
     }
     for spec in specs {
@@ -677,6 +744,16 @@ fn validate_args(name: &str, args: &Value) -> Result<(), String> {
                         spec.name,
                         spec.ty.label()
                     ));
+                }
+                if let (Some(max), Some(s)) = (spec.max_bytes, value.as_str()) {
+                    if s.len() > max {
+                        return Err(format!(
+                            "parameter `{}` for {name} is {} bytes, exceeds {} byte limit",
+                            spec.name,
+                            s.len(),
+                            max
+                        ));
+                    }
                 }
             }
         }
@@ -741,6 +818,22 @@ mod tests {
     }
 
     #[test]
+    fn initialize_reflects_only_bounded_protocol_versions() {
+        let exact = "v".repeat(MAX_PROTOCOL_VERSION_BYTES);
+        assert_eq!(
+            initialize_result(&json!({ "protocolVersion": exact }))["protocolVersion"],
+            json!(exact)
+        );
+
+        assert_eq!(
+            initialize_result(
+                &json!({ "protocolVersion": "v".repeat(MAX_PROTOCOL_VERSION_BYTES + 1) })
+            )["protocolVersion"],
+            json!(PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
     fn pending_control_requests_are_bounded() {
         let st = test_state();
         let mut receivers = Vec::new();
@@ -766,6 +859,54 @@ mod tests {
         let (tx, rx) = channel();
         st.register_pending(999_999, tx).expect("space reopens after one is removed");
         receivers.push(rx);
+    }
+
+    #[test]
+    fn validate_args_rejects_oversized_string_arguments() {
+        let err = validate_args(
+            "alpha_registry_fetch",
+            &json!({ "artifact_hash": "x".repeat(MAX_HASH_ARG_BYTES + 1) }),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("artifact_hash"), "names the field: {err}");
+        assert!(err.contains("exceeds"), "explains the byte cap: {err}");
+        assert!(err.contains(&MAX_HASH_ARG_BYTES.to_string()), "reports the cap: {err}");
+    }
+
+    #[test]
+    fn unknown_tool_errors_do_not_echo_unbounded_names() {
+        let st = test_state();
+        let huge = "tool".repeat(MAX_ERROR_TOKEN_BYTES);
+
+        let (is_error, value) = dispatch(&st, &huge, &json!({}));
+
+        assert!(is_error);
+        let err = value["error"].as_str().expect("error string");
+        assert!(err.contains("..."), "oversized token is marked truncated: {err:?}");
+        assert!(
+            err.len() <= "unknown tool: ".len() + MAX_ERROR_TOKEN_BYTES + 3,
+            "error is bounded: {} bytes",
+            err.len()
+        );
+    }
+
+    #[test]
+    fn unknown_parameter_errors_do_not_echo_unbounded_names() {
+        let st = test_state();
+        let huge_key = "surprise".repeat(MAX_ERROR_TOKEN_BYTES);
+        let args = json!({ huge_key: true });
+
+        let (is_error, value) = dispatch(&st, "alpha_status", &args);
+
+        assert!(is_error);
+        let err = value["error"].as_str().expect("error string");
+        assert!(err.contains("..."), "oversized token is marked truncated: {err:?}");
+        assert!(
+            err.len() <= "unknown parameter `` for alpha_status".len() + MAX_ERROR_TOKEN_BYTES + 3,
+            "error is bounded: {} bytes",
+            err.len()
+        );
     }
 
     #[test]

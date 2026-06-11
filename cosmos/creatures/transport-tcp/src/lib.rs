@@ -181,6 +181,12 @@ impl WireFrame {
 
 /// Schema of the cluster control op an operator/front-end sends to admit a peer or read the graph.
 pub const CTL_SCHEMA: &str = "transport.ctl";
+/// Maximum bytes accepted for one `transport.ctl` request before JSON decode. Control ops are small
+/// (`Members` or a single bounded `Connect` member); keep this far below the data-plane frame cap.
+pub const MAX_TRANSPORT_CTL_BYTES: usize = 64 * 1024;
+/// Maximum bytes accepted for one `transport.ctl` reply before JSON decode. The default member-table
+/// cap fits under this; larger/unbounded lab meshes should page or narrow their control view.
+pub const MAX_TRANSPORT_CTL_REPLY_BYTES: usize = 1024 * 1024;
 
 /// Cluster control op (schema [`CTL_SCHEMA`]). Recognized in `handle()` by schema, address-agnostic.
 #[derive(Serialize, Deserialize, Debug)]
@@ -196,6 +202,9 @@ impl TransportCtl {
         aether::wire::to_bytes(self)
     }
     pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_TRANSPORT_CTL_BYTES {
+            return None;
+        }
         serde_json::from_slice(bytes).ok()
     }
 }
@@ -213,6 +222,9 @@ impl TransportCtlReply {
         aether::wire::to_bytes(self)
     }
     pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_TRANSPORT_CTL_REPLY_BYTES {
+            return None;
+        }
         serde_json::from_slice(bytes).ok()
     }
 }
@@ -340,7 +352,22 @@ impl TransportTcp {
     pub fn with_gossip(self, advertise_addr: Option<String>) -> Self {
         self.state.gossip.store(true, Ordering::Relaxed);
         if let Some(a) = advertise_addr {
-            *mlock(&self.state.advertise_addr) = a;
+            if let Some(reason) = validate_member_addr(&a) {
+                eprintln!("transport-tcp: ignoring gossip advertise address ({reason})");
+            } else {
+                *mlock(&self.state.advertise_addr) = a;
+            }
+        }
+        // The default advertise address is the (unvalidated, bind-resolvable) listen address, so a
+        // rejected override falls back to a value peers may equally refuse — say what will really
+        // be gossiped instead of implying the fallback is fine. Receiving peers shape-check every
+        // gossiped member, so an invalid self entry simply never propagates.
+        let effective = mlock(&self.state.advertise_addr).clone();
+        if let Some(reason) = validate_member_addr(&effective) {
+            eprintln!(
+                "transport-tcp: gossiping advertise address `{effective}` that peers will refuse \
+                 ({reason}); set an IP socket address (e.g. 192.0.2.1:9001)"
+            );
         }
         self
     }
@@ -428,10 +455,7 @@ impl Creature for TransportTcp {
         let disposition = {
             let writers = mlock(&self.state.writers);
             match writers.get(&peer_node) {
-                Some(tx) => tx.try_send(bytes).err().map(|e| match e {
-                    TrySendError::Full(_) => "peer_send_dropped:backpressure",
-                    TrySendError::Disconnected(_) => "peer_send_dropped:no_link",
-                }),
+                Some(tx) => queue_peer_frame(tx, bytes, MAX_FRAME_BYTES).err(),
                 None => Some("peer_send_dropped:no_link"),
             }
         };
@@ -496,6 +520,25 @@ impl Creature for TransportTcp {
             }
         }
     }
+}
+
+fn queue_peer_frame(
+    tx: &SyncSender<Vec<u8>>,
+    frame: Vec<u8>,
+    max_frame_bytes: usize,
+) -> Result<(), &'static str> {
+    // An empty frame is `wire::to_bytes`'s release-mode degrade for an unserializable value —
+    // never a real wire message. Name it distinctly so the shed event tells the truth.
+    if frame.is_empty() {
+        return Err("peer_send_dropped:empty_frame");
+    }
+    if frame.len() > max_frame_bytes {
+        return Err("peer_send_dropped:frame_too_large");
+    }
+    tx.try_send(frame).map_err(|e| match e {
+        TrySendError::Full(_) => "peer_send_dropped:backpressure",
+        TrySendError::Disconnected(_) => "peer_send_dropped:no_link",
+    })
 }
 
 // ---- listener / dialer ----
@@ -1278,7 +1321,7 @@ fn member_gossip(state: &Arc<TransportState>) -> Vec<GossipMember> {
 fn gossip_to_peer(state: &Arc<TransportState>, peer: &NodeId) {
     let frame = WireFrame::Gossip { members: member_gossip(state) }.to_bytes();
     if let Some(tx) = mlock(&state.writers).get(peer) {
-        let _ = tx.try_send(frame);
+        let _ = queue_peer_frame(tx, frame, MAX_FRAME_BYTES);
     }
 }
 
@@ -1286,7 +1329,7 @@ fn gossip_to_peer(state: &Arc<TransportState>, peer: &NodeId) {
 fn gossip_broadcast(state: &Arc<TransportState>) {
     let frame = WireFrame::Gossip { members: member_gossip(state) }.to_bytes();
     for tx in mlock(&state.writers).values() {
-        let _ = tx.try_send(frame.clone());
+        let _ = queue_peer_frame(tx, frame.clone(), MAX_FRAME_BYTES);
     }
 }
 
@@ -1317,6 +1360,20 @@ fn ingest_gossip(state: &Arc<TransportState>, members: Vec<GossipMember>) {
 /// Handle a `transport.ctl` control op: admit/dial a peer (`Connect`) or report the graph
 /// (`Members`). Replies to the op's `reply_to`.
 fn handle_ctl(state: &Arc<TransportState>, env: &Envelope) -> Outcome {
+    if env.payload.len() > MAX_TRANSPORT_CTL_BYTES {
+        return Outcome::send(
+            Dispatch::reply_to_env(
+                env,
+                TransportCtlReply::Rejected {
+                    reason: format!(
+                        "transport control payload exceeds {MAX_TRANSPORT_CTL_BYTES} byte cap"
+                    ),
+                }
+                .to_bytes(),
+            )
+            .with_schema(CTL_SCHEMA),
+        );
+    }
     let Some(op) = TransportCtl::parse(&env.payload) else {
         return Outcome::none();
     };
@@ -1491,6 +1548,43 @@ mod tests {
         assert_eq!(DEFAULT_MAX_MEMBERS + 1, MAX_GOSSIP_MEMBERS);
     }
 
+    #[test]
+    fn peer_frame_enqueue_refuses_oversized_frames_before_queueing() {
+        let (tx, rx) = sync_channel::<Vec<u8>>(1);
+
+        assert_eq!(
+            queue_peer_frame(&tx, vec![1, 2, 3], 2).unwrap_err(),
+            "peer_send_dropped:frame_too_large"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "oversized frames must not be retained in the outbound queue"
+        );
+        assert_eq!(
+            queue_peer_frame(&tx, Vec::new(), 2).unwrap_err(),
+            "peer_send_dropped:empty_frame"
+        );
+        assert!(rx.try_recv().is_err(), "empty frames must not be retained in the outbound queue");
+
+        queue_peer_frame(&tx, vec![1, 2], 2).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn peer_frame_enqueue_preserves_backpressure_and_disconnect_events() {
+        let (tx, rx) = sync_channel::<Vec<u8>>(1);
+        queue_peer_frame(&tx, vec![1], MAX_FRAME_BYTES).unwrap();
+        assert_eq!(
+            queue_peer_frame(&tx, vec![2], MAX_FRAME_BYTES).unwrap_err(),
+            "peer_send_dropped:backpressure"
+        );
+        drop(rx);
+        assert_eq!(
+            queue_peer_frame(&tx, vec![3], MAX_FRAME_BYTES).unwrap_err(),
+            "peer_send_dropped:no_link"
+        );
+    }
+
     /// A bound-free transport state (no listener/threads) for testing the pure membership logic.
     fn test_state(self_id: &str) -> Arc<TransportState> {
         let (k, _) = Ed25519KeyMaterial::generate().unwrap();
@@ -1506,6 +1600,39 @@ mod tests {
     fn test_pubkey_hex() -> String {
         let (k, _) = Ed25519KeyMaterial::generate().unwrap();
         k.public_hex().to_string()
+    }
+
+    #[test]
+    fn gossip_advertise_addr_is_shape_checked() {
+        let (bad_key, _) = Ed25519KeyMaterial::generate().unwrap();
+        let bad_cfg = TransportConfig {
+            self_key: bad_key,
+            self_node: NodeId("bad".into()),
+            listen_addr: "127.0.0.1:0".into(),
+            peers: vec![],
+        };
+        let bad = TransportTcp::new(bad_cfg).with_gossip(Some("localhost:9001".into()));
+        assert!(
+            bad.state.gossip.load(Ordering::Relaxed),
+            "invalid advertise override must not disable gossip mode"
+        );
+        assert_eq!(
+            mlock(&bad.state.advertise_addr).as_str(),
+            "127.0.0.1:0",
+            "invalid advertise override falls back to the listener address"
+        );
+        assert_eq!(member_gossip(&bad.state)[0].addr, "127.0.0.1:0");
+
+        let (good_key, _) = Ed25519KeyMaterial::generate().unwrap();
+        let good_cfg = TransportConfig {
+            self_key: good_key,
+            self_node: NodeId("good".into()),
+            listen_addr: "127.0.0.1:0".into(),
+            peers: vec![],
+        };
+        let good = TransportTcp::new(good_cfg).with_gossip(Some("[::1]:9001".into()));
+        assert_eq!(mlock(&good.state.advertise_addr).as_str(), "[::1]:9001");
+        assert_eq!(member_gossip(&good.state)[0].addr, "[::1]:9001");
     }
 
     #[derive(Default)]
@@ -1787,6 +1914,63 @@ mod tests {
         }
         assert!(!mlock(&state.members).contains_key(&NodeId("b".into())));
         assert!(!mlock(&state.peers_by_pubkey).contains_key(&pk_b));
+    }
+
+    #[test]
+    fn control_payload_is_capped_before_json_decode() {
+        let state = test_state("me");
+        let env = Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(42)),
+                to: Address::Creature(CreatureId(1)),
+                reply_to: Some(Address::Creature(CreatureId(42))),
+                seq: 0,
+                causal: Vec::new(),
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(7),
+                commitment: None,
+                schema: CTL_SCHEMA.into(),
+            },
+            payload: vec![b' '; MAX_TRANSPORT_CTL_BYTES + 1],
+        };
+
+        assert!(
+            TransportCtl::parse(&env.payload).is_none(),
+            "oversized control payloads are rejected before serde"
+        );
+        let out = handle_ctl(&state, &env);
+        assert_eq!(out.dispatches.len(), 1);
+        match TransportCtlReply::parse(&out.dispatches[0].payload) {
+            Some(TransportCtlReply::Rejected { reason }) => {
+                assert!(reason.contains("byte cap"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert!(
+            mlock(&state.members).is_empty(),
+            "oversized control payloads must not alter the member table"
+        );
+    }
+
+    #[test]
+    fn control_reply_payload_is_capped_before_json_decode() {
+        let payload = vec![b' '; MAX_TRANSPORT_CTL_REPLY_BYTES + 1];
+        assert!(
+            TransportCtlReply::parse(&payload).is_none(),
+            "oversized control replies are rejected before serde"
+        );
+
+        let ok = TransportCtlReply::Members {
+            self_node: "me".into(),
+            members: vec![MemberView {
+                node_id: "peer".into(),
+                addr: "127.0.0.1:9".into(),
+                connected: true,
+            }],
+        }
+        .to_bytes();
+        assert!(matches!(TransportCtlReply::parse(&ok), Some(TransportCtlReply::Members { .. })));
     }
 
     #[test]

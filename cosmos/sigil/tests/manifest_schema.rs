@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use sigil::{
     Abi, Backend, Capabilities, Entrypoint, Manifest, NetCapability, Provenance, RealmId,
-    Requirements,
+    Requirements, MAX_MANIFEST_NAME_BYTES, MAX_MANIFEST_PROVIDES,
 };
 
 const SCHEMA_SRC: &str = include_str!("../manifest.schema.json");
@@ -28,7 +28,8 @@ fn schema() -> Value {
 // ---------------------------------------------------------------------------------------------
 // A minimal Draft-2020-12 validator — ONLY the keywords manifest.schema.json actually uses:
 // `$ref` (to `#/$defs/*`), `type` (string or array of strings), `required`, `properties`,
-// `additionalProperties: false`, `enum`, `items`, `minimum`, `maximum`. Anything else is ignored.
+// `additionalProperties: false`, `enum`, `items`, `minimum`, `maximum`, `maxLength`, `maxItems`.
+// Anything else is ignored.
 // Returns the list of validation errors (empty = valid).
 // ---------------------------------------------------------------------------------------------
 
@@ -70,6 +71,15 @@ fn validate(schema: &Value, root: &Value, instance: &Value, path: &str, errs: &m
         }
     }
 
+    if let Some(s) = instance.as_str() {
+        if let Some(max) = schema.get("maxLength").and_then(Value::as_u64) {
+            let len = s.len() as u64;
+            if len > max {
+                errs.push(format!("{path}: string length {len} > maxLength {max}"));
+            }
+        }
+    }
+
     if let Some(obj) = instance.as_object() {
         let props = schema.get("properties").and_then(Value::as_object);
 
@@ -96,6 +106,12 @@ fn validate(schema: &Value, root: &Value, instance: &Value, path: &str, errs: &m
     }
 
     if let Some(arr) = instance.as_array() {
+        if let Some(max) = schema.get("maxItems").and_then(Value::as_u64) {
+            let len = arr.len() as u64;
+            if len > max {
+                errs.push(format!("{path}: array length {len} > maxItems {max}"));
+            }
+        }
         if let Some(items) = schema.get("items") {
             for (i, el) in arr.iter().enumerate() {
                 validate(items, root, el, &format!("{path}/{i}"), errs);
@@ -211,6 +227,22 @@ fn malformed_manifests_are_rejected() {
             "capabilities": { "net": "carrier-pigeon" }
         }),
         "unknown net capability",
+    );
+    assert_invalid(
+        &json!({
+            "name": "x".repeat(MAX_MANIFEST_NAME_BYTES + 1),
+            "version": "1.0.0",
+            "abi": { "backend": "daemon", "abi_tag": "gawd_creature_v1" }
+        }),
+        "name over maxLength",
+    );
+    assert_invalid(
+        &json!({
+            "name": "x", "version": "1.0.0",
+            "abi": { "backend": "daemon", "abi_tag": "gawd_creature_v1" },
+            "provides": vec!["policy"; MAX_MANIFEST_PROVIDES + 1]
+        }),
+        "provides over maxItems",
     );
 }
 

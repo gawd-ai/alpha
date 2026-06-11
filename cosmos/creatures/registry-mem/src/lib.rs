@@ -46,7 +46,9 @@
 //! The in-memory catalog is bounded by default ([`DEFAULT_MAX_REGISTRY_ENTRIES`]) so a peer cannot
 //! grow this reference store indefinitely by publishing ever-new artifacts. At capacity, a new key is
 //! refused while an existing key can still be re-published; `with_max_entries(0)` is the explicit
-//! unbounded opt-out for lab or demo workloads. Full-artifact anti-entropy snapshots
+//! unbounded opt-out for lab or demo workloads. Published manifests are re-run through
+//! `Manifest::validate`, whose metadata strings and lists are capped before the registry retains
+//! them. Full-artifact anti-entropy snapshots
 //! (`ListEntries`) are also source-capped by total artifact bytes so a caller cannot force the
 //! registry to clone the whole catalog into one giant reply.
 
@@ -190,6 +192,11 @@ impl RegistryMem {
         if self.max_artifact_bytes != 0 && artifact.len() > self.max_artifact_bytes {
             let message =
                 registry_artifact_too_large_message(artifact.len(), self.max_artifact_bytes);
+            eprintln!("registry-mem: {message}; refusing artifact {hash} in realm {}", realm.0);
+            return PublishResult::Refused { artifact_hash: hash, message };
+        }
+        if let Err(e) = manifest.validate() {
+            let message = format!("invalid manifest: {e}");
             eprintln!("registry-mem: {message}; refusing artifact {hash} in realm {}", realm.0);
             return PublishResult::Refused { artifact_hash: hash, message };
         }
@@ -568,7 +575,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use aether::{Address, CreatureId, Header};
-    use sigil::Backend;
+    use sigil::{Backend, MAX_MANIFEST_NAME_BYTES};
 
     fn manifest(name: &str) -> Manifest {
         Manifest::new(name, "0.1.0", Backend::Daemon, "gawd_creature_v1")
@@ -1224,6 +1231,33 @@ mod tests {
         let direct_hash = r.publish(manifest("direct-too-big"), bytes);
         assert_eq!(direct_hash, hash, "direct publish still reports the content address");
         assert!(r.fetch(&hash).is_none(), "oversized direct publish was not stored");
+    }
+
+    #[test]
+    fn invalid_publish_manifest_is_rejected_and_not_stored() {
+        let mut r = RegistryMem::new();
+        let bytes = b"artifact-bytes".to_vec();
+        let hash = sha256_hex(&bytes);
+        let mut m = manifest("bad");
+        m.name = "n".repeat(MAX_MANIFEST_NAME_BYTES + 1);
+
+        let env = op_env(
+            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone() },
+            CreatureId(1),
+        );
+        let reply = r.handle(env);
+        let reply: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("invalid manifest"), "unexpected error: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(r.fetch(&hash).is_none(), "invalid bus publish was not stored");
+
+        let direct_hash = r.publish(m, bytes);
+        assert_eq!(direct_hash, hash, "direct publish still reports the content address");
+        assert!(r.fetch(&hash).is_none(), "invalid direct publish was not stored");
     }
 
     #[test]

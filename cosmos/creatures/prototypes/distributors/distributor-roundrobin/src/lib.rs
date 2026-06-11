@@ -16,10 +16,17 @@
 //! reference stays in the repo as: (a) the minimum-viable Distributor (still useful for tests that
 //! don't want SEER overhead), and (b) the IoC-composability proof — two distributor creatures can
 //! coexist; the operator picks one with `bind_role(Role::DISTRIBUTOR, …)`.
+//!
+//! The retained target list is bounded by default. Pass `0` to
+//! [`RoundRobinDistributor::with_targets_and_limit`] only for a lab/demo setup that intentionally
+//! accepts an unbounded target table.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aether::{Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome};
+
+/// Default maximum number of targets retained by the reference distributor.
+pub const DEFAULT_MAX_ROUNDROBIN_TARGETS: usize = 1024;
 
 pub struct RoundRobinDistributor {
     targets: Vec<CreatureId>,
@@ -28,7 +35,22 @@ pub struct RoundRobinDistributor {
 
 impl RoundRobinDistributor {
     pub fn with_targets(targets: Vec<CreatureId>) -> Self {
+        Self::with_targets_and_limit(targets, DEFAULT_MAX_ROUNDROBIN_TARGETS)
+    }
+
+    /// Build with an explicit retained-target cap. `max_targets == 0` disables the cap.
+    pub fn with_targets_and_limit(targets: Vec<CreatureId>, max_targets: usize) -> Self {
+        let targets = if max_targets == 0 {
+            targets
+        } else {
+            targets.into_iter().take(max_targets).collect()
+        };
         RoundRobinDistributor { targets, next: AtomicUsize::new(0) }
+    }
+
+    /// Number of retained targets, useful for tests and observability.
+    pub fn target_count(&self) -> usize {
+        self.targets.len()
     }
 }
 
@@ -118,5 +140,16 @@ mod tests {
             payload: b"x".to_vec(),
         };
         assert!(r.handle(env).dispatches.is_empty());
+    }
+
+    #[test]
+    fn target_list_is_bounded_by_default_and_zero_opt_out_is_unbounded() {
+        let targets: Vec<_> =
+            (0..=DEFAULT_MAX_ROUNDROBIN_TARGETS).map(|i| CreatureId(10_000 + i as u64)).collect();
+        let r = RoundRobinDistributor::with_targets(targets.clone());
+        assert_eq!(r.target_count(), DEFAULT_MAX_ROUNDROBIN_TARGETS);
+
+        let unbounded = RoundRobinDistributor::with_targets_and_limit(targets, 0);
+        assert_eq!(unbounded.target_count(), DEFAULT_MAX_ROUNDROBIN_TARGETS + 1);
     }
 }

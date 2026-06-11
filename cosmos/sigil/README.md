@@ -70,8 +70,9 @@ provenance:
 ```
 
 Construct one in Rust with `Manifest::new(name, version, backend, abi_tag)` and fill the rest, or
-`Manifest::parse(bytes)` to validate untrusted JSON (never panics — malformed input becomes a
-structured `ManifestError`).
+`Manifest::parse(bytes)` to validate untrusted JSON. Parsing is capped at 1 MiB and never panics:
+oversized or malformed input becomes a structured `ManifestError`. Structural validation also bounds
+metadata strings and repeated fields so a manifest remains metadata, not a bulk-data carrier.
 
 ## Machine-readable schema
 

@@ -129,15 +129,19 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
 - **Bounded by default, like the in-memory registry.** The durable store refuses new
   `(RealmId, artifact_hash)` keys past `DEFAULT_MAX_BESTIARY_ENTRIES` and rejects an artifact above the
   128 MiB ceiling, with `0` the explicit unbounded opt-out (`with_max_entries` / `with_max_artifact_bytes`);
-  `recover()` replays an existing catalogue even above the current cap. The JSONL journal itself is
-  capped per record before append, compaction rewrite, and recovery line allocation; the advisory
-  `.head` tip hint is also read under a small cap and ignored if malformed; artifacts live in blobs,
-  never in log lines. The legacy `ListEntries` full-artifact anti-entropy reply is also capped by
-  total artifact bytes before the store reads/clones blobs into the snapshot. A `PushEntries` batch is
-  count-capped before the daemon iterates entries or calls the store; `0` in daemon config is the
-  explicit unbounded opt-out. A publish past the entry cap is a wire-honest error (not a false
-  `Published`); a federation `PushEntries` of a *new* key into a full catalogue is skipped
-  (best-effort lattice merge) rather than failing the whole batch.
+  published manifests are also re-run through `Manifest::validate`, whose metadata strings and lists
+  are capped before the store retains them. `recover()` replays an existing catalogue even above the
+  current cap. The JSONL journal itself is capped per record before append, compaction rewrite, and
+  recovery line allocation; the advisory `.head` tip hint is also read under a small cap and ignored
+  if malformed; artifacts live in blobs, never in log lines. The legacy `ListEntries` full-artifact
+  anti-entropy reply, the daemon's autonomous `PushEntries` snapshot, and the curator's artifact-byte
+  snapshot are also capped by total artifact bytes before the store reads/clones blobs into the
+  payload. A `PushEntries` batch is count-capped before the daemon iterates entries or calls the store;
+  the autonomous outbound batch uses the same count cap before blob stats/reads. The retained
+  replication-peer list is also capped and shape-checked at daemon construction. `0` in daemon config
+  is the explicit unbounded opt-out. A publish past the entry cap is a
+  wire-honest error (not a false `Published`); a federation `PushEntries` of a *new* key into a full
+  catalogue is skipped (best-effort lattice merge) rather than failing the whole batch.
   Quarantine markers use the same shared shape caps, and the durable store refuses a sticky
   attesting-peer union that would grow beyond the peer cap.
 - **Verifiable entry proofs.** `ProveEntry` returns a standalone `EntryProof` — the daemon signs
@@ -193,9 +197,11 @@ Two creatures play it:
 - **`embodiment-advertiser`** answers placement Queries. One per Sanctum, configured with the
   Sanctum's `NodeId` and a list of `(CreatureId, Embodiment)` *offers* — the targets the operator
   chose to expose. For each Query it checks each offer against every predicate and answers with the
-  matching `EmbodimentOffer`s, capped to the shared placement answer limit. It shape-checks direct
-  Queries against the same requirement/outcome bounds the distributor uses before parsing predicates.
-  It does not introspect the kernel, does not rank, does not time out.
+  matching `EmbodimentOffer`s, capped to the shared placement answer limit. Its retained offer table
+  is also bounded by default and sanitized at construction: malformed offers are dropped up front,
+  valid offers beyond the default cap are not retained, and `0` is the explicit lab/demo opt-out.
+  It shape-checks direct Queries against the same requirement/outcome bounds the distributor uses
+  before parsing predicates. It does not introspect the kernel, does not rank, does not time out.
 
 ### Requirements as a predicate language
 
@@ -237,11 +243,12 @@ emits a SEER Query, even when there is exactly one local offer, and the traffic 
 bus journal. Wiring the consult early means cross-Realm or fitness-weighted placement lands as a new
 `PickModel`, never as a synchronous local code path retrofitted into placement later.
 
-**A failed consult is structured.** When every advertiser answers empty (or there are none, or an
-abort steer arrives), the distributor emits a `NoProviderReply` to the Intent's `reply_to` with a
-tagged reason — never a panic, never a silent drop. A distinct schema (`distributor.no_provider`)
-from the SEER topic lets an orchestrator bind the consult-reply path separately from the Intent-reply
-path.
+**A failed consult is structured and retained state is bounded.** When every advertiser answers empty
+(or there are none, an abort steer arrives, or the pending table must evict the oldest consult at its
+default cap), the distributor emits a `NoProviderReply` to the Intent's `reply_to` with a tagged
+reason — never a panic, never a silent drop. `with_max_pending(0)` is the explicit lab/demo opt-out
+for unbounded parked consults. A distinct schema (`distributor.no_provider`) from the SEER topic lets
+an orchestrator bind the consult-reply path separately from the Intent-reply path.
 
 ## Realm: a trust domain
 
@@ -326,8 +333,8 @@ four things, and admission gates them all:
    federator, which writes a reversible `MarkQuarantine` into its local registry. The federation
    carries the *path*; what triggers a notice and how a Sanctum reacts is the immune-response
    creature's call, gated by an injected trust model (a peer cannot quarantine your creatures unless
-   you trust it). Outbound, inbound, and pulled quarantine notices are shape-checked before the
-   federator ships or forwards them.
+   you trust it). Outbound, inbound, and pulled quarantine notices are shape-checked for bounded,
+   NUL-free short fields before the federator ships or forwards them.
 
 **Admission stays the only choke point.** Federation moves *bytes* into registries; loading any
 artifact still runs the operator's admission policy. A forged-signer artifact pulled from a peer is

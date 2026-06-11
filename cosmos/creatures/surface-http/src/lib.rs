@@ -29,7 +29,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Query, State,
     },
-    http::{header, StatusCode},
+    http::{header, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -55,6 +55,31 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// HTTP JSON request bodies are just another route into `control_verb`; cap them at the same size the
 /// control core accepts so the surface cannot buffer unbounded input before the bus guard runs.
 const MAX_HTTP_JSON_BODY_BYTES: usize = omni::MAX_CONTROL_VERB_BYTES;
+/// Maximum bytes for HTTP text-like payload arguments before `Verb` construction.
+const MAX_HTTP_TEXT_ARG_BYTES: usize = omni::MAX_CONTROL_VERB_BYTES;
+/// Maximum bytes for an authoring request — the AUTHORING contract's own field cap, so the
+/// surface refuses (and documents) exactly what the authoring bindees downstream would refuse.
+const MAX_HTTP_AUTHOR_ARG_BYTES: usize = omni::MAX_CONTROL_AUTHOR_REQUEST_BYTES;
+/// Maximum bytes for node-local path strings accepted by HTTP tools.
+const MAX_HTTP_PATH_ARG_BYTES: usize = 4096;
+/// Maximum bytes for artifact hashes accepted by HTTP tools.
+const MAX_HTTP_HASH_ARG_BYTES: usize = 128;
+/// Maximum bytes for Realm id strings accepted by HTTP tools.
+const MAX_HTTP_REALM_ARG_BYTES: usize = 256;
+/// Maximum bytes for peer node ids accepted by HTTP tools.
+const MAX_HTTP_NODE_ARG_BYTES: usize = 256;
+/// Maximum bytes for peer dial addresses accepted by HTTP tools.
+const MAX_HTTP_ADDR_ARG_BYTES: usize = 512;
+/// Maximum bytes for peer pubkeys accepted by HTTP tools.
+const MAX_HTTP_PUBKEY_ARG_BYTES: usize = 128;
+/// Maximum bytes for AI status text before the shared control layer sanitizes/truncates it further.
+const MAX_HTTP_AI_STATUS_ARG_BYTES: usize = 4096;
+/// Maximum raw query bytes accepted on protected HTTP routes before typed query extraction.
+const MAX_HTTP_QUERY_BYTES: usize = 1024;
+/// Maximum raw query bytes inspected on the unauthenticated WebSocket upgrade path.
+const MAX_HTTP_WS_QUERY_BYTES: usize = 1024;
+/// Maximum token bytes accepted from `/api/ws?token=...`.
+const MAX_HTTP_WS_TOKEN_BYTES: usize = 256;
 /// Maximum HTTP requests waiting on a `control_result` at once. The control core already bounds its
 /// orchestration worker queue; this bounds the surface-side corr table too, so a burst of clients
 /// cannot allocate one pending oneshot per request until timeouts drain.
@@ -343,6 +368,53 @@ fn into_response(res: VerbResult) -> Response {
     (code, Json(res.json)).into_response()
 }
 
+#[derive(Debug)]
+struct HttpArgError {
+    field: &'static str,
+    len: usize,
+    limit: usize,
+}
+
+fn bad_http_argument(err: HttpArgError) -> Response {
+    let human =
+        format!("parameter `{}` is {} bytes, exceeds {} byte limit", err.field, err.len, err.limit);
+    into_response(VerbResult::err(
+        json!({
+            "error": "bad-http-argument",
+            "field": err.field,
+            "bytes": err.len,
+            "limit": err.limit
+        }),
+        human,
+    ))
+}
+
+macro_rules! reject_bad_http_arg {
+    ($check:expr) => {
+        if let Err(err) = $check {
+            return bad_http_argument(err);
+        }
+    };
+}
+
+fn validate_http_arg(field: &'static str, value: &str, limit: usize) -> Result<(), HttpArgError> {
+    if value.len() > limit {
+        return Err(HttpArgError { field, len: value.len(), limit });
+    }
+    Ok(())
+}
+
+fn validate_http_opt_arg(
+    field: &'static str,
+    value: Option<&str>,
+    limit: usize,
+) -> Result<(), HttpArgError> {
+    if let Some(value) = value {
+        validate_http_arg(field, value, limit)?;
+    }
+    Ok(())
+}
+
 // ---- router / auth ------------------------------------------------------------------------------
 
 fn router(state: Arc<SurfaceState>) -> Router {
@@ -387,6 +459,9 @@ async fn require_api_key(
     request: axum::extract::Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    if !http_query_len_is_valid(request.uri().query()) {
+        return Err(StatusCode::URI_TOO_LONG);
+    }
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -397,6 +472,13 @@ async fn require_api_key(
             Ok(next.run(request).await)
         }
         _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+fn http_query_len_is_valid(query: Option<&str>) -> bool {
+    match query {
+        Some(query) => query.len() <= MAX_HTTP_QUERY_BYTES,
+        None => true,
     }
 }
 
@@ -496,6 +578,7 @@ async fn h_journal(State(st): State<Arc<SurfaceState>>, Query(q): Query<JournalQ
 }
 
 async fn h_author(State(st): State<Arc<SurfaceState>>, Json(b): Json<AuthorReq>) -> Response {
+    reject_bad_http_arg!(validate_http_arg("request", &b.request, MAX_HTTP_AUTHOR_ARG_BYTES));
     into_response(request_control(&st, Verb::Author { request: b.request }, AUTHOR_TIMEOUT).await)
 }
 
@@ -503,12 +586,23 @@ async fn h_author_critter(
     State(st): State<Arc<SurfaceState>>,
     Json(b): Json<AuthorReq>,
 ) -> Response {
+    reject_bad_http_arg!(validate_http_arg("request", &b.request, MAX_HTTP_AUTHOR_ARG_BYTES));
     into_response(
         request_control(&st, Verb::AuthorCritter { request: b.request }, AUTHOR_TIMEOUT).await,
     )
 }
 
 async fn h_load(State(st): State<Arc<SurfaceState>>, Json(b): Json<LoadReq>) -> Response {
+    reject_bad_http_arg!(validate_http_arg(
+        "manifest_path",
+        &b.manifest_path,
+        MAX_HTTP_PATH_ARG_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_arg(
+        "artifact_path",
+        &b.artifact_path,
+        MAX_HTTP_PATH_ARG_BYTES
+    ));
     into_response(
         request_control(
             &st,
@@ -533,6 +627,21 @@ async fn h_registry_publish(
     State(st): State<Arc<SurfaceState>>,
     Json(b): Json<RegistryPublishReq>,
 ) -> Response {
+    reject_bad_http_arg!(validate_http_arg(
+        "manifest_path",
+        &b.manifest_path,
+        MAX_HTTP_PATH_ARG_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_arg(
+        "artifact_path",
+        &b.artifact_path,
+        MAX_HTTP_PATH_ARG_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_opt_arg(
+        "realm",
+        b.realm.as_deref(),
+        MAX_HTTP_REALM_ARG_BYTES
+    ));
     into_response(
         request_control(
             &st,
@@ -551,6 +660,16 @@ async fn h_registry_fetch(
     State(st): State<Arc<SurfaceState>>,
     Query(q): Query<RegistryFetchQ>,
 ) -> Response {
+    reject_bad_http_arg!(validate_http_arg(
+        "artifact_hash",
+        &q.artifact_hash,
+        MAX_HTTP_HASH_ARG_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_opt_arg(
+        "realm",
+        q.realm.as_deref(),
+        MAX_HTTP_REALM_ARG_BYTES
+    ));
     into_response(
         request_control(
             &st,
@@ -565,6 +684,11 @@ async fn h_registry_list(
     State(st): State<Arc<SurfaceState>>,
     Query(q): Query<RegistryListQ>,
 ) -> Response {
+    reject_bad_http_arg!(validate_http_opt_arg(
+        "realm",
+        q.realm.as_deref(),
+        MAX_HTTP_REALM_ARG_BYTES
+    ));
     into_response(
         request_control(&st, Verb::RegistryList { realm: opt_realm(q.realm) }, READ_TIMEOUT).await,
     )
@@ -574,6 +698,12 @@ async fn h_bestiary_prove(
     State(st): State<Arc<SurfaceState>>,
     Query(q): Query<BestiaryProveQ>,
 ) -> Response {
+    reject_bad_http_arg!(validate_http_arg(
+        "artifact_hash",
+        &q.artifact_hash,
+        MAX_HTTP_HASH_ARG_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_arg("realm", &q.realm, MAX_HTTP_REALM_ARG_BYTES));
     into_response(
         request_control(
             &st,
@@ -585,6 +715,8 @@ async fn h_bestiary_prove(
 }
 
 async fn h_send(State(st): State<Arc<SurfaceState>>, Json(b): Json<SendReq>) -> Response {
+    reject_bad_http_arg!(validate_http_arg("text", &b.text, MAX_HTTP_TEXT_ARG_BYTES));
+    reject_bad_http_arg!(validate_http_opt_arg("node", b.node.as_deref(), MAX_HTTP_NODE_ARG_BYTES));
     into_response(
         request_control(&st, Verb::Send { id: b.id, text: b.text, node: b.node }, READ_TIMEOUT)
             .await,
@@ -592,12 +724,19 @@ async fn h_send(State(st): State<Arc<SurfaceState>>, Json(b): Json<SendReq>) -> 
 }
 
 async fn h_intent(State(st): State<Arc<SurfaceState>>, Json(b): Json<IntentReq>) -> Response {
+    reject_bad_http_arg!(validate_http_arg(
+        "outcome",
+        &b.outcome,
+        omni::MAX_CONTROL_ROLE_NAME_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_arg("text", &b.text, MAX_HTTP_TEXT_ARG_BYTES));
     into_response(
         request_control(&st, Verb::Intent { outcome: b.outcome, text: b.text }, READ_TIMEOUT).await,
     )
 }
 
 async fn h_bind(State(st): State<Arc<SurfaceState>>, Json(b): Json<BindReq>) -> Response {
+    reject_bad_http_arg!(validate_http_arg("role", &b.role, omni::MAX_CONTROL_ROLE_NAME_BYTES));
     into_response(request_control(&st, Verb::Bind { role: b.role, id: b.id }, READ_TIMEOUT).await)
 }
 
@@ -608,6 +747,8 @@ async fn h_unload(State(st): State<Arc<SurfaceState>>, Json(b): Json<UnloadReq>)
 /// The AI reports what it's doing (not allow-AI gated — the transparency channel). Surfaced live on
 /// the stream and on the operator's stdout tape; then relayed to the control plane as a verb.
 async fn h_ai_status(State(st): State<Arc<SurfaceState>>, Json(b): Json<AiStatusReq>) -> Response {
+    reject_bad_http_arg!(validate_http_arg("activity", &b.activity, MAX_HTTP_AI_STATUS_ARG_BYTES));
+    reject_bad_http_arg!(validate_http_arg("message", &b.message, MAX_HTTP_AI_STATUS_ARG_BYTES));
     let activity = omni::sanitize_ai_status_text(&b.activity);
     let message = omni::sanitize_ai_status_text(&b.message);
     let frame = json!({ "kind": "ai_status", "working": b.working, "activity": activity, "message": message });
@@ -635,6 +776,9 @@ async fn h_cluster_connect(
     State(st): State<Arc<SurfaceState>>,
     Json(b): Json<ClusterConnectReq>,
 ) -> Response {
+    reject_bad_http_arg!(validate_http_arg("node_id", &b.node_id, MAX_HTTP_NODE_ARG_BYTES));
+    reject_bad_http_arg!(validate_http_arg("addr", &b.addr, MAX_HTTP_ADDR_ARG_BYTES));
+    reject_bad_http_arg!(validate_http_arg("pubkey", &b.pubkey, MAX_HTTP_PUBKEY_ARG_BYTES));
     into_response(
         request_control(
             &st,
@@ -646,16 +790,26 @@ async fn h_cluster_connect(
 }
 
 /// The live sense stream. Auth'd via `?token=` (browsers can't set Authorization on a WS upgrade).
-async fn h_ws(
-    ws: WebSocketUpgrade,
-    Query(q): Query<HashMap<String, String>>,
-    State(st): State<Arc<SurfaceState>>,
-) -> Response {
-    let token = q.get("token").cloned().unwrap_or_default();
+async fn h_ws(ws: WebSocketUpgrade, uri: Uri, State(st): State<Arc<SurfaceState>>) -> Response {
+    let token = ws_token_from_query(uri.query()).unwrap_or_default();
     if !constant_time_eq(token.as_bytes(), st.api_key.as_bytes()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
     ws.on_upgrade(move |socket| handle_socket(socket, st))
+}
+
+fn ws_token_from_query(query: Option<&str>) -> Option<&str> {
+    let query = query?;
+    if query.len() > MAX_HTTP_WS_QUERY_BYTES {
+        return None;
+    }
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "token" && value.len() <= MAX_HTTP_WS_TOKEN_BYTES {
+            return Some(value);
+        }
+    }
+    None
 }
 
 async fn handle_socket(mut socket: WebSocket, st: Arc<SurfaceState>) {
@@ -768,6 +922,28 @@ mod tests {
     }
 
     #[test]
+    fn websocket_token_query_scan_is_bounded() {
+        assert_eq!(ws_token_from_query(Some("token=abc123")), Some("abc123"));
+        assert_eq!(ws_token_from_query(Some("x=1&token=abc123&y=2")), Some("abc123"));
+        assert_eq!(ws_token_from_query(None), None);
+        assert_eq!(ws_token_from_query(Some(&"x".repeat(MAX_HTTP_WS_QUERY_BYTES + 1))), None);
+        assert_eq!(
+            ws_token_from_query(Some(&format!(
+                "token={}",
+                "x".repeat(MAX_HTTP_WS_TOKEN_BYTES + 1)
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn protected_http_query_length_is_bounded() {
+        assert!(http_query_len_is_valid(None));
+        assert!(http_query_len_is_valid(Some(&"x".repeat(MAX_HTTP_QUERY_BYTES))));
+        assert!(!http_query_len_is_valid(Some(&"x".repeat(MAX_HTTP_QUERY_BYTES + 1))));
+    }
+
+    #[test]
     fn pending_control_requests_are_bounded() {
         let st = test_state();
         let mut receivers = Vec::new();
@@ -802,6 +978,22 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"].as_str(), Some("surface-busy"));
+    }
+
+    #[tokio::test]
+    async fn oversized_http_argument_maps_to_bounded_bad_request() {
+        let too_long = "x".repeat(MAX_HTTP_HASH_ARG_BYTES + 1);
+        let err = validate_http_arg("artifact_hash", &too_long, MAX_HTTP_HASH_ARG_BYTES)
+            .expect_err("oversized hash is rejected");
+        let response = bad_http_argument(err);
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"].as_str(), Some("bad-http-argument"));
+        assert_eq!(json["field"].as_str(), Some("artifact_hash"));
+        assert_eq!(json["bytes"].as_u64(), Some((MAX_HTTP_HASH_ARG_BYTES + 1) as u64));
+        assert_eq!(json["limit"].as_u64(), Some(MAX_HTTP_HASH_ARG_BYTES as u64));
     }
 
     #[test]

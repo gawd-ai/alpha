@@ -69,6 +69,18 @@ pub const DRILL_PREFIX: &str = "[drill]";
 /// for direct bus envelopes addressed to `Role::AUTHORING`, including model-backed or curious
 /// agents that consume this shared wire contract.
 pub const MAX_AUTHORING_REQUEST_BYTES: usize = 1024 * 1024;
+/// Maximum bytes of natural-language request text accepted inside an [`AuthoringRequest`].
+///
+/// The serialized envelope cap protects JSON parsing; this field cap protects downstream prompt
+/// assembly, template errors, and parked authoring state from retaining one near-limit prose blob.
+pub const MAX_AUTHORING_REQUEST_TEXT_BYTES: usize = 64 * 1024;
+/// Maximum bytes of retry context accepted inside an [`AuthoringRequest`].
+///
+/// `build-cargo` truncates stderr to 64 KiB before returning it, so this leaves headroom for composed
+/// retry notes while still bounding model prompt amplification.
+pub const MAX_AUTHORING_PREV_ERROR_BYTES: usize = 128 * 1024;
+/// Maximum bytes of the original request echoed in a `NoTemplate` error.
+pub const MAX_AUTHORING_ERROR_PREVIEW_BYTES: usize = 8 * 1024;
 
 /// Decode an inbound authoring request with the substrate-wide request-size guard.
 ///
@@ -84,9 +96,61 @@ pub fn decode_authoring_request(payload: &[u8]) -> Result<AuthoringRequest, Auth
             ),
         });
     }
-    serde_json::from_slice(payload).map_err(|e| AuthoringError::Invalid {
-        message: format!("malformed authoring request: {e}"),
-    })
+    let req: AuthoringRequest = serde_json::from_slice(payload).map_err(|e| {
+        AuthoringError::Invalid { message: format!("malformed authoring request: {e}") }
+    })?;
+    validate_authoring_request_shape(&req)?;
+    Ok(req)
+}
+
+/// Return a bounded copy of `s`, preserving UTF-8 character boundaries and marking truncation.
+pub fn bounded_authoring_text(s: &str, max: usize) -> String {
+    let prefix = prefix_on_char_boundary(s, max);
+    if prefix.len() == s.len() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}\n... (truncated; {} bytes total)", s.len())
+    }
+}
+
+/// Bounded request text suitable for retained `NoTemplate` errors.
+pub fn authoring_request_preview(request: &str) -> String {
+    bounded_authoring_text(request, MAX_AUTHORING_ERROR_PREVIEW_BYTES)
+}
+
+fn validate_authoring_request_shape(req: &AuthoringRequest) -> Result<(), AuthoringError> {
+    validate_authoring_text_field("request", &req.request, MAX_AUTHORING_REQUEST_TEXT_BYTES)?;
+    if let Some(prev) = &req.prev_error {
+        validate_authoring_text_field("prev_error", prev, MAX_AUTHORING_PREV_ERROR_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_authoring_text_field(
+    field: &str,
+    value: &str,
+    max: usize,
+) -> Result<(), AuthoringError> {
+    if value.len() > max {
+        return Err(AuthoringError::Invalid {
+            message: format!(
+                "authoring request field `{field}` too large: {} bytes exceeds {max} byte limit",
+                value.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn prefix_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
 }
 
 /// What the agent emits when a template matches: enough to hand straight to the BUILD socket.
@@ -259,6 +323,7 @@ impl AgentTemplated {
 
     /// Direct (non-bus) author — convenience for tests and the orchestrator path.
     pub fn author(&self, req: &AuthoringRequest) -> Result<AuthoringResponse, AuthoringError> {
+        validate_authoring_request_shape(req)?;
         // Templated-agent-internal recovery-drill mode: any request that *starts with*
         // `DRILL_PREFIX` engages the broken→fixed transition. The prefix is private to this
         // creature — other AUTHORING bindees won't recognize it (and they don't need to;
@@ -289,7 +354,7 @@ impl AgentTemplated {
         if lower.contains("fetch") && lower.contains("title") && lower.contains("url") {
             return Ok(template_fetch_url_title());
         }
-        Err(AuthoringError::NoTemplate { request: req.request.clone() })
+        Err(AuthoringError::NoTemplate { request: authoring_request_preview(&req.request) })
     }
 }
 
@@ -657,6 +722,28 @@ mod tests {
     }
 
     #[test]
+    fn no_template_error_keeps_only_bounded_request_preview() {
+        let request = format!(
+            "compute a novel metric {} tail-marker",
+            "x".repeat(MAX_AUTHORING_ERROR_PREVIEW_BYTES + 4096)
+        );
+        let e = AgentTemplated::new()
+            .author(&AuthoringRequest { request: request.clone(), ..Default::default() })
+            .unwrap_err();
+        match e {
+            AuthoringError::NoTemplate { request: preview } => {
+                assert!(preview.contains("truncated"), "preview marks truncation: {preview}");
+                assert!(
+                    !preview.contains(&"x".repeat(MAX_AUTHORING_ERROR_PREVIEW_BYTES + 1)),
+                    "preview must not retain the full oversized request"
+                );
+                assert!(preview.len() < request.len(), "preview is bounded");
+            }
+            other => panic!("expected NoTemplate, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn recovery_drill_broken_first_then_fixed_second() {
         let a = AgentTemplated::new();
         // Drill prefix + no prev_error → broken source. The prefix is private to this creature;
@@ -745,6 +832,48 @@ mod tests {
                 assert!(message.contains("too large"), "unexpected message: {message}");
             }
             other => panic!("expected Invalid Failed reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_authoring_request_field_yields_invalid_after_json_decode() {
+        let payload = serde_json::to_vec(&AuthoringRequest {
+            request: "x".repeat(MAX_AUTHORING_REQUEST_TEXT_BYTES + 1),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            payload.len() < MAX_AUTHORING_REQUEST_BYTES,
+            "this regression covers field validation after bounded JSON parse"
+        );
+
+        match decode_authoring_request(&payload).unwrap_err() {
+            AuthoringError::Invalid { message } => {
+                assert!(message.contains("`request`"), "field named in error: {message}");
+                assert!(message.contains("too large"), "unexpected message: {message}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_authoring_prev_error_yields_invalid_after_json_decode() {
+        let payload = serde_json::to_vec(&AuthoringRequest {
+            request: "reverse".into(),
+            prev_error: Some("e".repeat(MAX_AUTHORING_PREV_ERROR_BYTES + 1)),
+        })
+        .unwrap();
+        assert!(
+            payload.len() < MAX_AUTHORING_REQUEST_BYTES,
+            "prev_error field cap should fire before the envelope cap"
+        );
+
+        match decode_authoring_request(&payload).unwrap_err() {
+            AuthoringError::Invalid { message } => {
+                assert!(message.contains("`prev_error`"), "field named in error: {message}");
+                assert!(message.contains("too large"), "unexpected message: {message}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
         }
     }
 

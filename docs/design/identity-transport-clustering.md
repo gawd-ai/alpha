@@ -89,9 +89,23 @@ the node:
   bounded printable routing tokens (256 bytes, `[A-Za-z0-9._-]`), pubkeys must decode to a 32-byte
   ed25519 key and are stored as canonical lowercase hex, and dial addresses are bounded IP socket
   addresses (`127.0.0.1:9001`, `[::1]:9001`).
-- Per-peer outbound queues are bounded and **shed on overflow** (`try_send`), so a slow peer
-  applies backpressure instead of growing memory without bound. A shed frame is surfaced as a
-  `peer_send_dropped` event rather than vanishing silently.
+- An explicit gossip advertise address is run through that same dial-address shape check before it
+  can enter this node's self gossip entry; a bad override is ignored and the listener address
+  remains the advertised default. The effective advertise address is checked too — if it would be
+  refused by receiving peers (a hostname listener, say), the node says so at boot rather than
+  implying the fallback propagates.
+- `transport.ctl` request payloads are capped at **64 KiB** before JSON decode, and typed replies
+  are capped at **1 MiB** before callers decode them. The control contract only carries `Members` or
+  one `Connect` member, and the `Connect` fields still pass through the member shape checks above
+  before retention.
+- Per-peer outbound queues are bounded and **shed on overflow** (`try_send`), and an outbound frame
+  that exceeds the 128 MiB wire cap is refused before it can sit in a peer queue. A slow peer applies
+  backpressure instead of growing memory without bound. A shed frame is surfaced as a
+  `peer_send_dropped` event rather than vanishing silently. Because envelope payloads serialize as
+  hex (2x expansion), the frame cap means an artifact over roughly half the 128 MiB artifact ceiling
+  cannot cross the wire in one envelope today — cross-node shipping of larger artifacts needs a
+  chunked path, and the sender now sheds such a frame loudly instead of letting the receiver
+  tear the link down.
 
 Malformed bytes are dropped quietly — hostile input never panics a transport thread.
 

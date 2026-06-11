@@ -99,3 +99,29 @@ fn script_runs_lines_and_skips_comments() {
         "comment lines must be skipped, not echoed: {stdout:?}"
     );
 }
+
+#[test]
+fn oversized_script_is_rejected_before_execution() {
+    let path =
+        std::env::temp_dir().join(format!("alpha-node-cli-oversized-{}.gawd", std::process::id()));
+    let _cleanup = TempScript(path.clone());
+    std::fs::File::create(&path)
+        .expect("create oversized script")
+        .set_len(alpha::MAX_ALPHA_SCRIPT_BYTES + 1)
+        .expect("size oversized script");
+
+    let out =
+        alpha_node().args(["--minimal", "--script"]).arg(&path).output().expect("run alpha node");
+
+    assert!(!out.status.success(), "oversized --script should exit non-zero");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("exceeds"),
+        "stderr explains the size cap: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "script commands were not executed: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

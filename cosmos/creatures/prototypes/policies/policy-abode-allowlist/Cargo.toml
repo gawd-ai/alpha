@@ -12,3 +12,4 @@ description = "Reference injected RestorePolicy for abode-migrator: admits an Ab
 aether = { path = "../../../../aether" }
 abode = { path = "../../../../abode" }
 abode-migrator = { path = "../../../../creatures/abode-migrator" }
+sigil = { path = "../../../../sigil" }

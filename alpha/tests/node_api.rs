@@ -207,6 +207,40 @@ fn oversized_http_json_body_is_rejected_at_the_surface() {
 }
 
 #[test]
+fn oversized_http_field_is_rejected_before_control_dispatch() {
+    let d = Daemon::spawn(free_port(), true, true);
+    let body =
+        format!(r#"{{"manifest_path":"{}","artifact_path":"artifact.so"}}"#, "x".repeat(4097));
+
+    let (sc, body) = http(d.port, "POST", "/api/load", Some("testkey"), Some(&body));
+
+    assert_eq!(sc, 400, "oversized field should be rejected at the surface: {body}");
+    let j = json_of(&body);
+    assert_eq!(j["error"], serde_json::json!("bad-http-argument"));
+    assert_eq!(j["field"], serde_json::json!("manifest_path"));
+    assert_eq!(j["limit"], serde_json::json!(4096));
+}
+
+/// The surface refuses an authoring request at the AUTHORING contract's own field cap — the limit
+/// the bindees' `decode_authoring_request` would apply anyway. A request that passes the front
+/// door never fails the same size check deeper in the pipeline (and the advertised limit is the
+/// enforced one, not the looser generic text cap).
+#[test]
+fn oversized_author_request_is_rejected_at_the_surface_with_the_contract_cap() {
+    let d = Daemon::spawn(free_port(), true, true);
+    let cap = omni::MAX_CONTROL_AUTHOR_REQUEST_BYTES;
+    let body = format!(r#"{{"request":"{}"}}"#, "x".repeat(cap + 1));
+
+    let (sc, body) = http(d.port, "POST", "/api/author/critter", Some("testkey"), Some(&body));
+
+    assert_eq!(sc, 400, "over-cap author request should be rejected at the surface: {body}");
+    let j = json_of(&body);
+    assert_eq!(j["error"], serde_json::json!("bad-http-argument"));
+    assert_eq!(j["field"], serde_json::json!("request"));
+    assert_eq!(j["limit"], serde_json::json!(cap));
+}
+
+#[test]
 fn co_drive_author_critter_then_send_over_the_api() {
     // --allow-ai opens the gate; full boot wires AUTHORING + build-critter so authoring really runs.
     let d = Daemon::spawn(free_port(), false, true);

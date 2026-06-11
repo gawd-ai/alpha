@@ -18,7 +18,9 @@
 //!    artifact_hash)` key. No entry there → reject (only *known* creatures can be promoted).
 //! 3. The entry must carry a `ReputationScore` — a creature with no reputation is un-promoted.
 //! 4. The score must be finite and `>= min_score`.
-//! 5. The score must carry a promotion signature that **verifies** for that exact
+//! 5. If constructed with a trusted-selector allowlist, the score's `signed_by` key must be on that
+//!    bounded list.
+//! 6. The score must carry a promotion signature that **verifies** for that exact
 //!    `(artifact_hash, realm, score, attesting_realm)` claim under the injected verifier
 //!    (`ReputationScore::promotion_verifies`). An unsigned score (peer reputation, a test
 //!    attestation) is *not* a verified promotion — it's refused. A signature replayed from another
@@ -30,10 +32,11 @@
 //!   the manifest*. A real admission policy composes both — require a trusted signer (à la
 //!   `cosmos/creatures/prototypes/policies/policy-signed`) **and** a verified promotion. Kept single-axis so the promotion contract is
 //!   legible; the composition is an operator's `and`-of-policies.
-//! - **No which-key-to-trust model.** It verifies the signature mechanically but does not decide
-//!   *whose* promotion to honor (it accepts any key that signs a valid claim). A real policy pins an
-//!   allowlist of trusted selector Abode keys — exactly the IoC seam: registry-mem owns the *verify
-//!   mechanism*, this policy owns *which signature shape*, and a production policy owns *which key*.
+//! - **No global which-key-to-trust model.** The policy can be constructed with a bounded allowlist
+//!   of selector Abode keys, but the substrate never chooses those keys. `new` keeps the historical
+//!   lab posture and accepts any key that signs a valid promotion; use
+//!   [`PreferPromotedPolicy::new_trusting_selectors`] or
+//!   [`PreferPromotedPolicy::with_trusted_selectors`] for a production trust root.
 //!
 //! Operators write their own (`promoted-by-my-selector`, `quorum-of-3-realms`, …) and pass it to
 //! `Kernel::new`. The substrate ships the gate + the [`Policy`] socket; never a selection model.
@@ -43,6 +46,11 @@ use std::sync::Arc;
 use registry_mem::RegistryMem;
 use sanctum::{Admission, Policy};
 use sigil::{Ed25519Verifier, Manifest, RealmId, Verifier};
+
+/// Default maximum retained selector roots in the reference trust list.
+pub const DEFAULT_MAX_TRUSTED_SELECTORS: usize = 1_024;
+/// Maximum bytes in a trusted selector key retained by this reference policy.
+pub const MAX_TRUSTED_SELECTOR_BYTES: usize = 128;
 
 /// Admit only creatures with a verified, at-or-above-threshold promotion in the registry.
 pub struct PreferPromotedPolicy {
@@ -55,12 +63,68 @@ pub struct PreferPromotedPolicy {
     min_score: f32,
     /// The signature-verify mechanism (injected — `Ed25519Verifier` in production; a stub in tests).
     verifier: Arc<dyn Verifier>,
+    /// Optional trusted selector Abode keys. Empty with `allow_any_selector == false` is fail-closed.
+    trusted_selectors: Vec<String>,
+    /// Historical/lab posture: any key with a valid promotion signature is accepted.
+    allow_any_selector: bool,
 }
 
 impl PreferPromotedPolicy {
-    /// Default: verify with `Ed25519Verifier`.
+    /// Lab/default posture: verify with `Ed25519Verifier` and accept any valid promotion signer.
+    ///
+    /// Use [`Self::new_trusting_selectors`] or [`Self::with_trusted_selectors`] to pin a bounded
+    /// selector trust root.
     pub fn new(registry: Arc<RegistryMem>, min_score: f32) -> Self {
-        PreferPromotedPolicy { registry, min_score, verifier: Arc::new(Ed25519Verifier) }
+        PreferPromotedPolicy {
+            registry,
+            min_score,
+            verifier: Arc::new(Ed25519Verifier),
+            trusted_selectors: Vec::new(),
+            allow_any_selector: true,
+        }
+    }
+
+    /// Strict posture: admit only promotions signed by one of these selector Abode keys.
+    ///
+    /// The retained list is trimmed, deduplicated, shape-checked, and capped at
+    /// [`DEFAULT_MAX_TRUSTED_SELECTORS`]. An empty resulting list fails closed.
+    pub fn new_trusting_selectors(
+        registry: Arc<RegistryMem>,
+        min_score: f32,
+        trusted_selectors: Vec<String>,
+    ) -> Self {
+        Self::new(registry, min_score).with_trusted_selectors(trusted_selectors)
+    }
+
+    /// Bind a trusted-selector allowlist using the default retained-key cap.
+    pub fn with_trusted_selectors(self, trusted_selectors: Vec<String>) -> Self {
+        self.with_trusted_selector_limit(trusted_selectors, DEFAULT_MAX_TRUSTED_SELECTORS)
+    }
+
+    /// Bind a trusted-selector allowlist with an explicit retained-key cap.
+    ///
+    /// `max_trusted_selectors == 0` disables the cap for lab/demo workloads.
+    pub fn with_trusted_selector_limit(
+        mut self,
+        trusted_selectors: Vec<String>,
+        max_trusted_selectors: usize,
+    ) -> Self {
+        self.trusted_selectors =
+            sanitize_trusted_selectors(trusted_selectors, max_trusted_selectors);
+        self.allow_any_selector = false;
+        self
+    }
+
+    /// Explicitly return to the lab posture that trusts any valid promotion signer.
+    pub fn any_verified_selector(mut self) -> Self {
+        self.trusted_selectors.clear();
+        self.allow_any_selector = true;
+        self
+    }
+
+    /// Number of selector trust roots retained after constructor sanitization.
+    pub fn trusted_selector_count(&self) -> usize {
+        self.trusted_selectors.len()
     }
 
     /// Swap the verifier (tests that want a deterministic stub).
@@ -98,6 +162,17 @@ impl Policy for PreferPromotedPolicy {
                 rep.score, self.min_score
             ));
         }
+        if !self.allow_any_selector {
+            let selector = rep.signed_by.as_deref().ok_or_else(|| {
+                "prefer-promoted: promotion has no signed_by selector for the trust allowlist"
+                    .to_string()
+            })?;
+            if !self.trusted_selectors.iter().any(|trusted| trusted == selector) {
+                return Err(format!(
+                    "prefer-promoted: selector `{selector}` is not in the trust allowlist"
+                ));
+            }
+        }
         if !rep.promotion_verifies(hash, &realm, self.verifier.as_ref()) {
             return Err(
                 "prefer-promoted: promotion signature does not verify (unsigned, or signed by a key \
@@ -107,6 +182,28 @@ impl Policy for PreferPromotedPolicy {
         }
         Ok(())
     }
+}
+
+fn sanitize_trusted_selectors(selectors: Vec<String>, max_keys: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in selectors {
+        if max_keys != 0 && out.len() >= max_keys {
+            eprintln!(
+                "policy-prefer-promoted: selector trust list at capacity ({max_keys}); refusing additional key"
+            );
+            break;
+        }
+        let key = raw.trim();
+        if !trusted_selector_key_is_valid(key) || out.iter().any(|existing| existing == key) {
+            continue;
+        }
+        out.push(key.to_string());
+    }
+    out
+}
+
+fn trusted_selector_key_is_valid(key: &str) -> bool {
+    !key.is_empty() && key.len() <= MAX_TRUSTED_SELECTOR_BYTES && !key.as_bytes().contains(&0)
 }
 
 #[cfg(test)]
@@ -237,5 +334,56 @@ mod tests {
         m.provenance.realm = Some(RealmId::new("crew"));
         let err = p.admit(&m, &evidence()).unwrap_err();
         assert!(err.contains("no provenance.build_hash"), "got: {err}");
+    }
+
+    #[test]
+    fn trusted_selector_allowlist_admits_trusted_signer() {
+        let selector_key = Ed25519KeyMaterial::from_seed([0x5D; 32]).unwrap();
+        let pk = selector_key.public_hex().to_string();
+        let (registry, hash, _realm) = seeded(Some(0.9), Some(&selector_key), Some(pk.clone()));
+        let p = PreferPromotedPolicy::new_trusting_selectors(registry, 0.8, vec![pk]);
+        assert!(p.admit(&manifest(&hash, Some("crew")), &evidence()).is_ok());
+    }
+
+    #[test]
+    fn trusted_selector_allowlist_rejects_untrusted_signer() {
+        let trusted = Ed25519KeyMaterial::from_seed([0x5E; 32]).unwrap();
+        let untrusted = Ed25519KeyMaterial::from_seed([0x5F; 32]).unwrap();
+        let (registry, hash, _realm) =
+            seeded(Some(0.9), Some(&untrusted), Some(untrusted.public_hex().to_string()));
+        let p = PreferPromotedPolicy::new_trusting_selectors(
+            registry,
+            0.8,
+            vec![trusted.public_hex().to_string()],
+        );
+        let err = p.admit(&manifest(&hash, Some("crew")), &evidence()).unwrap_err();
+        assert!(err.contains("trust allowlist"), "got: {err}");
+    }
+
+    #[test]
+    fn trusted_selector_allowlist_is_sanitized_deduplicated_and_capped() {
+        let p = PreferPromotedPolicy::new(Arc::new(RegistryMem::new()), 0.8)
+            .with_trusted_selector_limit(
+                vec![
+                    "".into(),
+                    " selector-a ".into(),
+                    "selector-a".into(),
+                    "x".repeat(MAX_TRUSTED_SELECTOR_BYTES + 1),
+                    "selector-b".into(),
+                    "selector-c".into(),
+                ],
+                2,
+            );
+
+        assert_eq!(p.trusted_selector_count(), 2);
+        assert!(!p.allow_any_selector);
+        assert_eq!(p.trusted_selectors, vec!["selector-a", "selector-b"]);
+    }
+
+    #[test]
+    fn zero_trusted_selector_limit_is_explicit_unbounded_opt_out() {
+        let p = PreferPromotedPolicy::new(Arc::new(RegistryMem::new()), 0.8)
+            .with_trusted_selector_limit(vec!["selector-a".into(), "selector-b".into()], 0);
+        assert_eq!(p.trusted_selector_count(), 2);
     }
 }

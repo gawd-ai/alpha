@@ -18,6 +18,9 @@
 //!   nested-unwrap support without changing the socket.
 //! - Unmapped Realm: [`NoRoute`](RealmResolution::NoRoute) with
 //!   [`UnmappedRealm`](NoRealmRouteReason::UnmappedRealm).
+//! - The retained mapping table is bounded and shape-checked by default. Use
+//!   [`RealmGateway::new_with_limit`] with `0` only for lab/demo setups that intentionally accept an
+//!   unbounded table.
 //!
 //! ## What this policy does NOT do
 //!
@@ -48,6 +51,13 @@ use aether::{Address, NodeId, RealmId};
 pub use realm::route::{NoRealmRouteReason, NoRealmRouteReply};
 use realm::{RealmResolution, RealmRouting};
 
+/// Default maximum Realm→peer mappings retained by this reference gateway.
+pub const DEFAULT_MAX_REALM_GATEWAY_MAPPINGS: usize = 1024;
+/// Maximum bytes in a Realm name retained by the gateway.
+pub const MAX_REALM_GATEWAY_REALM_BYTES: usize = sigil::MAX_MANIFEST_REALM_BYTES;
+/// Maximum bytes in a peer node id retained by the gateway.
+pub const MAX_REALM_GATEWAY_NODE_ID_BYTES: usize = 256;
+
 /// Construction config — the `realm → peer` table an operator wires up before
 /// `realm::serve`-ing this policy into a loadable creature.
 #[derive(Clone, Debug, Default)]
@@ -64,7 +74,7 @@ impl RealmGatewayConfig {
 
     /// Builder-style add of one Realm→peer mapping.
     pub fn with(mut self, realm: RealmId, peer: NodeId) -> Self {
-        self.realm_to_peer.insert(realm, peer);
+        insert_mapping(&mut self.realm_to_peer, realm, peer, DEFAULT_MAX_REALM_GATEWAY_MAPPINGS);
         self
     }
 
@@ -72,8 +82,27 @@ impl RealmGatewayConfig {
     /// with N Realms, instead of chaining `.with(...)` N times. Accepts any iterable of pairs (a
     /// `Vec`, an array, a `HashMap`).
     pub fn with_many(mut self, mappings: impl IntoIterator<Item = (RealmId, NodeId)>) -> Self {
-        self.realm_to_peer.extend(mappings);
+        self = self.with_many_and_limit(mappings, DEFAULT_MAX_REALM_GATEWAY_MAPPINGS);
         self
+    }
+
+    /// Builder-style bulk add with an explicit retained mapping cap. `max_mappings == 0` disables
+    /// the cap for this config builder; pair with [`RealmGateway::new_with_limit`] if the live
+    /// gateway should also retain more than the default.
+    pub fn with_many_and_limit(
+        mut self,
+        mappings: impl IntoIterator<Item = (RealmId, NodeId)>,
+        max_mappings: usize,
+    ) -> Self {
+        for (realm, peer) in mappings {
+            insert_mapping(&mut self.realm_to_peer, realm, peer, max_mappings);
+        }
+        self
+    }
+
+    /// Number of retained mappings, useful for tests and observability.
+    pub fn mapping_count(&self) -> usize {
+        self.realm_to_peer.len()
     }
 }
 
@@ -96,6 +125,12 @@ impl Default for RealmGateway {
 
 impl RealmGateway {
     pub fn new(cfg: RealmGatewayConfig) -> Self {
+        Self::new_with_limit(cfg, DEFAULT_MAX_REALM_GATEWAY_MAPPINGS)
+    }
+
+    /// Build with an explicit retained mapping cap. `max_mappings == 0` disables the cap.
+    pub fn new_with_limit(mut cfg: RealmGatewayConfig, max_mappings: usize) -> Self {
+        cfg.realm_to_peer = retain_valid_mappings(cfg.realm_to_peer, max_mappings);
         RealmGateway { cfg }
     }
 }
@@ -115,6 +150,59 @@ impl RealmRouting for RealmGateway {
             },
         }
     }
+}
+
+fn retain_valid_mappings(
+    mappings: HashMap<RealmId, NodeId>,
+    max_mappings: usize,
+) -> HashMap<RealmId, NodeId> {
+    let mut retained = HashMap::new();
+    for (realm, peer) in mappings {
+        insert_mapping(&mut retained, realm, peer, max_mappings);
+    }
+    retained
+}
+
+fn insert_mapping(
+    mappings: &mut HashMap<RealmId, NodeId>,
+    realm: RealmId,
+    peer: NodeId,
+    max_mappings: usize,
+) {
+    if let Some(reason) = mapping_shape_error(&realm, &peer) {
+        eprintln!("realm-gateway: {reason}");
+        return;
+    }
+    if max_mappings != 0 && !mappings.contains_key(&realm) && mappings.len() >= max_mappings {
+        eprintln!(
+            "realm-gateway: mapping table at capacity ({max_mappings}); refusing realm {}",
+            realm.0
+        );
+        return;
+    }
+    mappings.insert(realm, peer);
+}
+
+fn mapping_shape_error(realm: &RealmId, peer: &NodeId) -> Option<String> {
+    if !realm.is_valid() || realm.0.len() > MAX_REALM_GATEWAY_REALM_BYTES || realm.0.contains('\0')
+    {
+        return Some(format!(
+            "realm must be valid, NUL-free, and <= {MAX_REALM_GATEWAY_REALM_BYTES} bytes"
+        ));
+    }
+    if !node_id_shape_is_valid(peer) {
+        return Some(format!(
+            "peer node id must be 1..={MAX_REALM_GATEWAY_NODE_ID_BYTES} ASCII [A-Za-z0-9._-] bytes"
+        ));
+    }
+    None
+}
+
+fn node_id_shape_is_valid(node: &NodeId) -> bool {
+    let s = node.0.as_str();
+    !s.is_empty()
+        && s.len() <= MAX_REALM_GATEWAY_NODE_ID_BYTES
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -158,6 +246,62 @@ mod tests {
         assert_eq!(
             gw.resolve(&RealmId::new("b"), &Address::Creature(CreatureId(1))),
             RealmResolution::Forward(NodeId("nb".into()))
+        );
+    }
+
+    #[test]
+    fn config_builder_bounds_and_shape_checks_mappings() {
+        let cfg = RealmGatewayConfig::new().with_many_and_limit(
+            [
+                (RealmId::new("crew"), NodeId("node-a".into())),
+                (RealmId::new("guests"), NodeId("node-b".into())),
+                (RealmId::new("bad:realm"), NodeId("node-c".into())),
+                (RealmId::new("bad-nul\0"), NodeId("node-d".into())),
+                (RealmId::new("bad-peer"), NodeId("bad peer".into())),
+            ],
+            1,
+        );
+
+        assert_eq!(cfg.mapping_count(), 1);
+        let gw = RealmGateway::new(cfg);
+        assert_eq!(
+            gw.resolve(&RealmId::new("crew"), &Address::Creature(CreatureId(1))),
+            RealmResolution::Forward(NodeId("node-a".into()))
+        );
+        assert_eq!(
+            gw.resolve(&RealmId::new("guests"), &Address::Creature(CreatureId(1))),
+            RealmResolution::NoRoute(NoRealmRouteReason::UnmappedRealm)
+        );
+    }
+
+    #[test]
+    fn gateway_new_sanitizes_direct_config_and_zero_limit_is_unbounded() {
+        let mut direct = RealmGatewayConfig::new();
+        direct.realm_to_peer.insert(RealmId::new("crew"), NodeId("node-a".into()));
+        direct.realm_to_peer.insert(RealmId::new("bad:realm"), NodeId("node-b".into()));
+        direct.realm_to_peer.insert(RealmId::new("bad-peer"), NodeId("bad peer".into()));
+
+        let gw = RealmGateway::new(direct);
+        assert_eq!(
+            gw.resolve(&RealmId::new("crew"), &Address::Creature(CreatureId(1))),
+            RealmResolution::Forward(NodeId("node-a".into()))
+        );
+        assert_eq!(
+            gw.resolve(&RealmId::new("bad:realm"), &Address::Creature(CreatureId(1))),
+            RealmResolution::NoRoute(NoRealmRouteReason::UnmappedRealm)
+        );
+
+        let cfg = RealmGatewayConfig::new().with_many_and_limit(
+            [
+                (RealmId::new("crew"), NodeId("node-a".into())),
+                (RealmId::new("guests"), NodeId("node-b".into())),
+            ],
+            0,
+        );
+        let gw = RealmGateway::new_with_limit(cfg, 0);
+        assert_eq!(
+            gw.resolve(&RealmId::new("guests"), &Address::Creature(CreatureId(1))),
+            RealmResolution::Forward(NodeId("node-b".into()))
         );
     }
 

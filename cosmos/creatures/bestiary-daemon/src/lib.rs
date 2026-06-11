@@ -31,9 +31,9 @@
 //!   Hoisting it to a contract crate is deferred (the same family as the deferred policy
 //!   generalization); the `omega-federator` keeps owning the cross-Realm SEER reputation path
 //!   unchanged, and local reputation still flows via `AttestFitness` over REGISTRY.
-//! - **The PUSH is a full live-set push each cadence, not a head diff.** The lattice merge is
-//!   idempotent, so a full push converges; a high-volume Bestiary would diff by log head. Documented,
-//!   not silently capped.
+//! - **The PUSH is a bounded full live-set push each cadence, not a head diff.** The lattice merge is
+//!   idempotent, so a full push converges; the daemon refuses over-cap snapshots before reading blob
+//!   bytes or serializing the batch. A high-volume Bestiary would diff by log head.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,12 +57,20 @@ use sigil::RealmId;
 /// `0` in [`BestiaryConfig::max_push_entries`] means unbounded.
 pub const DEFAULT_MAX_PUSH_ENTRIES: usize = DEFAULT_MAX_BESTIARY_ENTRIES * 2;
 
-/// Default total artifact bytes read into one `ListEntries` anti-entropy snapshot.
+/// Default total artifact bytes read into one anti-entropy snapshot.
 ///
 /// This mirrors `registry-mem`'s source-side snapshot cap: full fetches can still return one large
-/// artifact, but a catalog-wide pull cannot force the daemon to clone the whole live set into one
-/// reply. `0` in [`BestiaryConfig::max_snapshot_artifact_bytes`] means unbounded.
+/// artifact, but a catalog-wide pull, PUSH, or curation pass cannot force the daemon to clone the
+/// whole live set into one payload. `0` in [`BestiaryConfig::max_snapshot_artifact_bytes`] means
+/// unbounded.
 pub const DEFAULT_MAX_SNAPSHOT_ARTIFACT_BYTES: usize = MAX_REGISTRY_ARTIFACT_BYTES;
+
+/// Default maximum replication peers retained by the daemon config.
+pub const DEFAULT_MAX_REPLICATION_PEERS: usize = 1024;
+/// Maximum bytes in a replication peer node id.
+pub const MAX_BESTIARY_REPLICATION_NODE_ID_BYTES: usize = 256;
+/// Maximum bytes in a replication Realm selector.
+pub const MAX_BESTIARY_REPLICATION_REALM_BYTES: usize = sigil::MAX_MANIFEST_REALM_BYTES;
 
 /// A peer this daemon PUSHes its catalog to.
 #[derive(Clone, Debug)]
@@ -91,9 +99,11 @@ pub struct BestiaryConfig {
     pub max_bestiary_op_bytes: usize,
     /// Maximum artifact bytes retained per registry publish or pushed entry. `0` means unbounded.
     pub max_artifact_bytes: usize,
-    /// Maximum total artifact bytes read into one `ListEntries` reply. `0` means unbounded.
+    /// Maximum total artifact bytes read into one `ListEntries` reply, autonomous PUSH batch, or
+    /// curation snapshot. `0` means unbounded.
     pub max_snapshot_artifact_bytes: usize,
-    /// Maximum self-verifying entries accepted in one `PushEntries` batch. `0` means unbounded.
+    /// Maximum self-verifying entries accepted in or sent as one `PushEntries` batch. `0` means
+    /// unbounded.
     pub max_push_entries: usize,
 }
 
@@ -111,6 +121,78 @@ impl BestiaryConfig {
             max_push_entries: DEFAULT_MAX_PUSH_ENTRIES,
         }
     }
+}
+
+fn sanitize_replication_peer_config(
+    mut cfg: BestiaryConfig,
+    max_replication_peers: usize,
+) -> BestiaryConfig {
+    cfg.replication_peers =
+        retain_valid_replication_peers(cfg.replication_peers, max_replication_peers);
+    cfg
+}
+
+fn retain_valid_replication_peers(
+    peers: Vec<ReplicationPeer>,
+    max_replication_peers: usize,
+) -> Vec<ReplicationPeer> {
+    let mut retained = Vec::new();
+    for peer in peers {
+        insert_replication_peer(&mut retained, peer, max_replication_peers);
+    }
+    retained
+}
+
+fn insert_replication_peer(
+    retained: &mut Vec<ReplicationPeer>,
+    peer: ReplicationPeer,
+    max_replication_peers: usize,
+) {
+    if let Some(reason) = replication_peer_shape_error(&peer) {
+        eprintln!("bestiary-daemon: {reason}");
+        return;
+    }
+    if retained.iter().any(|existing| same_replication_peer(existing, &peer)) {
+        return;
+    }
+    if max_replication_peers != 0 && retained.len() >= max_replication_peers {
+        eprintln!(
+            "bestiary-daemon: replication peer table at capacity ({max_replication_peers}); refusing peer {}",
+            peer.node.0
+        );
+        return;
+    }
+    retained.push(peer);
+}
+
+fn replication_peer_shape_error(peer: &ReplicationPeer) -> Option<String> {
+    if !node_id_shape_is_valid(&peer.node) {
+        return Some(format!(
+            "replication peer node must be 1..={MAX_BESTIARY_REPLICATION_NODE_ID_BYTES} ASCII [A-Za-z0-9._-] bytes"
+        ));
+    }
+    if let Some(realm) = &peer.realm {
+        if !realm.is_valid()
+            || realm.0.len() > MAX_BESTIARY_REPLICATION_REALM_BYTES
+            || realm.0.contains('\0')
+        {
+            return Some(format!(
+                "replication peer realm must be valid, NUL-free, and <= {MAX_BESTIARY_REPLICATION_REALM_BYTES} bytes"
+            ));
+        }
+    }
+    None
+}
+
+fn node_id_shape_is_valid(node: &NodeId) -> bool {
+    let s = node.0.as_str();
+    !s.is_empty()
+        && s.len() <= MAX_BESTIARY_REPLICATION_NODE_ID_BYTES
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn same_replication_peer(a: &ReplicationPeer, b: &ReplicationPeer) -> bool {
+    a.node == b.node && a.daemon == b.daemon && a.realm == b.realm
 }
 
 /// The bits the maintenance worker needs — cloned out of the daemon at `bind`.
@@ -140,6 +222,18 @@ impl BestiaryDaemon {
         curator: Arc<dyn Curator>,
         cfg: BestiaryConfig,
     ) -> Self {
+        Self::new_with_peer_limit(store, curator, cfg, DEFAULT_MAX_REPLICATION_PEERS)
+    }
+
+    /// Build with an explicit replication-peer cap. `max_replication_peers == 0` disables the cap
+    /// for lab/demo configurations.
+    pub fn new_with_peer_limit(
+        store: Arc<dyn BestiaryStore>,
+        curator: Arc<dyn Curator>,
+        cfg: BestiaryConfig,
+        max_replication_peers: usize,
+    ) -> Self {
+        let cfg = sanitize_replication_peer_config(cfg, max_replication_peers);
         BestiaryDaemon {
             store,
             curator,
@@ -147,6 +241,11 @@ impl BestiaryDaemon {
             stop: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Number of retained replication peers after constructor sanitization.
+    pub fn replication_peer_count(&self) -> usize {
+        self.cfg.replication_peers.len()
     }
 
     // ---- registry.op (byte-identical to registry-mem) ----
@@ -484,7 +583,7 @@ fn maintenance_loop(shared: Shared) {
 /// Off-drain curation: consult the curator (its blocking model call runs here, never in `handle`),
 /// then compact.
 fn curate_and_compact(shared: &Shared) {
-    match shared.store.snapshot_for_curation() {
+    match shared.store.snapshot_for_curation_bounded(shared.cfg.max_snapshot_artifact_bytes) {
         Ok(snaps) => {
             for snap in &snaps {
                 let ctx = CurationContext {
@@ -508,10 +607,14 @@ fn curate_and_compact(shared: &Shared) {
 /// idempotent, so a full push converges).
 fn push_once(shared: &Shared) {
     for peer in &shared.cfg.replication_peers {
-        let entries = match shared.store.signed_entries(peer.realm.as_ref()) {
+        let entries = match shared.store.signed_entries_bounded(
+            peer.realm.as_ref(),
+            shared.cfg.max_snapshot_artifact_bytes,
+            shared.cfg.max_push_entries,
+        ) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("bestiary-daemon: signed_entries for push failed: {e}");
+                eprintln!("bestiary-daemon: bounded signed_entries for push failed: {e}");
                 continue;
             }
         };
@@ -528,5 +631,56 @@ fn push_once(shared: &Shared) {
                 eprintln!("bestiary-daemon[{:?}]: push to {:?} failed: {e}", shared.me, peer.node);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(node: &str, daemon: u64, realm: Option<&str>) -> ReplicationPeer {
+        ReplicationPeer {
+            node: NodeId(node.into()),
+            daemon: CreatureId(daemon),
+            realm: realm.map(RealmId::new),
+        }
+    }
+
+    #[test]
+    fn replication_peers_are_sanitized_deduplicated_and_bounded() {
+        let oversized_node = "n".repeat(MAX_BESTIARY_REPLICATION_NODE_ID_BYTES + 1);
+        let oversized_realm = "r".repeat(MAX_BESTIARY_REPLICATION_REALM_BYTES + 1);
+        let cfg = BestiaryConfig {
+            replication_peers: vec![
+                peer("node-a", 10, Some("local")),
+                peer("node-a", 10, Some("local")),
+                peer("bad node", 11, Some("local")),
+                peer(&oversized_node, 12, Some("local")),
+                peer("node-b", 13, Some("bad:realm")),
+                peer("node-c", 14, Some("bad\0realm")),
+                peer("node-d", 15, Some(&oversized_realm)),
+                peer("node-e", 16, None),
+            ],
+            ..BestiaryConfig::local()
+        };
+
+        let cfg = sanitize_replication_peer_config(cfg, 1);
+
+        assert_eq!(cfg.replication_peers.len(), 1);
+        assert_eq!(cfg.replication_peers[0].node, NodeId("node-a".into()));
+        assert_eq!(cfg.replication_peers[0].daemon, CreatureId(10));
+        assert_eq!(cfg.replication_peers[0].realm, Some(RealmId::new("local")));
+    }
+
+    #[test]
+    fn zero_replication_peer_limit_is_explicit_unbounded_opt_out() {
+        let cfg = BestiaryConfig {
+            replication_peers: vec![peer("node-a", 10, None), peer("node-b", 11, None)],
+            ..BestiaryConfig::local()
+        };
+
+        let cfg = sanitize_replication_peer_config(cfg, 0);
+
+        assert_eq!(cfg.replication_peers.len(), 2);
     }
 }

@@ -34,6 +34,14 @@ pick a tier *for* the operator to enforce containment. Which tier to use, and wh
 all, is the operator's self-determined call. The same declared capabilities can ship as a daemon or
 a beast; the tier is the containment choice, the manifest is the description.
 
+Artifacts that a tier must materialize as bytes are capped at 128 MiB at the `anima::Artifact`
+reader boundary. That covers beast/critter path loads, in-memory artifact loads before WASM
+compile or Rhai UTF-8 parsing, and the native ship→spill path (wire-shipped `.so` bytes). A native
+daemon loaded by local path still passes directly to `dlopen` with no size cap, because a daemon
+is trusted-by-admission and the OS loader, not the substrate, maps the local `.so` — admission's
+`build_hash` integrity check streams the file through the hasher rather than materializing it, so
+the cap never gates a path-loaded native creature.
+
 ## The ABI
 
 A native creature and the host meet at a single C boundary, and **only POD crosses** it — integers,
@@ -64,10 +72,11 @@ the C ABI is undefined behavior), null-checks the returned vtable, and wraps it.
 
 A creature's only outward authority is a `send` callback handed to it at `bind` inside `BindCtxFfi`
 — there is no ambient global. The creature serializes a `Dispatch` and calls `send`; the host
-deserializes it and routes it through the one gated bus path. Distinct `RC_*` return codes carry the
-failure shape back (backpressure, no-such-creature, denied, …) so a creature can act on each, and
-`RC_PANIC` lets the host detect that a creature unwound inside its own glue and pull it off the bus
-rather than treat the call as success.
+rejects oversized serialized dispatch bytes before building a slice or deserializing, then routes
+valid dispatches through the one gated bus path. Distinct `RC_*` return codes carry the failure shape
+back (backpressure, no-such-creature, denied, …) so a creature can act on each, and `RC_PANIC` lets
+the host detect that a creature unwound inside its own glue and pull it off the bus rather than treat
+the call as success.
 
 Authors never write the vtable. They write a Rust type, `impl Creature for It`, and call
 `forge::declare_creature!(It)` once; the macro emits the constructor and the glue that bridges the C
@@ -115,7 +124,8 @@ Verification is a **mechanism** the substrate ships (ed25519 over the signing pa
 are trust roots is an injected policy, never defined in the contract. Admission gathers evidence —
 signature validity, content-address self-consistency, structural validity — and an injected `Policy`
 decides whether to admit. Parsing never panics on hostile input: malformed bytes become a structured
-error.
+error. Manifest JSON and retained metadata are size-bounded before admission or registry retention,
+so malformed manifests cannot become an unbounded memory or durable-journal amplifier.
 
 ## Safe unload
 

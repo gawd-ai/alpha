@@ -66,7 +66,8 @@ use std::collections::HashMap;
 
 use aether::{Address, Creature, CreatureCtx, Dispatch, Envelope, Outcome};
 use agent_templated::{
-    decode_authoring_request, AuthoringError, AuthoringReply, AuthoringRequest, AuthoringResponse,
+    authoring_request_preview, decode_authoring_request, AuthoringError, AuthoringReply,
+    AuthoringRequest, AuthoringResponse,
 };
 use build_cargo::ManifestStub;
 use seer::{topics, SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA};
@@ -409,9 +410,9 @@ impl AgentCurious {
             AnswerChoice::FetchUrlTitle => {
                 Ok(template_fetch_url_title("agent-curious/fetch-url-title"))
             }
-            AnswerChoice::Abort => {
-                Err(AuthoringError::NoTemplate { request: pending.request.clone() })
-            }
+            AnswerChoice::Abort => Err(AuthoringError::NoTemplate {
+                request: authoring_request_preview(&pending.request),
+            }),
             AnswerChoice::Unknown => Err(AuthoringError::Invalid {
                 message: format!(
                     "unrecognized answer content: `{}`",
@@ -442,9 +443,10 @@ impl AgentCurious {
             return Outcome::none();
         };
 
-        let payload =
-            AuthoringReply::Failed(AuthoringError::NoTemplate { request: pending.request })
-                .to_bytes();
+        let payload = AuthoringReply::Failed(AuthoringError::NoTemplate {
+            request: authoring_request_preview(&pending.request),
+        })
+        .to_bytes();
         Outcome::send(
             Dispatch::to(pending.reply_to, payload).with_schema(schema::REPLY).with_corr(corr),
         )
@@ -722,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_request_uses_bounded_seer_preview_but_parks_full_request() {
+    fn unmatched_request_uses_bounded_seer_preview_and_terminal_preview() {
         let mut a = AgentCurious::new();
         let full_request =
             format!("ambiguous {} tail-marker", "x".repeat(MAX_REQUEST_SEER_PREVIEW_BYTES + 4096));
@@ -765,10 +767,14 @@ mod tests {
         let aborted = a.handle(answer_env(43, query_id, "abort"));
         match decode_reply(&aborted.dispatches[0]) {
             AuthoringReply::Failed(AuthoringError::NoTemplate { request }) => {
-                assert_eq!(
-                    request, full_request,
-                    "pending exchange keeps the full original request"
+                assert!(request.contains("truncated"), "terminal reply marks preview: {request}");
+                assert!(
+                    !request.contains(
+                        &"x".repeat(agent_templated::MAX_AUTHORING_ERROR_PREVIEW_BYTES + 1)
+                    ),
+                    "terminal NoTemplate reply must not retain the full oversized request"
                 );
+                assert!(request.len() < full_request.len(), "terminal error echo is bounded");
             }
             other => panic!("expected Failed(NoTemplate), got {other:?}"),
         }

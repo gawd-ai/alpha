@@ -60,8 +60,11 @@ fn load() -> Result<(PathBuf, DemoManifest), String> {
          $GAWD_DEMOS_MANIFEST, <workspace>/demos/demos.json, ./demos/demos.json)."
             .to_string()
     })?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("alpha demo: cannot read {}: {e}", path.display()))?;
+    let text = crate::read_text_file_bounded(
+        &path,
+        crate::MAX_ALPHA_DEMO_MANIFEST_BYTES,
+        "alpha demo manifest",
+    )?;
     let manifest: DemoManifest = serde_json::from_str(&text)
         .map_err(|e| format!("alpha demo: invalid {}: {e}", path.display()))?;
     Ok((path, manifest))

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::address::{Address, CreatureId};
-use crate::envelope::{header_size_error, Envelope, Header};
+use crate::envelope::{address_depth_error, header_size_error, Envelope, Header};
 use crate::instance::Dispatch;
 use crate::router::{RouteError, Router};
 
@@ -114,6 +114,11 @@ impl BusHandle {
             commitment: d.commitment,
             schema: d.schema,
         };
+        // Depth first: it is a cheap iterative walk, while the size gate serializes the header —
+        // a pathologically deep address must never reach the recursive serializer.
+        if let Some((depth, max)) = address_depth_error(&header) {
+            return Err(RouteError::TooDeep { depth, max });
+        }
         if let Some((len, limit)) = header_size_error(&header) {
             return Err(RouteError::HeaderTooLarge { len, limit });
         }

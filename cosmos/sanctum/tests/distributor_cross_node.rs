@@ -273,7 +273,6 @@ fn boot_node_a(
         vec![(NodeId(NODE_B.into()), b_advertiser_id)],
         PickModel::FirstFit,
         10_000,
-        1024,
     );
     let distributor_id = k
         .load_instance(

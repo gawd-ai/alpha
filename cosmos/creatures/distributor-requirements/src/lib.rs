@@ -42,10 +42,10 @@
 //! ## What this creature deliberately doesn't do
 //!
 //! - **It doesn't time out.** A `placement` `Query` carries no deadline by default (the body
-//!   defines no field). If a peer never answers, the pending Intent stays parked. Time is
-//!   injected policy: an operator who wants a deadline binds a watchdog creature that emits a
-//!   `Steer{kind: "abort"}` on the placement corr after T ms, and the distributor honors it
-//!   (deferred — see `on_steer`).
+//!   defines no field). If a peer never answers, the pending Intent stays parked until an answer,
+//!   an explicit `Steer{kind: "abort"}`, or the bounded pending table evicts it with a structured
+//!   `PendingEvicted` reply. Time is injected policy: an operator who wants a deadline binds a
+//!   watchdog creature that emits the abort steer on the placement corr after T ms.
 //! - **It doesn't disambiguate by cost.** The bundled [`PickModel`]s (FirstFit / RoundRobin) are
 //!   intentionally crude. "Best-fit by cpu headroom," "least-loaded," "verifiable-die for fair
 //!   randomization" are operator-injected models.
@@ -89,6 +89,9 @@ pub const MAX_PLACEMENT_INTENT_OUTCOME_BYTES: usize = placement::MAX_QUERY_OUTCO
 pub const MAX_PLACEMENT_INTENT_REQUIREMENTS: usize = placement::MAX_QUERY_REQUIREMENTS;
 /// Maximum bytes in one predicate string accepted from an `Address::Intent`.
 pub const MAX_PLACEMENT_INTENT_REQUIREMENT_BYTES: usize = placement::MAX_QUERY_REQUIREMENT_BYTES;
+/// Default cap for parked placement consults. `0` via [`Distributor::with_max_pending`] is the
+/// explicit lab/demo opt-out.
+pub const DEFAULT_MAX_PENDING_CONSULTS: usize = 128;
 /// Rejected-intent replies echo only a small preview of requirements, never the whole hostile shape.
 const MAX_REJECTED_INTENT_REQUIREMENT_ECHOES: usize = 4;
 const MAX_REJECTED_INTENT_ECHO_BYTES: usize = 256;
@@ -227,8 +230,8 @@ pub struct Distributor {
     /// Maximum number of pending consults the distributor will hold at once. When [`on_intent`]
     /// arrives at capacity, the oldest pending (by `consult_corr` — monotonic, so smallest=oldest)
     /// is evicted and a [`NoProviderReason::PendingEvicted`] reply is emitted to its originator.
-    /// **`0` means unbounded** (the default; pick a real number in production — a
-    /// flaky peer otherwise leaks pending entries forever).
+    /// Defaults to [`DEFAULT_MAX_PENDING_CONSULTS`]. **`0` means unbounded** and must be selected
+    /// explicitly for lab/demo workloads that accept unbounded parked state.
     max_pending: usize,
     /// Round-robin cursor for [`PickModel::RoundRobin`] (per-distributor, not per-consult).
     rr_cursor: AtomicU64,
@@ -244,16 +247,16 @@ pub struct Distributor {
 }
 
 impl Distributor {
-    /// Construct a distributor with explicit topology + model + corr seed + pending-table cap.
-    /// `max_pending == 0` disables the cap (the default; pick a real number in production
-    /// — a flaky peer that never answers otherwise leaks pending entries forever).
+    /// Construct a distributor with explicit topology + model + corr seed.
+    ///
+    /// The pending-consult table is bounded by default; use [`with_max_pending`](Self::with_max_pending)
+    /// to tune it or pass `0` only for an explicit unbounded lab/demo posture.
     pub fn new(
         self_node: NodeId,
         local_advertisers: Vec<CreatureId>,
         peer_advertisers: Vec<(NodeId, CreatureId)>,
         model: PickModel,
         consult_corr_seed: u64,
-        max_pending: usize,
     ) -> Self {
         Distributor {
             self_node,
@@ -261,11 +264,17 @@ impl Distributor {
             peer_advertisers,
             model,
             pending: HashMap::new(),
-            max_pending,
+            max_pending: DEFAULT_MAX_PENDING_CONSULTS,
             rr_cursor: AtomicU64::new(0),
             next_consult_corr: AtomicU64::new(consult_corr_seed),
             me: None,
         }
+    }
+
+    /// Override the pending-consult cap. `0` means explicitly unbounded.
+    pub fn with_max_pending(mut self, max_pending: usize) -> Self {
+        self.max_pending = max_pending;
+        self
     }
 
     /// How many placement consults are currently in flight. Useful for tests + observability;
@@ -782,7 +791,6 @@ mod tests {
             vec![],
             model,
             10_000, // consult corr seed
-            1024,   // max_pending — generous; tests don't exercise eviction here
         );
         d.set_me_for_tests(CreatureId(7));
         d
@@ -796,7 +804,6 @@ mod tests {
             vec![(NodeId("node-B".into()), CreatureId(70))],
             PickModel::FirstFit,
             10_000,
-            1024,
         );
         d.set_me_for_tests(CreatureId(7));
 
@@ -828,14 +835,8 @@ mod tests {
     fn intent_with_no_advertisers_replies_no_provider_immediately() {
         // Operator misconfig — no advertisers anywhere. The Intent must not be silently dropped;
         // the originator gets a structured NoProviderReply.
-        let mut d = Distributor::new(
-            NodeId("node-A".into()),
-            vec![],
-            vec![],
-            PickModel::FirstFit,
-            10_000,
-            1024,
-        );
+        let mut d =
+            Distributor::new(NodeId("node-A".into()), vec![], vec![], PickModel::FirstFit, 10_000);
         d.set_me_for_tests(CreatureId(7));
 
         let out = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"hi"));
@@ -895,7 +896,6 @@ mod tests {
             vec![],
             PickModel::FirstFit,
             10_000,
-            1024,
         );
         // Deliberately NOT calling set_me_for_tests — `me` is None, so the guard fires.
 
@@ -959,7 +959,6 @@ mod tests {
             vec![],
             PickModel::RoundRobin,
             10_000,
-            1024,
         );
         d.set_me_for_tests(CreatureId(7));
 
@@ -992,7 +991,6 @@ mod tests {
             vec![],
             PickModel::RoundRobin,
             10_000,
-            1024,
         );
         d.set_me_for_tests(CreatureId(7));
         let _ = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"abc"));
@@ -1186,7 +1184,6 @@ mod tests {
             vec![],
             PickModel::FirstFit,
             10_000,
-            1024,
         );
         d.set_me_for_tests(CreatureId(7));
 
@@ -1215,8 +1212,8 @@ mod tests {
             vec![],
             PickModel::FirstFit,
             10_000,
-            2, // max_pending
-        );
+        )
+        .with_max_pending(2);
         d.set_me_for_tests(CreatureId(7));
 
         let _ = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"first"));
@@ -1243,23 +1240,61 @@ mod tests {
     }
 
     #[test]
-    fn max_pending_zero_means_unbounded_no_eviction() {
-        // The escape hatch — max_pending=0 disables the cap (the default). Useful when an
-        // operator opts into wherever the pending leak is acceptable (test fixtures, ephemeral
-        // benchmarks).
+    fn default_max_pending_is_bounded_and_evicts_oldest() {
         let mut d = Distributor::new(
             NodeId("node-A".into()),
             vec![CreatureId(50)],
             vec![],
             PickModel::FirstFit,
             10_000,
-            0, // unbounded
         );
         d.set_me_for_tests(CreatureId(7));
 
-        for i in 1..=10u64 {
+        for i in 1..=DEFAULT_MAX_PENDING_CONSULTS as u64 {
             let _ = d.handle(intent_env(i, "reverse", vec!["cpu >= 4"], b"x"));
         }
-        assert_eq!(d.pending_consults(), 10, "unbounded: no eviction at any size");
+        assert_eq!(d.pending_consults(), DEFAULT_MAX_PENDING_CONSULTS);
+
+        let out = d.handle(intent_env(
+            DEFAULT_MAX_PENDING_CONSULTS as u64 + 1,
+            "reverse",
+            vec!["cpu >= 4"],
+            b"x",
+        ));
+
+        assert_eq!(out.dispatches.len(), 2, "evict reply + new consult Query");
+        let evict_reply = out
+            .dispatches
+            .iter()
+            .find(|d| d.schema == SCHEMA_NO_PROVIDER)
+            .expect("default-cap eviction reply");
+        assert_eq!(evict_reply.corr, Some(1), "oldest parked Intent is evicted first");
+        let parsed = NoProviderReply::parse(&evict_reply.payload).expect("NoProviderReply parses");
+        assert_eq!(parsed.reason, NoProviderReason::PendingEvicted);
+        assert_eq!(d.pending_consults(), DEFAULT_MAX_PENDING_CONSULTS);
+    }
+
+    #[test]
+    fn max_pending_zero_means_unbounded_no_eviction() {
+        // The escape hatch — max_pending=0 disables the cap. Useful when an operator explicitly
+        // accepts unbounded pending state (test fixtures, ephemeral benchmarks).
+        let mut d = Distributor::new(
+            NodeId("node-A".into()),
+            vec![CreatureId(50)],
+            vec![],
+            PickModel::FirstFit,
+            10_000,
+        )
+        .with_max_pending(0);
+        d.set_me_for_tests(CreatureId(7));
+
+        for i in 1..=DEFAULT_MAX_PENDING_CONSULTS as u64 + 1 {
+            let _ = d.handle(intent_env(i, "reverse", vec!["cpu >= 4"], b"x"));
+        }
+        assert_eq!(
+            d.pending_consults(),
+            DEFAULT_MAX_PENDING_CONSULTS + 1,
+            "unbounded: no eviction past the default cap"
+        );
     }
 }

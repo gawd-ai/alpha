@@ -77,3 +77,27 @@ fn alpha_demos_manifest_env_overrides_the_default_registry() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn oversized_demo_manifest_is_rejected_before_json_parse() {
+    let dir = std::env::temp_dir().join(format!(
+        "alpha-demo-manifest-test-{}-{}",
+        process::id(),
+        "oversized"
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("demos.json");
+    fs::File::create(&manifest).unwrap().set_len(alpha::MAX_ALPHA_DEMO_MANIFEST_BYTES + 1).unwrap();
+
+    let out = alpha_demo()
+        .arg("list")
+        .env("ALPHA_DEMOS_MANIFEST", &manifest)
+        .output()
+        .expect("run alpha demo list with oversized ALPHA_DEMOS_MANIFEST");
+    assert!(!out.status.success(), "oversized demo manifest should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("alpha demo manifest"), "should name the bounded file: {stderr:?}");
+    assert!(stderr.contains("exceeds"), "should explain the byte cap: {stderr:?}");
+
+    let _ = fs::remove_dir_all(dir);
+}

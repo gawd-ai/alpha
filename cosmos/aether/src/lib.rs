@@ -70,6 +70,13 @@ mod tests {
     fn bus(r: &Arc<Router>, me: CreatureId) -> BusHandle {
         BusHandle::new(me, r.clone(), Arc::new(StubSigner::new("test")))
     }
+    fn nested_realm_address(layers: usize) -> Address {
+        let mut a = Address::Creature(CreatureId(7));
+        for _ in 0..layers {
+            a = Address::Realm { realm: RealmId::local(), target: Box::new(a) };
+        }
+        a
+    }
 
     #[derive(Default)]
     struct CountingSigner {
@@ -129,6 +136,70 @@ mod tests {
         assert!(
             r.journal_snapshot().is_empty(),
             "oversized header was not retained in the journal"
+        );
+    }
+
+    #[test]
+    fn overdeep_federation_addresses_are_refused_before_signing_or_gateway_delivery() {
+        let r = router();
+        let (realm_gw, realm_rx) = r.register(Capabilities::default());
+        r.bind_role(Role::new(Role::REALM_GATEWAY), realm_gw);
+        let (sender, _s) = r.register(Capabilities::default());
+        let signer = Arc::new(CountingSigner::default());
+        let b = BusHandle::new(sender, r.clone(), signer.clone());
+
+        let err = b
+            .send(Dispatch::to(nested_realm_address(MAX_ADDRESS_NESTING_DEPTH + 1), Vec::new()))
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RouteError::TooDeep {
+                    depth,
+                    max
+                } if depth == MAX_ADDRESS_NESTING_DEPTH + 1 && max == MAX_ADDRESS_NESTING_DEPTH
+            ),
+            "overdeep destination rejected with the dedicated route error: {err:?}"
+        );
+        assert_eq!(signer.calls.load(Ordering::SeqCst), 0, "overdeep header was not signed");
+        assert!(
+            realm_rx.try_recv().is_err(),
+            "overdeep federation address was not delivered to the gateway"
+        );
+        assert!(r.journal_snapshot().is_empty(), "overdeep header was not retained in the journal");
+    }
+
+    #[test]
+    fn direct_route_rejects_overdeep_from_endpoint_before_delivery() {
+        let r = router();
+        let (target, rx) = r.register(Capabilities::default());
+        let env = Envelope {
+            header: Header {
+                from: nested_realm_address(MAX_ADDRESS_NESTING_DEPTH + 1),
+                to: Address::Creature(target),
+                reply_to: None,
+                seq: 0,
+                causal: Vec::new(),
+                stamp: 0,
+                sig: String::new(),
+                corr: None,
+                commitment: None,
+                schema: String::new(),
+            },
+            payload: Vec::new(),
+        };
+
+        let err = r.route(env).unwrap_err();
+        assert!(
+            matches!(err, RouteError::TooDeep { depth, max }
+                if depth == MAX_ADDRESS_NESTING_DEPTH + 1 && max == MAX_ADDRESS_NESTING_DEPTH),
+            "overdeep source rejected with the dedicated route error: {err:?}"
+        );
+        assert!(rx.try_recv().is_err(), "overdeep source envelope was not delivered");
+        assert!(
+            r.journal_snapshot().is_empty(),
+            "overdeep source envelope was not retained in the journal"
         );
     }
 
@@ -389,6 +460,26 @@ mod tests {
         b.send(Dispatch::to(Address::Topic(t), b"alive".to_vec())).unwrap();
         assert_eq!(arx.recv().unwrap().payload, b"alive");
         assert_eq!(crx.recv().unwrap().payload, b"alive");
+    }
+
+    #[test]
+    fn duplicate_topic_subscribe_is_idempotent() {
+        let r = router();
+        let (a, arx) = r.register(Capabilities::default());
+        let t = Topic::new(Topic::PROPRIOCEPTION);
+        r.subscribe(t.clone(), a);
+        r.subscribe(t.clone(), a);
+        r.subscribe(t.clone(), a);
+
+        let (sender, _s) = r.register(Capabilities::default());
+        let b = bus(&r, sender);
+        b.send(Dispatch::to(Address::Topic(t), b"once".to_vec())).unwrap();
+
+        assert_eq!(arx.recv().unwrap().payload, b"once");
+        assert!(
+            matches!(arx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "duplicate subscribe should not duplicate fan-out deliveries"
+        );
     }
 
     /// `Ed25519Signer` plugs into the `Signer` slot the same way `StubSigner` does — proving
