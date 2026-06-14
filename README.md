@@ -132,18 +132,20 @@ We'd rather you knew exactly where the seams are:
 
 ## Repository map
 
-The root holds only the **α** door (`alpha/`); everything between α and **Ω** lives under `cosmos/`,
-so the cosmology is legible from `ls`. Per-crate detail is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+The root holds the two poles — the **α** door (`alpha/`) and the **Ω** server (`omega/`); everything
+*between* them lives under `cosmos/`, so the cosmology is legible from `ls`. Per-crate detail is in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 | Path | What it is |
 |---|---|
-| `alpha/` | **α — the front door.** One binary: `alpha node \| mcp \| http \| demo`, dispatching in-process. |
+| `alpha/` | **α — the front door (client).** One binary: `alpha node \| mcp \| http \| demo`, dispatching in-process. |
+| `omega/` | **Ω — the federation/gateway server.** One binary: `omega serve` boots a headless gateway Sanctum (transport mesh + registry + `omega-federator` on `Role::OMEGA_GATEWAY`), the dual of `alpha node`. |
 | `cosmos/sigil/` | The at-rest contract — a creature's signed `Manifest` (identity / capabilities / provenance / content address). The sole metadata source. |
 | `cosmos/aether/` | The bus spine — typed `Envelope`, `Address`, the sharded `Router`, the journal, and the `seer` (Query/Answer) + `abode` (snapshot) primitives. |
 | `cosmos/anima/` | The per-tier loaders — `NativeEngine` (dlopen + safe-unload), `WasmEngine` (wasmtime), `ScriptEngine` (Rhai). |
 | `cosmos/sanctum/` | **The kernel** — model-free lifecycle, routing, and admission *mechanism*. Tier-blind. |
 | `cosmos/forge/` | The creature-authoring SDK — `declare_creature!`, the bus, managed spawn, the prelude. |
-| `cosmos/{abode,seer,realm,omega}/` | First-class concept crates: continuity, query/answer, the trust domain, and **Ω** (the global graph). |
+| `cosmos/{abode,seer,realm,bestiary,omega-contract}/` | First-class concept crates: continuity, query/answer, the trust domain, the durable registry, and the lean **Ω** wire contract (`omega.deferred` + `GATEWAY_ROLE`; re-exported by the `omega` server). |
 | `cosmos/omni/` | The spine-only control core every surface drives over `Role::CONTROL`. |
 | `cosmos/creatures/` | Production-capable reference organs: authoring, transport, registry, distributor, federation, immune response, … |
 | `cosmos/creatures/prototypes/` | Injected, operator-replaceable strategy models (policies, scorers, distributors, gateways) — **not** substrate. |

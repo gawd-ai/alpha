@@ -27,13 +27,13 @@
 //! grain.
 
 use aether::{Address, Creature, CreatureCtx, Dispatch, Envelope, Outcome};
-// The `omega.deferred` wire contract is owned by the `omega` concept crate (the seam),
+// The `omega.deferred` wire contract is owned by the lean `omega-contract` leaf crate (the seam),
 // not by this stub. Re-exported so consumers (and this stub's tests, and the
 // `omega_stub_route` integration test) can still name them via `omega_gateway::…`.
-pub use omega::deferred::{OmegaDeferredReason, OmegaDeferredReply};
+pub use omega_contract::deferred::{OmegaDeferredReason, OmegaDeferredReply};
 
-// `OmegaDeferredReason` / `OmegaDeferredReply` live in `omega::deferred` —
-// the concept crate owns the wire contract; they are re-exported above.
+// `OmegaDeferredReason` / `OmegaDeferredReply` live in `omega_contract::deferred` —
+// the contract crate owns the wire shape; they are re-exported above.
 
 /// The stub creature.
 ///

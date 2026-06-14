@@ -11,7 +11,8 @@ description = "A reference Omega-gateway creature — not substrate. Replies wit
 [dependencies]
 aether = { path = "../../../../aether" }
 sigil = { path = "../../../../sigil" }
-# The `omega` concept crate owns the gateway seam — the bound Role, the structured
-# `omega.deferred` wire contract, and the `OmegaRouting` trait this stub implements.
-omega = { path = "../../../../../omega" }
+# The lean `omega-contract` leaf crate owns the gateway seam — the bound Role name and the
+# structured `omega.deferred` wire contract this stub replies with. (The stub implements
+# `aether::Creature`; `omega` deliberately ships no routing trait — see the omega-contract docs.)
+omega-contract = { path = "../../../../omega-contract" }
 serde_json = { workspace = true }

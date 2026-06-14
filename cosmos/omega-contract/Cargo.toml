@@ -1,0 +1,17 @@
+[package]
+name = "omega-contract"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The Ω wire contract + reserved seam (lean leaf): the omega-gateway socket name (GATEWAY_ROLE), the omega.deferred reply contract, and the reserved OmegaServices trait. No creature edge — a stub gateway or an orchestrator parses omega.deferred by depending on this, never on the omega server crate."
+
+[dependencies]
+realm = { path = "../realm" }
+aether = { path = "../aether" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

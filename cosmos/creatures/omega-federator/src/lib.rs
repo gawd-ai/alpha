@@ -448,7 +448,8 @@ impl OmegaFederator {
     }
 }
 
-/// The federator binds [`omega::GATEWAY_ROLE`] and *resolves* Omega addresses. The `omega` concept
+/// The federator binds [`Role::OMEGA_GATEWAY`](aether::Role::OMEGA_GATEWAY) (named
+/// `omega::GATEWAY_ROLE` by the Ω contract crate) and *resolves* Omega addresses. The `omega` concept
 /// crate deliberately exposes no routing seam trait — the two gateways diverge too far for a
 /// shared per-envelope `resolve` (this federator's
 /// behavior is stateful anti-entropy + signed reputation + a quarantine path, not a pure decision), so

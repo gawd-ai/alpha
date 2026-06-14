@@ -9,9 +9,12 @@ members = [
     "alpha",
 
     # ---- the Ω pole: the federation apex / mesh side, dual to the α door. Where alpha is the local
-    #      operator (client), omega is the network graph of Realms (the server/mesh) — today the Ω
-    #      contract crate (an embryo), eventually its own binary. A root crate like alpha, not a cosmos
-    #      vocabulary noun; it consumes the cosmology (realm + aether) the same way alpha does ----
+    #      operator (client), omega is the network graph of Realms (the server/mesh). `omega` is now a
+    #      lib+bin: `omega serve` boots a dedicated federation/gateway Sanctum (transport mesh +
+    #      registry + omega-federator on Role::OMEGA_GATEWAY), the dual of `alpha node`. A root crate
+    #      like alpha, not a cosmos vocabulary noun; it consumes the cosmology the same way alpha does.
+    #      The frozen Ω WIRE CONTRACT lives in the lean cosmos/omega-contract leaf (below), so a stub
+    #      gateway can parse omega.deferred without pulling this server's kernel deps ----
     "omega",
 
     # ---- narrated, runnable demos (stay at the root, alongside the door they exercise) ----
@@ -37,12 +40,15 @@ members = [
 
     # ---- first-class concept crates: promoted out of aether so future authority lands in a home that
     #      already exists. abode/seer/bestiary carry live contracts; realm (= the trust domain) is an
-    #      embryo that imprints the cosmology now. Layering: aether → {seer, abode, realm, bestiary}
-    #      (the Ω pole `omega`, now at the root, consumes realm + aether from there) ----
+    #      embryo that imprints the cosmology now; omega-contract is the lean Ω wire contract
+    #      (omega.deferred + GATEWAY_ROLE + the reserved OmegaServices seam) the Ω server crate
+    #      re-exports. Layering: aether → {seer, abode, realm, bestiary, omega-contract}
+    #      (the Ω pole `omega`, at the root, consumes realm + aether + omega-contract from here) ----
     "cosmos/abode",
     "cosmos/seer",
     "cosmos/realm",
     "cosmos/bestiary",
+    "cosmos/omega-contract",
 
     # ---- the injected model seam: a leaf crate (depends on no creature) carrying the `Model`
     #      contract so BOTH the model-backed author (agent-mind) and the Bestiary curator can consume

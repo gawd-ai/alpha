@@ -32,7 +32,7 @@ makes "fabric, not model" structurally enforced, not promised.
 ```
 .                          # repo root: the α door + support dirs only — "nothing mixed"
 alpha/                      # the α pole — front door + local operator (client): node/mcp/http compose in-process; demo spawns external demos
-omega/                      # the Ω pole — federation apex / mesh (server), dual to alpha: the Ω contract crate today, its own binary later
+omega/                      # the Ω pole — federation apex / mesh (server), dual to alpha: a lib+bin — `omega serve` boots a federation/gateway Sanctum (the frozen Ω wire contract is the cosmos/omega-contract leaf)
 demos/                     # narrated, runnable demos (walkthrough, federation, distribute, bestiary-live; cluster/ is a runbook)
 docs/                      # CONCEPTS / ARCHITECTURE / ROADMAP / TOPICS + design notes …
 foundation/                # shared GAWD foundations Alpha CONSUMES but does not own (cross-system, gawd-prefixed, externalize later):
@@ -45,6 +45,7 @@ cosmos/                    # everything between α and Ω — the interior the f
   forge/                   #   the creature-authoring surface (declare_creature! + NativeBus + managed::spawn)
   abode/  seer/            #   first-class concept crates: snapshot contract + Query/Answer primitive
   realm/                #   the trust domain (owns its realm-gateway seam + realm::serve); Ω (omega) is a root pole, above
+  omega-contract/       #   the lean Ω wire contract (omega.deferred + GATEWAY_ROLE + reserved OmegaServices); re-exported by the omega server
   omni/                    #   the spine-only control core every surface drives over the bus
   creatures/               #   production-capable reference organs (mostly native; critter source ships as bytes):
                            #     transport-tcp                     (ed25519 + framed TCP)

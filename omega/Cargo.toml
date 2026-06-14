@@ -6,12 +6,42 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "The Ω of GAWD (embryo): the highest set-of-sets, the final membrane — the set-of-Realms that provides common services to the Realms beneath it (cross-realm graph optimization, gating, sanctum persistence/backup, self-containment). It names Ω and reserves the OmegaServices seam so that future authority arrives as an implementation of an existing concept, never as a new top-level membrane bolted on later."
+description = "omega — the Ω server: the federation apex / mesh side, dual to the α front door. `omega serve` boots a dedicated federation/gateway Sanctum (transport mesh + registry + omega-federator on Role::OMEGA_GATEWAY). The frozen Ω wire contract lives in the lean omega-contract leaf crate (re-exported here)."
+
+# The Ω server composition root lives in the lib (so it can be driven by the integration test); the
+# binary is a thin dispatcher, mirroring `alpha`.
+[lib]
+name = "omega"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omega"
+path = "src/main.rs"
 
 [dependencies]
-realm = { path = "../cosmos/realm" }
+# The frozen Ω wire contract (re-exported so the public `omega::deferred` path keeps resolving).
+omega-contract = { path = "../cosmos/omega-contract" }
+# The kernel + engines + the shared control core the gateway composes (the same set alpha links,
+# minus the authoring/build organs — a gateway federates, it does not author).
 aether = { path = "../cosmos/aether" }
-serde = { workspace = true }
+anima = { path = "../cosmos/anima" }
+sigil = { path = "../cosmos/sigil" }
+sanctum = { path = "../cosmos/sanctum" }
+omni = { path = "../cosmos/omni" }
+# The injected dev admission policy the gateway boots its kernel with.
+policy-dev = { path = "../cosmos/creatures/prototypes/policies/policy-dev" }
+# The loadable control surface + the authenticated peer transport.
+surface-http = { path = "../cosmos/creatures/surface-http" }
+transport-tcp = { path = "../cosmos/creatures/transport-tcp" }
+# The registry the gateway serves, the real federation creature it binds on OMEGA_GATEWAY, and the
+# reference reputation weigher injected into it.
+registry-mem = { path = "../cosmos/creatures/registry-mem" }
+omega-federator = { path = "../cosmos/creatures/omega-federator" }
+reputation-roundrobin = { path = "../cosmos/creatures/prototypes/reputation/reputation-roundrobin" }
+# Clean shutdown on SIGINT/SIGTERM (the gateway daemon).
+ctrlc = { workspace = true }
 
 [dev-dependencies]
+# The α-client / Ω-server federation integration test drives registry ops + hashes artifacts.
 serde_json = { workspace = true }
+sha2 = { workspace = true }

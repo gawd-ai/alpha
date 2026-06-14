@@ -18,7 +18,9 @@ to end.
 
 The operator surface is one binary, `alpha`: a node daemon, an MCP control-hub, and an HTTP/WS plane,
 each a thin host over the same `Role::CONTROL` bus contract. A node joins a gossip mesh from a seed,
-and an AI drives any node it is allowed to.
+and an AI drives any node it is allowed to. Its dual, the **Ω server** `omega serve`, boots a dedicated
+federation/gateway Sanctum (`omega-federator` on `Role::OMEGA_GATEWAY`) — both poles compose the same
+kernel and control core; they differ in posture, not mechanism.
 
 ## Where it goes next
 
@@ -26,9 +28,10 @@ and an AI drives any node it is allowed to.
   with richer partition tolerance.
 - **Placement** — cross-Realm placement: a creature's requirements matched against embodiment beyond
   the local Realm, not only within it.
-- **Federation** — Omega discovery and production realm/omega gateway creatures. (A durable, federated
-  Bestiary beyond the in-memory seed now ships — `bestiary-daemon`; what remains is autonomous
-  cross-Realm anti-entropy scheduling and quorum.)
+- **Federation** — Omega discovery and production realm/omega gateway creatures. (The Ω pole now has a
+  body — `omega serve` runs a federation/gateway Sanctum — and a durable, federated Bestiary beyond the
+  in-memory seed ships as `bestiary-daemon`; what remains is peer discovery, autonomous cross-Realm
+  anti-entropy scheduling, and quorum.)
 - **Trust** — more of the proof-of-trust surface made live: weighted and consensus picks, additional
   verifiable-randomness schemes, and standing SEER consumers for the policy, budget, fitness,
   consensus, and curation topics.

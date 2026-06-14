@@ -68,6 +68,21 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   `Resume` wire op) → `kernel.load` (which re-verifies at admission, so a tampered fetch is refused).
   Loads code → gated. New runnable `demos/distribute` shows it cross-node over real ed25519 TCP.
 
+### Ω — a real server (`omega serve`)
+- `omega` is now a **lib+bin**, giving the Ω pole a body symmetric to the α front door. `omega serve`
+  boots a kernel configured as a dedicated **federation / gateway Sanctum** — `transport-tcp` on
+  `Role::TRANSPORT` (gossip mesh + seeds), `registry-mem` on `Role::REGISTRY`, and the real
+  `omega-federator` on `Role::OMEGA_GATEWAY` (with the reference `RoundRobinReputation` weigher), plus
+  an optional HTTP/WS control plane. It is headless with no authoring agent and no REPL — the dual of
+  `alpha node` (which keeps its operator/authoring seat and its own `--cluster-listen`). The split is
+  posture/defaults, not a capability fence.
+- The frozen Ω **wire contract** moved to a new lean `omega-contract` leaf crate (`omega.deferred`,
+  `GATEWAY_ROLE`, the reserved `OmegaServices` seam — just `realm`/`aether`/`serde`), so a stub gateway
+  or an orchestrator parses an `omega.deferred` reply without pulling the server's kernel deps. The
+  `omega` crate re-exports it, so the public path `omega::deferred` / `omega::GATEWAY_ROLE` is
+  unchanged. **No wire change**: `Address::Omega`, `Role::OMEGA_GATEWAY = "omega-gateway"`, and the
+  `omega.deferred` schema are byte-identical; this is pure code-motion + a new composition root.
+
 ### Abode — authenticated migration (M9-2)
 - A migration responder now returns a **cryptographic witness**: having passed all six admission gates,
   it signs `(source abode_key ‖ state_hash ‖ challenge ‖ responder_node ‖ responder_pubkey)` with its

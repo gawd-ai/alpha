@@ -13,9 +13,6 @@ aether = { path = "../../aether" }
 bestiary = { path = "../../bestiary" }
 seer = { path = "../../seer" }
 sigil = { path = "../../sigil" }
-# The `omega` concept crate owns the gateway socket name (`omega::GATEWAY_ROLE`) this
-# federator binds. (Omega intentionally has no routing seam trait — see the crate docs.)
-omega = { path = "../../../omega" }
 registry-mem = { path = "../registry-mem" }
 serde = { workspace = true }
 serde_json = { workspace = true }
