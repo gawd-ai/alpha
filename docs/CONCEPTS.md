@@ -312,7 +312,7 @@ resolved differently (the integration risk the substrate was designed around; se
 
 | Cosmology | Crate / artifact in this repo |
 |---|---|
-| Sanctum (node) | `sanctum` (the kernel library) + `alpha node` (the daemon subcommand of the α front door) |
+| Sanctum (node) | `sanctum` (the kernel library), realized as a process by `alpha node` (an operator/authoring seat — the α front door) or `omega serve` (a federation/gateway server — the Ω pole) |
 | the bus | `aether` — one `Envelope`, one `Router`, the `Creature` seam, the journal |
 | creature load mechanism | one `Kernel::load` over `anima` — `libloading` for native `daemon`s, `wasmtime` for `beast`s, Rhai for `critter`s — selected by `abi.backend` |
 | self-hosting | transport, registry, the authoring agent, the admission policy, and the placement distributor are all ordinary creatures (`cosmos/creatures/*`, `cosmos/creatures/prototypes/*`) |

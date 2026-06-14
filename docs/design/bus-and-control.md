@@ -320,9 +320,13 @@ control plane.
 
 The `alpha` (α) front door is the surfaces' host. `alpha node` boots a sanctum
 with an optional HTTP/WS surface; `alpha http` serves a headless node plus the
-HTTP surface; `alpha mcp` boots the MCP control-hub. Loading a privileged surface
-is itself a privileged act — the bootstrap is the trusted REPL seat or boot
-config, never a restricted remote caller. Local text inputs that the front door
+HTTP surface; `alpha mcp` boots the MCP control-hub. The Ω pole's server,
+`omega serve`, exposes the *same* HTTP/WS control plane with `--listen` — the
+identical role-bound, Bearer-authenticated `omni::boot_control` + `surface-http`
+pair `alpha node --listen` boots — because control is one bus contract, not a
+per-binary feature. Loading a privileged surface is itself a privileged act — the
+bootstrap is the trusted REPL seat or boot config, never a restricted remote
+caller. Local text inputs that the front door
 ingests before control dispatch are bounded too: interactive `alpha node` REPL
 lines, `alpha node --script`, and the external `alpha demo` registry manifest
 are capped at 1 MiB, while `--author-api-key-file` is capped at 8 KiB before

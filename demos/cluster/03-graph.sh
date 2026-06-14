@@ -40,4 +40,4 @@ fi
 
 graph_once
 echo "✓ A '●' marks a connected peer. Full mesh = each node shows 2 connected peers."
-echo "  Next: ./04-cross-run.sh  (author on A, run it from B over the mesh)"
+echo "  Next: ./04-cross-run.sh  (author on B, run it from A — the Ω server — over the mesh)"

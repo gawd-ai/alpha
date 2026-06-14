@@ -82,6 +82,13 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   `omega` crate re-exports it, so the public path `omega::deferred` / `omega::GATEWAY_ROLE` is
   unchanged. **No wire change**: `Address::Omega`, `Role::OMEGA_GATEWAY = "omega-gateway"`, and the
   `omega.deferred` schema are byte-identical; this is pure code-motion + a new composition root.
+- The demos and docs now reflect — and *use* — the two-pole structure. The federation demo's in-process
+  Realm gateways bind their `omega-federator` through the new shared `omega::serve::boot_federator`
+  recipe (the same one `omega serve` runs), so the demo and the server cannot drift. The `demos/cluster/`
+  runbook now stands up both poles on one mesh — node A an `omega serve` server (mesh anchor + idle
+  federator), B/C `alpha node` operators — and cross-executes a creature authored on an α operator from
+  the Ω server. Concept and operator docs (CONCEPTS, ARCHITECTURE, SECURITY, the bus/control design note,
+  the READMEs, AGENTS) now describe a Sanctum as realized by **both** `alpha node` and `omega serve`.
 
 ### Abode — authenticated migration (M9-2)
 - A migration responder now returns a **cryptographic witness**: having passed all six admission gates,

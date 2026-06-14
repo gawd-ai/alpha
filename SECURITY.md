@@ -22,7 +22,10 @@ is **not** hardened for hostile production deployment. Treat it accordingly:
 
 `alpha node` can expose an HTTP + WebSocket control plane (`--listen`, the loadable `surface-http`
 creature), and `alpha mcp` runs the MCP control-hub; both drive the node's `Role::CONTROL` over the bus.
-This surface **can author and hot-load native code**, so treat it as privileged:
+The Ω server `omega serve` exposes the **same** `--listen` control plane with the **same** auth posture
+(off by default, one Bearer key, the off-by-default `--allow-ai` gate) — everything below applies to it
+equally, except that `omega serve` has no authoring organ, so its surface cannot author (it can still
+hot-load and drive). This surface **can author and hot-load native code**, so treat it as privileged:
 
 - **Off by default.** No API exists unless you pass `--listen <addr>` (which has no default). Bind a
   **localhost** address (e.g. `127.0.0.1:7777`) to keep it host-local; exposing it beyond the host

@@ -12,10 +12,18 @@
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 export ROOT="$(cd "$HERE/../.." && pwd)"
 export RUN="$HERE/run"     # pids / logs / captured pubkeys live here
-# One binary: `alpha` is the α front door. `alpha node` is the daemon; `alpha mcp` the
-# MCP hub. BIN/MCP both point at it so the call sites read `"$BIN" node …` / `"$MCP" mcp …`.
+# Two poles, two binaries. `alpha` is the α front door — `alpha node` is an operator daemon,
+# `alpha mcp` the MCP hub; BIN/MCP both point at it (`"$BIN" node …` / `"$MCP" mcp …`). `omega` is
+# the Ω server — `omega serve` boots a federation/gateway Sanctum. This runbook makes node A an
+# `omega serve` server (the mesh anchor + an idle federator) and B/C `alpha node` operators, so the
+# cluster shows both poles on one mesh. They share the same control plane, gossip, and transport.
 export BIN="${BIN:-$ROOT/target/release/alpha}"
 export MCP="${MCP:-$ROOT/target/release/alpha}"
+export OMEGA="${OMEGA:-$ROOT/target/release/omega}"
+
+# Node A is the Ω server; it declares its own Realm (the federator's self_realm). With no peer Realm
+# configured, A's federator is present but idle — the cross-Realm job is shown by the `federation` demo.
+export A_REALM="${A_REALM:-crew}"
 
 # Per-node host / cluster port / api port.
 export A_HOST="${A_HOST:-127.0.0.1}"; export A_CPORT="${A_CPORT:-9101}"; export A_APORT="${A_APORT:-7101}"

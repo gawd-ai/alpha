@@ -37,10 +37,9 @@ use sigil::{Backend, Capabilities, Ed25519KeyMaterial, Ed25519Verifier, Manifest
 
 use bestiary::{BestiaryStore, DeterministicCurator, FsBestiaryStore};
 use bestiary_daemon::{BestiaryConfig, BestiaryDaemon};
-use omega_federator::{FederatorConfig, FederatorMsg, OmegaFederator};
+use omega_federator::FederatorMsg;
 use policy_signed::SignedPolicy;
 use registry_mem::{RegistryMem, RegistryOp, RegistryReply, SyncEntry};
-use reputation_roundrobin::RoundRobinReputation;
 use sha2::{Digest, Sha256};
 use transport_tcp::{PeerConfig, PeerEvent, TransportConfig, TransportTcp};
 
@@ -198,6 +197,10 @@ fn parse_args(args: &[String]) -> (usize, usize) {
 /// star), plus a full mesh among gateways (so any Realm can reach any other). For every link the
 /// higher global index dials the lower; nodes boot in index order, so a dialer's target is always
 /// already listening.
+///
+/// Each gateway is the in-process equivalent of one [`omega serve`](omega) process: its
+/// `OMEGA_GATEWAY` binding is bound by [`omega::serve::boot_federator`] — the same recipe the binary
+/// runs in production — so what this demo narrates and what an operator deploys cannot drift.
 fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
     let n = realms * sanctums;
     let g = |r: usize, s: usize| r * sanctums + s; // global index
@@ -247,6 +250,7 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
     } else {
         note("registry backend: in-memory registry-mem (set ALPHA_DURABLE_BESTIARY=1 to run on the durable Bestiary)");
     }
+    note("each gateway = one `omega serve` Sanctum in-process (its OMEGA_GATEWAY binding is omega::serve::boot_federator, the very recipe the binary runs); workers are `alpha node` Sanctums");
     let mut nodes: Vec<Node> = Vec::with_capacity(n);
     for idx in 0..n {
         let r = realm_of(idx);
@@ -309,7 +313,12 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
         };
         kernel.bind_role(Role::new(Role::REGISTRY), registry_id);
 
-        // Federator (gateways only) — maps every *other* Realm to that Realm's gateway node.
+        // Federator (gateways only) — maps every *other* Realm to that Realm's gateway node. Each
+        // gateway Sanctum here is the in-process equivalent of one `omega serve` process, so its
+        // `OMEGA_GATEWAY` binding comes from the very recipe the binary runs in production —
+        // `omega::serve::boot_federator` — rather than a demo-local copy. The manifest is the demo's
+        // *signed* boot manifest (this kernel runs the strict `SignedPolicy`, not the binary's
+        // `DevPolicy`), which is exactly why `boot_federator` takes the manifest as a parameter.
         let federator_id = if is_gateway(idx) {
             let mut realm_to_peer = HashMap::new();
             for (other_r, &other_name) in REALM_NAMES.iter().enumerate().take(realms) {
@@ -318,18 +327,18 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
                         .insert(RealmId::new(other_name), NodeId(format!("{other_name}-gw")));
                 }
             }
-            let federator = OmegaFederator::new(FederatorConfig {
-                self_node: NodeId(name.clone()),
-                self_realm: RealmId::new(realm),
-                local_registry: registry_id,
-                abode_key: abode_keys[idx].clone(),
-                realm_to_peer,
-                weigher: Box::new(RoundRobinReputation::new()),
-            });
-            let fid = kernel
-                .load_instance(signed_boot_manifest("omega-federator", &key), Box::new(federator))
-                .map_err(|e| format!("{name}: federator admits: {e}"))?;
-            kernel.bind_role(Role::new(Role::OMEGA_GATEWAY), fid);
+            let fid = omega::serve::boot_federator(
+                &kernel,
+                signed_boot_manifest("omega-federator", &key),
+                omega::serve::FederatorBootConfig {
+                    self_node: NodeId(name.clone()),
+                    self_realm: RealmId::new(realm),
+                    local_registry: registry_id,
+                    abode_key: abode_keys[idx].clone(),
+                    realm_to_peer,
+                },
+            )
+            .map_err(|e| format!("{name}: {e}"))?;
             Some(fid)
         } else {
             None

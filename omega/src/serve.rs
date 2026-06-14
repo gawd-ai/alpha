@@ -26,7 +26,7 @@ use policy_dev::DevPolicy;
 use registry_mem::RegistryMem;
 use reputation_roundrobin::RoundRobinReputation;
 use sanctum::Kernel;
-use sigil::Ed25519KeyMaterial;
+use sigil::{Ed25519KeyMaterial, Manifest};
 
 /// Parsed `omega serve` options.
 struct Opts {
@@ -283,9 +283,9 @@ pub struct GatewayIds {
 }
 
 /// Boot the federation/gateway organs into `kernel`: `transport-tcp` on `Role::TRANSPORT`,
-/// `registry-mem` on `Role::REGISTRY`, and `omega-federator` on `Role::OMEGA_GATEWAY` (with the
-/// reference `RoundRobinReputation` weigher). No authoring agent — a gateway does not author.
-/// Mirrors the per-node boot in `cosmos/sanctum/tests/omega_federation_cross_node.rs`.
+/// `registry-mem` on `Role::REGISTRY`, and `omega-federator` on `Role::OMEGA_GATEWAY` (via
+/// [`boot_federator`]). No authoring agent — a gateway does not author. Mirrors the per-node boot in
+/// `cosmos/sanctum/tests/omega_federation_cross_node.rs`.
 pub fn boot_gateway(kernel: &Arc<Kernel>, cfg: &GatewayConfig) -> Result<GatewayIds, String> {
     let transport = boot_cluster(kernel, &cfg.node_id, &cfg.listen, &cfg.seeds, &cfg.node_key)?;
 
@@ -294,20 +294,64 @@ pub fn boot_gateway(kernel: &Arc<Kernel>, cfg: &GatewayConfig) -> Result<Gateway
         .map_err(|e| format!("registry-mem admits: {e}"))?;
     kernel.bind_role(Role::new(Role::REGISTRY), registry);
 
+    let federator = boot_federator(
+        kernel,
+        boot_manifest("omega-federator"),
+        FederatorBootConfig {
+            self_node: NodeId(cfg.node_id.clone()),
+            self_realm: cfg.self_realm.clone(),
+            local_registry: registry,
+            abode_key: cfg.node_key.clone(),
+            realm_to_peer: cfg.realm_to_peer.clone(),
+        },
+    )?;
+
+    Ok(GatewayIds { transport, registry, federator })
+}
+
+/// The wiring [`boot_federator`] needs — everything that distinguishes one gateway's federator from
+/// another's. The weigher is not a field: `boot_federator` always binds the reference
+/// `RoundRobinReputation` (the shared recipe's one fixed choice).
+pub struct FederatorBootConfig {
+    /// This gateway's node id.
+    pub self_node: NodeId,
+    /// This gateway's own Realm.
+    pub self_realm: RealmId,
+    /// The local registry the federator answers from and merges pulled entries into.
+    pub local_registry: CreatureId,
+    /// The node's ed25519 identity — the federator's Abode key for outbound signed reputation deltas.
+    pub abode_key: Ed25519KeyMaterial,
+    /// Realm→peer routes for Omega routing.
+    pub realm_to_peer: HashMap<RealmId, NodeId>,
+}
+
+/// Bind an `omega-federator` on `Role::OMEGA_GATEWAY` with the reference `RoundRobinReputation`
+/// weigher. This is the one omega-specific organ that both `omega serve` (via [`boot_gateway`]) and
+/// the in-process `federation` demo share, so the `OMEGA_GATEWAY` binding never drifts between the
+/// running server and the demo that illustrates it.
+///
+/// `manifest` is the caller's admission manifest, because the two callers run under different
+/// policies: [`boot_manifest`]`("omega-federator")` for the binary's `DevPolicy`, or a
+/// `signed_boot_manifest` for a `SignedPolicy` kernel (the demo). Everything else — the federator's
+/// config and the weigher — is identical, which is the point of sharing it.
+pub fn boot_federator(
+    kernel: &Kernel,
+    manifest: Manifest,
+    cfg: FederatorBootConfig,
+) -> Result<CreatureId, String> {
     let federator = OmegaFederator::new(FederatorConfig {
-        self_node: NodeId(cfg.node_id.clone()),
-        self_realm: cfg.self_realm.clone(),
-        local_registry: registry,
-        abode_key: cfg.node_key.clone(),
-        realm_to_peer: cfg.realm_to_peer.clone(),
+        self_node: cfg.self_node,
+        self_realm: cfg.self_realm,
+        local_registry: cfg.local_registry,
+        abode_key: cfg.abode_key,
+        realm_to_peer: cfg.realm_to_peer,
         weigher: Box::new(RoundRobinReputation::new()),
     });
     let federator = kernel
-        .load_instance(boot_manifest("omega-federator"), Box::new(federator))
+        .load_instance(manifest, Box::new(federator))
         .map_err(|e| format!("omega-federator admits: {e}"))?;
     kernel.bind_role(Role::new(Role::OMEGA_GATEWAY), federator);
-
-    Ok(GatewayIds { transport, registry, federator })
+    Ok(federator)
 }
 
 /// This node's derived ed25519 identity — the one key it signs bus envelopes with and authenticates

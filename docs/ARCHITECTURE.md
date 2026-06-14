@@ -253,10 +253,10 @@ column below shows each crate's home.
 | Cosmology | Status |
 |---|---|
 | **creature** (daemon / beast / critter) | ✅ daemon + beast + critter real |
-| **Sanctum** (node) | ✅ `alpha node` + `sanctum` |
+| **Sanctum** (node) | ✅ `sanctum`, run as `alpha node` (operator/authoring) or `omega serve` (federation/gateway) |
 | **Abode** (portable per-identity state) | ✅ authorship key + `aether::abode` snapshot + hand-off migration + fork/merge reconciler |
 | **Realm** (federated mesh) | ✅ the `Realm` address grain + `realm-gateway`; cross-node ship over ed25519 TCP |
-| **Omega** (global federation + Bestiary) | ✅ the `Omega` grain + `omega-gateway` + `omega-federator` (pull anti-entropy + reputation + quarantine) |
+| **Omega** (global federation + Bestiary) | ✅ the `Omega` grain + `omega-gateway` + `omega-federator` (pull anti-entropy + reputation + quarantine), run as a server by `omega serve` |
 
 ## What the substrate does NOT do (yet)
 

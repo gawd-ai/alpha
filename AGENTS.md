@@ -86,8 +86,16 @@ cargo run -p federation           # many Sanctums × Realms over ed25519 TCP (lo
 cargo build --locked --workspace
 CARGO_BUILD_JOBS=2 cargo test --locked --workspace -- --test-threads=1   # CI uses this cap
 cargo run -p alpha -- node              # boot a live node + REPL (add --minimal for a bare kernel)
+cargo run -p omega -- serve --node-id Ω --cluster-listen 127.0.0.1:9100   # boot the Ω federation/gateway server (headless)
 cargo doc --workspace --no-deps --open # browse the API — every crate has //! docs
 ```
+
+A **Sanctum** is the kernel (`sanctum`) run as a process; both poles realize one — `alpha node` is the
+operator/authoring seat (REPL + authoring organs), `omega serve` the headless federation/gateway server
+(`omega-federator` on `Role::OMEGA_GATEWAY`, no authoring). They compose the same kernel + control core
+and differ in posture, not mechanism. `demos/cluster/` is the runbook that stands up both on one mesh
+(A `omega serve`, B/C `alpha node`); `demos/federation/`'s in-process gateways bind their federator via
+the same `omega::serve::boot_federator` recipe `omega serve` uses.
 
 The composed end-to-end loops live in `cosmos/sanctum/tests/`. The `panic-daemon` "failures" in a test run
 are **expected** — it is the fault-isolation specimen proving a panicking creature doesn't crash

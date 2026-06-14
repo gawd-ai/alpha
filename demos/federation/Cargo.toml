@@ -28,7 +28,10 @@ transport-tcp = { path = "../../cosmos/creatures/transport-tcp" }
 registry-mem = { path = "../../cosmos/creatures/registry-mem" }
 bestiary = { path = "../../cosmos/bestiary" }
 bestiary-daemon = { path = "../../cosmos/creatures/bestiary-daemon" }
+# The gateway's `OMEGA_GATEWAY` binding comes from the same recipe `omega serve` runs in production
+# (`omega::serve::boot_federator`), so the demo and the server never drift. That recipe pulls in the
+# reference `reputation-roundrobin` weigher, so the demo no longer needs it directly.
+omega = { path = "../../omega" }
 omega-federator = { path = "../../cosmos/creatures/omega-federator" }
-reputation-roundrobin = { path = "../../cosmos/creatures/prototypes/reputation/reputation-roundrobin" }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

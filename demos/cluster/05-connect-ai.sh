@@ -4,7 +4,9 @@
 #   • self-contained: `alpha mcp` boots its own node; the assistant authors/loads/runs on that hub.
 #   • remote-over-mesh: `alpha mcp --target <node@control-id> --seed <id@host:port#pubkey> --node-id
 #     <hub> --listen <addr>` joins this cluster's mesh and routes every tool call to a *peer* node's
-#     Role::CONTROL — the GAWD-protocol path (no HTTP side-channel). That fronts one of A/B/C.
+#     Role::CONTROL — the GAWD-protocol path (no HTTP side-channel).
+# To author + drive, front an **α operator** (B or C); the **Ω server** (A) is drivable for
+# control/federation but has no authoring organ, so `alpha_author` there has nothing to call.
 # Below: the `.mcp.json` to register, then a live proof that the MCP surface speaks (tools/list).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -14,21 +16,24 @@ source ./env.sh
 
 cat <<EOF
 Register these with your MCP host (Claude Desktop/Code, etc.). To co-drive a *specific* cluster node
-over the mesh, use remote mode — fronting node A (its pubkey was captured in 01-boot as $RUN/A.pub;
-grab A's control-plane id from its boot log: \`grep 'Role::CONTROL (id=' $RUN/A.log\`):
+over the mesh, use remote mode. Front the α operator **B** for authoring/driving (its pubkey was
+captured in 01-boot as $RUN/B.pub; grab B's control-plane id from its boot log:
+\`grep 'Role::CONTROL (id=' $RUN/B.log\`). The mesh entry point (--seed) is still A, the anchor:
 
 {
   "mcpServers": {
-    "alpha-A": {
+    "alpha-B": {
       "command": "$MCP",
-      "args": ["mcp", "--target", "A@<A-control-id>",
-               "--node-id", "mcp-hub-A", "--listen", "127.0.0.1:9190",
+      "args": ["mcp", "--target", "B@<B-control-id>",
+               "--node-id", "mcp-hub-B", "--listen", "127.0.0.1:9190",
                "--seed", "A@$A_HOST:$A_CPORT#$(node_pub A)"]
     }
   }
 }
 
-(Or the simplest assistant sandbox — a self-contained hub that authors/runs on its own node:
+(Front the Ω server A the same way — \`--target A@<A-control-id>\` — to read its graph and drive
+ control/federation; just don't expect authoring there. Or the simplest assistant sandbox, a
+ self-contained hub that authors/runs on its own node:
   { "mcpServers": { "alpha": { "command": "$MCP", "args": ["mcp"] } } }  )
 EOF
 

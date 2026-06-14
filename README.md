@@ -41,7 +41,10 @@ cargo run -p federation -- --realms 3 --sanctums 2
 ```
 
 You'll see a within-Realm cross-node fetch, cross-Realm pull anti-entropy, **signed reputation**,
-**quarantine** propagation, and **Omega-addressed routing**.
+**quarantine** propagation, and **Omega-addressed routing**. The demo runs every Sanctum in one
+process; each Realm gateway there is the in-process equivalent of an **`omega serve`** server (it binds
+its `omega-federator` through the very same recipe, `omega::serve::boot_federator`), so what the demo
+narrates is what a deployed Ω server does.
 
 Or drive it yourself. Boot one Sanctum, author a creature live, then have a second Sanctum join the
 mesh from a single seed and run that creature *across the cluster* — `send <node>:<id>` routes an
@@ -62,7 +65,8 @@ alpha> send A:7 hello       # route to creature 7 on peer A, over the mesh → "
 *(`alpha` is the built binary — `cargo build -p alpha`, or prefix the commands with `cargo run -p
 alpha --`. `alpha node` boots the three engines, wires its own organs, and drops into the REPL; add
 `--minimal` for a bare kernel.)* The exact seed string and a three-node runbook live in
-[`demos/cluster/`](demos/cluster/); the [operator quickstart](docs/quickstart/operator.md) walks
+[`demos/cluster/`](demos/cluster/) — which stands up both poles on one mesh (node A an `omega serve`
+server, B/C `alpha node` operators); the [operator quickstart](docs/quickstart/operator.md) walks
 boot → author live → watch the sense-tape → scale up, step by step.
 
 ## The five governing loops
