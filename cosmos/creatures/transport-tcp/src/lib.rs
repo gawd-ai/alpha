@@ -1255,7 +1255,7 @@ fn reader_loop(
         }
         let n = u32::from_le_bytes(len_buf) as usize;
         if n == 0 || n > MAX_FRAME_BYTES {
-            // Cap absurd frame sizes (R9: hostile peer doesn't get to OOM us). 128 MB is roomy
+            // Cap absurd frame sizes (R9: hostile peer doesn't get to OOM us). 128 MiB is roomy
             // for the ship-an-artifact case (an echo-daemon debug `.so` is ~16 MB, the
             // envelope JSON with hex-encoded payload is ~33 MB) and bounded enough to refuse a
             // billion-byte-prefix attack. A future policy makes this operator-injectable.

@@ -90,8 +90,8 @@ followed by a JSON `WireFrame` — either a routed `Envelope` or a membership `G
 so both share the one authenticated socket. The bounds keep a hostile or buggy peer from exhausting
 the node:
 
-- A frame's length prefix is capped at **128 MB**; an over-cap prefix tears the connection down
-  rather than allocating. (128 MB is roomy for shipping a real artifact envelope, tight enough to
+- A frame's length prefix is capped at **128 MiB**; an over-cap prefix tears the connection down
+  rather than allocating. (128 MiB is roomy for shipping a real artifact envelope, tight enough to
   refuse a billion-byte-prefix attack.)
 - A single gossip frame is capped at **1024 members** and rejected whole if it exceeds that — a
   ceiling on how many dialer threads one message can spawn, not a topology limit.
