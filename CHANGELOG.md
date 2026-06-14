@@ -225,6 +225,15 @@ determinism/round-trip test that locks its new shape.
   (omitted from the bytes when absent, so a *local* envelope's signing payload moves only by the
   prefix). Both determinism tripwires are deliberately re-pinned. This is a cross-node-coordinated
   break: a 0.4.1 node verifies a 0.4.0 node's frames as `BadSig`, so a cluster upgrades together.
+- **`Manifest::validate` now caps metadata shape**, which is an acceptance-tightening: a manifest that
+  a pre-0.4.1 node admitted (no caps) but that exceeds a new `MAX_MANIFEST_*` bound — an over-long
+  name, too many `provides`/`entrypoints`/`fs`/`calls`, an over-cap field — or that carries an empty
+  `abi.abi_tag`, is now refused at admission, control-plane load, registry publish, and bestiary
+  `put` with a structured error (`StoreError::Invalid` on the durable store; `RegistryReply::Error`
+  on the bus). Durable state already at rest is unaffected — the Bestiary journal `recover()` replays
+  records without re-validating, so an upgraded node still loads what it persisted; only fresh
+  admission/publish (including a peer `PushEntries` of a pre-cap entry) re-checks. The caps are
+  generous (see `sigil::MAX_MANIFEST_*`) and no in-tree creature approaches them.
 
 ## 0.4.0 - 2026-06-04
 

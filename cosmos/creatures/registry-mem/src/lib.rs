@@ -92,20 +92,40 @@ pub const DEFAULT_MAX_REGISTRY_ENTRIES: usize = 1_024;
 /// state, but without a per-snapshot cap a caller could ask the registry to clone many stored
 /// artifacts into one large reply. `0` via [`RegistryMem::with_max_snapshot_artifact_bytes`] is the
 /// explicit opt-out for lab/demo pulls that intentionally accept larger snapshots.
+///
+/// Note: this bounds the snapshot the registry *builds*. Delivering it **cross-node** is bounded
+/// further by the transport frame cap (a hex-encoded snapshot ~2x its raw size must fit one frame),
+/// so a Realm whose artifacts exceed roughly half that frame cap does not fully sync via a single
+/// snapshot — large individual artifacts cross nodes via the GX/gawdxfer chunked fetch path
+/// (`registry fetch-load`), not a single full-artifact op.
 pub const DEFAULT_MAX_REGISTRY_SNAPSHOT_ARTIFACT_BYTES: usize = MAX_REGISTRY_ARTIFACT_BYTES;
 
-enum PublishResult {
+/// The outcome of a direct publish: whether the entry actually landed, or was refused (and why).
+///
+/// Both arms carry the artifact's content address (`sha256(artifact)`) — the address is a property of
+/// the bytes, not of storage success — so a caller can refer to the artifact regardless. Use
+/// [`RegistryMem::try_publish_in`] when you need to know storage succeeded; the
+/// [`RegistryMem::publish`] / [`RegistryMem::publish_in`] convenience flattens this to the bare hash.
+pub enum PublishResult {
+    /// The entry was stored under the returned content address.
     Stored(String),
+    /// The publish was refused (over a size/entry cap, or an invalid manifest); nothing was stored.
     Refused { artifact_hash: String, message: String },
 }
 
 impl PublishResult {
-    fn artifact_hash(self) -> String {
+    /// The content address (`sha256(artifact)`) — set on both arms.
+    pub fn artifact_hash(self) -> String {
         match self {
             PublishResult::Stored(hash) | PublishResult::Refused { artifact_hash: hash, .. } => {
                 hash
             }
         }
+    }
+
+    /// Whether the entry actually landed in the catalogue.
+    pub fn stored(&self) -> bool {
+        matches!(self, PublishResult::Stored(_))
     }
 }
 
@@ -185,16 +205,39 @@ impl RegistryMem {
     }
 
     /// Direct (non-bus) publish into the `"local"` Realm — a convenience for in-process callers.
-    /// Bus callers go through `handle` with a
-    /// `RegistryOp::Publish`. Returns the `sha256(artifact)` hex the entry is indexed under.
+    /// Bus callers go through `handle` with a `RegistryOp::Publish`. Returns the `sha256(artifact)`
+    /// hex the entry is indexed under.
+    ///
+    /// **The return is the content address, not proof of storage.** A publish refused over a size or
+    /// entry cap, or for an invalid manifest, still returns that hash (and logs to stderr) — a later
+    /// `fetch` of a refused key simply misses. Use [`RegistryMem::try_publish`] /
+    /// [`RegistryMem::try_publish_in`] when you need to know the entry actually landed; the bus path
+    /// already reports a refusal as `RegistryReply::Error`.
     pub fn publish(&self, manifest: Manifest, artifact: Vec<u8>) -> String {
         self.publish_in(RealmId::local(), manifest, artifact)
     }
 
     /// Direct (non-bus) publish into a named Realm. Returns the artifact_hash the entry is keyed
-    /// under inside that Realm.
+    /// under inside that Realm. See [`RegistryMem::publish`] — the return is the content address, not
+    /// proof of storage; use [`RegistryMem::try_publish_in`] to observe a refusal.
     pub fn publish_in(&self, realm: RealmId, manifest: Manifest, artifact: Vec<u8>) -> String {
         self.publish_in_checked(realm, manifest, artifact).artifact_hash()
+    }
+
+    /// Direct (non-bus) publish into the `"local"` Realm, returning the full [`PublishResult`] so the
+    /// caller can distinguish a stored entry from a refusal (the honest direct path).
+    pub fn try_publish(&self, manifest: Manifest, artifact: Vec<u8>) -> PublishResult {
+        self.publish_in_checked(RealmId::local(), manifest, artifact)
+    }
+
+    /// Direct (non-bus) publish into a named Realm, returning the full [`PublishResult`].
+    pub fn try_publish_in(
+        &self,
+        realm: RealmId,
+        manifest: Manifest,
+        artifact: Vec<u8>,
+    ) -> PublishResult {
+        self.publish_in_checked(realm, manifest, artifact)
     }
 
     fn publish_in_checked(

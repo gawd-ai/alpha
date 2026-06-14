@@ -201,6 +201,10 @@ pub enum StoreError {
     /// A caller asked the store to retain bytes beyond its configured bounds.
     #[error("bestiary limit exceeded: {0}")]
     Limit(String),
+    /// A manifest failed structural validation (`Manifest::validate`) — a malformed shape or an
+    /// over-cap metadata field, distinct from a *byte-retention* [`StoreError::Limit`].
+    #[error("bestiary invalid manifest: {0}")]
+    Invalid(String),
     /// A log record was authored by a key that is not this daemon's — the journal is self-owned, so a
     /// foreign record at rest is rejected (peer entries arrive only via verified, re-signed pushes).
     #[error("bestiary foreign-author log record: {0}")]
@@ -868,7 +872,7 @@ impl BestiaryStore for FsBestiaryStore {
                 self.max_artifact_bytes,
             )));
         }
-        manifest.validate().map_err(|e| StoreError::Limit(format!("invalid manifest: {e}")))?;
+        manifest.validate().map_err(|e| StoreError::Invalid(e.to_string()))?;
         let hash = sha256_hex(&artifact);
         let key = (realm.clone(), hash.clone());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -2057,7 +2061,7 @@ mod tests {
         m.name = "n".repeat(MAX_MANIFEST_NAME_BYTES + 1);
 
         let err = s.put(&realm, m, bytes).unwrap_err();
-        assert!(matches!(err, StoreError::Limit(_)), "invalid manifest rejected: {err:?}");
+        assert!(matches!(err, StoreError::Invalid(_)), "invalid manifest rejected: {err:?}");
         assert!(s.get(&realm, &hash).unwrap().is_none(), "invalid manifest was not stored");
         assert!(!s.blob_path(&hash).exists(), "invalid manifest did not write a blob");
         assert!(
