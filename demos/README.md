@@ -9,6 +9,7 @@ rides code paths the integration tests prove.
 |---|---|---|---|
 | [**walkthrough**](walkthrough/) | `cargo run -p walkthrough` | **One node's loop.** An AI authors a creature from an English request → compiles → ed25519-signs → admits → hot-loads → runs it (native *and* critter tiers), then a running self **migrates between two Sanctums** with cryptographic continuity. | `m3_authoring_loop.rs`, `abode_migrate_local.rs` |
 | [**federation**](federation/) | `cargo run -p federation` | **Many nodes, many Realms.** Several Sanctums across 2–3 Realms wired over real ed25519-authenticated TCP (loopback): a within-Realm cross-node fetch, then cross-Realm pull anti-entropy, **signed reputation**, **quarantine** propagation, and **Omega-addressed routing** (Loop 5, Acculturate). | `omega_federation_cross_node.rs`, `m2_two_node.rs`, `distributor_cross_node.rs` |
+| [**distribute**](distribute/) | `cargo run -p distribute` | **Cross-node artifact transfer.** Two Sanctums over ed25519-authenticated TCP (loopback): A publishes a creature into its registry; B pulls it in **bounded, resumable GX chunks** and admits + runs it with a single `registry fetch-load` command — the cross-node ship loop the substrate used to hand-script, with per-chunk *and* whole-file SHA-256 integrity (a tampered fetch is refused at admission). | `m2_two_node.rs` |
 | [**bestiary-live**](bestiary-live/) | `… cargo run -p bestiary-live --features openai` | **A real model into a durable Bestiary.** A live LLM authors a creature from English (bounded compile-error retry, sandboxed critter tier), which is signed, hot-loaded, run, then **published into a durable, replicated, AI-curated Bestiary** — with a **verifiable entry proof**, recovery across a store restart, and a second node converging via the monotonic lattice. **Opt-in / key-gated.** | `agent_mind_authoring_loop.rs`, `bestiary_durable_local.rs`, `bestiary_replication_cross_node.rs` |
 | [**cluster**](cluster/) | `cd demos/cluster && ./00-build.sh && ./01-boot.sh …` | **Three real `alpha node` processes** (the deployable thing, not one process) form a **dynamic many-to-many mesh** from one seed via gossip, then **cross-execute** over it and **attach an AI** to each — driven entirely through the shell + HTTP API + MCP. The operator-facing counterpart to `federation`. | `cluster_gossip_mesh.rs`, `m2_two_node.rs` |
 
@@ -22,6 +23,9 @@ rides code paths the integration tests prove.
   Sanctum it gracefully narrates what to add to see the next layer. Set **`ALPHA_DURABLE_BESTIARY=1`**
   to run the whole scenario on the on-disk `bestiary-daemon` instead of the in-memory stub — the
   fastest way to watch federation drive a *durable* registry (hermetic, no model needed).
+- **distribute** is hermetic (no model, no network beyond loopback): it boots two real Sanctums and
+  shows the `registry fetch-load` verb pulling an artifact cross-node in windowed GX chunks, re-requesting
+  only the missing chunks on a stall (resume without restart) and re-verifying at admission.
 - **bestiary-live** is **opt-in and key-gated**: it needs a model and the `openai` feature. Set
   `ALPHA_LLM_MODEL` (and `ALPHA_LLM_BASE_URL` / `ALPHA_LLM_API_KEY`, or point at a local Ollama /
   LM-Studio) and run `cargo run -p bestiary-live --features openai`. With `ALPHA_LLM_MODEL` unset it

@@ -32,11 +32,12 @@ and an AI drives any node it is allowed to.
 - **Trust** — more of the proof-of-trust surface made live: weighted and consensus picks, additional
   verifiable-randomness schemes, and standing SEER consumers for the policy, budget, fitness,
   consensus, and curation topics.
-- **Budgets** — extend the limit-as-gradient's live *lift* (`ExtendBudget`) beyond fuel to memory and
-  wall-clock (today only the fuel lift is honored; the mem/wall lifts are accepted by the wire but not
-  yet enforced); per-tier wall-clock for the critter and native tiers (the beast tier already traps a
-  `wall_ms` *cap* via wasmtime epoch interruption); a live store limiter for the native tier's
-  deployment seam.
+- **Budgets** — extend live budget enforcement to the trusted-by-admission **native** tier (CPU,
+  memory, and wall-clock are OS-level there, so every dimension reports `Unenforceable` today) and lift
+  the **critter** tier's memory cap live (its structural caps are fixed at load); plus a live store
+  limiter for the native tier's deployment seam. (The **beast** tier already lifts fuel, memory, and
+  wall-clock live via `ExtendBudget` and traps a `wall_ms` *cap* via wasmtime epoch interruption; the
+  **critter** tier enforces and lifts fuel + wall-clock.)
 - **Scenarios** — declarative runbooks the control plane replays as verbs over the bus, so a demo or
   an operator can drive a live remote node instead of building its own topology in code.
 

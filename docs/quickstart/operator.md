@@ -23,11 +23,11 @@ builder), an in-memory registry (`REGISTRY`), and a `monitor` watching the sense
 probe id, the command list, and drops you at a prompt:
 
 ```
-alpha node — Alpha Sanctum daemon (v0.4.0)
+alpha node — Alpha Sanctum daemon (v0.4.1)
 posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.
 boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.
 probe endpoint id = 1
-commands: author [--critter] <request> | load <manifest> <artifact> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit
+commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm] | bestiary prove <artifact-hash> <realm> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit
 alpha>
 ```
 
