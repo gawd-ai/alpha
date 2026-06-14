@@ -1,8 +1,8 @@
 //! Unit tests for the `gawdxfer` GX bulk-transfer contract.
 
 use super::*;
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
