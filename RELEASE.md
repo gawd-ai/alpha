@@ -1,19 +1,24 @@
 # Release Checklist
 
-This repository's v0.4.0 release is source-first: the `alpha` front door, engines,
-prototypes, and shipped creatures are all built from the source tree. Nothing is
-published to a package registry — the workspace is source-only (every member inherits
-`publish = false`), and on Alpha the distributable unit is the creature, not a crate.
+Alpha releases are **source-first**: the `alpha` front door, engines, prototypes, and shipped
+creatures are all built from the source tree. Nothing is published to a package registry — the
+workspace is source-only (every member inherits `publish = false`), and on Alpha the distributable
+unit is the creature, not a crate.
 
-This is the first public release. Pre-public internal history does not require
-backward compatibility; the public contract starts at the published release tag.
+The public contract starts at the published release tag; pre-tag internal history carries no
+backward-compatibility guarantee. Set `VERSION` once and reuse it throughout this checklist:
+
+```sh
+VERSION=vX.Y.Z   # the release being cut, e.g. v0.4.1
+```
 
 ## Preflight
 
-- Before tagging, set the `CHANGELOG.md` `0.4.0` date to the publication date and confirm it
-  matches the tag/release date.
-- Confirm `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/ARCHITECTURE.md`, and
-  the design-note index agree on the release line and feature posture.
+- Confirm the workspace version (`Cargo.toml` `[workspace.package] version`) equals `${VERSION#v}`.
+- Set the `CHANGELOG.md` `## ${VERSION#v} - unreleased` heading's date to the publication date and
+  confirm it matches the tag/release date.
+- Confirm `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/ARCHITECTURE.md`, and the
+  design-note index agree on the release line and feature posture.
 - Confirm local Markdown links resolve.
 - Confirm the workspace stays source-only: no member is crates.io-publishable
   (every crate sets `publish.workspace = true`, inheriting `publish = false`).
@@ -35,32 +40,42 @@ CARGO_BUILD_JOBS=2 cargo run --locked -p walkthrough
 CARGO_BUILD_JOBS=2 cargo run --locked -p federation
 ```
 
+The opt-in model-backed author (`agent-mind`) lives behind `--features openai` (it links `ureq`), so
+the default gates above never exercise it. Run its feature gates too, and let `cargo deny` see the
+network dependency tree (the allow-list is maintained unconditionally — `cargo deny` runs
+`--all-features`, so it covers the `openai` tree regardless of release scope):
+
+```sh
+CARGO_BUILD_JOBS=2 cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
+CARGO_BUILD_JOBS=2 cargo clippy --locked -p alpha --features openai -- -D warnings
+CARGO_BUILD_JOBS=2 cargo test --locked -p agent-mind --features openai
+cargo deny check --all-features
+```
+
 ## Tagging
 
 Do not call a tree released until the committed release tree is tagged.
 
 ```sh
 git status --short
-git ls-remote --tags origin v0.4.0
-git tag --points-at HEAD | grep '^v0.4.0$'
-git tag --list 'v0.4'
+git ls-remote --tags origin "$VERSION"
+git tag --points-at HEAD | grep "^${VERSION}$"
 ```
 
-If `v0.4.0` exists only as a stale local draft tag and no remote `v0.4.0` exists, recreate
-it after the release commit:
+If `$VERSION` exists only as a stale local draft tag and no remote `$VERSION` exists, recreate it
+after the release commit:
 
 ```sh
-git tag -d v0.4.0
-git tag -a v0.4.0 -m 'v0.4.0'
+git tag -d "$VERSION"
+git tag -a "$VERSION" -m "$VERSION"
 ```
 
-If a local `v0.4` tag exists, treat it as a stale shorthand unless the release plan explicitly wants
-an alias. Do not push it accidentally; delete the local shorthand after confirming no remote `v0.4`
-is intended.
+Avoid pushing a truncated shorthand (e.g. `v0.4`) unless the release plan explicitly wants an alias;
+delete any local shorthand after confirming no remote alias is intended.
 
 Push only after the gates are green and the tag points at the intended commit:
 
 ```sh
 git push origin HEAD
-git push origin v0.4.0
+git push origin "$VERSION"
 ```
