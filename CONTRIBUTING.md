@@ -33,7 +33,8 @@
 `cosmos/anima/` (per-tier loaders) · `cosmos/sanctum/` (kernel library) ·
 `alpha/` (the α front door — `alpha node`/`mcp`/`http`/`demo`) · `cosmos/forge/` (authoring surface) ·
 `cosmos/creatures/*` (production-capable reference organs) · `cosmos/creatures/prototypes/*` (injected reference models +
-critter script references) · `cosmos/creatures/prototypes/fixtures/*` (test-only creatures).
+critter script references) · `cosmos/creatures/prototypes/fixtures/*` (test-only creatures) ·
+`foundation/gawdxfer/` (the shared GX bulk-transfer contract — beside the cosmology, not within it).
 Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For a fast machine-first map (and the
 load-bearing invariants), see [`AGENTS.md`](AGENTS.md). Before authoring a creature, read the two
 contracts it builds against: the pub/sub + consult surface in [`docs/TOPICS.md`](docs/TOPICS.md) and
@@ -45,6 +46,14 @@ reference strategy (an admission policy, fitness scorer, reputation weigher, mer
 or critter script reference) lives in `cosmos/creatures/prototypes/`. A creature that exists only to
 be exercised by the kernel test suite (a fault specimen or a walking-skeleton stub) lives in
 `cosmos/creatures/prototypes/fixtures/`.
+
+**Where a shared foundation crate goes.** `cosmos/` is Alpha's *own* interior — the cosmology. A crate
+that another GAWD system would want *verbatim* — a cross-system contract or tool, `gawd`-prefixed, that
+will carry its own version (eventually its own repo, maybe its own binary) — lives in `foundation/`,
+beside the cosmology rather than inside it; filing shared infra under `cosmos/` would falsely claim
+Alpha owns it. `foundation/gawdxfer` (the GX bulk-transfer contract, shared with `sctl`) is the first.
+An Alpha-internal seam that is *not* cross-system — e.g. `cosmos/mind` (the injected-model seam) — stays
+in `cosmos/`.
 
 ## Release packaging
 

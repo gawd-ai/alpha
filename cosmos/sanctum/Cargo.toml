@@ -39,7 +39,7 @@ policy-dev = { path = "../creatures/prototypes/policies/policy-dev" }
 policy-signed = { path = "../creatures/prototypes/policies/policy-signed" }
 transport-tcp = { path = "../creatures/transport-tcp" }
 registry-mem = { path = "../creatures/registry-mem" }
-gawdxfer = { path = "../gawdxfer" }
+gawdxfer = { path = "../../foundation/gawdxfer" }
 # The durable Bestiary: the contract/store crate + the daemon creature that fills Role::REGISTRY
 # with persistence + replication, exercised by bestiary_durable_local + bestiary_replication_cross_node.
 bestiary = { path = "../bestiary" }

@@ -13,6 +13,12 @@ members = [
     "demos/distribute",
     "demos/bestiary-live",
 
+    # ---- shared GAWD foundations: cross-system contracts/tools Alpha CONSUMES but does not own,
+    #      destined to externalize into their own repos. They sit BESIDE the cosmology (alpha + cosmos),
+    #      not within it, because they are not part of it — `gawd`-prefixed per the naming rule
+    #      (a name "stable across GAWD systems"). gawdxfer is the GX bulk-transfer contract sctl shares. ----
+    "foundation/gawdxfer",
+
     # ---- everything between α and Ω lives under cosmos/ ----
 
     # ---- substrate spine + tooling ----
@@ -30,7 +36,6 @@ members = [
     "cosmos/realm",
     "cosmos/bestiary",
     "cosmos/omega",
-    "cosmos/gawdxfer",
 
     # ---- the injected model seam: a leaf crate (depends on no creature) carrying the `Model`
     #      contract so BOTH the model-backed author (agent-mind) and the Bestiary curator can consume

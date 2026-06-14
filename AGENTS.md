@@ -51,19 +51,23 @@ no `gawd-`-prefixed crate). Creature crates keep descriptive seam names
 (`policy-signed`, `scorer-latency`) — self-describing in a `use`, a lockfile, or a stack trace, where
 a folder can't help.
 
-The tree mirrors the cosmology: `alpha` (**α**, the door) is the only crate at the root;
-everything between α and **Ω** lives under `cosmos/`; `demos/` and `docs/` stay at the root. (The
-memory-safety harnesses live with the tests they drive, in `cosmos/sanctum/tests/memcheck/` — not a
-root `ci/` dir; the real CI is `.github/workflows/`.)
+The tree mirrors the cosmology: `alpha` (**α**, the door) is the cosmology's one crate at the root;
+everything between α and **Ω** lives under `cosmos/`. Beside them sits `foundation/` — shared GAWD
+foundations Alpha *consumes but does not own* (cross-system contracts/tools, `gawd`-prefixed, destined
+to externalize into their own repos). They are **not** part of the cosmology, so they live beside it,
+not within it — filing one under `cosmos/` would falsely claim it is Alpha's interior. `demos/` and
+`docs/` stay at the root. (The memory-safety harnesses live with the tests they drive, in
+`cosmos/sanctum/tests/memcheck/` — not a root `ci/` dir; the real CI is `.github/workflows/`.)
 
 | Path | What it is |
 |---|---|
-| `alpha/` | **The α front door** — the single outermost entry point and the *only* crate at the repository root. `alpha node` / `alpha mcp` / `alpha http` dispatch in-process (the node daemon + MCP-hub composition roots live here); `alpha demo [list\|run <name>]` is a managed runner that *spawns* a demo from the external `demos/demos.json` registry, not linked in. `alpha` = α, `omega` = Ω; everything is between them, only stimuli in / products out. |
+| `alpha/` | **The α front door** — the cosmology's single outermost entry point and its *only* root crate (`foundation/` beside it is shared infra, not cosmology). `alpha node` / `alpha mcp` / `alpha http` dispatch in-process (the node daemon + MCP-hub composition roots live here); `alpha demo [list\|run <name>]` is a managed runner that *spawns* a demo from the external `demos/demos.json` registry, not linked in. `alpha` = α, `omega` = Ω; everything is between them, only stimuli in / products out. |
 | `demos/` | Narrated, runnable demos (`walkthrough`, `federation`, `distribute`, `bestiary-live`; the `cluster/` dir is a runbook, not a packaged demo). The registry of what `alpha demo` can launch is [`demos/demos.json`](demos/demos.json). The fastest way to *see* Alpha. Stay at the root, alongside the door they exercise. |
+| `foundation/` | **Shared GAWD foundations** — cross-system contracts/tools Alpha *consumes but does not own* (`gawd`-prefixed, destined to externalize into their own repos). Beside the cosmology, not within it. A new crate lands here (not `cosmos/`) when another GAWD system would want the *exact same* crate and it will carry its own version/repo/maybe binary. |
+| `foundation/gawdxfer/` | **The GX bulk-transfer contract** shared by GAWD systems: chunked/resumable init, chunk, ack, progress, resume, status, completion, binary chunk framing, chunk math, and streaming SHA-256 helpers. Transport-neutral; Alpha and `sctl` adapt this instead of inventing local xfer protocols. |
 | `cosmos/` | **Everything between α and Ω** — the interior the front door opens onto: the whole spine, the concept crates, the control core, and every creature. |
 | `cosmos/{sigil,aether,anima,sanctum,forge}/` | **The spine**: contract → bus → per-tier loaders → kernel → authoring SDK. |
 | `cosmos/{abode,seer,realm,omega}/` | **First-class concept crates**: the distributed-self snapshot contract (`abode`), the consult-and-reconcile primitive (`seer`), the trust-domain (`realm`), and **Ω** (`omega`). They live alongside `aether` so federation authority has a home that already exists. `realm` owns the realm-gateway seam *and* its routing mechanism (`realm::serve`); `omega` owns the gateway socket + `deferred` wire contract and reserves `OmegaServices` (its routing stays in each gateway creature — its stub and federator diverge too far to share one). |
-| `cosmos/gawdxfer/` | **The GX bulk-transfer contract** shared by GAWD systems: chunked/resumable init, chunk, ack, progress, resume, status, completion, binary chunk framing, chunk math, and streaming SHA-256 helpers. Transport-neutral; Alpha and `sctl` adapt this instead of inventing local xfer protocols. |
 | `cosmos/omni/` | **The spine-only control core** every surface drives over the bus (`run_verb` + `ControlCore`). |
 | `cosmos/creatures/` | **Production-capable reference organs** — the real substrate creatures (the daemon boots several), plus the loadable surfaces (`surface-http`, `surface-mcp`). Indexed by [`cosmos/creatures/README.md`](cosmos/creatures/README.md). Reads as a reduction gradient ↓. |
 | `cosmos/creatures/prototypes/<seam>/` | **Operator-replaceable injected models** — the reference strategies that fill the IoC sockets (the "model" in *fabric, not model*), grouped by socket (`policies/`, `scorers/`, `distributors/`, `reputation/`, `merge/`, `gateways/`, `critters/`, + `monitor/`). These are reference strategies, not disposable demo material. Legend: [`cosmos/creatures/prototypes/README.md`](cosmos/creatures/prototypes/README.md). |

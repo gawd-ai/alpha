@@ -12,7 +12,7 @@ description = "In-memory Bestiary seed — content-addressed (manifest, artifact
 aether = { path = "../../aether" }
 sigil = { path = "../../sigil" }
 bestiary = { path = "../../bestiary" }
-gawdxfer = { path = "../../gawdxfer" }
+gawdxfer = { path = "../../../foundation/gawdxfer" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

@@ -31,9 +31,11 @@ makes "fabric, not model" structurally enforced, not promised.
 
 ```
 .                          # repo root: the α door + support dirs only — "nothing mixed"
-alpha/                      # the α front door: node/mcp/http compose in-process; demo spawns external demos — the ONLY crate at the root
-demos/                     # narrated, runnable demos (walkthrough, federation, cluster)
+alpha/                      # the α front door: node/mcp/http compose in-process; demo spawns external demos — the cosmology's only root crate
+demos/                     # narrated, runnable demos (walkthrough, federation, distribute, bestiary-live; cluster/ is a runbook)
 docs/                      # CONCEPTS / ARCHITECTURE / ROADMAP / TOPICS + design notes …
+foundation/                # shared GAWD foundations Alpha CONSUMES but does not own (cross-system, gawd-prefixed, externalize later):
+  gawdxfer/                #   the GX bulk-transfer contract: chunk-frame codec + chunk math + streaming SHA-256; shared with sctl
 cosmos/                    # everything between α and Ω — the interior the front door opens onto:
   sigil/                   #   the at-rest contract (Manifest type + crypto)
   aether/                  #   the bus spine (Envelope, Address, Router, Creature seam, journal)
