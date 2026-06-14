@@ -595,6 +595,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: schema_str.to_string(),
+                origin: None,
             },
             payload,
         }

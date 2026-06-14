@@ -89,7 +89,7 @@ impl Creature for BudgetApoptosis {
         // Map the parsed event to the kernel's control vocabulary. Fire-and-forget: control ops
         // have no synchronous reply by design (a creature waiting on a confirmation would block
         // the bus; if a requester needs ack, it adds its own `reply_to` / `corr`).
-        let op = KernelControl::Unload { module: b.module };
+        let op = KernelControl::Unload { module: b.creature };
         let payload = match serde_json::to_vec(&op) {
             Ok(b) => b,
             Err(_) => return Outcome::none(), // serialization failure is unreachable in practice
@@ -376,25 +376,25 @@ impl BudgetGraceful {
         };
         let already = self
             .grace_granted
-            .get(&req.module)
+            .get(&req.creature)
             .map(|g| g.is_granted(LimitKind::Fuel))
             .unwrap_or(false);
         if already {
             self.record_decision(
-                req.module,
+                req.creature,
                 BudgetDecision::Observe { reason: BudgetTrajectory::Unclassifiable },
             );
             return Outcome::none(); // one-shot exhausted — a creature can't keep asking for more
         }
-        if !self.mark_grace_granted(req.module, LimitKind::Fuel) {
+        if !self.mark_grace_granted(req.creature, LimitKind::Fuel) {
             self.record_decision(
-                req.module,
+                req.creature,
                 BudgetDecision::Observe { reason: BudgetTrajectory::Unclassifiable },
             );
             return Outcome::none(); // cannot mark one-shot state, so do not grant untracked grace
         }
         self.record_decision(
-            req.module,
+            req.creature,
             BudgetDecision::Grant {
                 reason: BudgetTrajectory::Unclassifiable,
                 kind: LimitKind::Fuel,
@@ -402,7 +402,7 @@ impl BudgetGraceful {
             },
         );
         let op = KernelControl::ExtendBudget {
-            module: req.module,
+            module: req.creature,
             fuel: Some(fuel),
             mem_bytes: None,
             wall_ms: None,
@@ -445,18 +445,18 @@ impl Creature for BudgetGraceful {
             "wall" => LimitKind::Wall,
             _ => {
                 self.record_decision(
-                    b.module,
+                    b.creature,
                     BudgetDecision::Observe { reason: BudgetTrajectory::Unclassifiable },
                 );
                 return Outcome::none();
             }
         };
 
-        let decision = self.decide(b.module, &b.level, kind, &b.vector);
+        let decision = self.decide(b.creature, &b.level, kind, &b.vector);
 
         match decision {
             BudgetDecision::Unload { .. } => {
-                let op = KernelControl::Unload { module: b.module };
+                let op = KernelControl::Unload { module: b.creature };
                 let Ok(payload) = serde_json::to_vec(&op) else { return Outcome::none() };
                 Outcome::send(Dispatch::to(Address::Kernel, payload).with_schema("kernel_control"))
             }
@@ -464,19 +464,19 @@ impl Creature for BudgetGraceful {
                 // Fill only the dimension that fired; other fields stay None (leave untouched).
                 let op = match kind {
                     LimitKind::Fuel => KernelControl::ExtendBudget {
-                        module: b.module,
+                        module: b.creature,
                         fuel: Some(new_cap),
                         mem_bytes: None,
                         wall_ms: None,
                     },
                     LimitKind::Memory => KernelControl::ExtendBudget {
-                        module: b.module,
+                        module: b.creature,
                         fuel: None,
                         mem_bytes: Some(new_cap),
                         wall_ms: None,
                     },
                     LimitKind::Wall => KernelControl::ExtendBudget {
-                        module: b.module,
+                        module: b.creature,
                         fuel: None,
                         mem_bytes: None,
                         wall_ms: Some(new_cap),
@@ -509,6 +509,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: payload.to_vec(),
         }
@@ -516,7 +517,7 @@ mod tests {
 
     fn event(module: u64, level: &str, kind: &str, vector: BudgetVector) -> Vec<u8> {
         serde_json::to_vec(&BudgetSignalEvent {
-            module,
+            creature: module,
             level: level.into(),
             kind: kind.into(),
             vector,
@@ -528,7 +529,7 @@ mod tests {
     fn request_env(module: u64, fuel: Option<u64>) -> Envelope {
         let mut e = proprio_env(
             &serde_json::to_vec(&BudgetRequest {
-                module,
+                creature: module,
                 fuel,
                 mem_bytes: None,
                 wall_ms: None,
@@ -622,7 +623,7 @@ mod tests {
         // A `Proprioception { module, event }` payload has a different shape than
         // `BudgetSignalEvent`; the parse should fail and we should emit nothing.
         let other =
-            serde_json::to_vec(&sanctum::Proprioception { module: 1, event: "loaded".into() })
+            serde_json::to_vec(&sanctum::Proprioception { creature: 1, event: "loaded".into() })
                 .unwrap();
         assert!(p.handle(proprio_env(&other)).dispatches.is_empty());
     }
@@ -1010,7 +1011,7 @@ mod tests {
     fn graceful_unrelated_proprio_events_pass_through_as_no_op() {
         let mut p = BudgetGraceful::new();
         let other =
-            serde_json::to_vec(&sanctum::Proprioception { module: 1, event: "loaded".into() })
+            serde_json::to_vec(&sanctum::Proprioception { creature: 1, event: "loaded".into() })
                 .unwrap();
         assert!(p.handle(proprio_env(&other)).dispatches.is_empty());
         // No decision recorded because no BudgetSignalEvent parsed.

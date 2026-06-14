@@ -187,6 +187,28 @@ pub enum AuthoringError {
     Invalid { message: String },
 }
 
+/// One-line, human-facing summary of what this build's bundled template matcher recognizes, plus the
+/// pointer to model-backed free-form authoring. Single source of truth shared by [`AuthoringError`]'s
+/// `Display` and any front-end that guides an operator after a miss — keep it next to
+/// [`AgentTemplated::author`]'s match arms so the keyword list never drifts from what actually matches.
+pub fn recognized_templates_hint() -> &'static str {
+    "this build's templated author recognizes a native daemon from a request containing `reverse` \
+     (or `fetch`+`title`+`url`), and a critter from a request containing `critter` (add `upper` for \
+     uppercase). For free-form English authoring, build with `--features openai` and select a model \
+     (e.g. `--author-model <id>`)."
+}
+
+impl std::fmt::Display for AuthoringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthoringError::NoTemplate { request } => {
+                write!(f, "no template matched \"{request}\". {}", recognized_templates_hint())
+            }
+            AuthoringError::Invalid { message } => write!(f, "{message}"),
+        }
+    }
+}
+
 impl AuthoringReply {
     pub fn to_bytes(&self) -> Vec<u8> {
         aether::wire::to_bytes(self)
@@ -722,6 +744,28 @@ mod tests {
     }
 
     #[test]
+    fn no_template_error_display_guides_to_templates_and_openai() {
+        let e = AgentTemplated::new()
+            .author(&AuthoringRequest {
+                request: "make me a sandwich".into(),
+                ..Default::default()
+            })
+            .unwrap_err();
+        let shown = e.to_string();
+        assert!(shown.contains("no template matched"), "{shown}");
+        assert!(shown.contains("make me a sandwich"), "{shown}");
+        assert!(shown.contains("reverse"), "names the recognized templates: {shown}");
+        assert!(shown.contains("critter"), "names the critter keyword: {shown}");
+        assert!(shown.contains("--features openai"), "points to free-form authoring: {shown}");
+    }
+
+    #[test]
+    fn invalid_error_display_surfaces_its_message() {
+        let e = AuthoringError::Invalid { message: "malformed thing".into() };
+        assert_eq!(e.to_string(), "malformed thing");
+    }
+
+    #[test]
     fn no_template_error_keeps_only_bounded_request_preview() {
         let request = format!(
             "compute a novel metric {} tail-marker",
@@ -795,6 +839,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: b"{ not json".to_vec(),
         };
@@ -822,6 +867,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: vec![b'{'; MAX_AUTHORING_REQUEST_BYTES + 1],
         };

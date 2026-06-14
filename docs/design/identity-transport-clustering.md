@@ -34,6 +34,16 @@ payload?* — and never decides which keys count. Which node keys are admitted i
 allowlist; which Abode keys are trusted authors is the admission policy. Two questions, two seams,
 never conflated: one proves the peer, the other proves the artifact's authorship and integrity.
 
+**One identity for the link and the bus.** A clustered node signs its **bus envelopes** with the
+*same* node key it authenticates **links** with — its bus signer is `Ed25519Signer(node_key)`, not an
+unrelated stub. That single fact is what makes cross-node sender authentication real: a peer that
+authenticated this node at the handshake already holds the public key its envelopes are signed under,
+so it can verify them (see [Cross-node sender attribution](#cross-node-sender-attribution)). A
+node with no cluster identity (a pure local-dev Sanctum) keeps a non-cryptographic stub signer — no
+peer ever needs to verify it. The node also records its own public key on the router, so the
+verify-on-delivery the bus runs for *local* senders resolves a real key instead of always failing
+closed.
+
 ## Authenticated transport
 
 `transport-tcp` is the creature bound to `Role::TRANSPORT`. The router sends every
@@ -104,8 +114,42 @@ the node:
   `peer_send_dropped` event rather than vanishing silently. Because envelope payloads serialize as
   hex (2x expansion), the frame cap means an artifact over roughly half the 128 MiB artifact ceiling
   cannot cross the wire in one envelope today — cross-node shipping of larger artifacts needs a
-  chunked path, and the sender now sheds such a frame loudly instead of letting the receiver
-  tear the link down.
+  GX/gawdxfer chunked path, and the sender now sheds such a frame loudly instead of letting the
+  receiver tear the link down. GX is the canonical GAWD bulk-transfer contract; transports should
+  adapt it rather than adding another artifact-specific framing scheme. On `transport-tcp`,
+  `RegistryOp::FetchGxPlan` returns a small registry plan/manifest reply, and the requester pulls
+  individual `FetchGxChunk` indices as bounded `transport.gx.chunk` envelopes; the registry derives
+  the plan hash from its content-address key, so it does not re-hash the whole artifact per plan or
+  per chunk and does not trust redundant caller metadata. Requested chunk sizes on the pull path are
+  clamped to the shared GX min/max bounds, so valid sizes below the default remain usable; the
+  compatibility push shortcut uses default-or-larger chunks to avoid dispatch floods. GX fetch
+  metadata is shape-gated before registry lookup: `artifact_hash` must be lowercase SHA-256 hex, and
+  chunk-pull `transfer_id` must be bounded printable ASCII in the registry-issued
+  `registry.{artifact_hash}.{chunk_size}.{seq}.{corr}` shape, belonging to the requested artifact's
+  returned plan and chunk-size policy.
+  `FetchGx` remains a compatibility push shortcut over the same frame lane. The local envelope payload is
+  `gawdxfer::encode_binary_frame(...)`; the transport queues a small authenticated route bind
+  (`transfer_id -> local target`, plus `total_chunks` when the sender's transfer plan exposes it) and
+  the raw `GX1\0` chunk as one peer-queue item, then the writer emits those two frames in order on
+  the peer stream, not as envelope JSON. This is an atomic queueing invariant: under backpressure the
+  peer must not receive a bind for a chunk that was shed locally. The `GX1\0` prefix path checks the
+  same 128 MiB wire cap before allocating the prefixed copy. Inbound raw
+  chunks borrow the decoded payload until route checks pass, so rejected chunks do not allocate a
+  second copy before being dropped. They are delivered only if that peer installed a bounded route
+  binding for the transfer id and the frame's `chunk_hash` matches the borrowed payload. Active binds
+  are idempotent but not mutable: a conflicting rebind for the same `(peer, transfer_id)` is dropped
+  instead of changing the local target. Transfer-plan generated routes retire after the declared final
+  chunk, and counted routes require each chunk header to echo the same `total_chunks`; a missing or
+  contradictory count is dropped with its route state cleared. A bad declared-final chunk hash also
+  retires the route rather than pinning it. Binds without a count remain bounded by the per-peer route
+  cap and disconnect cleanup. `gawdxfer::TransferPlan` sender helpers, `ChunkAssembler` in-memory
+  receivers, and `FileChunkReceiver` file-backed receivers revalidate the public transfer-plan fields
+  and reject out-of-bounds chunk sizes or contradictory chunk counts. The in-memory receiver refuses a
+  declared file size above its 128 MiB default allocation cap before building the receive buffer; the
+  file-backed receiver carries the sctl STP path's default 1 GiB transfer cap, writes one verified
+  chunk at a time into a preallocated temp file, streams the completed file through SHA-256 before
+  final rename, and defaults to a single finish-time `sync_data()` instead of syncing every chunk.
+  Callers that need per-chunk durability can opt into it explicitly.
 
 Malformed bytes are dropped quietly — hostile input never panics a transport thread.
 
@@ -120,7 +164,9 @@ delivery. Two header rewrites make a reply find its way home:
   peer node" from the receiver's vantage, so it is rewritten to `Node(peer, x)` — the eventual
   reply routes back across the same link to the original requester.
 - **`from` is resealed by the local bus** to the transport creature's own id. The original
-  cross-hop sender identity is carried by the (rewritten) `reply_to`, not by `from`.
+  cross-hop sender *creature* is carried by the (rewritten) `reply_to`, not by `from` — but the
+  authenticated *node* the frame came from is preserved in the `origin` header (next section), stamped
+  by the transport before the reseal.
 
 `corr`, `schema`, and `commitment` ride through untouched: `corr`/`schema` are what match a reply
 to its request across the boundary, and `commitment` is the commit-and-reveal slot a receiving
@@ -135,6 +181,62 @@ bus reseals `from` before any local listener sees the envelope). Admitted peers 
 *data* across the mesh; they are never trusted to drive a peer node's kernel. The trust granted by
 admission and the trust required to command a kernel are different trusts, and this boundary keeps
 them apart.
+
+## Cross-node sender attribution
+
+A receiver should be able to tell which node a cross-node envelope really came from — and not be
+fooled by what the envelope *claims*. The substrate answers this at **node granularity**, and it does
+so at the one place the truth is known: the wire boundary.
+
+**`origin`.** `Header` carries an `origin: Option<Origin>` where `Origin { node: NodeId }`. `None`
+means the envelope is local (same-node). It is a *sealed* field — like `from`, `seq`, and `sig`, a
+creature cannot set it: it is absent from `Dispatch` (the type a creature emits), so there is nothing
+to forge. The only way `origin` is populated is the transport's one privileged path,
+`Bus::emit_attested`, reachable only from a handle the kernel grants exclusively to the transport at
+boot (`Kernel::load_transport_instance` → `BusHandle::new_attesting`). There is no manifest
+capability for it, so a signed or authored creature can never grant itself the power to attest. The
+default `Bus::emit_attested` refuses (`Denied`); every non-transport implementation inherits the
+refusal.
+
+**Stamp the authenticated peer, verify the signature.** When a frame arrives, the transport — which
+authenticated the peer's public key at the handshake — does two things *before* it reseals `from`,
+while the inbound bytes are still exactly what the sender signed:
+
+1. **Verifies** the envelope's signature under the *connection-authenticated* public key (bound at the
+   handshake, never a later gossip lookup, so a gossiped pubkey change can't retroactively flip a live
+   link's verdict). This is the cryptographic check the unified node identity makes possible.
+2. **Stamps** `origin = Origin { node: <authenticated peer> }` — from the link the handshake proved,
+   *never* from the frame's own claim (the same boundary discipline as the `KERNEL_ID` refusal).
+
+`origin` then enters the envelope's signing payload, so the local re-seal signs over it: it cannot be
+altered in-fabric without breaking verification.
+
+**The verdict is diagnostic, not enforcement.** The transport publishes an `OriginVerdict` per
+cross-node frame on `PROPRIOCEPTION`:
+
+| Verdict | Meaning |
+|---|---|
+| `Verified` | the peer's node key signed this exact content |
+| `BadSig` | the signature did not verify under the authenticated key — tampered content or a node signing with the wrong key |
+| `Unresolved` | no key was available to check (an authenticated link always has one, so this signals a desync) |
+| `Local` | inferred by consumers from `origin == None`; the transport never emits it |
+
+The spine never *rejects* on a verdict — what a bad verdict earns is **injected policy**, exactly like
+budget breaches and quarantine. The reference `policy-origin` creature counts a peer's non-`Verified`
+verdicts and, past an injected threshold, pulls the reversible `TransportCtl::Forget` lever (drop the
+peer from the allowlist until an operator re-`Connect`s it). An operator might instead log, page,
+rate-limit, or demand a fresh handshake — same shape, same stream. (The one exception is **replay**: a
+cross-node frame whose `seq` does not advance the per-`(node, sender)` high-water mark is *dropped* at
+the boundary, a wire-integrity refusal like the `KERNEL_ID` one, not a sender-auth policy. The
+watermark resets on reconnect, where a fresh session legitimately restarts `seq`.)
+
+**What this is and isn't.** `Verified` proves *node* A signed the content; because one node key signs
+on behalf of all its creatures, it is node-grain, not per-creature non-repudiation. Because the check
+is content-signature (not merely "arrived on an authenticated link"), it survives an on-path attacker
+tampering with the plaintext frames the link carries after the handshake. What is deliberately
+deferred: per-creature portable identity, end-to-end proof to the *final* recipient across an
+untrusted relay (the mesh is direct authenticated links, no transport relay — so there is none to
+cross today), revocation, and signed membership gossip.
 
 ## Dynamic clustering
 

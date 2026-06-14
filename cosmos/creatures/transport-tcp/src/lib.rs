@@ -2,9 +2,10 @@
 //!
 //! Bound to `Role::TRANSPORT`, so the kernel routes every `Address::Node(_,_)` envelope here.
 //! Authenticates each peer with a mutual ed25519 challenge-response handshake against a pre-shared
-//! pubkey allowlist — no PKI, no TOFU. After the handshake, envelopes
-//! travel as length-prefixed JSON (the same shape the loopback uses, so the wire format is one
-//! step's worth of change, not a redesign).
+//! pubkey allowlist — no PKI, no TOFU. After the handshake, envelopes and gossip travel as
+//! length-prefixed JSON (the same shape the loopback uses, so the wire format is one step's worth of
+//! change, not a redesign). Bulk artifact chunks use the shared GX/gawdxfer binary frame on that
+//! same authenticated length-prefixed stream.
 //!
 //! ### What this creature delivers
 //!
@@ -46,8 +47,8 @@ use std::thread::{Builder, JoinHandle};
 use std::time::Duration;
 
 use aether::{
-    Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, NodeId, Outcome,
-    Topic, KERNEL_ID,
+    Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, NodeId, Origin,
+    OriginEvent, OriginVerdict, Outcome, Topic, KERNEL_ID, ORIGIN_EVENT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use sigil::{
@@ -73,10 +74,21 @@ const PEER_QUEUE_DEPTH: usize = 1024;
 
 /// Per-frame cap. See the reader for rationale.
 const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
+/// Magic prefix for raw GX/gawdxfer chunk frames on the authenticated peer stream.
+///
+/// The outer TCP record is still transport-tcp's length prefix. Inside that record, JSON frames
+/// begin with a JSON object and GX frames begin with this marker followed by
+/// `gawdxfer::encode_binary_frame`. This keeps bulk chunks out of envelope JSON without inventing a
+/// transport-specific artifact protocol.
+const GX_FRAME_PREFIX: &[u8; 4] = b"GX1\0";
 
 /// Cap on members grafted from a single gossip frame (R9). Far above any real cluster's
 /// membership — a bound on dialer threads one message can spawn, not a topology limit.
 const MAX_GOSSIP_MEMBERS: usize = 1024;
+/// Maximum active raw-GX route bindings retained per peer. A binding is `transfer_id -> local
+/// creature target`, installed only by authenticated peers and removed on disconnect or, for
+/// transfer-plan generated chunks, after the declared final chunk.
+const MAX_GX_ROUTES_PER_PEER: usize = 4096;
 /// Default cap on the accumulated dynamic member table. One slot is reserved for `self` in gossip
 /// frames, so a full default member table still fits under `MAX_GOSSIP_MEMBERS`. `0` in
 /// [`TransportTcp::with_max_members`] is the explicit unbounded lab/demo opt-out.
@@ -147,13 +159,15 @@ struct GossipMember {
     addr: String,
 }
 
-/// One wire frame on a peer connection: a routed envelope or a membership-gossip push. Gossip rides
-/// the same authenticated socket, so membership needs no cross-node module addressing.
-#[derive(Serialize, Deserialize)]
+/// One JSON wire frame on a peer connection: a routed envelope, a membership-gossip push, or a raw
+/// GX route binding. Gossip rides the same authenticated socket, so membership needs no cross-node
+/// module addressing. Raw GX chunk frames are parsed by [`parse_wire_payload`] before JSON decode.
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "f", rename_all = "snake_case")]
 enum WireFrame {
     Env(Box<Envelope>),
     Gossip { members: Vec<GossipMember> },
+    GxBind(GxRouteBind),
 }
 impl WireFrame {
     fn to_bytes(&self) -> Vec<u8> {
@@ -166,21 +180,126 @@ impl WireFrame {
         // spawns — not merely on the graft loop. The transient decode is still bounded by the global
         // per-frame byte cap; an over-cap frame from a (necessarily authenticated) peer is dropped
         // whole and signalled, rather than partially applied. A well-behaved peer never sends more.
-        if let WireFrame::Gossip { members } = &frame {
-            if members.len() > MAX_GOSSIP_MEMBERS {
+        match &frame {
+            WireFrame::Gossip { members } if members.len() > MAX_GOSSIP_MEMBERS => {
                 eprintln!(
-                    "transport-tcp: rejecting gossip frame with {} members (cap {MAX_GOSSIP_MEMBERS})",
-                    members.len()
-                );
+                "transport-tcp: rejecting gossip frame with {} members (cap {MAX_GOSSIP_MEMBERS})",
+                members.len()
+            );
                 return None;
             }
+            WireFrame::GxBind(bind) if bind.shape_error().is_some() => return None,
+            _ => {}
         }
         Some(frame)
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct GxRouteBind {
+    transfer_id: String,
+    target: CreatureId,
+    schema: String,
+    corr: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_chunks: Option<u32>,
+}
+
+impl GxRouteBind {
+    fn shape_error(&self) -> Option<String> {
+        let req = gawdxfer::ChunkRequest::new(self.transfer_id.clone(), 0);
+        if let Some(error) = req.shape_error() {
+            return Some(error);
+        }
+        if self.target == KERNEL_ID {
+            return Some("GX chunks may not target the reserved local KERNEL_ID".to_string());
+        }
+        if self.schema != GX_CHUNK_SCHEMA {
+            return Some(format!("GX bind schema must be `{GX_CHUNK_SCHEMA}`"));
+        }
+        if self.total_chunks == Some(0) {
+            return Some("GX bind total_chunks must be greater than zero".to_string());
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GxRoute {
+    target: CreatureId,
+    schema: String,
+    corr: Option<u64>,
+    total_chunks: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerFrame {
+    frames: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum ParsedWireFrame<'a> {
+    Env(Box<Envelope>),
+    Gossip { members: Vec<GossipMember> },
+    GxBind(GxRouteBind),
+    GxChunk(gawdxfer::ChunkFrameHeader, &'a [u8]),
+}
+
+fn parse_wire_payload(bytes: &[u8]) -> Option<ParsedWireFrame<'_>> {
+    if let Some((header, payload)) = decode_gx_wire_frame(bytes) {
+        return Some(ParsedWireFrame::GxChunk(header, payload));
+    }
+    match WireFrame::parse(bytes)? {
+        WireFrame::Env(env) => Some(ParsedWireFrame::Env(env)),
+        WireFrame::Gossip { members } => Some(ParsedWireFrame::Gossip { members }),
+        WireFrame::GxBind(bind) => Some(ParsedWireFrame::GxBind(bind)),
+    }
+}
+
+fn decode_gx_wire_frame(bytes: &[u8]) -> Option<(gawdxfer::ChunkFrameHeader, &[u8])> {
+    let body = bytes.strip_prefix(GX_FRAME_PREFIX)?;
+    let (header, payload) =
+        gawdxfer::decode_binary_frame::<gawdxfer::ChunkFrameHeader>(body).ok()?;
+    if header.shape_error().is_some() {
+        return None;
+    }
+    Some((header, payload))
+}
+
+#[cfg(test)]
+fn encode_gx_wire_frame(
+    header: &gawdxfer::ChunkFrameHeader,
+    payload: &[u8],
+) -> Result<Vec<u8>, gawdxfer::FrameError> {
+    let body = gawdxfer::encode_binary_frame(header, payload)?;
+    prefix_gx_wire_frame(&body)
+}
+
+fn prefix_gx_wire_frame(body: &[u8]) -> Result<Vec<u8>, gawdxfer::FrameError> {
+    let capacity = prefixed_gx_wire_frame_len(body.len())?;
+    let mut frame = Vec::with_capacity(capacity);
+    frame.extend_from_slice(GX_FRAME_PREFIX);
+    frame.extend_from_slice(body);
+    Ok(frame)
+}
+
+fn prefixed_gx_wire_frame_len(body_len: usize) -> Result<usize, gawdxfer::FrameError> {
+    let capacity =
+        GX_FRAME_PREFIX.len().checked_add(body_len).ok_or(gawdxfer::FrameError::FrameTooLarge)?;
+    if capacity > MAX_FRAME_BYTES {
+        return Err(gawdxfer::FrameError::FrameTooLarge);
+    }
+    Ok(capacity)
+}
+
 /// Schema of the cluster control op an operator/front-end sends to admit a peer or read the graph.
 pub const CTL_SCHEMA: &str = "transport.ctl";
+/// Schema for a raw GX/gawdxfer chunk body addressed to `Address::Node(peer, _)`.
+///
+/// The local envelope payload is `gawdxfer::encode_binary_frame(...)` bytes. The transport prefixes
+/// those bytes with the private `GX_FRAME_PREFIX` tag and sends them over the authenticated peer
+/// stream without wrapping the chunk in JSON.
+pub const GX_CHUNK_SCHEMA: &str = gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA;
 /// Maximum bytes accepted for one `transport.ctl` request before JSON decode. Control ops are small
 /// (`Members` or a single bounded `Connect` member); keep this far below the data-plane frame cap.
 pub const MAX_TRANSPORT_CTL_BYTES: usize = 64 * 1024;
@@ -196,6 +315,11 @@ pub enum TransportCtl {
     Connect { node_id: String, pubkey_hex: String, addr: String },
     /// Ask this node for its view of the cluster graph.
     Members,
+    /// Drop a peer: remove it from the allowlist + member set and tear down its link, so it can
+    /// neither send nor re-handshake until a fresh [`Connect`](TransportCtl::Connect). The reversible
+    /// inverse of `Connect` — the lever an injected defense policy pulls when a peer misbehaves
+    /// (e.g. `policy-origin` on repeated forged-origin verdicts). Idempotent.
+    Forget { node_id: String },
 }
 impl TransportCtl {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -216,6 +340,7 @@ pub enum TransportCtlReply {
     Connecting { node_id: String },
     Rejected { reason: String },
     Members { self_node: String, members: Vec<MemberView> },
+    Forgotten { node_id: String },
 }
 impl TransportCtlReply {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -269,7 +394,13 @@ struct TransportState {
     advertise_addr: Mutex<String>,
     /// NodeId → outbound queue. `handle(Node(peer, _))` pushes here; the per-peer writer thread
     /// drains. Wrapped in Mutex because connect/disconnect rewrites it.
-    writers: Mutex<HashMap<NodeId, SyncSender<Vec<u8>>>>,
+    writers: Mutex<HashMap<NodeId, SyncSender<PeerFrame>>>,
+    /// `(peer, transfer_id)` → local route for raw GX chunks received outside JSON envelopes.
+    gx_routes: Mutex<HashMap<(NodeId, String), GxRoute>>,
+    /// Replay-guard high-water marks: `(origin node, original sender creature)` → highest `seq` seen
+    /// this link session. A cross-node frame whose `seq` does not advance is dropped. Reset for a
+    /// peer when a fresh handshake installs (a new session legitimately restarts the sender's `seq`).
+    origin_seq: Mutex<HashMap<(NodeId, CreatureId), u64>>,
     /// Open sockets, by peer NodeId — kept so shutdown can call `Shutdown::Both` on each to
     /// unblock any reader that's mid-`read`. Multiple connections per peer may exist briefly during
     /// re-dial; the Vec covers that race.
@@ -335,6 +466,8 @@ impl TransportTcp {
             dialing: Mutex::new(HashSet::new()),
             gossip: AtomicBool::new(false),
             writers: Mutex::new(HashMap::new()),
+            gx_routes: Mutex::new(HashMap::new()),
+            origin_seq: Mutex::new(HashMap::new()),
             sockets: Mutex::new(HashMap::new()),
             bus: Mutex::new(None),
             me: Mutex::new(None),
@@ -438,6 +571,9 @@ impl Creature for TransportTcp {
         if env.header.schema == CTL_SCHEMA {
             return handle_ctl(&self.state, &env);
         }
+        if env.header.schema == GX_CHUNK_SCHEMA {
+            return handle_gx_chunk_outbound(&self.state, &env);
+        }
         // We only handle Node-addressed envelopes (the router only delivers those here anyway).
         let Address::Node(peer_node, _target_mid) = &env.header.to else {
             return Outcome::none();
@@ -493,6 +629,7 @@ impl Creature for TransportTcp {
 
         // Disconnect every per-peer outbound queue so writer threads exit their `recv_timeout`.
         mlock(&self.state.writers).clear();
+        mlock(&self.state.gx_routes).clear();
 
         // Join all spawned threads. Each respects `state.stop` + the timeouts above, so they exit
         // within ~POLL of the signal. In cluster mode a dialer mid-handshake (or the listener
@@ -523,22 +660,173 @@ impl Creature for TransportTcp {
 }
 
 fn queue_peer_frame(
-    tx: &SyncSender<Vec<u8>>,
+    tx: &SyncSender<PeerFrame>,
     frame: Vec<u8>,
     max_frame_bytes: usize,
 ) -> Result<(), &'static str> {
-    // An empty frame is `wire::to_bytes`'s release-mode degrade for an unserializable value —
-    // never a real wire message. Name it distinctly so the shed event tells the truth.
-    if frame.is_empty() {
+    queue_peer_frames(tx, vec![frame], max_frame_bytes)
+}
+
+fn queue_peer_frames(
+    tx: &SyncSender<PeerFrame>,
+    frames: Vec<Vec<u8>>,
+    max_frame_bytes: usize,
+) -> Result<(), &'static str> {
+    if frames.is_empty() {
         return Err("peer_send_dropped:empty_frame");
     }
-    if frame.len() > max_frame_bytes {
-        return Err("peer_send_dropped:frame_too_large");
+    for frame in &frames {
+        // An empty frame is `wire::to_bytes`'s release-mode degrade for an unserializable value —
+        // never a real wire message. Name it distinctly so the shed event tells the truth.
+        if frame.is_empty() {
+            return Err("peer_send_dropped:empty_frame");
+        }
+        if frame.len() > max_frame_bytes {
+            return Err("peer_send_dropped:frame_too_large");
+        }
     }
-    tx.try_send(frame).map_err(|e| match e {
+    tx.try_send(PeerFrame { frames }).map_err(|e| match e {
         TrySendError::Full(_) => "peer_send_dropped:backpressure",
         TrySendError::Disconnected(_) => "peer_send_dropped:no_link",
     })
+}
+
+fn handle_gx_chunk_outbound(state: &Arc<TransportState>, env: &Envelope) -> Outcome {
+    let Address::Node(peer_node, target_mid) = &env.header.to else {
+        return Outcome::none();
+    };
+    if *target_mid == KERNEL_ID {
+        publish_peer_event(state, peer_node, "peer_send_dropped:gx_kernel_target");
+        return Outcome::none();
+    }
+
+    let disposition =
+        match gawdxfer::decode_binary_frame::<gawdxfer::ChunkFrameHeader>(&env.payload) {
+            Ok((header, _payload)) if header.shape_error().is_none() => {
+                let bind = WireFrame::GxBind(GxRouteBind {
+                    transfer_id: header.transfer_id,
+                    target: *target_mid,
+                    schema: GX_CHUNK_SCHEMA.to_string(),
+                    corr: env.header.corr,
+                    total_chunks: header.total_chunks,
+                })
+                .to_bytes();
+                match prefix_gx_wire_frame(&env.payload) {
+                    Ok(frame) => {
+                        let writers = mlock(&state.writers);
+                        match writers.get(peer_node) {
+                            Some(tx) => {
+                                queue_peer_frames(tx, vec![bind, frame], MAX_FRAME_BYTES).err()
+                            }
+                            None => Some("peer_send_dropped:no_link"),
+                        }
+                    }
+                    Err(_) => Some("peer_send_dropped:frame_too_large"),
+                }
+            }
+            _ => Some("peer_send_dropped:malformed_gx_chunk"),
+        };
+    if let Some(event) = disposition {
+        publish_peer_event(state, peer_node, event);
+    }
+    Outcome::none()
+}
+
+fn install_gx_route(state: &TransportState, peer: &NodeId, bind: GxRouteBind) {
+    if let Some(reason) = bind.shape_error() {
+        eprintln!("transport-tcp: rejected GX route bind from peer {}: {reason}", peer.0);
+        publish_peer_event(state, peer, "gx_route_bind_dropped:malformed");
+        return;
+    }
+    let incoming = GxRoute {
+        target: bind.target,
+        schema: bind.schema,
+        corr: bind.corr,
+        total_chunks: bind.total_chunks,
+    };
+    let mut event = None;
+    {
+        let mut routes = mlock(&state.gx_routes);
+        let key = (peer.clone(), bind.transfer_id.clone());
+        if let Some(existing) = routes.get(&key) {
+            if existing != &incoming {
+                event = Some("gx_route_bind_dropped:conflict");
+            }
+        } else {
+            let peer_routes = routes.keys().filter(|(route_peer, _)| route_peer == peer).count();
+            if peer_routes >= MAX_GX_ROUTES_PER_PEER {
+                event = Some("gx_route_bind_dropped:capacity");
+            } else {
+                routes.insert(key, incoming);
+            }
+        }
+    }
+    if let Some(event) = event {
+        publish_peer_event(state, peer, event);
+    }
+}
+
+fn deliver_gx_chunk_locally(
+    state: &TransportState,
+    peer: &NodeId,
+    header: gawdxfer::ChunkFrameHeader,
+    payload: &[u8],
+) {
+    let route_key = (peer.clone(), header.transfer_id.clone());
+    let route = mlock(&state.gx_routes).get(&route_key).cloned();
+    let Some(route) = route else {
+        publish_peer_event(state, peer, "gx_chunk_dropped:no_route");
+        return;
+    };
+    if let Some(expected) = route.total_chunks {
+        match header.total_chunks {
+            Some(actual) if actual == expected => {}
+            _ => {
+                mlock(&state.gx_routes).remove(&route_key);
+                publish_peer_event(state, peer, "gx_chunk_dropped:route_mismatch");
+                return;
+            }
+        }
+    }
+    let retire_route = route
+        .total_chunks
+        .is_some_and(|total_chunks| header.chunk_index == total_chunks.saturating_sub(1));
+    let actual_hash = gawdxfer::hash_bytes(payload);
+    if actual_hash != header.chunk_hash {
+        publish_peer_event(state, peer, "gx_chunk_dropped:hash_mismatch");
+        if retire_route {
+            mlock(&state.gx_routes).remove(&route_key);
+        }
+        return;
+    }
+    let body = match gawdxfer::encode_binary_frame(&header, payload) {
+        Ok(body) => body,
+        Err(_) => {
+            publish_peer_event(state, peer, "gx_chunk_dropped:frame_encode_failed");
+            if retire_route {
+                mlock(&state.gx_routes).remove(&route_key);
+            }
+            return;
+        }
+    };
+    let mut dispatch =
+        Dispatch::to(Address::Creature(route.target), body).with_schema(route.schema);
+    if let Some(corr) = route.corr {
+        dispatch = dispatch.with_corr(corr);
+    }
+
+    let bus = mlock(&state.bus).as_ref().cloned();
+    if let Some(bus) = bus {
+        if let Err(e) = bus.emit(dispatch) {
+            eprintln!(
+                "transport-tcp: inbound GX chunk from peer {} for transfer {} dropped on local route: {e}",
+                peer.0, header.transfer_id
+            );
+        }
+    }
+    if retire_route {
+        mlock(&state.gx_routes).remove(&route_key);
+    }
 }
 
 // ---- listener / dialer ----
@@ -552,6 +840,7 @@ fn listener_loop(state: Arc<TransportState>, listener: TcpListener) {
     while !state.stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                configure_stream_for_transport(&stream);
                 let state_h = state.clone();
                 let h = match Builder::new()
                     .name("transport-handshake-server".into())
@@ -637,6 +926,7 @@ fn dialer_loop(state: Arc<TransportState>, peer: PeerConfig) {
         }
         match TcpStream::connect_timeout(&sockaddr, POLL) {
             Ok(stream) => {
+                configure_stream_for_transport(&stream);
                 client_handshake_and_run(state.clone(), stream, &peer);
                 backoff = Duration::from_millis(100);
             }
@@ -711,8 +1001,9 @@ fn server_handshake_and_run(state: Arc<TransportState>, mut stream: TcpStream) {
         return;
     }
 
-    // Authenticated. Hand the stream off to the per-peer reader/writer pair.
-    install_connection(state, stream, client_node);
+    // Authenticated. Hand the stream off to the per-peer reader/writer pair, carrying the pubkey the
+    // client just proved possession of so inbound frames are verified under the *connection's* key.
+    install_connection(state, stream, client_node, client_pubkey_hex);
 }
 
 fn client_handshake_and_run(state: Arc<TransportState>, mut stream: TcpStream, peer: &PeerConfig) {
@@ -773,8 +1064,15 @@ fn client_handshake_and_run(state: Arc<TransportState>, mut stream: TcpStream, p
         return;
     }
 
-    // Authenticated.
-    install_connection(state, stream, peer.node_id.clone());
+    // Authenticated. `server_pubkey_hex` was checked equal to the configured `peer.pubkey_hex`, so
+    // it is the key the server proved possession of — carry it for inbound origin verification.
+    install_connection(state, stream, peer.node_id.clone(), server_pubkey_hex);
+}
+
+fn configure_stream_for_transport(stream: &TcpStream) {
+    // The wire carries many small control/bind frames interleaved with bulk GX chunks. Waiting for
+    // Nagle/delayed-ACK coalescing turns a 12 MiB local transfer into many poll-sized stalls.
+    let _ = stream.set_nodelay(true);
 }
 
 /// Construct the canonical bytes both sides sign over. Direction bound by which pubkey comes
@@ -803,12 +1101,18 @@ fn fresh_nonce() -> Option<[u8; NONCE_BYTES]> {
 
 // ---- per-peer reader + writer ----
 
-fn install_connection(state: Arc<TransportState>, stream: TcpStream, peer: NodeId) {
+fn install_connection(
+    state: Arc<TransportState>,
+    stream: TcpStream,
+    peer: NodeId,
+    peer_pubkey: String,
+) {
+    configure_stream_for_transport(&stream);
     // Reset stream timeouts for the run phase — short reads/writes are how we wake on shutdown.
     let _ = stream.set_read_timeout(Some(POLL));
     let _ = stream.set_write_timeout(Some(POLL));
 
-    let (tx, rx) = sync_channel::<Vec<u8>>(PEER_QUEUE_DEPTH);
+    let (tx, rx) = sync_channel::<PeerFrame>(PEER_QUEUE_DEPTH);
 
     // **Double-connect race fix.** When both nodes mutually dial each other at boot, both
     // handshakes can succeed before either side has installed a writer. Without the
@@ -865,6 +1169,10 @@ fn install_connection(state: Arc<TransportState>, stream: TcpStream, peer: NodeI
     };
     mlock(&state.sockets).entry(peer.clone()).or_default().push(shutdown_handle);
 
+    // A fresh handshake is a new link session: the sender's per-`BusHandle` `seq` restarts from 0,
+    // so clear any stale replay watermarks for this peer before the reader starts admitting frames.
+    reset_origin_watermarks(&state, &peer);
+
     publish_peer_event(&state, &peer, "peer_connected");
 
     // Cluster mode: sync our member view to the newcomer so membership propagates over the mesh.
@@ -875,9 +1183,10 @@ fn install_connection(state: Arc<TransportState>, stream: TcpStream, peer: NodeI
     // Reader: pull envelopes off the wire and route them locally.
     let state_r = state.clone();
     let peer_r = peer.clone();
+    let peer_pubkey_r = peer_pubkey.clone();
     let h_r = match Builder::new()
         .name(format!("transport-reader-{}", peer.0))
-        .spawn(move || reader_loop(state_r, reader_stream, peer_r))
+        .spawn(move || reader_loop(state_r, reader_stream, peer_r, peer_pubkey_r))
     {
         Ok(h) => h,
         Err(e) => {
@@ -922,7 +1231,12 @@ fn install_connection(state: Arc<TransportState>, stream: TcpStream, peer: NodeI
     }
 }
 
-fn reader_loop(state: Arc<TransportState>, mut stream: TcpStream, peer: NodeId) {
+fn reader_loop(
+    state: Arc<TransportState>,
+    mut stream: TcpStream,
+    peer: NodeId,
+    peer_pubkey: String,
+) {
     loop {
         if state.stop.load(Ordering::Relaxed) {
             break;
@@ -951,13 +1265,20 @@ fn reader_loop(state: Arc<TransportState>, mut stream: TcpStream, peer: NodeId) 
         if read_exact_with_stop(&state, &mut stream, &mut payload).is_err() {
             break;
         }
-        match WireFrame::parse(&payload) {
-            Some(WireFrame::Env(env)) => deliver_locally(&state, *env, &peer),
-            Some(WireFrame::Gossip { members }) => {
+        match parse_wire_payload(&payload) {
+            Some(ParsedWireFrame::Env(env)) => deliver_locally(&state, *env, &peer, &peer_pubkey),
+            Some(ParsedWireFrame::Gossip { members }) => {
                 // Membership only matters in cluster mode; a static node ignores stray gossip.
                 if state.gossip.load(Ordering::Relaxed) {
                     ingest_gossip(&state, members);
                 }
+            }
+            Some(ParsedWireFrame::GxBind(bind)) => install_gx_route(&state, &peer, bind),
+            // GX chunks only route after an authenticated peer has installed a bounded route binding
+            // for the transfer id. This preserves the raw lane without letting arbitrary chunks choose
+            // their own local destination.
+            Some(ParsedWireFrame::GxChunk(header, payload)) => {
+                deliver_gx_chunk_locally(&state, &peer, header, payload);
             }
             // Drop malformed frames quietly (R9 — no panic on hostile bytes).
             None => continue,
@@ -971,6 +1292,7 @@ fn reader_loop(state: Arc<TransportState>, mut stream: TcpStream, peer: NodeId) 
     // discipline keeps ≤1 live connection per peer (the redundant-arrival path returns before
     // pushing a handle). (T4)
     mlock(&state.writers).remove(&peer);
+    mlock(&state.gx_routes).retain(|(route_peer, _), _| route_peer != &peer);
     mlock(&state.sockets).remove(&peer);
 }
 
@@ -1006,23 +1328,25 @@ fn read_exact_with_stop(
 fn writer_loop(
     state: Arc<TransportState>,
     mut stream: TcpStream,
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<PeerFrame>,
     peer: NodeId,
 ) {
-    loop {
+    'writer: loop {
         if state.stop.load(Ordering::Relaxed) {
             break;
         }
-        let bytes = match rx.recv_timeout(POLL) {
+        let batch = match rx.recv_timeout(POLL) {
             Ok(b) => b,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let len = (bytes.len() as u32).to_le_bytes();
-        if write_all_with_stop(&state, &mut stream, &len).is_err()
-            || write_all_with_stop(&state, &mut stream, &bytes).is_err()
-        {
-            break;
+        for bytes in batch.frames {
+            let len = (bytes.len() as u32).to_le_bytes();
+            if write_all_with_stop(&state, &mut stream, &len).is_err()
+                || write_all_with_stop(&state, &mut stream, &bytes).is_err()
+            {
+                break 'writer;
+            }
         }
     }
     let _ = stream.shutdown(Shutdown::Both);
@@ -1070,7 +1394,7 @@ fn write_all_with_stop(
 /// commit-and-reveal slot a receiving Realm may have to verify; dropping it here
 /// would silently defeat any cross-node commit-and-reveal (a fair Distribute pick, a consensus
 /// tie-break), which is exactly why the realm-gateway/omega-federator preserve it on rewrite.
-fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId) {
+fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId, peer_pubkey: &str) {
     let target_mid = match &env.header.to {
         Address::Node(node, mid) if *node == state.self_node => *mid,
         Address::Node(node, _mid) => {
@@ -1106,43 +1430,132 @@ fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId) {
         return;
     }
 
-    // Capture the small correlation fields before `env` is moved into the dispatch builder, so a
-    // dropped inbound frame can name itself in the log below.
+    // Clone the `Arc<dyn Bus>` out and DROP the guard before emitting — `emit` re-enters the router
+    // (table read + journal mutex + try_send), so holding `state.bus` across it would serialize
+    // every peer reader thread on one mutex and widen the poison/deadlock window (T6).
+    let bus = mlock(&state.bus).as_ref().cloned();
+    let Some(bus) = bus else { return };
+
+    // Capture what we need from the header *before* the payload moves into the dispatch builder:
+    // the correlation fields, the sender's per-link `seq` (replay guard) and original `from`
+    // creature, and — crucially — the signature over the *un-rewritten* bytes (the exact bytes the
+    // sender signed), which is verifiable here under the peer's handshake-authenticated key.
     let corr = env.header.corr;
+    let seq = env.header.seq;
+    let sender_creature = match &env.header.from {
+        Address::Creature(c) => *c,
+        other => {
+            eprintln!(
+                "transport-tcp: dropped an inbound frame from peer {} with non-creature \
+                 original sender {other:?}",
+                peer.0
+            );
+            publish_peer_event(state, peer, "frame_bad_from_dropped");
+            return;
+        }
+    };
+    // Verify against the connection-authenticated pubkey, NOT a mutable member-table lookup — so a
+    // later gossip pubkey change can never retroactively flip a live link's verdict.
+    let sig_ok = !peer_pubkey.is_empty()
+        && Ed25519Verifier.verify(peer_pubkey, &env.signing_payload(), &env.header.sig);
 
     // Rewrite `reply_to`: a `Creature(mid)` from the peer means "mid on the peer node" from our POV.
     let reply_to = env.header.reply_to.clone().map(|rt| match rt {
         Address::Creature(mid) => Address::Node(peer.clone(), mid),
         other => other,
     });
+    let commitment = env.header.commitment.clone();
+    let schema = env.header.schema.clone();
 
-    let mut dispatch =
-        Dispatch::to(Address::Creature(target_mid), env.payload).with_schema(env.header.schema);
+    let mut dispatch = Dispatch::to(Address::Creature(target_mid), env.payload).with_schema(schema);
     if let Some(rt) = reply_to {
         dispatch = dispatch.with_reply_to(rt);
     }
     if let Some(corr) = corr {
         dispatch = dispatch.with_corr(corr);
     }
-    if let Some(commit) = env.header.commitment {
+    if let Some(commit) = commitment {
         dispatch = dispatch.with_commitment(commit);
     }
 
-    // Clone the `Arc<dyn Bus>` out and DROP the guard before emitting — `emit` re-enters the router
-    // (table read + journal mutex + try_send), so holding `state.bus` across it would serialize
-    // every peer reader thread on one mutex and widen the poison/deadlock window (T6).
-    let bus = mlock(&state.bus).as_ref().cloned();
-    if let Some(bus) = bus {
+    // A transport loaded *without* the boot-only attestation grant relays as before — no origin, no
+    // verdict. Only an attesting transport (the production load path) attributes cross-node senders.
+    if !bus.may_attest() {
         if let Err(e) = bus.emit(dispatch) {
-            // The frame already crossed the wire and authenticated; a local-route failure after
-            // that was invisible. Make it discoverable (best-effort delivery is unchanged).
             eprintln!(
                 "transport-tcp: inbound frame from peer {} to creature {target_mid:?} \
                  (corr={corr:?}) dropped on local route: {e}",
                 peer.0
             );
         }
+        return;
     }
+
+    // Replay guard (wire-integrity, like the KERNEL_ID refusal): a frame whose `seq` does not
+    // advance the per-(node, sender) high-water mark is dropped. Reset on reconnect handles the
+    // legitimate `seq` restart of a fresh link session.
+    if is_replayed_seq(state, peer, sender_creature, seq) {
+        publish_peer_event(state, peer, "frame_replay_dropped");
+        return;
+    }
+
+    // Non-enforcing origin verdict: stamp the *authenticated* peer (never the frame's own claim) and
+    // publish the judgement for an injected policy to act on. `Unresolved` should be unreachable on
+    // an authenticated link — its appearance signals a member/connection desync.
+    let verdict = if peer_pubkey.is_empty() {
+        OriginVerdict::Unresolved
+    } else if sig_ok {
+        OriginVerdict::Verified
+    } else {
+        OriginVerdict::BadSig
+    };
+    publish_origin_verdict(state, peer, target_mid, corr, verdict);
+
+    if let Err(e) = bus.emit_attested(dispatch, Origin::node(peer.clone())) {
+        eprintln!(
+            "transport-tcp: inbound frame from peer {} to creature {target_mid:?} \
+             (corr={corr:?}) dropped on local route: {e}",
+            peer.0
+        );
+    }
+}
+
+/// Replay-guard check: returns `true` (drop) when `seq` does not advance the high-water mark for
+/// `(peer, sender)`, else records it and returns `false`. Monotone per sender within a link session.
+fn is_replayed_seq(state: &TransportState, peer: &NodeId, sender: CreatureId, seq: u64) -> bool {
+    let mut wm = mlock(&state.origin_seq);
+    let key = (peer.clone(), sender);
+    match wm.get(&key) {
+        Some(&last) if seq <= last => true,
+        _ => {
+            wm.insert(key, seq);
+            false
+        }
+    }
+}
+
+/// Drop a peer's replay watermarks — called when a fresh handshake installs, so the new session's
+/// restarted `seq` stream is not mistaken for a replay of the previous one.
+fn reset_origin_watermarks(state: &TransportState, peer: &NodeId) {
+    mlock(&state.origin_seq).retain(|(node, _), _| node != peer);
+}
+
+/// Publish a non-enforcing [`OriginEvent`] on `PROPRIOCEPTION` (mirrors [`publish_peer_event`]).
+fn publish_origin_verdict(
+    state: &TransportState,
+    origin_node: &NodeId,
+    target: CreatureId,
+    corr: Option<u64>,
+    verdict: OriginVerdict,
+) {
+    let ev = OriginEvent { origin_node: origin_node.clone(), target, corr, verdict };
+    let payload = aether::wire::to_bytes(&ev);
+    let bus = mlock(&state.bus).as_ref().cloned();
+    let Some(bus) = bus else { return };
+    let _ = bus.emit(
+        Dispatch::to(Address::Topic(Topic::new(Topic::PROPRIOCEPTION)), payload)
+            .with_schema(ORIGIN_EVENT_SCHEMA),
+    );
 }
 
 fn publish_peer_event(state: &TransportState, peer: &NodeId, event: &str) {
@@ -1433,6 +1846,39 @@ fn handle_ctl(state: &Arc<TransportState>, env: &Envelope) -> Outcome {
                 .with_schema(CTL_SCHEMA),
             )
         }
+        TransportCtl::Forget { node_id } => {
+            let node = NodeId(node_id);
+            forget_member(state, &node);
+            gossip_broadcast(state);
+            Outcome::send(
+                Dispatch::reply_to_env(
+                    env,
+                    TransportCtlReply::Forgotten { node_id: node.0 }.to_bytes(),
+                )
+                .with_schema(CTL_SCHEMA),
+            )
+        }
+    }
+}
+
+/// Drop a peer: remove it from the allowlist + member set, stop dialing it, clear its replay
+/// watermarks, and tear down its live link. Reversible — a later `Connect` re-admits it. Never
+/// touches `self`. The inverse of [`admit_member`].
+fn forget_member(state: &Arc<TransportState>, node: &NodeId) {
+    if *node == state.self_node {
+        return;
+    }
+    // Allowlist is keyed by pubkey → node; drop every pubkey mapping to this node so it can't
+    // re-handshake until explicitly re-admitted.
+    mlock(&state.peers_by_pubkey).retain(|_, n| n != node);
+    mlock(&state.members).remove(node);
+    mlock(&state.dialing).remove(node);
+    reset_origin_watermarks(state, node);
+    // Drop the outbound queue and slam any open socket so the reader/writer pair exits and the peer
+    // sees EOF. (The reader publishes `peer_disconnected` on its way out.)
+    mlock(&state.writers).remove(node);
+    for s in mlock(&state.sockets).remove(node).into_iter().flatten() {
+        let _ = s.shutdown(Shutdown::Both);
     }
 }
 
@@ -1455,6 +1901,20 @@ mod tests {
     fn fresh_nonce_returns_distinct_values() {
         // Probabilistic; two 32-byte RNG draws colliding is ~2^-256.
         assert_ne!(fresh_nonce(), fresh_nonce());
+    }
+
+    #[test]
+    fn stream_configuration_enables_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        configure_stream_for_transport(&client);
+        configure_stream_for_transport(&server);
+
+        assert!(client.nodelay().unwrap(), "client stream has TCP_NODELAY enabled");
+        assert!(server.nodelay().unwrap(), "server stream has TCP_NODELAY enabled");
     }
 
     /// **Double-connect race regression.** When both nodes dial each other at boot, the
@@ -1496,6 +1956,8 @@ mod tests {
             max_members: AtomicUsize::new(DEFAULT_MAX_MEMBERS),
             dialing: Mutex::new(HashSet::new()),
             writers: Mutex::new(HashMap::new()),
+            gx_routes: Mutex::new(HashMap::new()),
+            origin_seq: Mutex::new(HashMap::new()),
             sockets: Mutex::new(HashMap::new()),
             bus: Mutex::new(None),
             me: Mutex::new(None),
@@ -1506,8 +1968,8 @@ mod tests {
         let peer = NodeId("peer".into());
 
         // Both calls happen, simulating the race.
-        install_connection(state.clone(), s1, peer.clone());
-        install_connection(state.clone(), s2, peer.clone());
+        install_connection(state.clone(), s1, peer.clone(), test_pubkey_hex());
+        install_connection(state.clone(), s2, peer.clone(), test_pubkey_hex());
 
         // Exactly one writer survived — the FIRST call won; the second saw the entry already
         // present and bowed out.
@@ -1550,7 +2012,7 @@ mod tests {
 
     #[test]
     fn peer_frame_enqueue_refuses_oversized_frames_before_queueing() {
-        let (tx, rx) = sync_channel::<Vec<u8>>(1);
+        let (tx, rx) = sync_channel::<PeerFrame>(1);
 
         assert_eq!(
             queue_peer_frame(&tx, vec![1, 2, 3], 2).unwrap_err(),
@@ -1567,12 +2029,12 @@ mod tests {
         assert!(rx.try_recv().is_err(), "empty frames must not be retained in the outbound queue");
 
         queue_peer_frame(&tx, vec![1, 2], 2).unwrap();
-        assert_eq!(rx.try_recv().unwrap(), vec![1, 2]);
+        assert_eq!(rx.try_recv().unwrap().frames, vec![vec![1, 2]]);
     }
 
     #[test]
     fn peer_frame_enqueue_preserves_backpressure_and_disconnect_events() {
-        let (tx, rx) = sync_channel::<Vec<u8>>(1);
+        let (tx, rx) = sync_channel::<PeerFrame>(1);
         queue_peer_frame(&tx, vec![1], MAX_FRAME_BYTES).unwrap();
         assert_eq!(
             queue_peer_frame(&tx, vec![2], MAX_FRAME_BYTES).unwrap_err(),
@@ -1582,6 +2044,358 @@ mod tests {
         assert_eq!(
             queue_peer_frame(&tx, vec![3], MAX_FRAME_BYTES).unwrap_err(),
             "peer_send_dropped:no_link"
+        );
+    }
+
+    #[test]
+    fn peer_frame_batch_enqueue_is_atomic_under_backpressure() {
+        let (tx, rx) = sync_channel::<PeerFrame>(1);
+        queue_peer_frame(&tx, vec![9], MAX_FRAME_BYTES).unwrap();
+
+        assert_eq!(
+            queue_peer_frames(&tx, vec![vec![1], vec![2]], MAX_FRAME_BYTES).unwrap_err(),
+            "peer_send_dropped:backpressure"
+        );
+
+        assert_eq!(
+            rx.try_recv().unwrap().frames,
+            vec![vec![9]],
+            "failed batch must not leave a partial bind frame in the queue"
+        );
+        assert!(rx.try_recv().is_err(), "failed batch must not enqueue any trailing frame either");
+    }
+
+    fn gx_chunk_env(peer: &str, payload: Vec<u8>) -> Envelope {
+        Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(42)),
+                to: Address::Node(NodeId(peer.into()), CreatureId(77)),
+                reply_to: Some(Address::Creature(CreatureId(42))),
+                seq: 0,
+                causal: Vec::new(),
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(7),
+                commitment: None,
+                schema: GX_CHUNK_SCHEMA.into(),
+                origin: None,
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn gx_chunk_schema_queues_prefixed_raw_frame_to_peer() {
+        let state = test_state("me");
+        let peer = NodeId("peer".into());
+        let (tx, rx) = sync_channel::<PeerFrame>(2);
+        mlock(&state.writers).insert(peer.clone(), tx);
+
+        let header =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 3, gawdxfer::hash_bytes(b"chunk"))
+                .with_total_chunks(4);
+        let body = gawdxfer::encode_binary_frame(&header, b"chunk").expect("encode gx body");
+        let out = handle_gx_chunk_outbound(&state, &gx_chunk_env(&peer.0, body.clone()));
+
+        assert!(out.dispatches.is_empty(), "raw GX send is transport-local");
+        let queued = rx.try_recv().expect("queued gx bind+chunk batch");
+        assert_eq!(queued.frames.len(), 2, "GX bind and chunk queue atomically");
+        let bind = &queued.frames[0];
+        match WireFrame::parse(bind) {
+            Some(WireFrame::GxBind(bind)) => {
+                assert_eq!(bind.transfer_id, "xfer-1");
+                assert_eq!(bind.target, CreatureId(77));
+                assert_eq!(bind.schema, GX_CHUNK_SCHEMA);
+                assert_eq!(bind.corr, Some(7));
+                assert_eq!(bind.total_chunks, Some(4));
+            }
+            other => panic!("expected GX route bind before raw chunk, got {other:?}"),
+        }
+        let queued = &queued.frames[1];
+        assert!(queued.starts_with(GX_FRAME_PREFIX));
+        assert_eq!(&queued[GX_FRAME_PREFIX.len()..], body.as_slice());
+        match decode_gx_wire_frame(queued) {
+            Some((decoded, payload)) => {
+                assert_eq!(decoded, header);
+                assert_eq!(payload, b"chunk");
+            }
+            other => panic!("expected decoded queued GX chunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_gx_chunk_payload_is_not_queued_to_peer() {
+        let state = test_state("me");
+        let peer = NodeId("peer".into());
+        let (tx, rx) = sync_channel::<PeerFrame>(1);
+        mlock(&state.writers).insert(peer.clone(), tx);
+
+        let out = handle_gx_chunk_outbound(&state, &gx_chunk_env(&peer.0, b"not gx".to_vec()));
+
+        assert!(out.dispatches.is_empty());
+        assert!(rx.try_recv().is_err(), "malformed GX payload must not reach the peer queue");
+    }
+
+    #[test]
+    fn malformed_gx_chunk_header_shape_is_not_queued_to_peer() {
+        let state = test_state("me");
+        let peer = NodeId("peer".into());
+        let (tx, rx) = sync_channel::<PeerFrame>(1);
+        mlock(&state.writers).insert(peer.clone(), tx);
+
+        let bad_header = gawdxfer::ChunkFrameHeader::new(
+            "xfer-1".into(),
+            3,
+            gawdxfer::hash_bytes(b"chunk").to_uppercase(),
+        );
+        let body = gawdxfer::encode_binary_frame(&bad_header, b"chunk").expect("encode gx body");
+        let wire = prefix_gx_wire_frame(&body).expect("prefix gx body");
+        assert!(
+            decode_gx_wire_frame(&wire).is_none(),
+            "raw GX parser rejects malformed header shape"
+        );
+
+        let out = handle_gx_chunk_outbound(&state, &gx_chunk_env(&peer.0, body));
+
+        assert!(out.dispatches.is_empty());
+        assert!(rx.try_recv().is_err(), "malformed GX header must not reach the peer queue");
+    }
+
+    #[test]
+    fn gx_prefix_refuses_over_cap_frame_before_allocating_copy() {
+        let max_body = MAX_FRAME_BYTES - GX_FRAME_PREFIX.len();
+        assert_eq!(
+            prefixed_gx_wire_frame_len(max_body).expect("exact cap is allowed"),
+            MAX_FRAME_BYTES
+        );
+        assert_eq!(
+            prefixed_gx_wire_frame_len(max_body + 1),
+            Err(gawdxfer::FrameError::FrameTooLarge)
+        );
+        assert_eq!(
+            prefixed_gx_wire_frame_len(usize::MAX),
+            Err(gawdxfer::FrameError::FrameTooLarge)
+        );
+    }
+
+    #[test]
+    fn inbound_gx_chunk_requires_route_bind_before_local_delivery() {
+        let state = test_state("me");
+        let bus = attach_recording_bus(&state);
+        let peer = NodeId("peer".into());
+        let header =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 3, gawdxfer::hash_bytes(b"chunk"));
+
+        deliver_gx_chunk_locally(&state, &peer, header.clone(), b"chunk");
+        assert!(
+            !mlock(&bus.sent).iter().any(|d| d.to == Address::Creature(CreatureId(77))),
+            "unbound raw GX chunks must not choose a local target"
+        );
+        mlock(&bus.sent).clear();
+
+        install_gx_route(
+            &state,
+            &peer,
+            GxRouteBind {
+                transfer_id: "xfer-1".into(),
+                target: CreatureId(77),
+                schema: GX_CHUNK_SCHEMA.into(),
+                corr: Some(7),
+                total_chunks: None,
+            },
+        );
+        deliver_gx_chunk_locally(&state, &peer, header.clone(), b"chunk");
+
+        let sent = mlock(&bus.sent).clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].to, Address::Creature(CreatureId(77)));
+        assert_eq!(sent[0].schema, GX_CHUNK_SCHEMA);
+        assert_eq!(sent[0].corr, Some(7));
+        let (decoded, payload): (gawdxfer::ChunkFrameHeader, &[u8]) =
+            gawdxfer::decode_binary_frame(&sent[0].payload).expect("local gx chunk payload");
+        assert_eq!(decoded, header);
+        assert_eq!(payload, b"chunk");
+    }
+
+    #[test]
+    fn inbound_gx_route_retires_after_declared_final_chunk() {
+        let state = test_state("me");
+        let bus = attach_recording_bus(&state);
+        let peer = NodeId("peer".into());
+
+        install_gx_route(
+            &state,
+            &peer,
+            GxRouteBind {
+                transfer_id: "xfer-1".into(),
+                target: CreatureId(77),
+                schema: GX_CHUNK_SCHEMA.into(),
+                corr: Some(7),
+                total_chunks: Some(4),
+            },
+        );
+        assert_eq!(mlock(&state.gx_routes).len(), 1);
+
+        let not_final =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 2, gawdxfer::hash_bytes(b"chunk"))
+                .with_total_chunks(4);
+        deliver_gx_chunk_locally(&state, &peer, not_final, b"chunk");
+        assert_eq!(mlock(&state.gx_routes).len(), 1, "route stays until final chunk");
+
+        let final_chunk =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 3, gawdxfer::hash_bytes(b"chunk"))
+                .with_total_chunks(4);
+        deliver_gx_chunk_locally(&state, &peer, final_chunk, b"chunk");
+
+        assert!(mlock(&state.gx_routes).is_empty(), "route retires after final chunk");
+        assert_eq!(
+            mlock(&bus.sent).len(),
+            2,
+            "both chunks were delivered before the route was retired"
+        );
+    }
+
+    #[test]
+    fn inbound_gx_route_drops_chunk_with_mismatched_declared_count() {
+        let state = test_state("me");
+        let bus = attach_recording_bus(&state);
+        let peer = NodeId("peer".into());
+
+        install_gx_route(
+            &state,
+            &peer,
+            GxRouteBind {
+                transfer_id: "xfer-1".into(),
+                target: CreatureId(77),
+                schema: GX_CHUNK_SCHEMA.into(),
+                corr: Some(7),
+                total_chunks: Some(4),
+            },
+        );
+
+        let mismatched =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 0, gawdxfer::hash_bytes(b"chunk"))
+                .with_total_chunks(5);
+        deliver_gx_chunk_locally(&state, &peer, mismatched, b"chunk");
+
+        assert!(
+            !mlock(&bus.sent).iter().any(|d| d.to == Address::Creature(CreatureId(77))),
+            "mismatched route/chunk count must not deliver to the target creature"
+        );
+        assert!(
+            mlock(&state.gx_routes).is_empty(),
+            "mismatched route state is discarded before accepting more chunks"
+        );
+    }
+
+    #[test]
+    fn inbound_gx_route_drops_chunk_missing_declared_count_on_counted_route() {
+        let state = test_state("me");
+        let bus = attach_recording_bus(&state);
+        let peer = NodeId("peer".into());
+
+        install_gx_route(
+            &state,
+            &peer,
+            GxRouteBind {
+                transfer_id: "xfer-1".into(),
+                target: CreatureId(77),
+                schema: GX_CHUNK_SCHEMA.into(),
+                corr: Some(7),
+                total_chunks: Some(4),
+            },
+        );
+
+        let missing_count =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 0, gawdxfer::hash_bytes(b"chunk"));
+        deliver_gx_chunk_locally(&state, &peer, missing_count, b"chunk");
+
+        assert!(
+            !mlock(&bus.sent).iter().any(|d| d.to == Address::Creature(CreatureId(77))),
+            "counted routes require chunks to echo the declared count"
+        );
+        assert!(
+            mlock(&state.gx_routes).is_empty(),
+            "missing count on a counted route discards the route before accepting more chunks"
+        );
+    }
+
+    #[test]
+    fn inbound_gx_route_drops_chunk_with_payload_hash_mismatch() {
+        let state = test_state("me");
+        let bus = attach_recording_bus(&state);
+        let peer = NodeId("peer".into());
+
+        install_gx_route(
+            &state,
+            &peer,
+            GxRouteBind {
+                transfer_id: "xfer-1".into(),
+                target: CreatureId(77),
+                schema: GX_CHUNK_SCHEMA.into(),
+                corr: Some(7),
+                total_chunks: Some(1),
+            },
+        );
+
+        let forged =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 0, gawdxfer::hash_bytes(b"declared"))
+                .with_total_chunks(1);
+        deliver_gx_chunk_locally(&state, &peer, forged, b"actual");
+
+        assert!(
+            !mlock(&bus.sent).iter().any(|d| d.to == Address::Creature(CreatureId(77))),
+            "chunk whose payload does not match its header hash must not reach the local target"
+        );
+        assert!(
+            mlock(&state.gx_routes).is_empty(),
+            "a bad declared-final chunk retires the counted route instead of pinning it"
+        );
+    }
+
+    #[test]
+    fn inbound_gx_route_rejects_conflicting_rebind_for_active_transfer() {
+        let state = test_state("me");
+        let bus = attach_recording_bus(&state);
+        let peer = NodeId("peer".into());
+
+        install_gx_route(
+            &state,
+            &peer,
+            GxRouteBind {
+                transfer_id: "xfer-1".into(),
+                target: CreatureId(77),
+                schema: GX_CHUNK_SCHEMA.into(),
+                corr: Some(7),
+                total_chunks: Some(4),
+            },
+        );
+        install_gx_route(
+            &state,
+            &peer,
+            GxRouteBind {
+                transfer_id: "xfer-1".into(),
+                target: CreatureId(88),
+                schema: GX_CHUNK_SCHEMA.into(),
+                corr: Some(9),
+                total_chunks: Some(4),
+            },
+        );
+        mlock(&bus.sent).clear();
+
+        let header =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 0, gawdxfer::hash_bytes(b"chunk"))
+                .with_total_chunks(4);
+        deliver_gx_chunk_locally(&state, &peer, header, b"chunk");
+
+        let sent = mlock(&bus.sent).clone();
+        assert!(
+            sent.iter().any(|d| d.to == Address::Creature(CreatureId(77))),
+            "original active route remains authoritative"
+        );
+        assert!(
+            !sent.iter().any(|d| d.to == Address::Creature(CreatureId(88))),
+            "conflicting rebind must not hijack the transfer target"
         );
     }
 
@@ -1671,6 +2485,7 @@ mod tests {
                 corr: Some(55),
                 commitment: Some("commitment".into()),
                 schema: "test.schema".into(),
+                origin: None,
             },
             payload: b"payload".to_vec(),
         }
@@ -1686,13 +2501,19 @@ mod tests {
             &state,
             inbound_env(Address::Node(NodeId("someone-else".into()), CreatureId(3))),
             &peer,
+            "",
         );
         assert!(
             mlock(&bus.sent).is_empty(),
             "wrong-node frames must be refused at the wire boundary"
         );
 
-        deliver_locally(&state, inbound_env(Address::Node(NodeId("me".into()), KERNEL_ID)), &peer);
+        deliver_locally(
+            &state,
+            inbound_env(Address::Node(NodeId("me".into()), KERNEL_ID)),
+            &peer,
+            "",
+        );
         assert!(
             mlock(&bus.sent).is_empty(),
             "remote peers must not be able to address the local kernel control inbox"
@@ -1702,6 +2523,7 @@ mod tests {
             &state,
             inbound_env(Address::Node(NodeId("me".into()), CreatureId(3))),
             &peer,
+            "",
         );
         let sent = mlock(&bus.sent).clone();
         assert_eq!(sent.len(), 1, "a self-node frame still routes locally");
@@ -1711,6 +2533,203 @@ mod tests {
         assert_eq!(sent[0].schema, "test.schema");
         assert_eq!(sent[0].commitment.as_deref(), Some("commitment"));
         assert_eq!(sent[0].payload, b"payload");
+    }
+
+    /// A test bus that holds the boot attestation grant: it records the attested deliveries (with the
+    /// stamped origin) separately from the diagnostic events emitted on PROPRIOCEPTION.
+    #[derive(Default)]
+    struct AttestingBus {
+        attested: std::sync::Mutex<Vec<(Dispatch, Origin)>>,
+        events: std::sync::Mutex<Vec<Dispatch>>,
+    }
+
+    impl Bus for AttestingBus {
+        fn emit(&self, d: Dispatch) -> Result<(), aether::BusError> {
+            mlock(&self.events).push(d);
+            Ok(())
+        }
+        fn whoami(&self) -> CreatureId {
+            CreatureId(999)
+        }
+        fn emit_attested(&self, d: Dispatch, origin: Origin) -> Result<(), aether::BusError> {
+            mlock(&self.attested).push((d, origin));
+            Ok(())
+        }
+        fn may_attest(&self) -> bool {
+            true
+        }
+    }
+
+    fn attach_attesting_bus(state: &Arc<TransportState>) -> Arc<AttestingBus> {
+        let bus = Arc::new(AttestingBus::default());
+        let bus_for_state: Arc<dyn Bus> = bus.clone();
+        *mlock(&state.bus) = Some(bus_for_state);
+        bus
+    }
+
+    /// The latest origin verdict the transport published on PROPRIOCEPTION, if any.
+    fn last_verdict(bus: &AttestingBus) -> Option<OriginVerdict> {
+        mlock(&bus.events).iter().rev().find_map(|d| {
+            (d.schema == ORIGIN_EVENT_SCHEMA)
+                .then(|| serde_json::from_slice::<OriginEvent>(&d.payload).ok())
+                .flatten()
+                .map(|e| e.verdict)
+        })
+    }
+
+    fn saw_peer_event(bus: &AttestingBus, expected: &str) -> bool {
+        mlock(&bus.events).iter().any(|d| {
+            d.schema == "peer_event"
+                && serde_json::from_slice::<PeerEvent>(&d.payload)
+                    .ok()
+                    .is_some_and(|ev| ev.event == expected)
+        })
+    }
+
+    /// An inbound frame to `CreatureId(3)` on this node, signed by `key`, optionally carrying a
+    /// (forged) self-claimed `origin` in its header.
+    fn signed_inbound_env(key: &Ed25519KeyMaterial, seq: u64, claimed: Option<&str>) -> Envelope {
+        let mut env = Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(42)),
+                to: Address::Node(NodeId("me".into()), CreatureId(3)),
+                reply_to: Some(Address::Creature(CreatureId(7))),
+                seq,
+                causal: Vec::new(),
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(55),
+                commitment: None,
+                schema: "test.schema".into(),
+                origin: claimed.map(|n| Origin::node(NodeId(n.into()))),
+            },
+            payload: b"payload".to_vec(),
+        };
+        env.header.sig = key.sign(&env.signing_payload());
+        env
+    }
+
+    #[test]
+    fn attested_delivery_stamps_the_authenticated_peer_and_verifies_the_signature() {
+        let state = test_state("me");
+        let bus = attach_attesting_bus(&state);
+        let (key, _) = Ed25519KeyMaterial::generate().unwrap();
+        let peer = NodeId("node-A".into());
+
+        // The frame even *claims* to be from a different node ("evil"); the transport must ignore the
+        // claim and stamp the peer the handshake authenticated.
+        let env = signed_inbound_env(&key, 1, Some("evil"));
+        deliver_locally(&state, env, &peer, key.public_hex());
+
+        let attested = mlock(&bus.attested).clone();
+        assert_eq!(attested.len(), 1, "the frame was delivered via the attested path");
+        assert_eq!(
+            attested[0].1,
+            Origin::node(peer.clone()),
+            "origin is the authenticated peer, never the frame's self-claim"
+        );
+        assert_eq!(attested[0].0.to, Address::Creature(CreatureId(3)));
+        assert_eq!(last_verdict(&bus), Some(OriginVerdict::Verified));
+    }
+
+    #[test]
+    fn attested_delivery_flags_a_bad_signature_but_still_delivers() {
+        // A frame whose signature does not verify under the authenticated peer's key earns `BadSig`.
+        // The verdict is non-enforcing — the frame is still delivered; acting on it is policy.
+        let state = test_state("me");
+        let bus = attach_attesting_bus(&state);
+        let peer = NodeId("node-A".into());
+        // inbound_env carries the literal sig "sig"; pass a syntactically valid but wrong pubkey.
+        let pubkey = test_pubkey_hex();
+        deliver_locally(
+            &state,
+            inbound_env(Address::Node(NodeId("me".into()), CreatureId(3))),
+            &peer,
+            &pubkey,
+        );
+        assert_eq!(mlock(&bus.attested).len(), 1, "delivered despite the bad signature");
+        assert_eq!(last_verdict(&bus), Some(OriginVerdict::BadSig));
+    }
+
+    #[test]
+    fn attested_delivery_reports_unresolved_when_no_peer_key_is_available() {
+        // Defensive: an authenticated link always carries a pubkey, so an empty one signals a
+        // member/connection desync. It must never silently pass as `Verified`.
+        let state = test_state("me");
+        let bus = attach_attesting_bus(&state);
+        let peer = NodeId("node-A".into());
+        deliver_locally(
+            &state,
+            inbound_env(Address::Node(NodeId("me".into()), CreatureId(3))),
+            &peer,
+            "",
+        );
+        assert_eq!(last_verdict(&bus), Some(OriginVerdict::Unresolved));
+    }
+
+    #[test]
+    fn inbound_frame_with_non_creature_sender_is_dropped_before_origin_attestation() {
+        // A legitimate cross-node envelope was sealed by the peer's bus, so its original `from`
+        // must be a creature id. Refuse hand-crafted wire frames with another sender shape before
+        // they can bypass the per-(peer, creature) replay watermark.
+        let state = test_state("me");
+        let bus = attach_attesting_bus(&state);
+        let (key, _) = Ed25519KeyMaterial::generate().unwrap();
+        let peer = NodeId("node-A".into());
+        let mut env = signed_inbound_env(&key, 1, None);
+        env.header.from = Address::Role(aether::Role::new("forged"));
+        env.header.sig = key.sign(&env.signing_payload());
+
+        deliver_locally(&state, env, &peer, key.public_hex());
+
+        assert!(mlock(&bus.attested).is_empty(), "malformed original sender is not delivered");
+        assert_eq!(last_verdict(&bus), None, "no origin verdict is published for a dropped shape");
+        assert!(saw_peer_event(&bus, "frame_bad_from_dropped"));
+    }
+
+    #[test]
+    fn the_replay_guard_drops_a_non_advancing_seq_and_resets_on_reconnect() {
+        let state = test_state("me");
+        let bus = attach_attesting_bus(&state);
+        let (key, _) = Ed25519KeyMaterial::generate().unwrap();
+        let peer = NodeId("node-A".into());
+
+        // seq 1 admitted, a replay of seq 1 dropped, seq 2 admitted again.
+        deliver_locally(&state, signed_inbound_env(&key, 1, None), &peer, key.public_hex());
+        deliver_locally(&state, signed_inbound_env(&key, 1, None), &peer, key.public_hex());
+        deliver_locally(&state, signed_inbound_env(&key, 2, None), &peer, key.public_hex());
+        assert_eq!(mlock(&bus.attested).len(), 2, "the replayed seq-1 frame was dropped");
+
+        // A fresh handshake resets the watermark, so the new session's seq-1 is admitted again.
+        reset_origin_watermarks(&state, &peer);
+        deliver_locally(&state, signed_inbound_env(&key, 1, None), &peer, key.public_hex());
+        assert_eq!(mlock(&bus.attested).len(), 3, "post-reconnect seq-1 is not a replay");
+    }
+
+    #[test]
+    fn forget_member_clears_the_allowlist_and_is_reversible() {
+        let state = test_state("me");
+        let pk = test_pubkey_hex();
+        let node = NodeId("peer".into());
+        assert_eq!(admit_member(&state, &node, &pk, "127.0.0.1:9000"), AdmitMemberResult::Changed);
+        let canon = canonical_peer_pubkey(&pk).unwrap();
+        assert_eq!(mlock(&state.peers_by_pubkey).get(&canon), Some(&node));
+        assert!(mlock(&state.members).contains_key(&node));
+
+        forget_member(&state, &node);
+        assert!(
+            !mlock(&state.peers_by_pubkey).contains_key(&canon),
+            "a forgotten peer is off the handshake allowlist"
+        );
+        assert!(!mlock(&state.members).contains_key(&node), "and out of the member set");
+
+        // Forgetting self is a no-op, and a later Connect re-admits the peer (reversible).
+        forget_member(&state, &state.self_node.clone());
+        assert_eq!(
+            admit_member(&state, &node, &pk, "127.0.0.1:9000"),
+            AdmitMemberResult::Changed,
+            "Connect re-admits a forgotten peer"
+        );
     }
 
     #[test]
@@ -1895,6 +2914,7 @@ mod tests {
                 corr: Some(7),
                 commitment: None,
                 schema: CTL_SCHEMA.into(),
+                origin: None,
             },
             payload: TransportCtl::Connect {
                 node_id: "b".into(),
@@ -1931,6 +2951,7 @@ mod tests {
                 corr: Some(7),
                 commitment: None,
                 schema: CTL_SCHEMA.into(),
+                origin: None,
             },
             payload: vec![b' '; MAX_TRANSPORT_CTL_BYTES + 1],
         };
@@ -2034,5 +3055,23 @@ mod tests {
             }],
         };
         assert!(matches!(WireFrame::parse(&g.to_bytes()), Some(WireFrame::Gossip { .. })));
+        assert!(matches!(parse_wire_payload(&g.to_bytes()), Some(ParsedWireFrame::Gossip { .. })));
+
+        let gx_header =
+            gawdxfer::ChunkFrameHeader::new("xfer-1".into(), 3, gawdxfer::hash_bytes(b"chunk"));
+        let gx = encode_gx_wire_frame(&gx_header, b"chunk").expect("encode gx frame");
+        assert!(gx.starts_with(GX_FRAME_PREFIX));
+        assert!(
+            WireFrame::parse(&gx).is_none(),
+            "GX binary frames must not be parsed as JSON wire frames"
+        );
+        assert!(matches!(parse_wire_payload(&gx), Some(ParsedWireFrame::GxChunk(_, _))));
+        match decode_gx_wire_frame(&gx) {
+            Some((header, payload)) => {
+                assert_eq!(header, gx_header);
+                assert_eq!(payload, b"chunk");
+            }
+            other => panic!("expected decoded GX chunk, got {other:?}"),
+        }
     }
 }

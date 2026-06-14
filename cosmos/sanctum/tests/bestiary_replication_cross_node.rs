@@ -297,10 +297,10 @@ fn bestiary_replication_converges_with_sticky_quarantine_and_federated_tombstone
     bus.send(
         Dispatch::to(
             Address::Creature(a.daemon_id),
-            serde_json::to_vec(&RegistryOp::PublishInRealm {
+            serde_json::to_vec(&RegistryOp::Publish {
                 manifest: Manifest::new("x", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
                 artifact: x_bytes.clone(),
-                realm: realm.clone(),
+                realm: Some(realm.clone()),
             })
             .unwrap(),
         )

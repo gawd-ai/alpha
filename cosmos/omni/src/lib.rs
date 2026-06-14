@@ -60,7 +60,7 @@ pub use control::{
 };
 
 /// The one-line command summary printed by the REPL banner and the `help` verb.
-pub const COMMANDS: &str = "commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | bestiary prove <artifact-hash> <realm> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit";
+pub const COMMANDS: &str = "commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm] | bestiary prove <artifact-hash> <realm> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit";
 
 /// Control-surface manifests are JSON metadata, not artifacts. Keep the node-local path reader
 /// bounded so a granted surface caller cannot make the control plane slurp an arbitrary local file.
@@ -240,7 +240,7 @@ pub enum Verb {
     },
     /// Publish a creature into the catalogue **by node-local path** — reads the manifest + artifact
     /// off *this node's* filesystem (the same operator caveat as [`Verb::Load`]; not a client upload),
-    /// then ships a `RegistryOp::Publish`/`PublishInRealm` to `Role::REGISTRY`. Mutating → gated.
+    /// then ships a `RegistryOp::Publish` (optional `realm`) to `Role::REGISTRY`. Mutating → gated.
     RegistryPublish {
         manifest_path: String,
         artifact_path: String,
@@ -268,6 +268,30 @@ pub enum Verb {
     BestiaryProve {
         artifact_hash: String,
         realm: RealmId,
+    },
+    /// Fetch a creature artifact over **GX** from a registry, assemble + integrity-check it, and
+    /// **load** it into this node — the operator path that the `m2_two_node` test hand-scripted. Drives
+    /// `FetchGxPlan` → a windowed `FetchGxChunk` pull (re-requesting only the gaps on a stall, so a
+    /// dropped chunk resumes rather than restarts) → `gawdxfer::ChunkAssembler` (per-chunk + whole-file
+    /// SHA-256) → `kernel.load` (which re-verifies signature + bytes at admission). Loads code → gated;
+    /// request/reply → needs the worker probe.
+    FetchLoad {
+        /// `sha256(artifact_bytes)` hex — the content-address key to fetch.
+        artifact_hash: String,
+        /// `Some(node-id)` fetches from a peer node's registry over the cluster; `None` fetches from
+        /// the local `Role::REGISTRY`. `#[serde(default)]` so a surface may omit it.
+        #[serde(default)]
+        node: Option<String>,
+        /// The peer registry's [`CreatureId`] — **required** when `node` is `Some` (Role addressing is
+        /// node-local, so a cross-node op must name the target creature). Ignored when `node` is `None`.
+        #[serde(default)]
+        registry_id: Option<u64>,
+        /// `None` fetches from `RealmId::local()`; `Some(r)` from the named Realm.
+        #[serde(default)]
+        realm: Option<RealmId>,
+        /// Requested GX chunk size; `None` lets the registry pick its default. The registry clamps it.
+        #[serde(default)]
+        chunk_size: Option<u32>,
     },
     Send {
         id: u64,
@@ -310,6 +334,7 @@ impl Verb {
                 | Verb::AuthorCritter { .. }
                 | Verb::Load { .. }
                 | Verb::RegistryPublish { .. }
+                | Verb::FetchLoad { .. }
                 | Verb::Send { .. }
                 | Verb::Intent { .. }
                 | Verb::Bind { .. }
@@ -620,8 +645,46 @@ pub fn parse_verb(line: &str) -> Result<Option<Verb>, String> {
         },
         ["registry", "list"] => Verb::RegistryList { realm: None },
         ["registry", "list", realm] => Verb::RegistryList { realm: Some(RealmId::new(*realm)) },
+        ["registry", "fetch-load", artifact_hash] => Verb::FetchLoad {
+            artifact_hash: (*artifact_hash).to_string(),
+            node: None,
+            registry_id: None,
+            realm: None,
+            chunk_size: None,
+        },
+        ["registry", "fetch-load", artifact_hash, realm] => Verb::FetchLoad {
+            artifact_hash: (*artifact_hash).to_string(),
+            node: None,
+            registry_id: None,
+            realm: Some(RealmId::new(*realm)),
+            chunk_size: None,
+        },
+        ["registry", "fetch-load", artifact_hash, node, registry_id] => {
+            match registry_id.parse::<u64>() {
+                Ok(rid) => Verb::FetchLoad {
+                    artifact_hash: (*artifact_hash).to_string(),
+                    node: Some((*node).to_string()),
+                    registry_id: Some(rid),
+                    realm: None,
+                    chunk_size: None,
+                },
+                Err(_) => return Err(FETCH_LOAD_USAGE.into()),
+            }
+        }
+        ["registry", "fetch-load", artifact_hash, node, registry_id, realm] => {
+            match registry_id.parse::<u64>() {
+                Ok(rid) => Verb::FetchLoad {
+                    artifact_hash: (*artifact_hash).to_string(),
+                    node: Some((*node).to_string()),
+                    registry_id: Some(rid),
+                    realm: Some(RealmId::new(*realm)),
+                    chunk_size: None,
+                },
+                Err(_) => return Err(FETCH_LOAD_USAGE.into()),
+            }
+        }
         ["registry", ..] => {
-            return Err("usage: registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm]".into())
+            return Err("usage: registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm]".into())
         }
         ["bestiary", "prove", artifact_hash, realm] => Verb::BestiaryProve {
             artifact_hash: (*artifact_hash).to_string(),
@@ -760,6 +823,9 @@ pub fn run_verb(verb: Verb, ctx: &mut VerbCtx, progress: &mut dyn FnMut(&str)) -
             verb_registry_fetch(ctx, &artifact_hash, realm)
         }
         Verb::RegistryList { realm } => verb_registry_list(ctx, realm),
+        Verb::FetchLoad { artifact_hash, node, registry_id, realm, chunk_size } => {
+            verb_fetch_load(ctx, &artifact_hash, node.as_deref(), registry_id, realm, chunk_size)
+        }
         Verb::BestiaryProve { artifact_hash, realm } => {
             verb_bestiary_prove(ctx, &artifact_hash, realm)
         }
@@ -970,16 +1036,9 @@ fn verb_registry_publish(
                 )
             }
         };
-    let op = match &realm {
-        None => RegistryOp::Publish { manifest, artifact },
-        Some(r) => RegistryOp::PublishInRealm { manifest, artifact, realm: r.clone() },
-    };
+    let op = RegistryOp::Publish { manifest, artifact, realm };
     match registry_request(ctx, op, MAX_REGISTRY_ACK_REPLY_BYTES) {
-        Ok(RegistryReply::Published { artifact_hash }) => VerbResult::ok(
-            json!({ "ok": true, "artifact_hash": artifact_hash, "realm": "local" }),
-            format!("published artifact {artifact_hash} into realm `local`"),
-        ),
-        Ok(RegistryReply::PublishedInRealm { artifact_hash, realm }) => VerbResult::ok(
+        Ok(RegistryReply::Published { artifact_hash, realm }) => VerbResult::ok(
             json!({ "ok": true, "artifact_hash": artifact_hash, "realm": realm.0 }),
             format!("published artifact {artifact_hash} into realm `{}`", realm.0),
         ),
@@ -1014,13 +1073,7 @@ fn verb_registry_fetch(
     artifact_hash: &str,
     realm: Option<RealmId>,
 ) -> VerbResult {
-    let op = match &realm {
-        None => RegistryOp::FetchMetadata { artifact_hash: artifact_hash.to_string() },
-        Some(r) => RegistryOp::FetchMetadataInRealm {
-            artifact_hash: artifact_hash.to_string(),
-            realm: r.clone(),
-        },
-    };
+    let op = RegistryOp::FetchMetadata { artifact_hash: artifact_hash.to_string(), realm };
     match registry_request(ctx, op, MAX_REGISTRY_FETCH_REPLY_BYTES) {
         Ok(RegistryReply::FetchedMetadata { entry, artifact_len }) => {
             fetched_metadata_ok(&entry, artifact_len)
@@ -1083,6 +1136,352 @@ fn verb_registry_list(ctx: &mut VerbCtx, realm: Option<RealmId>) -> VerbResult {
         }
         Ok(other) => registry_unexpected(other),
         Err(res) => res,
+    }
+}
+
+/// Usage string for the `registry fetch-load` REPL form, shared by the parse arms.
+const FETCH_LOAD_USAGE: &str =
+    "usage: registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm]";
+
+/// Overall wall-clock budget for a whole GX fetch-and-load (plan + every chunk). A large artifact over
+/// a slow link can legitimately take a while; this only fires on a genuinely dead transfer.
+const FETCH_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long one `recv` blocks before we treat the transfer as stalled and re-request the gaps. Short
+/// enough to recover a dropped chunk promptly, long enough not to spin.
+const GX_STALL: Duration = Duration::from_millis(2000);
+/// How many chunk requests we keep roughly in flight — backpressure that bounds the registry's reply
+/// burst instead of asking for the whole artifact at once.
+const GX_PULL_WINDOW: u32 = 8;
+
+/// The bus address a fetch-load op targets: a peer node's registry creature (cross-node, over the
+/// cluster) or this node's local `Role::REGISTRY`.
+fn fetch_load_target(node: Option<&str>, registry_id: Option<u64>) -> Result<Address, VerbResult> {
+    match (node, registry_id) {
+        (Some(n), Some(rid)) => {
+            Ok(Address::Node(aether::NodeId(n.to_string()), aether::CreatureId(rid)))
+        }
+        (Some(_), None) => Err(VerbResult::err(
+            json!({ "ok": false, "error": "cross-node fetch-load needs <registry-id>" }),
+            "fetch-load: a cross-node fetch needs the peer registry's id (registry addressing is node-local)",
+        )),
+        (None, _) => Ok(Address::Role(Role::new(Role::REGISTRY))),
+    }
+}
+
+/// Build the plan-only GX op for a realm. The GX bulk ops keep their explicit `*InRealm` split (the
+/// small full-artifact ops collapsed their pairs in 0.4.1; the bulk ones did not).
+fn gx_plan_op(artifact_hash: &str, realm: Option<&RealmId>, chunk_size: Option<u32>) -> RegistryOp {
+    match realm {
+        None => RegistryOp::FetchGxPlan { artifact_hash: artifact_hash.to_string(), chunk_size },
+        Some(r) => RegistryOp::FetchGxPlanInRealm {
+            artifact_hash: artifact_hash.to_string(),
+            realm: r.clone(),
+            chunk_size,
+        },
+    }
+}
+
+/// Send one `FetchGxChunk` (or its realm-explicit twin) to `target`, correlated by `corr` so the raw
+/// chunk frame routes back to our probe. Errors map to a `VerbResult`.
+/// The transfer-invariant context for pulling GX chunks: everything a `FetchGxChunk` request needs
+/// except the chunk index. Built once per fetch-load, then `request`ed per index (prime, refill, and
+/// gap re-request all go through it).
+struct GxChunkPuller<'a> {
+    bus: &'a BusHandle,
+    target: &'a Address,
+    artifact_hash: &'a str,
+    realm: Option<&'a RealmId>,
+    transfer_id: &'a str,
+    chunk_size: u32,
+    corr: u64,
+}
+
+impl GxChunkPuller<'_> {
+    /// Send one `FetchGxChunk` (or its realm-explicit twin), correlated by `corr` so the raw chunk
+    /// frame routes back to our probe. Errors map to a `VerbResult`.
+    fn request(&self, chunk_index: u32) -> Result<(), VerbResult> {
+        let op = match self.realm {
+            None => RegistryOp::FetchGxChunk {
+                artifact_hash: self.artifact_hash.to_string(),
+                transfer_id: self.transfer_id.to_string(),
+                chunk_size: self.chunk_size,
+                chunk_index,
+            },
+            Some(r) => RegistryOp::FetchGxChunkInRealm {
+                artifact_hash: self.artifact_hash.to_string(),
+                realm: r.clone(),
+                transfer_id: self.transfer_id.to_string(),
+                chunk_size: self.chunk_size,
+                chunk_index,
+            },
+        };
+        let payload = serde_json::to_vec(&op).map_err(|e| {
+            VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("fetch-load: chunk op encode failed: {e}"),
+            )
+        })?;
+        let d = Dispatch::to(self.target.clone(), payload)
+            .with_schema(REGISTRY_OP_SCHEMA)
+            .with_reply_to(Address::Creature(self.bus.id()))
+            .with_corr(self.corr);
+        self.bus.send(d).map_err(|e| {
+            VerbResult::err(
+                json!({ "ok": false, "unrouted": true, "error": e.to_string() }),
+                format!("fetch-load: chunk request failed: {e}"),
+            )
+        })
+    }
+}
+
+/// Fetch a creature artifact over GX, assemble + integrity-check it, and load it into this node. This
+/// is the operator path the `m2_two_node` test hand-scripted: `FetchGxPlan` → a windowed `FetchGxChunk`
+/// pull (re-requesting only the gaps on a stall, so a dropped chunk resumes rather than restarts) →
+/// `ChunkAssembler` (per-chunk + whole-file SHA-256) → `kernel.load` (which re-verifies signature +
+/// bytes at admission, so a tampered fetch is refused there).
+fn verb_fetch_load(
+    ctx: &mut VerbCtx,
+    artifact_hash: &str,
+    node: Option<&str>,
+    registry_id: Option<u64>,
+    realm: Option<RealmId>,
+    chunk_size: Option<u32>,
+) -> VerbResult {
+    if let Some(message) = bestiary::artifact_hash_shape_error(artifact_hash) {
+        return VerbResult::err(
+            json!({ "ok": false, "error": message }),
+            format!("fetch-load: {message}"),
+        );
+    }
+    let target = match fetch_load_target(node, registry_id) {
+        Ok(t) => t,
+        Err(res) => return res,
+    };
+    let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
+
+    // --- step 1: ask for a plan-only GX transfer (we pace the chunk pull ourselves) ---
+    let plan_corr = ctx.next_corr();
+    let plan_payload =
+        match serde_json::to_vec(&gx_plan_op(artifact_hash, realm.as_ref(), chunk_size)) {
+            Ok(p) => p,
+            Err(e) => {
+                return VerbResult::err(
+                    json!({ "ok": false, "error": e.to_string() }),
+                    format!("fetch-load: plan op encode failed: {e}"),
+                )
+            }
+        };
+    let plan_dispatch = Dispatch::to(target.clone(), plan_payload)
+        .with_schema(REGISTRY_OP_SCHEMA)
+        .with_reply_to(Address::Creature(bus.id()))
+        .with_corr(plan_corr);
+    let plan_env =
+        match request_reply(bus, rx, plan_dispatch, plan_corr, REGISTRY_TIMEOUT) {
+            Ok(Some(env)) => env,
+            Ok(None) => return VerbResult::err(
+                json!({ "ok": false, "error": "no GX plan reply" }),
+                "fetch-load: no plan reply (nothing bound to REGISTRY, or the peer is unreachable)",
+            ),
+            Err(e) => {
+                return VerbResult::err(
+                    json!({ "ok": false, "unrouted": true, "error": e.to_string() }),
+                    format!("fetch-load: plan request failed: {e}"),
+                )
+            }
+        };
+    let plan_reply = match parse_role_reply::<RegistryReply>(
+        &plan_env.payload,
+        MAX_REGISTRY_FETCH_REPLY_BYTES,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("fetch-load: plan reply parse failed: {e}"),
+            )
+        }
+    };
+    let (manifest, plan) = match plan_reply {
+        // Both the realm-implicit and realm-explicit GX plan replies carry the same plan fields; the
+        // extra `realm` on the `InRealm` reply is irrelevant here (`..`).
+        RegistryReply::FetchedGx {
+            manifest,
+            artifact_hash: reply_artifact_hash,
+            transfer_id,
+            file_size,
+            file_hash,
+            chunk_size,
+            ..
+        }
+        | RegistryReply::FetchedGxInRealm {
+            manifest,
+            artifact_hash: reply_artifact_hash,
+            transfer_id,
+            file_size,
+            file_hash,
+            chunk_size,
+            ..
+        } => {
+            if reply_artifact_hash != artifact_hash || file_hash != artifact_hash {
+                let message = format!(
+                    "registry returned GX plan for artifact_hash `{reply_artifact_hash}` with file_hash `{file_hash}`, expected `{artifact_hash}`"
+                );
+                let human = format!("fetch-load: {message}");
+                return VerbResult::err(json!({ "ok": false, "error": message }), human);
+            }
+            match gawdxfer::TransferPlan::new(transfer_id, file_size, file_hash, chunk_size) {
+                Ok(plan) => (manifest, plan),
+                Err(e) => {
+                    return VerbResult::err(
+                        json!({ "ok": false, "error": e.to_string() }),
+                        format!("fetch-load: registry returned an invalid GX plan: {e}"),
+                    )
+                }
+            }
+        }
+        RegistryReply::NotFound => {
+            return VerbResult::err(
+                json!({ "ok": false, "not_found": true, "artifact_hash": artifact_hash }),
+                format!("fetch-load: no entry for {artifact_hash}"),
+            )
+        }
+        RegistryReply::Error { message } => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": message }),
+                format!("fetch-load: registry refused the plan: {message}"),
+            )
+        }
+        other => return registry_unexpected(other),
+    };
+
+    // --- step 2: pull chunks in a sliding window, re-requesting gaps on a stall (resume) ---
+    let total_chunks = plan.total_chunks;
+    let plan_chunk_size = plan.chunk_size;
+    let file_size = plan.file_size;
+    let transfer_id = plan.transfer_id.clone();
+    let mut assembler = match gawdxfer::ChunkAssembler::new(plan) {
+        Ok(a) => a,
+        Err(e) => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("fetch-load: cannot hold the artifact in memory to assemble it: {e}"),
+            )
+        }
+    };
+    let chunk_corr = ctx.next_corr();
+    let puller = GxChunkPuller {
+        bus,
+        target: &target,
+        artifact_hash,
+        realm: realm.as_ref(),
+        transfer_id: &transfer_id,
+        chunk_size: plan_chunk_size,
+        corr: chunk_corr,
+    };
+
+    // Prime the window, then keep ~`GX_PULL_WINDOW` requests outstanding by requesting one fresh index
+    // per accepted chunk. `next` is the high-water mark of indices ever requested.
+    let mut next: u32 = 0;
+    while next < total_chunks && next < GX_PULL_WINDOW {
+        if let Err(res) = puller.request(next) {
+            return res;
+        }
+        next += 1;
+    }
+
+    let deadline = std::time::Instant::now() + FETCH_LOAD_TIMEOUT;
+    while !assembler.is_complete() {
+        if std::time::Instant::now() >= deadline {
+            let missing = assembler.missing_chunks();
+            return VerbResult::err(
+                json!({ "ok": false, "error": "gx-timeout", "missing_chunks": missing.len() }),
+                format!(
+                    "fetch-load: timed out with {} of {total_chunks} chunks still missing",
+                    missing.len()
+                ),
+            );
+        }
+        match rx.recv_timeout(GX_STALL) {
+            Ok(env)
+                if env.header.corr == Some(chunk_corr)
+                    && env.header.schema == gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA =>
+            {
+                // A corrupt frame is dropped (the stall path will re-request the gap); a good one
+                // advances the window by requesting the next never-requested index.
+                if assembler.accept_binary_frame(&env.payload).is_ok() && next < total_chunks {
+                    if let Err(res) = puller.request(next) {
+                        return res;
+                    }
+                    next += 1;
+                }
+            }
+            Ok(env)
+                if env.header.corr == Some(chunk_corr) && env.header.schema == "registry.reply" =>
+            {
+                // The registry answered a chunk request with an error/not-found rather than a frame.
+                if let Ok(reply) =
+                    parse_role_reply::<RegistryReply>(&env.payload, MAX_REGISTRY_FETCH_REPLY_BYTES)
+                {
+                    match reply {
+                        RegistryReply::Error { message } => {
+                            return VerbResult::err(
+                                json!({ "ok": false, "error": message }),
+                                format!("fetch-load: registry refused a chunk: {message}"),
+                            )
+                        }
+                        RegistryReply::NotFound => {
+                            return VerbResult::err(
+                                json!({ "ok": false, "not_found": true }),
+                                "fetch-load: registry lost the entry mid-transfer",
+                            )
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(_) => {} // an unrelated envelope on the probe inbox — ignore
+            Err(_) => {
+                // Stall: re-request the gaps. Idempotent — the registry is content-addressed and the
+                // assembler dedups, so re-asking is always safe (this is the "resume" path).
+                for &gap in assembler.missing_chunks().iter().take(GX_PULL_WINDOW as usize) {
+                    if let Err(res) = puller.request(gap) {
+                        return res;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- step 3: integrity-check the whole artifact, then admit + load it ---
+    let artifact = match assembler.finish() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": e.to_string() }),
+                format!("fetch-load: assembled artifact failed its integrity check: {e}"),
+            )
+        }
+    };
+    let realm_str = realm.as_ref().map(|r| r.0.clone()).unwrap_or_else(|| RealmId::local().0);
+    match ctx.kernel.load(manifest, Artifact::Bytes(artifact)) {
+        Ok(id) => VerbResult::ok(
+            json!({
+                "ok": true,
+                "creature_id": id.0,
+                "artifact_hash": artifact_hash,
+                "realm": realm_str,
+                "chunks": total_chunks,
+                "bytes": file_size,
+            }),
+            format!(
+                "fetch-load: pulled {file_size} bytes in {total_chunks} GX chunks from realm `{realm_str}`, admitted + loaded as id={}",
+                id.0
+            ),
+        ),
+        Err(e) => VerbResult::err(
+            json!({ "ok": false, "error": e.to_string() }),
+            format!("fetch-load: admission/load rejected the fetched artifact: {e}"),
+        ),
     }
 }
 
@@ -1216,7 +1615,7 @@ fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str))
     };
     let resp = match parse_role_reply::<AuthoringReply>(&env.payload, MAX_AUTHORING_REPLY_BYTES) {
         Ok(AuthoringReply::Authored(r)) => r,
-        Ok(AuthoringReply::Failed(e)) => return author_err(format!("authoring failed: {e:?}")),
+        Ok(AuthoringReply::Failed(e)) => return author_err(format!("authoring failed: {e}")),
         Err(e) => return author_err(format!("author parse failed: {e}")),
     };
     progress(&format!(
@@ -1330,7 +1729,7 @@ fn verb_author_critter(
     };
     let resp = match parse_role_reply::<AuthoringReply>(&env.payload, MAX_AUTHORING_REPLY_BYTES) {
         Ok(AuthoringReply::Authored(r)) => r,
-        Ok(AuthoringReply::Failed(e)) => return author_err(format!("authoring failed: {e:?}")),
+        Ok(AuthoringReply::Failed(e)) => return author_err(format!("authoring failed: {e}")),
         Err(e) => return author_err(format!("author parse failed: {e}")),
     };
     progress(&format!(
@@ -1851,6 +2250,66 @@ mod tests {
         assert!(parsed.ok);
         assert_eq!(parsed.json, json!({ "ok": true }));
         assert_eq!(parsed.human, "ready");
+    }
+
+    #[test]
+    fn parse_fetch_load_grammar_covers_local_realm_and_cross_node_forms() {
+        let hash = "a".repeat(64);
+
+        // local
+        match parse_verb(&format!("registry fetch-load {hash}")).unwrap().unwrap() {
+            Verb::FetchLoad { artifact_hash, node, registry_id, realm, chunk_size } => {
+                assert_eq!(artifact_hash, hash);
+                assert_eq!(node, None);
+                assert_eq!(registry_id, None);
+                assert_eq!(realm, None);
+                assert_eq!(chunk_size, None);
+            }
+            other => panic!("expected FetchLoad, got {other:?}"),
+        }
+
+        // local, realm-scoped
+        match parse_verb(&format!("registry fetch-load {hash} crew")).unwrap().unwrap() {
+            Verb::FetchLoad { node, registry_id, realm, .. } => {
+                assert_eq!(node, None);
+                assert_eq!(registry_id, None);
+                assert_eq!(realm, Some(RealmId::new("crew")));
+            }
+            other => panic!("expected FetchLoad, got {other:?}"),
+        }
+
+        // cross-node
+        match parse_verb(&format!("registry fetch-load {hash} node-b 7")).unwrap().unwrap() {
+            Verb::FetchLoad { node, registry_id, realm, .. } => {
+                assert_eq!(node, Some("node-b".to_string()));
+                assert_eq!(registry_id, Some(7));
+                assert_eq!(realm, None);
+            }
+            other => panic!("expected FetchLoad, got {other:?}"),
+        }
+
+        // cross-node, realm-scoped
+        match parse_verb(&format!("registry fetch-load {hash} node-b 7 crew")).unwrap().unwrap() {
+            Verb::FetchLoad { node, registry_id, realm, .. } => {
+                assert_eq!(node, Some("node-b".to_string()));
+                assert_eq!(registry_id, Some(7));
+                assert_eq!(realm, Some(RealmId::new("crew")));
+            }
+            other => panic!("expected FetchLoad, got {other:?}"),
+        }
+
+        // a non-numeric registry-id is a usage error, not a silent mis-parse
+        assert!(parse_verb(&format!("registry fetch-load {hash} node-b not-a-number")).is_err());
+
+        // FetchLoad loads code → gated, and runs on the worker (needs a probe).
+        let v = Verb::FetchLoad {
+            artifact_hash: hash,
+            node: None,
+            registry_id: None,
+            realm: None,
+            chunk_size: None,
+        };
+        assert!(v.is_gated(), "fetch-load loads code, so it is gated by allow-AI");
     }
 
     #[test]

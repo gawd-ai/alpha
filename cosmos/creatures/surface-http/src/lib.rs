@@ -430,6 +430,7 @@ fn router(state: Arc<SurfaceState>) -> Router {
         .route("/api/registry/publish", post(h_registry_publish))
         .route("/api/registry/fetch", get(h_registry_fetch))
         .route("/api/registry/list", get(h_registry_list))
+        .route("/api/registry/fetch-load", post(h_registry_fetch_load))
         .route("/api/bestiary/prove", get(h_bestiary_prove))
         .route("/api/send", post(h_send))
         .route("/api/intent", post(h_intent))
@@ -510,6 +511,19 @@ struct RegistryFetchQ {
 struct RegistryListQ {
     #[serde(default)]
     realm: Option<String>,
+}
+#[derive(Deserialize)]
+struct RegistryFetchLoadReq {
+    artifact_hash: String,
+    /// Omit for a local fetch; set with `registry_id` for a cross-node fetch over the cluster.
+    #[serde(default)]
+    node: Option<String>,
+    #[serde(default)]
+    registry_id: Option<u64>,
+    #[serde(default)]
+    realm: Option<String>,
+    #[serde(default)]
+    chunk_size: Option<u32>,
 }
 #[derive(Deserialize)]
 struct BestiaryProveQ {
@@ -675,6 +689,40 @@ async fn h_registry_fetch(
             &st,
             Verb::RegistryFetch { artifact_hash: q.artifact_hash, realm: opt_realm(q.realm) },
             READ_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+/// Fetch a creature artifact over GX from a (possibly remote) registry, integrity-check it, and load
+/// it into this node. Loads code → honors the allow-AI gate; a large transfer can run long, so it uses
+/// the same generous budget as `author`.
+async fn h_registry_fetch_load(
+    State(st): State<Arc<SurfaceState>>,
+    Json(b): Json<RegistryFetchLoadReq>,
+) -> Response {
+    reject_bad_http_arg!(validate_http_arg(
+        "artifact_hash",
+        &b.artifact_hash,
+        MAX_HTTP_HASH_ARG_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_opt_arg("node", b.node.as_deref(), MAX_HTTP_NODE_ARG_BYTES));
+    reject_bad_http_arg!(validate_http_opt_arg(
+        "realm",
+        b.realm.as_deref(),
+        MAX_HTTP_REALM_ARG_BYTES
+    ));
+    into_response(
+        request_control(
+            &st,
+            Verb::FetchLoad {
+                artifact_hash: b.artifact_hash,
+                node: b.node,
+                registry_id: b.registry_id,
+                realm: opt_realm(b.realm),
+                chunk_size: b.chunk_size,
+            },
+            AUTHOR_TIMEOUT,
         )
         .await,
     )
@@ -1010,6 +1058,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "fitness".to_string(),
+                origin: None,
             },
             payload: vec![b'a'; MAX_PRESENTED_PAYLOAD_BYTES + 1],
         };
@@ -1034,6 +1083,7 @@ mod tests {
                 corr: Some(11),
                 commitment: None,
                 schema: omni::CONTROL_PROGRESS_SCHEMA.to_string(),
+                origin: None,
             },
             payload: vec![b'{'; MAX_PRESENTED_PAYLOAD_BYTES + 1],
         };
@@ -1061,6 +1111,7 @@ mod tests {
                 corr: Some(11),
                 commitment: None,
                 schema: omni::CONTROL_PROGRESS_SCHEMA.to_string(),
+                origin: None,
             },
             payload: serde_json::to_vec(&serde_json::json!({ "corr": 11, "line": "compiling" }))
                 .unwrap(),

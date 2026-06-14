@@ -99,6 +99,7 @@ mod tests {
                 corr: Some(13),
                 commitment: None,
                 schema: "text".into(),
+                origin: None,
             },
             payload: payload.to_vec(),
         }
@@ -136,6 +137,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: b"x".to_vec(),
         };

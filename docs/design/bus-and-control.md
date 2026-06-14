@@ -278,8 +278,8 @@ publish` reads a manifest and an artifact **from node-local paths** (the same
 operator caveat as `load`: these are files on the node, not a client upload),
 parses and ships them as a `RegistryOp::Publish`; `registry fetch` returns the
 entry's *metadata* (name, version, content address, artifact length) rather than
-inlining the bytes, using the byte-light `RegistryOp::FetchMetadata` /
-`FetchMetadataInRealm` path; `registry list` enumerates a Realm's catalogue via
+inlining the bytes, using the byte-light `RegistryOp::FetchMetadata` path (an
+optional `realm` scopes it); `registry list` enumerates a Realm's catalogue via
 the byte-light `RegistryOp::ListMetadata` path. Full `RegistryOp::ListEntries`
 remains the anti-entropy wire for federation pulls because it intentionally
 carries artifact bytes. The control core therefore parses `registry fetch` and

@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use sigil::{Capabilities, Verifier};
 
@@ -96,6 +96,13 @@ pub struct Router {
     /// The verify **mechanism**, injected. Whether a failure rejects, and which
     /// keys are roots, is injected *policy* applied elsewhere.
     verifier: Arc<dyn Verifier>,
+    /// This node's own bus-signing public key, set once at boot when the node has a real ed25519
+    /// identity (a clustered node — its handshake key doubles as its bus signer). Unset on a
+    /// local-only/dev node. Resolves [`public_key_of`](Router::public_key_of) for *local* senders so
+    /// verify-on-delivery is a real check rather than always exercising the negative branch. A
+    /// cross-node frame's *original* signature is verified at the transport boundary (where the
+    /// peer's key is known), not here, so the router only ever needs its own key.
+    local_pubkey: OnceLock<String>,
     /// Inbox capacity for newly registered creatures (bounded → backpressure, never OOM).
     inbox_capacity: usize,
 }
@@ -111,7 +118,28 @@ impl Router {
             clock: AtomicU64::new(0),
             next_id: AtomicU64::new(KERNEL_ID.0 + 1), // ids start after the reserved kernel id
             verifier,
+            local_pubkey: OnceLock::new(),
             inbox_capacity: inbox_capacity.max(1),
+        }
+    }
+
+    /// Record this node's bus-signing public key (its ed25519 node identity). Set once at boot via
+    /// `Kernel::set_node_identity`; idempotent (a second call is ignored). With it set, the internal
+    /// `public_key_of` resolves local senders to this key so the verify-on-delivery mechanism actually
+    /// validates the signature.
+    pub fn set_local_pubkey(&self, pubkey: String) {
+        let _ = self.local_pubkey.set(pubkey);
+    }
+
+    /// The public key the verifier should check `from`'s signature against. A **local** sender
+    /// (`Address::Creature`) signed with this node's bus key, so it resolves to `local_pubkey` when
+    /// the node has an identity (else empty, the dev/stub path). Non-local `from` addresses don't
+    /// carry a resolvable key here — a cross-node frame is verified at the transport boundary, before
+    /// the bus reseals `from` — so they return empty.
+    fn public_key_of(&self, from: &Address) -> String {
+        match from {
+            Address::Creature(_) => self.local_pubkey.get().cloned().unwrap_or_default(),
+            _ => String::new(),
         }
     }
 
@@ -204,9 +232,10 @@ impl Router {
         env.header.stamp = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
 
         // permission mechanism: verification is *invoked* on every delivery (R5). Whether a failure
-        // rejects is injected policy; the default invokes the stub and proceeds.
+        // rejects is injected policy; the default invokes the verifier and proceeds. With a node
+        // identity set, `public_key_of` resolves the local key so this is a real check.
         let _verified = self.verifier.verify(
-            &public_key_of(&env.header.from),
+            &self.public_key_of(&env.header.from),
             &env.signing_payload(),
             &env.header.sig,
         );
@@ -303,11 +332,6 @@ impl Router {
         }
         Ok(())
     }
-}
-
-fn public_key_of(_from: &Address) -> String {
-    // The stub verifier ignores the key. A full implementation resolves the sender's Abode key.
-    String::new()
 }
 
 /// Whether `calls` permits addressing `to`. A coarse match by destination kind/name (with `"*"`

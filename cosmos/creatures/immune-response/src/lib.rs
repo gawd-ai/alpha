@@ -93,14 +93,14 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub const SCHEMA: &str = "immune.response";
 
 /// The schema the kernel publishes its per-load/unload liveness event under (see `sanctum`'s
-/// `publish_proprio`). Mirrors `sanctum::Proprioception` (`{"module":u64,"event":String}`) without
+/// `publish_proprio`). Mirrors `sanctum::Proprioception` (`{"creature":u64,"event":String}`) without
 /// depending on the kernel crate (modules never depend on the kernel — the crate-layout rule);
 /// the integration test pins the shape by injecting the kernel's own `Proprioception` bytes.
 pub const PROPRIO_SCHEMA: &str = "proprioception";
 
 /// The schema the kernel publishes a budget signal under, also on the PROPRIOCEPTION topic (see
 /// `sanctum`'s `publish_budget_signal`). Mirrors `sanctum::BudgetSignalEvent`'s leading fields
-/// (`module` / `level` / `kind`; the `vector` is ignored here — the immune-response acts on the
+/// (`creature` / `level` / `kind`; the `vector` is ignored here — the immune-response acts on the
 /// breach *level*, not the raw scalars, which are a budget *policy*'s concern).
 pub const BUDGET_SIGNAL_SCHEMA: &str = "budget_signal";
 
@@ -137,11 +137,11 @@ pub const MAX_QUARANTINE_ATTESTING_PEER_BYTES: usize = 256;
 // ===================================================================================================
 
 /// Deserialize mirror of `sanctum::Proprioception`. `serde` ignores any extra fields, so a kernel
-/// that adds a field stays compatible; a *rename* of `module`/`event` breaks the integration test
+/// that adds a field stays compatible; a *rename* of `creature`/`event` breaks the integration test
 /// (which feeds the kernel's own bytes), not silently here.
 #[derive(Clone, Debug, Deserialize)]
 struct ProprioWire {
-    module: u64,
+    creature: u64,
     event: String,
 }
 
@@ -150,7 +150,7 @@ struct ProprioWire {
 /// `level`, never the raw scalars (those drive a budget *policy*, a different creature).
 #[derive(Clone, Debug, Deserialize)]
 struct BudgetSignalWire {
-    module: u64,
+    creature: u64,
     level: String,
     #[allow(dead_code)] // parsed for completeness / forward-compat; reaction keys off `level`.
     kind: String,
@@ -392,7 +392,10 @@ impl ImmuneResponse {
         }
         // Reuse the already-parsed `ev.kind` rather than re-deserializing the whole envelope a
         // second time via `ev_kind(env)` (the redundant parse this replaces). (T17)
-        self.quarantine_watched(CreatureId(ev.module), format!("hard budget breach ({})", ev.kind))
+        self.quarantine_watched(
+            CreatureId(ev.creature),
+            format!("hard budget breach ({})", ev.kind),
+        )
     }
 
     fn on_proprioception(&mut self, env: &Envelope) -> Outcome {
@@ -404,7 +407,7 @@ impl ImmuneResponse {
         if ev.event != EVENT_LEAKED {
             return Outcome::none();
         }
-        self.quarantine_watched(CreatureId(ev.module), "leaked resources on unload".to_string())
+        self.quarantine_watched(CreatureId(ev.creature), "leaked resources on unload".to_string())
     }
 
     /// Quarantine a watched module's artifact (the local, no-reply path used by the topic triggers).
@@ -691,6 +694,7 @@ mod tests {
             corr,
             commitment: None,
             schema: schema.into(),
+            origin: None,
         }
     }
 
@@ -705,7 +709,7 @@ mod tests {
     /// PROPRIOCEPTION topic — but routed to us directly in unit tests via the schema).
     fn budget_env(module: u64, level: &str, kind: &str) -> Envelope {
         let payload = serde_json::to_vec(&serde_json::json!({
-            "module": module,
+            "creature": module,
             "level": level,
             "kind": kind,
             "vector": { "consumed": 10, "limit": 5, "dispatches_this_envelope": 0,
@@ -717,7 +721,7 @@ mod tests {
 
     fn proprio_env(module: u64, event: &str) -> Envelope {
         let payload =
-            serde_json::to_vec(&serde_json::json!({ "module": module, "event": event })).unwrap();
+            serde_json::to_vec(&serde_json::json!({ "creature": module, "event": event })).unwrap();
         Envelope { header: header(Address::Creature(ME), PROPRIO_SCHEMA, None), payload }
     }
 

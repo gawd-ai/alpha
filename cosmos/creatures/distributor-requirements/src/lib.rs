@@ -751,6 +751,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: "text".into(),
+                origin: None,
             },
             payload: payload.to_vec(),
         }
@@ -771,6 +772,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: SCHEMA_SEER.to_string(),
+                origin: None,
             },
             payload: env.to_bytes(),
         }
@@ -1110,6 +1112,7 @@ mod tests {
                 corr: Some(10_000),
                 commitment: None,
                 schema: SCHEMA_SEER.to_string(),
+                origin: None,
             },
             payload: steer.to_bytes(),
         };
@@ -1141,6 +1144,7 @@ mod tests {
                 corr: Some(10_000),
                 commitment: None,
                 schema: SCHEMA_SEER.to_string(),
+                origin: None,
             },
             payload: wrong.to_bytes(),
         };

@@ -47,7 +47,9 @@ reply: olleh
 The crate scaffolding (Cargo.toml, the manifest fields, the build invocation) is in
 [`CONTRIBUTING.md` → "Add a creature (native daemon)"](../../CONTRIBUTING.md). For the **live** path,
 `alpha> author <request>` has an agent write a daemon, then `cargo build` + sign + admit + hot-load
-it (a cold build takes a minute or two — prefer `author --critter` for an instant creature).
+it (a cold build takes a minute or two — prefer `author --critter` for an instant creature). The
+default agent is a keyword template matcher (a request containing `reverse`); build with
+`--features openai` and select a model for free-form English authoring.
 
 ## 3. Containment
 

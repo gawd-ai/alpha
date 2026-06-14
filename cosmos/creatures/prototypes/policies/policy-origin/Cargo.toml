@@ -1,0 +1,14 @@
+[package]
+name = "policy-origin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference injected cross-node defense policy. Subscribes to PROPRIOCEPTION, consumes the transport's non-enforcing OriginVerdict events, and on repeated non-Verified verdicts from a peer pulls the reversible TransportCtl::Forget lever (drop it from the allowlist). NOT substrate — operators ship their own thresholds / escalation / log-only policies."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+transport-tcp = { path = "../../../transport-tcp" }
+serde_json = { workspace = true }

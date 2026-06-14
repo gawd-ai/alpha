@@ -13,13 +13,18 @@
 //! `--author-model <id>` (+ optional `--author-base-url` / `--author-api-key-file` or `--author-api-key`
 //! / `--author-timeout-secs`) binds the model-backed author per node instance — see [`crate::AuthorFlags`].
 //!
-//! **Dev posture (disclosed at boot):** the dev policy admits everything and the bus signer is a
-//! stub. This is a single-node developer surface, not a hardened deployment.
+//! **Dev posture (disclosed at boot):** the dev policy admits everything. A non-clustered node's bus
+//! signer is a stub; a clustered node (`--cluster-listen`) signs with its real ed25519 node identity
+//! so peers can verify its cross-node traffic. Either way this is a developer surface, not a hardened
+//! deployment.
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
-use aether::{CreatureId, Deadline, StubSigner, StubVerifier};
+use aether::{
+    CreatureId, Deadline, Ed25519Signer, Ed25519Verifier, Signer, StubSigner, StubVerifier,
+    Verifier,
+};
 use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use policy_dev::DevPolicy;
 use sanctum::Kernel;
@@ -123,13 +128,35 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         }
     };
 
+    // One identity: when this node will cluster, derive its ed25519 node key *up front* so the bus
+    // signer is the *same* key the transport authenticates links with. A peer that authenticates this
+    // node at the handshake can then verify the envelopes it signs (real cross-node `Verified`). A
+    // non-clustered dev node keeps the stub signer/verifier (no real crypto needed).
+    let node_identity: Option<NodeKeyBoot> = if opts.cluster_listen.is_some() {
+        match derive_node_key(opts.cluster_key.as_deref()) {
+            Ok(nk) => Some(nk),
+            Err(e) => {
+                eprintln!("alpha node: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    let (signer, verifier): (Arc<dyn Signer>, Arc<dyn Verifier>) = match &node_identity {
+        Some(nk) => (Arc::new(Ed25519Signer::new(nk.key.clone())), Arc::new(Ed25519Verifier)),
+        None => (Arc::new(StubSigner::new("local-node")), Arc::new(StubVerifier)),
+    };
     let kernel = Arc::new(Kernel::new(
         vec![Arc::new(NativeEngine), Arc::new(WasmEngine::new()), Arc::new(ScriptEngine)],
-        Arc::new(StubSigner::new("local-node")),
-        Arc::new(StubVerifier),
+        signer,
+        verifier,
         Arc::new(DevPolicy),
         1024,
     ));
+    if let Some(nk) = &node_identity {
+        kernel.set_node_identity(nk.key.public_hex().to_string());
+    }
     let ai = Arc::new(AiControl::new(opts.allow_ai));
 
     // Clean shutdown on SIGINT/SIGTERM (T14): the signal handler runs the kernel's reverse-order
@@ -166,7 +193,11 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     }
 
     note!("alpha node — Alpha Sanctum daemon (v{})", env!("CARGO_PKG_VERSION"));
-    note!("posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.");
+    if node_identity.is_some() {
+        note!("posture: DEV — the dev policy admits everything; the bus signer is this node's real ed25519 identity (cross-node origins are verified), but admission is not hardened.");
+    } else {
+        note!("posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.");
+    }
 
     let mut critter_builder: Option<CreatureId> = None;
     if opts.minimal {
@@ -197,20 +228,21 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             eprintln!("alpha node: --cluster-listen requires --node-id <id>");
             std::process::exit(2);
         };
-        match boot_cluster(&kernel, &node_id, listen, &opts.seeds, opts.cluster_key.as_deref()) {
-            Ok(b) => {
-                cluster_transport = Some(b.transport);
+        let nk = node_identity.as_ref().expect("node identity derived when clustering");
+        match boot_cluster(&kernel, &node_id, listen, &opts.seeds, nk) {
+            Ok(transport) => {
+                cluster_transport = Some(transport);
                 note!("cluster: node-id={node_id}  listen={listen}  seeds={}", opts.seeds.len());
-                note!("cluster: node pubkey = {}", b.pubkey_hex);
-                if b.generated {
+                note!("cluster: node pubkey = {}", nk.key.public_hex());
+                if nk.generated {
                     note!(
                         "cluster: generated a node key — reuse this identity with `--cluster-key {}`",
-                        b.seed_hex
+                        sigil::crypto::hex_encode(&nk.seed)
                     );
                 }
                 note!(
                     "cluster: peers join this node with  cluster join {node_id}@{listen}#{}",
-                    b.pubkey_hex
+                    nk.key.public_hex()
                 );
             }
             Err(e) => {
@@ -494,24 +526,19 @@ fn boot_http_surface(
 }
 
 /// Result of booting the cluster transport: its creature id + this node's identity (printed at boot).
-struct ClusterBoot {
-    transport: CreatureId,
-    pubkey_hex: String,
-    seed_hex: String,
-    generated: bool,
+/// This node's derived ed25519 identity — the one key it both signs bus envelopes with and
+/// authenticates transport links with. Minted once at boot, before the kernel is constructed.
+/// Shared with the MCP-hub boot path ([`crate::mcp`]).
+pub(crate) struct NodeKeyBoot {
+    pub(crate) key: sigil::Ed25519KeyMaterial,
+    pub(crate) seed: [u8; 32],
+    pub(crate) generated: bool,
 }
 
-/// Boot the `transport-tcp` organ in gossip (cluster) mode and bind it to `Role::TRANSPORT`. Mints
-/// (or loads, via `cluster_key`) this node's ed25519 identity and dials each `--seed`.
-fn boot_cluster(
-    kernel: &Kernel,
-    node_id: &str,
-    listen: &str,
-    seeds: &[String],
-    cluster_key: Option<&str>,
-) -> Result<ClusterBoot, String> {
+/// Mint (or load, via `--cluster-key`) the node's ed25519 identity. Done up front so the same key
+/// drives the kernel's bus signer and the transport handshake — see [`run`].
+pub(crate) fn derive_node_key(cluster_key: Option<&str>) -> Result<NodeKeyBoot, String> {
     use sigil::{crypto, Ed25519KeyMaterial};
-
     let (seed, generated): ([u8; 32], bool) = match cluster_key {
         Some(hex) => {
             let bytes = crypto::hex_decode(hex)
@@ -524,8 +551,20 @@ fn boot_cluster(
         None => (crypto::fresh_seed()?, true),
     };
     let key = Ed25519KeyMaterial::from_seed(seed).map_err(|e| format!("node key: {e}"))?;
-    let pubkey_hex = key.public_hex().to_string();
+    Ok(NodeKeyBoot { key, seed, generated })
+}
 
+/// Boot the `transport-tcp` organ in gossip (cluster) mode and bind it to `Role::TRANSPORT`, using
+/// the pre-derived node identity `nk`. Loaded via [`Kernel::load_transport_instance`] so the
+/// transport holds the boot-only **origin-attestation** grant: it stamps an authenticated
+/// `Origin{node}` on inbound cross-node frames. Dials each `--seed`.
+fn boot_cluster(
+    kernel: &Kernel,
+    node_id: &str,
+    listen: &str,
+    seeds: &[String],
+    nk: &NodeKeyBoot,
+) -> Result<CreatureId, String> {
     let mut peers = Vec::new();
     for s in seeds {
         let bad = || format!("bad --seed {s:?} (want node-id@host:port#pubkey-hex)");
@@ -542,18 +581,18 @@ fn boot_cluster(
     }
 
     let cfg = transport_tcp::TransportConfig {
-        self_key: key,
+        self_key: nk.key.clone(),
         self_node: aether::NodeId(node_id.to_string()),
         listen_addr: listen.to_string(),
         peers,
     };
     let transport = kernel
-        .load_instance(
+        .load_transport_instance(
             omni::boot_manifest("transport-tcp"),
             Box::new(transport_tcp::TransportTcp::new(cfg).with_gossip(Some(listen.to_string()))),
         )
         .map_err(|e| format!("transport admits: {e}"))?;
     kernel.bind_role(aether::Role::new(aether::Role::TRANSPORT), transport);
 
-    Ok(ClusterBoot { transport, pubkey_hex, seed_hex: crypto::hex_encode(&seed), generated })
+    Ok(transport)
 }

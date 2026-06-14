@@ -20,6 +20,12 @@
 //! `sha256(record.realm)` and confirms it matches the file stem (a record filed under the wrong realm
 //! hash is `Corrupt`). That makes a separate signed `realms.index` sidecar unnecessary — the records
 //! self-describe their Realm and the filename is a validated hash, not a source of truth.
+//! Artifact blobs are likewise not trusted just because their filename is a digest: every full blob
+//! read is bounded by the configured artifact cap (or a stricter snapshot budget), recomputes
+//! `sha256(bytes)`, and refuses a mismatch; a later publish of the same content rewrites a corrupt
+//! existing blob instead of treating the path as valid dedupe. GX chunk serving uses bounded range
+//! reads instead of re-reading and re-hashing the whole blob per chunk; the transfer plan still binds
+//! the whole-file hash, and the receiver verifies it before admission.
 //!
 //! ## The self-owned journal
 //!
@@ -33,7 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -396,6 +402,30 @@ pub trait BestiaryStore: Send + Sync {
         realm: &RealmId,
         artifact_hash: &str,
     ) -> Result<Option<(CatalogEntry, usize)>, StoreError>;
+    /// Fetch live entry metadata for an operation that will serve artifact bytes.
+    ///
+    /// Unlike [`get_metadata`](BestiaryStore::get_metadata), this still avoids reading artifact
+    /// bytes but enforces the configured artifact cap before advertising that the artifact is
+    /// fetchable. Metadata/listing surfaces use `get_metadata`; transfer planning uses this method.
+    fn get_fetch_metadata(
+        &self,
+        realm: &RealmId,
+        artifact_hash: &str,
+    ) -> Result<Option<(CatalogEntry, usize)>, StoreError>;
+    /// Read one byte range from a live artifact blob without materializing the whole artifact.
+    ///
+    /// This is the durable-store half of GX chunk serving. It proves the `(realm, artifact_hash)` row
+    /// is live, enforces the configured artifact cap, checks the requested range against the current
+    /// blob length, and reads only that range. It deliberately does not recompute the whole blob hash
+    /// on every chunk; the GX plan binds the file hash and the receiver verifies the reassembled
+    /// artifact before admission.
+    fn get_artifact_chunk(
+        &self,
+        realm: &RealmId,
+        artifact_hash: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError>;
     /// Snapshot live entries as [`SyncEntry`]s for anti-entropy pull. `realm: None` = all Realms.
     fn list(&self, realm: Option<&RealmId>) -> Result<Vec<SyncEntry>, StoreError>;
     /// Snapshot live entries under a total artifact-byte cap. `0` means unbounded.
@@ -611,17 +641,59 @@ impl FsBestiaryStore {
         }
         let path = self.blob_path(artifact_hash);
         if path.exists() {
-            return Ok(()); // content-addressed dedupe: identical bytes already on disk
+            match self.read_blob(artifact_hash) {
+                Ok(_) => return Ok(()), // content-addressed dedupe: identical bytes already on disk
+                Err(err) => {
+                    eprintln!(
+                        "bestiary: rewriting corrupt or unreadable blob {artifact_hash}: {err}"
+                    );
+                }
+            }
         }
         self.atomic_write(&path, artifact)
     }
 
     fn read_blob(&self, artifact_hash: &str) -> Result<Vec<u8>, StoreError> {
+        self.read_blob_bounded(artifact_hash, self.max_artifact_bytes)
+    }
+
+    fn read_blob_bounded(
+        &self,
+        artifact_hash: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, StoreError> {
         if !is_artifact_hash(artifact_hash) {
             return Err(invalid_artifact_hash(artifact_hash));
         }
-        fs::read(self.blob_path(artifact_hash))
-            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))
+        let path = self.blob_path(artifact_hash);
+        let mut file = File::open(&path)
+            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
+        let mut bytes = Vec::new();
+        if max_bytes == 0 {
+            file.read_to_end(&mut bytes).map_err(|e| {
+                StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}"))
+            })?;
+        } else {
+            let read_limit =
+                u64::try_from(max_bytes).ok().and_then(|n| n.checked_add(1)).unwrap_or(u64::MAX);
+            let mut limited = file.take(read_limit);
+            limited.read_to_end(&mut bytes).map_err(|e| {
+                StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}"))
+            })?;
+            if bytes.len() > max_bytes {
+                return Err(StoreError::Limit(registry_artifact_too_large_message(
+                    bytes.len(),
+                    max_bytes,
+                )));
+            }
+        }
+        let actual = sha256_hex(&bytes);
+        if actual != artifact_hash {
+            return Err(StoreError::Integrity(format!(
+                "blob {artifact_hash} content hash mismatch: got {actual}"
+            )));
+        }
+        Ok(bytes)
     }
 
     fn blob_len(&self, artifact_hash: &str) -> Result<usize, StoreError> {
@@ -633,6 +705,53 @@ impl FsBestiaryStore {
         usize::try_from(meta.len()).map_err(|_| {
             StoreError::Corrupt(format!("blob {artifact_hash} length does not fit usize"))
         })
+    }
+
+    fn fetchable_blob_len(&self, artifact_hash: &str) -> Result<usize, StoreError> {
+        let blob_len = self.blob_len(artifact_hash)?;
+        if self.max_artifact_bytes != 0 && blob_len > self.max_artifact_bytes {
+            return Err(StoreError::Limit(registry_artifact_too_large_message(
+                blob_len,
+                self.max_artifact_bytes,
+            )));
+        }
+        Ok(blob_len)
+    }
+
+    fn read_blob_range(
+        &self,
+        artifact_hash: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Err(invalid_artifact_hash(artifact_hash));
+        }
+        let blob_len = self.fetchable_blob_len(artifact_hash)?;
+        let offset_usize = usize::try_from(offset).map_err(|_| {
+            StoreError::Corrupt(format!(
+                "blob {artifact_hash} chunk offset {offset} does not fit usize"
+            ))
+        })?;
+        let end = offset_usize.checked_add(len).ok_or_else(|| {
+            StoreError::Corrupt(format!("blob {artifact_hash} chunk range overflows usize"))
+        })?;
+        if offset_usize > blob_len || end > blob_len {
+            return Err(StoreError::Corrupt(format!(
+                "blob {artifact_hash} chunk range {offset_usize}..{end} exceeds blob length {blob_len}"
+            )));
+        }
+        let mut bytes = vec![0u8; len];
+        if len == 0 {
+            return Ok(bytes);
+        }
+        let mut file = File::open(self.blob_path(artifact_hash))
+            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} seek failed: {e}")))?;
+        file.read_exact(&mut bytes)
+            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
+        Ok(bytes)
     }
 
     /// Append a record for `op`/`first_seen` to its realm chain (sign, write, advance the head).
@@ -839,6 +958,41 @@ impl BestiaryStore for FsBestiaryStore {
         )))
     }
 
+    fn get_fetch_metadata(
+        &self,
+        realm: &RealmId,
+        artifact_hash: &str,
+    ) -> Result<Option<(CatalogEntry, usize)>, StoreError> {
+        match self.get_metadata(realm, artifact_hash)? {
+            Some((entry, _)) => {
+                let artifact_len = self.fetchable_blob_len(artifact_hash)?;
+                Ok(Some((entry, artifact_len)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_artifact_chunk(
+        &self,
+        realm: &RealmId,
+        artifact_hash: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        if !is_artifact_hash(artifact_hash) {
+            return Ok(None);
+        }
+        let key = (realm.clone(), artifact_hash.to_string());
+        let is_live = {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::live_entry(&inner, &key).is_some()
+        };
+        if !is_live {
+            return Ok(None);
+        }
+        self.read_blob_range(artifact_hash, offset, len).map(Some)
+    }
+
     fn list(&self, realm: Option<&RealmId>) -> Result<Vec<SyncEntry>, StoreError> {
         self.list_bounded(realm, 0)
     }
@@ -857,11 +1011,10 @@ impl BestiaryStore for FsBestiaryStore {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
-        let mut out = Vec::with_capacity(rows.len());
         let mut artifact_bytes = 0usize;
-        for ((r, hash), live) in rows {
-            if max_artifact_bytes != 0 {
-                let len = self.blob_len(&hash)?;
+        if max_artifact_bytes != 0 {
+            for ((_, hash), _) in &rows {
+                let len = self.blob_len(hash)?;
                 artifact_bytes = artifact_bytes.saturating_add(len);
                 if artifact_bytes > max_artifact_bytes {
                     return Err(StoreError::Limit(format!(
@@ -869,7 +1022,19 @@ impl BestiaryStore for FsBestiaryStore {
                     )));
                 }
             }
-            let artifact = self.read_blob(&hash)?;
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        let mut read_artifact_bytes = 0usize;
+        for ((r, hash), live) in rows {
+            let read_limit = max_artifact_bytes.saturating_sub(read_artifact_bytes);
+            let artifact = if max_artifact_bytes == 0 {
+                self.read_blob(&hash)?
+            } else {
+                self.read_blob_bounded(&hash, read_limit)?
+            };
+            if max_artifact_bytes != 0 {
+                read_artifact_bytes = read_artifact_bytes.saturating_add(artifact.len());
+            }
             out.push(SyncEntry {
                 artifact_hash: hash,
                 realm: r,
@@ -907,10 +1072,10 @@ impl BestiaryStore for FsBestiaryStore {
         if !is_artifact_hash(artifact_hash) {
             return Ok(false);
         }
-        if !score.score.is_finite() {
+        if let Some(message) = score.attest_shape_error(artifact_hash, realm) {
             eprintln!(
-                "bestiary: rejected a non-finite reputation score for {artifact_hash} in realm {} (not stored)",
-                realm.0
+                "bestiary: rejected reputation signal for {artifact_hash} in realm {}: {message}",
+                realm.0,
             );
             return Ok(false);
         }
@@ -1169,8 +1334,17 @@ impl BestiaryStore for FsBestiaryStore {
             }
         }
         let mut out = Vec::with_capacity(total_entries);
+        let mut read_artifact_bytes = 0usize;
         for ((r, hash), live) in live_rows {
-            let artifact = self.read_blob(&hash)?;
+            let read_limit = max_artifact_bytes.saturating_sub(read_artifact_bytes);
+            let artifact = if max_artifact_bytes == 0 {
+                self.read_blob(&hash)?
+            } else {
+                self.read_blob_bounded(&hash, read_limit)?
+            };
+            if max_artifact_bytes != 0 {
+                read_artifact_bytes = read_artifact_bytes.saturating_add(artifact.len());
+            }
             let sync = SyncEntry {
                 artifact_hash: hash.clone(),
                 realm: r.clone(),
@@ -1350,8 +1524,17 @@ impl BestiaryStore for FsBestiaryStore {
             }
         }
         let mut out = Vec::with_capacity(rows.len());
+        let mut read_artifact_bytes = 0usize;
         for ((r, hash), live) in rows {
-            let artifact = self.read_blob(&hash)?;
+            let read_limit = max_artifact_bytes.saturating_sub(read_artifact_bytes);
+            let artifact = if max_artifact_bytes == 0 {
+                self.read_blob(&hash)?
+            } else {
+                self.read_blob_bounded(&hash, read_limit)?
+            };
+            if max_artifact_bytes != 0 {
+                read_artifact_bytes = read_artifact_bytes.saturating_add(artifact.len());
+            }
             out.push(CurationSnapshot {
                 realm: r,
                 artifact_hash: hash,
@@ -1624,6 +1807,118 @@ mod tests {
 
         let full = s.list(Some(&realm)).expect_err("full anti-entropy listing needs the blob");
         assert!(matches!(full, StoreError::Corrupt(_)), "missing blob is detected: {full:?}");
+    }
+
+    #[test]
+    fn artifact_chunk_reads_only_requested_live_blob_range() {
+        let root = TempRoot::new("artifact-chunk");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let bytes = b"artifact-bytes".to_vec();
+        let hash = s.put(&realm, manifest("c"), bytes.clone()).unwrap();
+
+        assert_eq!(s.get_artifact_chunk(&realm, &hash, 3, 5).unwrap().unwrap(), b"ifact");
+        assert_eq!(
+            s.get_artifact_chunk(&realm, &hash, bytes.len() as u64, 0).unwrap().unwrap(),
+            Vec::<u8>::new()
+        );
+        assert!(
+            s.get_artifact_chunk(&RealmId::new("other"), &hash, 0, 1).unwrap().is_none(),
+            "chunks are served only for live rows in the requested realm"
+        );
+        let err = s
+            .get_artifact_chunk(&realm, &hash, bytes.len() as u64, 1)
+            .expect_err("out-of-range chunk is refused");
+        assert!(matches!(err, StoreError::Corrupt(_)), "out-of-range chunk refused: {err:?}");
+    }
+
+    #[test]
+    fn fetch_metadata_enforces_current_artifact_cap_without_hiding_catalog_metadata() {
+        let root = TempRoot::new("fetch-metadata-cap");
+        let realm = RealmId::new("crew");
+        let bytes = b"12345";
+        let hash;
+        {
+            let writer = store(&root);
+            hash = writer.put(&realm, manifest("c"), bytes.to_vec()).unwrap();
+        }
+
+        let capped = store(&root).with_max_artifact_bytes(4);
+        capped.recover().unwrap();
+
+        let (entry, artifact_len) = capped.get_metadata(&realm, &hash).unwrap().unwrap();
+        assert_eq!(entry.artifact_hash, hash);
+        assert_eq!(artifact_len, bytes.len(), "catalog metadata remains byte-light and visible");
+
+        let fetch = capped
+            .get_fetch_metadata(&realm, &hash)
+            .expect_err("fetch metadata refuses a blob over the current artifact cap");
+        assert!(
+            matches!(fetch, StoreError::Limit(_)),
+            "over-cap fetch metadata refused: {fetch:?}"
+        );
+
+        let chunk = capped
+            .get_artifact_chunk(&realm, &hash, 0, 1)
+            .expect_err("chunk serving uses the same fetch cap");
+        assert!(matches!(chunk, StoreError::Limit(_)), "over-cap chunk refused: {chunk:?}");
+    }
+
+    #[test]
+    fn full_blob_reads_verify_the_content_address() {
+        let root = TempRoot::new("blob-hash-read");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let hash = s.put(&realm, manifest("c"), b"artifact-bytes".to_vec()).unwrap();
+
+        fs::write(s.blob_path(&hash), b"corrupted-bytes").unwrap();
+
+        let get = s.get(&realm, &hash).expect_err("corrupt blob is refused on full fetch");
+        assert!(matches!(get, StoreError::Integrity(_)), "corrupt blob rejected: {get:?}");
+        let list = s.list(Some(&realm)).expect_err("corrupt blob is refused on full listing");
+        assert!(matches!(list, StoreError::Integrity(_)), "corrupt blob rejected: {list:?}");
+    }
+
+    #[test]
+    fn full_blob_reads_are_bounded_even_for_existing_blob_paths() {
+        let root = TempRoot::new("blob-read-cap");
+        let s = store(&root).with_max_artifact_bytes(4);
+        let bytes = b"12345";
+        let hash = sha256_hex(bytes);
+        fs::write(s.blob_path(&hash), bytes).unwrap();
+
+        let err = s.read_blob(&hash).expect_err("over-cap blob read is refused");
+
+        assert!(matches!(err, StoreError::Limit(_)), "over-cap blob rejected: {err:?}");
+    }
+
+    #[test]
+    fn blob_reads_can_use_a_call_specific_cap_for_snapshots() {
+        let root = TempRoot::new("blob-read-call-cap");
+        let s = store(&root).with_max_artifact_bytes(0);
+        let bytes = b"12345";
+        let hash = sha256_hex(bytes);
+        fs::write(s.blob_path(&hash), bytes).unwrap();
+
+        let err = s.read_blob_bounded(&hash, 4).expect_err("call cap refuses this blob");
+        assert!(matches!(err, StoreError::Limit(_)), "over-cap blob rejected: {err:?}");
+        assert_eq!(s.read_blob_bounded(&hash, 5).unwrap(), bytes);
+    }
+
+    #[test]
+    fn republish_rewrites_a_corrupt_existing_blob() {
+        let root = TempRoot::new("blob-hash-heal");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let bytes = b"artifact-bytes".to_vec();
+        let hash = s.put(&realm, manifest("c"), bytes.clone()).unwrap();
+        fs::write(s.blob_path(&hash), b"corrupted-bytes").unwrap();
+
+        let healed = s.put(&realm, manifest("c"), bytes.clone()).unwrap();
+
+        assert_eq!(healed, hash);
+        let entry = s.get(&realm, &hash).unwrap().expect("republished entry is readable");
+        assert_eq!(entry.artifact, bytes);
     }
 
     #[test]
@@ -2006,6 +2301,47 @@ mod tests {
         assert!(
             s.get(&realm, &hash).unwrap().unwrap().quarantine.is_none(),
             "oversized peer id was not retained"
+        );
+    }
+
+    #[test]
+    fn reputation_signal_shape_is_capped_before_store() {
+        let root = TempRoot::new("reputation-shape");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let hash = s.put(&realm, manifest("rep"), b"rep".to_vec()).unwrap();
+
+        assert!(
+            !s.attest(
+                &RealmId::new("bad:realm"),
+                &hash,
+                ReputationScore::unsigned(0.9, Some(RealmId::new("crew"))),
+            )
+            .unwrap(),
+            "invalid reputation realm is rejected"
+        );
+        assert!(
+            s.get(&realm, &hash).unwrap().unwrap().reputation.is_none(),
+            "malformed reputation realm was not retained"
+        );
+
+        assert!(
+            !s.attest(
+                &realm,
+                &hash,
+                ReputationScore {
+                    score: 0.9,
+                    attesting_realm: Some(RealmId::new("crew")),
+                    signed_by: Some("selector".into()),
+                    signature: None,
+                },
+            )
+            .unwrap(),
+            "half-signed promotions are rejected"
+        );
+        assert!(
+            s.get(&realm, &hash).unwrap().unwrap().reputation.is_none(),
+            "half-signed reputation marker was not retained"
         );
     }
 

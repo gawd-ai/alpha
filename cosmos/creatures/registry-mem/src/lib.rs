@@ -7,11 +7,19 @@
 //!
 //! ### Wire shape
 //!
-//! Operations and replies travel as JSON in the envelope payload. The artifact bytes ride as a
-//! hex-encoded string (see `sigil::crypto::hex_bytes` for the rationale).
+//! Operations and replies travel as JSON in the envelope payload. The legacy full-fetch artifact
+//! bytes ride as a hex-encoded string (see `sigil::crypto::hex_bytes` for the rationale). Bulk
+//! shipping should use GX: `FetchGx` is the compatibility push path, while `FetchGxPlan` plus
+//! `FetchGxChunk` lets a caller pull or resume individual `gawdxfer` chunks on the transport chunk
+//! lane.
 //!
 //! - `RegistryOp::Publish { manifest, artifact, realm? }` → reply `RegistryReply::Published { artifact_hash, realm }`
 //! - `RegistryOp::Fetch { artifact_hash, realm? }` → reply `RegistryReply::Fetched { manifest, artifact, realm }`
+//! - `RegistryOp::FetchGx { artifact_hash, chunk_size, realm? }` → reply
+//!   `RegistryReply::FetchedGx { manifest, transfer plan }` plus `transport.gx.chunk` envelopes
+//! - `RegistryOp::FetchGxPlan { artifact_hash, chunk_size, realm? }` → reply
+//!   `RegistryReply::FetchedGx { manifest, transfer plan }` only; callers pull chunks with
+//!   `RegistryOp::FetchGxChunk { artifact_hash, transfer_id, chunk_size, chunk_index, realm? }`
 //! - `RegistryOp::FetchMetadata { artifact_hash, realm? }` → reply
 //!   `RegistryReply::FetchedMetadata { entry, artifact_len }` without artifact bytes
 //!   or `RegistryReply::NotFound`
@@ -55,7 +63,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use aether::{Creature, CreatureCtx, Envelope, Outcome, RealmId};
+use aether::{Creature, CreatureCtx, Dispatch, Envelope, Outcome, RealmId};
 use sha2::{Digest, Sha256};
 use sigil::Manifest;
 
@@ -64,7 +72,7 @@ use sigil::Manifest;
 // contract crate so the durable `bestiary-daemon` can share one wire contract with this in-memory
 // stub. Re-exported here so every `registry_mem::TypeName` consumer compiles unchanged.
 use bestiary::{
-    registry_artifact_too_large_message, registry_op_too_large_message,
+    artifact_hash_shape_error, registry_artifact_too_large_message, registry_op_too_large_message,
     MAX_REGISTRY_ARTIFACT_BYTES, MAX_REGISTRY_OP_BYTES,
 };
 pub use bestiary::{
@@ -99,6 +107,13 @@ impl PublishResult {
             }
         }
     }
+}
+
+struct GxChunkPull {
+    artifact_hash: String,
+    transfer_id: String,
+    chunk_size: u32,
+    chunk_index: u32,
 }
 
 /// The registry creature.
@@ -231,16 +246,15 @@ impl RegistryMem {
         artifact_hash: &str,
         score: ReputationScore,
     ) -> bool {
-        // Chokepoint defense-in-depth (T10): a non-finite score (`f32::INFINITY`/`NaN`, reachable
-        // from out-of-range peer wire data) must never be stored — it poisons every downstream
-        // selection / defense read. The federator guards its ingest paths too, but this
+        // Chokepoint defense-in-depth (T10): malformed reputation signals (including non-finite
+        // scores reachable from out-of-range peer wire data) must never be stored — they poison
+        // downstream selection / defense reads. The producers guard their ingest paths too, but this
         // is the last gate before the trust store, so guard here regardless of caller. `false` maps
         // to `NotFound`, the same as "we don't hold that artifact" — both mean "not applied."
-        if !score.score.is_finite() {
+        if let Some(message) = score.attest_shape_error(artifact_hash, realm) {
             eprintln!(
-                "registry-mem: rejected a non-finite reputation score for {artifact_hash} \
-                 in realm {} (not stored)",
-                realm.0
+                "registry-mem: rejected reputation signal for {artifact_hash} in realm {}: {message}",
+                realm.0,
             );
             return false;
         }
@@ -353,6 +367,9 @@ impl RegistryMem {
         realm: &RealmId,
         artifact_hash: &str,
     ) -> Option<(CatalogEntry, usize)> {
+        if artifact_hash_shape_error(artifact_hash).is_some() {
+            return None;
+        }
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -379,6 +396,9 @@ impl RegistryMem {
     /// Realm-aware fetch. Returns `None` if the `(realm, artifact_hash)` key is absent —
     /// the same hash in a different Realm is a different entry by construction.
     pub fn fetch_in(&self, realm: &RealmId, artifact_hash: &str) -> Option<Entry> {
+        if artifact_hash_shape_error(artifact_hash).is_some() {
+            return None;
+        }
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -408,60 +428,110 @@ impl Creature for RegistryMem {
             RegistryReply::Error { message }
         } else {
             match serde_json::from_slice::<RegistryOp>(&env.payload) {
-                // Realm-implicit: the `"local"` Realm. Reply with the matching Realm-implicit variant —
-                // a Realm-implicit caller gets a Realm-implicit reply back, round-tripping the wire.
-                Ok(RegistryOp::Publish { manifest, artifact }) => {
-                    match self.publish_in_checked(RealmId::local(), manifest, artifact) {
-                        PublishResult::Stored(artifact_hash) => {
-                            RegistryReply::Published { artifact_hash }
-                        }
-                        PublishResult::Refused { message, .. } => RegistryReply::Error { message },
-                    }
-                }
-                Ok(RegistryOp::Fetch { artifact_hash }) => {
-                    match self.fetch_in(&RealmId::local(), &artifact_hash) {
-                        Some(entry) => RegistryReply::Fetched {
-                            manifest: entry.manifest,
-                            artifact: entry.artifact,
-                        },
-                        None => RegistryReply::NotFound,
-                    }
-                }
-                Ok(RegistryOp::FetchMetadata { artifact_hash }) => {
-                    match self.fetch_metadata_in(&RealmId::local(), &artifact_hash) {
-                        Some((entry, artifact_len)) => {
-                            RegistryReply::FetchedMetadata { entry, artifact_len }
-                        }
-                        None => RegistryReply::NotFound,
-                    }
-                }
-                // Realm-explicit. Reply with the matching Realm-explicit variant carrying the
-                // resolved Realm so the caller can confirm.
-                Ok(RegistryOp::PublishInRealm { manifest, artifact, realm }) => {
+                // The full-artifact ops carry an optional Realm: `None` resolves to the `"local"`
+                // Realm. The reply always echoes the resolved Realm so the caller can confirm which
+                // catalog was touched.
+                Ok(RegistryOp::Publish { manifest, artifact, realm }) => {
+                    let realm = realm.unwrap_or_else(RealmId::local);
                     match self.publish_in_checked(realm.clone(), manifest, artifact) {
                         PublishResult::Stored(artifact_hash) => {
-                            RegistryReply::PublishedInRealm { artifact_hash, realm }
+                            RegistryReply::Published { artifact_hash, realm }
                         }
                         PublishResult::Refused { message, .. } => RegistryReply::Error { message },
                     }
                 }
-                Ok(RegistryOp::FetchInRealm { artifact_hash, realm }) => {
-                    match self.fetch_in(&realm, &artifact_hash) {
-                        Some(entry) => RegistryReply::FetchedInRealm {
-                            manifest: entry.manifest,
-                            artifact: entry.artifact,
-                            realm,
-                        },
-                        None => RegistryReply::NotFound,
+                Ok(RegistryOp::Fetch { artifact_hash, realm }) => {
+                    let realm = realm.unwrap_or_else(RealmId::local);
+                    if let Some(message) = artifact_hash_shape_error(&artifact_hash) {
+                        RegistryReply::Error { message }
+                    } else {
+                        match self.fetch_in(&realm, &artifact_hash) {
+                            Some(entry) => RegistryReply::Fetched {
+                                manifest: entry.manifest,
+                                artifact: entry.artifact,
+                                realm,
+                            },
+                            None => RegistryReply::NotFound,
+                        }
                     }
                 }
-                Ok(RegistryOp::FetchMetadataInRealm { artifact_hash, realm }) => {
-                    match self.fetch_metadata_in(&realm, &artifact_hash) {
-                        Some((entry, artifact_len)) => {
-                            RegistryReply::FetchedMetadata { entry, artifact_len }
+                Ok(RegistryOp::FetchGx { artifact_hash, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        &env,
+                        RealmId::local(),
+                        artifact_hash,
+                        chunk_size,
+                        false,
+                        true,
+                    );
+                }
+                Ok(RegistryOp::FetchGxPlan { artifact_hash, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        &env,
+                        RealmId::local(),
+                        artifact_hash,
+                        chunk_size,
+                        false,
+                        false,
+                    );
+                }
+                Ok(RegistryOp::FetchGxChunk {
+                    artifact_hash,
+                    transfer_id,
+                    chunk_size,
+                    chunk_index,
+                }) => {
+                    return self.fetch_gx_chunk_outcome(
+                        &env,
+                        RealmId::local(),
+                        GxChunkPull { artifact_hash, transfer_id, chunk_size, chunk_index },
+                    );
+                }
+                Ok(RegistryOp::FetchMetadata { artifact_hash, realm }) => {
+                    let realm = realm.unwrap_or_else(RealmId::local);
+                    if let Some(message) = artifact_hash_shape_error(&artifact_hash) {
+                        RegistryReply::Error { message }
+                    } else {
+                        match self.fetch_metadata_in(&realm, &artifact_hash) {
+                            Some((entry, artifact_len)) => {
+                                RegistryReply::FetchedMetadata { entry, artifact_len }
+                            }
+                            None => RegistryReply::NotFound,
                         }
-                        None => RegistryReply::NotFound,
                     }
+                }
+                Ok(RegistryOp::FetchGxInRealm { artifact_hash, realm, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        &env,
+                        realm,
+                        artifact_hash,
+                        chunk_size,
+                        true,
+                        true,
+                    );
+                }
+                Ok(RegistryOp::FetchGxPlanInRealm { artifact_hash, realm, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        &env,
+                        realm,
+                        artifact_hash,
+                        chunk_size,
+                        true,
+                        false,
+                    );
+                }
+                Ok(RegistryOp::FetchGxChunkInRealm {
+                    artifact_hash,
+                    realm,
+                    transfer_id,
+                    chunk_size,
+                    chunk_index,
+                }) => {
+                    return self.fetch_gx_chunk_outcome(
+                        &env,
+                        realm,
+                        GxChunkPull { artifact_hash, transfer_id, chunk_size, chunk_index },
+                    );
                 }
                 // Reputation + quarantine signals + anti-entropy snapshot.
                 Ok(RegistryOp::AttestFitness {
@@ -563,6 +633,195 @@ impl Creature for RegistryMem {
     }
 }
 
+impl RegistryMem {
+    fn fetch_gx_outcome(
+        &self,
+        env: &Envelope,
+        realm: RealmId,
+        artifact_hash: String,
+        chunk_size: Option<u32>,
+        include_realm: bool,
+        push_chunks: bool,
+    ) -> Outcome {
+        if let Some(message) = artifact_hash_shape_error(&artifact_hash) {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::Error { message }.to_bytes())
+                    .with_schema("registry.reply"),
+            );
+        }
+        let Some(entry) = self.fetch_in(&realm, &artifact_hash) else {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::NotFound.to_bytes())
+                    .with_schema("registry.reply"),
+            );
+        };
+        let chunk_size = if push_chunks {
+            registry_gx_push_chunk_size(chunk_size)
+        } else {
+            registry_gx_chunk_size(chunk_size)
+        };
+        let transfer_id = registry_gx_transfer_id(&artifact_hash, chunk_size, env);
+        let plan = match gawdxfer::TransferPlan::new(
+            &transfer_id,
+            entry.artifact.len() as u64,
+            &artifact_hash,
+            chunk_size,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: format!("GX fetch refused: {e}") }
+                            .to_bytes(),
+                    )
+                    .with_schema("registry.reply"),
+                );
+            }
+        };
+
+        let reply = if include_realm {
+            RegistryReply::FetchedGxInRealm {
+                manifest: entry.manifest.clone(),
+                artifact_hash,
+                transfer_id: plan.transfer_id.clone(),
+                file_size: plan.file_size,
+                file_hash: plan.file_hash.clone(),
+                chunk_size: plan.chunk_size,
+                total_chunks: plan.total_chunks,
+                realm,
+            }
+        } else {
+            RegistryReply::FetchedGx {
+                manifest: entry.manifest.clone(),
+                artifact_hash,
+                transfer_id: plan.transfer_id.clone(),
+                file_size: plan.file_size,
+                file_hash: plan.file_hash.clone(),
+                chunk_size: plan.chunk_size,
+                total_chunks: plan.total_chunks,
+            }
+        };
+
+        let mut out = Outcome::send(
+            Dispatch::reply_to_env(env, reply.to_bytes()).with_schema("registry.reply"),
+        );
+        if !push_chunks {
+            return out;
+        }
+        let target = env.reply_target();
+        for chunk_index in 0..plan.total_chunks {
+            match plan.encode_chunk(&entry.artifact, chunk_index) {
+                Ok(frame) => {
+                    let mut dispatch = Dispatch::to(target.clone(), frame)
+                        .with_schema(gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+                    if let Some(corr) = env.header.corr {
+                        dispatch = dispatch.with_corr(corr);
+                    }
+                    out.push(dispatch);
+                }
+                Err(e) => {
+                    return Outcome::send(
+                        Dispatch::reply_to_env(
+                            env,
+                            RegistryReply::Error {
+                                message: format!("GX fetch chunk encode failed: {e}"),
+                            }
+                            .to_bytes(),
+                        )
+                        .with_schema("registry.reply"),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    fn fetch_gx_chunk_outcome(&self, env: &Envelope, realm: RealmId, pull: GxChunkPull) -> Outcome {
+        if let Some(message) = artifact_hash_shape_error(&pull.artifact_hash) {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::Error { message }.to_bytes())
+                    .with_schema("registry.reply"),
+            );
+        }
+        if let Some(message) = registry_gx_pull_shape_error(&pull) {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::Error { message }.to_bytes())
+                    .with_schema("registry.reply"),
+            );
+        }
+        let Some(entry) = self.fetch_in(&realm, &pull.artifact_hash) else {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::NotFound.to_bytes())
+                    .with_schema("registry.reply"),
+            );
+        };
+        let chunk_size = registry_gx_chunk_size(Some(pull.chunk_size));
+        let plan = match gawdxfer::TransferPlan::new(
+            pull.transfer_id,
+            entry.artifact.len() as u64,
+            pull.artifact_hash.clone(),
+            chunk_size,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: format!("GX chunk refused: {e}") }
+                            .to_bytes(),
+                    )
+                    .with_schema("registry.reply"),
+                );
+            }
+        };
+        let frame = match plan.encode_chunk(&entry.artifact, pull.chunk_index) {
+            Ok(frame) => frame,
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: format!("GX chunk refused: {e}") }
+                            .to_bytes(),
+                    )
+                    .with_schema("registry.reply"),
+                );
+            }
+        };
+        let mut dispatch = Dispatch::to(env.reply_target(), frame)
+            .with_schema(gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+        if let Some(corr) = env.header.corr {
+            dispatch = dispatch.with_corr(corr);
+        }
+        Outcome::send(dispatch)
+    }
+}
+
+fn registry_gx_transfer_id(artifact_hash: &str, chunk_size: u32, env: &Envelope) -> String {
+    let corr = env.header.corr.unwrap_or(0);
+    gawdxfer::registry_transfer_id(artifact_hash, chunk_size, env.header.seq, corr)
+}
+
+fn registry_gx_chunk_size(requested: Option<u32>) -> u32 {
+    requested
+        .unwrap_or(gawdxfer::DEFAULT_CHUNK_SIZE)
+        .clamp(gawdxfer::MIN_CHUNK_SIZE, gawdxfer::MAX_CHUNK_SIZE)
+}
+
+fn registry_gx_push_chunk_size(requested: Option<u32>) -> u32 {
+    requested
+        .unwrap_or(gawdxfer::DEFAULT_CHUNK_SIZE)
+        .clamp(gawdxfer::DEFAULT_CHUNK_SIZE, gawdxfer::MAX_CHUNK_SIZE)
+}
+
+fn registry_gx_pull_shape_error(pull: &GxChunkPull) -> Option<String> {
+    gawdxfer::registry_transfer_id_shape_error(
+        &pull.transfer_id,
+        &pull.artifact_hash,
+        pull.chunk_size,
+    )
+}
+
 /// sha256 hex of the artifact bytes — the registry's index key and also the manifest's
 /// `provenance.build_hash` (so the receiving node's admission gate can recompute and verify).
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -594,6 +853,7 @@ mod tests {
                 corr: Some(42),
                 commitment: None,
                 schema: "registry.op".into(),
+                origin: None,
             },
             payload: serde_json::to_vec(&op).unwrap(),
         }
@@ -605,7 +865,7 @@ mod tests {
         let m = manifest("c");
         let bytes = b"hello-artifact-bytes".to_vec();
         let publish_env = op_env(
-            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone() },
+            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone(), realm: None },
             CreatureId(1),
         );
         let pub_reply = r.handle(publish_env);
@@ -613,13 +873,17 @@ mod tests {
         let pub_payload = &pub_reply.dispatches[0].payload;
         let pub_reply: RegistryReply = serde_json::from_slice(pub_payload).unwrap();
         let hash = match pub_reply {
-            RegistryReply::Published { artifact_hash } => artifact_hash,
+            RegistryReply::Published { artifact_hash, realm } => {
+                assert_eq!(realm, RealmId::local(), "realm-less publish echoes the local Realm");
+                artifact_hash
+            }
             other => panic!("expected Published, got {other:?}"),
         };
         assert_eq!(hash, sha256_hex(&bytes), "artifact_hash is the artifact-bytes sha256");
 
         // Fetch round-trip.
-        let fetch_env = op_env(RegistryOp::Fetch { artifact_hash: hash.clone() }, CreatureId(2));
+        let fetch_env =
+            op_env(RegistryOp::Fetch { artifact_hash: hash.clone(), realm: None }, CreatureId(2));
         // Corr is preserved on reply.
         assert_eq!(fetch_env.header.corr, Some(42));
         let fetch_reply = r.handle(fetch_env);
@@ -628,9 +892,10 @@ mod tests {
         let reply: RegistryReply =
             serde_json::from_slice(&fetch_reply.dispatches[0].payload).unwrap();
         match reply {
-            RegistryReply::Fetched { manifest, artifact } => {
+            RegistryReply::Fetched { manifest, artifact, realm } => {
                 assert_eq!(manifest, m);
                 assert_eq!(artifact, bytes);
+                assert_eq!(realm, RealmId::local());
             }
             other => panic!("expected Fetched, got {other:?}"),
         }
@@ -640,7 +905,10 @@ mod tests {
     fn fetch_unknown_returns_not_found() {
         let mut r = RegistryMem::new();
         let env = op_env(
-            RegistryOp::Fetch { artifact_hash: "deadbeef-not-in-store".into() },
+            RegistryOp::Fetch {
+                artifact_hash: "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES),
+                realm: None,
+            },
             CreatureId(1),
         );
         let reply = r.handle(env);
@@ -648,8 +916,323 @@ mod tests {
         assert!(matches!(r, RegistryReply::NotFound));
     }
 
-    /// **Realm-aware publish/fetch round-trip.** The Realm-explicit variants
-    /// key entries by `(realm, artifact_hash)`, so the same hash in two Realms is two distinct
+    #[test]
+    fn legacy_fetch_rejects_malformed_artifact_hash_before_lookup() {
+        let mut r = RegistryMem::new();
+        let bad_hash = "../escape".to_string();
+
+        assert!(r.fetch_in(&RealmId::local(), &bad_hash).is_none());
+        assert!(r.fetch_metadata_in(&RealmId::local(), &bad_hash).is_none());
+
+        for op in [
+            RegistryOp::Fetch { artifact_hash: bad_hash.clone(), realm: None },
+            RegistryOp::FetchMetadata { artifact_hash: bad_hash.clone(), realm: None },
+            RegistryOp::Fetch {
+                artifact_hash: bad_hash.clone(),
+                realm: Some(RealmId::new("crew")),
+            },
+            RegistryOp::FetchMetadata {
+                artifact_hash: bad_hash.clone(),
+                realm: Some(RealmId::new("crew")),
+            },
+        ] {
+            let reply = r.handle(op_env(op, CreatureId(2)));
+            assert_eq!(reply.dispatches.len(), 1);
+            let reply: RegistryReply =
+                serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+            match reply {
+                RegistryReply::Error { message } => {
+                    assert!(message.contains("artifact_hash"), "{message}");
+                    assert!(message.contains("64 lowercase hex"), "{message}");
+                }
+                other => {
+                    panic!("expected malformed artifact_hash error before lookup, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gx_chunk_size_policy_preserves_small_pull_chunks_but_bounds_push() {
+        let small_valid = 64 * 1024;
+
+        assert_eq!(registry_gx_chunk_size(Some(32)), gawdxfer::MIN_CHUNK_SIZE);
+        assert_eq!(registry_gx_chunk_size(Some(small_valid)), small_valid);
+        assert_eq!(
+            registry_gx_chunk_size(Some(gawdxfer::MAX_CHUNK_SIZE + 1)),
+            gawdxfer::MAX_CHUNK_SIZE
+        );
+
+        assert_eq!(registry_gx_push_chunk_size(Some(32)), gawdxfer::DEFAULT_CHUNK_SIZE);
+        assert_eq!(registry_gx_push_chunk_size(Some(small_valid)), gawdxfer::DEFAULT_CHUNK_SIZE);
+        assert_eq!(
+            registry_gx_push_chunk_size(Some(gawdxfer::MAX_CHUNK_SIZE + 1)),
+            gawdxfer::MAX_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn fetch_gx_returns_plan_then_raw_chunk_dispatches() {
+        let mut r = RegistryMem::new();
+        let m = manifest("gx");
+        let bytes = b"chunked-registry-artifact".repeat(16);
+        let hash = r.publish(m.clone(), bytes.clone());
+
+        let reply = r.handle(op_env(
+            RegistryOp::FetchGx { artifact_hash: hash.clone(), chunk_size: Some(32) },
+            CreatureId(2),
+        ));
+
+        assert!(reply.dispatches.len() > 1, "GX fetch returns an init reply plus chunks");
+        assert_eq!(reply.dispatches[0].schema, "registry.reply");
+        let init: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        let (manifest, transfer_id, file_size, file_hash, chunk_size, total_chunks) = match init {
+            RegistryReply::FetchedGx {
+                manifest,
+                artifact_hash,
+                transfer_id,
+                file_size,
+                file_hash,
+                chunk_size,
+                total_chunks,
+            } => {
+                assert_eq!(artifact_hash, hash);
+                (manifest, transfer_id, file_size, file_hash, chunk_size, total_chunks)
+            }
+            other => panic!("expected FetchedGx, got {other:?}"),
+        };
+        assert_eq!(manifest, m);
+        assert_eq!(file_hash, hash, "GX plan file_hash is the registry artifact key");
+        assert_eq!(
+            chunk_size,
+            gawdxfer::DEFAULT_CHUNK_SIZE,
+            "compatibility GX push clamps tiny chunks to the default to avoid dispatch floods"
+        );
+        let plan = gawdxfer::TransferPlan::new(transfer_id, file_size, file_hash, chunk_size)
+            .expect("valid returned plan");
+        assert_eq!(plan.total_chunks, total_chunks);
+        assert_eq!(reply.dispatches.len(), 1 + total_chunks as usize);
+
+        let mut assembler = gawdxfer::ChunkAssembler::new(plan).expect("assembler");
+        for dispatch in &reply.dispatches[1..] {
+            assert_eq!(dispatch.to, Address::Creature(CreatureId(2)));
+            assert_eq!(dispatch.schema, gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+            assert_eq!(dispatch.corr, Some(42));
+            assembler.accept_binary_frame(&dispatch.payload).expect("valid gx chunk");
+        }
+        assert_eq!(assembler.finish().expect("complete artifact"), bytes);
+    }
+
+    #[test]
+    fn fetch_gx_rejects_malformed_artifact_hash_before_lookup() {
+        let mut r = RegistryMem::new();
+        let bad_hash = "../escape".to_string();
+
+        for op in [
+            RegistryOp::FetchGx { artifact_hash: bad_hash.clone(), chunk_size: None },
+            RegistryOp::FetchGxPlan { artifact_hash: bad_hash.clone(), chunk_size: None },
+            RegistryOp::FetchGxChunk {
+                artifact_hash: bad_hash.clone(),
+                transfer_id: format!("registry.bad.{}.0.42", gawdxfer::DEFAULT_CHUNK_SIZE),
+                chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+                chunk_index: 0,
+            },
+        ] {
+            let reply = r.handle(op_env(op, CreatureId(2)));
+            assert_eq!(reply.dispatches.len(), 1);
+            let reply: RegistryReply =
+                serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+            match reply {
+                RegistryReply::Error { message } => {
+                    assert!(message.contains("artifact_hash"), "{message}");
+                    assert!(message.contains("64 lowercase hex"), "{message}");
+                }
+                other => panic!("expected malformed GX artifact_hash error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_gx_chunk_rejects_malformed_transfer_id_before_lookup() {
+        let mut r = RegistryMem::new();
+        let reply = r.handle(op_env(
+            RegistryOp::FetchGxChunk {
+                artifact_hash: "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES),
+                transfer_id: "not printable".into(),
+                chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+                chunk_index: 0,
+            },
+            CreatureId(2),
+        ));
+
+        assert_eq!(reply.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("printable ASCII"), "{message}");
+            }
+            other => panic!("expected malformed GX transfer_id error before lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_gx_chunk_rejects_transfer_id_for_another_artifact_before_lookup() {
+        let mut r = RegistryMem::new();
+        let artifact_hash = "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+        let other_hash = "b".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+        let reply = r.handle(op_env(
+            RegistryOp::FetchGxChunk {
+                artifact_hash,
+                transfer_id: format!("registry.{other_hash}.{}.0.42", gawdxfer::DEFAULT_CHUNK_SIZE),
+                chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+                chunk_index: 0,
+            },
+            CreatureId(2),
+        ));
+
+        assert_eq!(reply.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("artifact_hash"), "{message}");
+            }
+            other => {
+                panic!("expected artifact-bound GX transfer_id error before lookup, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_gx_chunk_rejects_transfer_id_for_another_chunk_size_before_lookup() {
+        let mut r = RegistryMem::new();
+        let artifact_hash = "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+        let reply = r.handle(op_env(
+            RegistryOp::FetchGxChunk {
+                artifact_hash: artifact_hash.clone(),
+                transfer_id: format!("registry.{artifact_hash}.1024.0.42"),
+                chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+                chunk_index: 0,
+            },
+            CreatureId(2),
+        ));
+
+        assert_eq!(reply.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("chunk_size"), "{message}");
+            }
+            other => {
+                panic!(
+                    "expected chunk-size-bound GX transfer_id error before lookup, got {other:?}"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_gx_chunk_rejects_non_issued_transfer_id_before_lookup() {
+        let mut r = RegistryMem::new();
+        let artifact_hash = "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+        let reply = r.handle(op_env(
+            RegistryOp::FetchGxChunk {
+                artifact_hash: artifact_hash.clone(),
+                transfer_id: format!("registry.{artifact_hash}.not-decimal.0.42"),
+                chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+                chunk_index: 0,
+            },
+            CreatureId(2),
+        ));
+
+        assert_eq!(reply.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&reply.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("decimal"), "{message}");
+            }
+            other => {
+                panic!("expected non-issued GX transfer_id error before lookup, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_gx_plan_then_chunk_pull_reassembles_out_of_order() {
+        let mut r = RegistryMem::new();
+        let m = manifest("gx-pull");
+        let requested_chunk_size = 64 * 1024;
+        let bytes = vec![0xAB; requested_chunk_size as usize + 17];
+        let hash = r.publish(m.clone(), bytes.clone());
+
+        let plan_out = r.handle(op_env(
+            RegistryOp::FetchGxPlan {
+                artifact_hash: hash.clone(),
+                chunk_size: Some(requested_chunk_size),
+            },
+            CreatureId(2),
+        ));
+
+        assert_eq!(plan_out.dispatches.len(), 1, "plan-only fetch does not push chunks");
+        assert_eq!(plan_out.dispatches[0].schema, "registry.reply");
+        let init: RegistryReply = serde_json::from_slice(&plan_out.dispatches[0].payload).unwrap();
+        let (transfer_id, file_size, file_hash, chunk_size, total_chunks) = match init {
+            RegistryReply::FetchedGx {
+                manifest,
+                artifact_hash,
+                transfer_id,
+                file_size,
+                file_hash,
+                chunk_size,
+                total_chunks,
+            } => {
+                assert_eq!(manifest, m);
+                assert_eq!(artifact_hash, hash);
+                (transfer_id, file_size, file_hash, chunk_size, total_chunks)
+            }
+            other => panic!("expected FetchedGx plan, got {other:?}"),
+        };
+        assert_eq!(total_chunks, 2, "fixture spans multiple GX chunks");
+        assert_eq!(
+            chunk_size, requested_chunk_size,
+            "registry preserves valid chunk sizes below the default"
+        );
+        assert_eq!(file_hash, hash, "GX plan file_hash is the registry artifact key");
+        let plan = gawdxfer::TransferPlan::new(
+            transfer_id.clone(),
+            file_size,
+            file_hash.clone(),
+            chunk_size,
+        )
+        .expect("valid returned plan");
+        let mut assembler = gawdxfer::ChunkAssembler::new(plan).expect("assembler");
+
+        for chunk_index in (0..total_chunks).rev() {
+            let chunk_out = r.handle(op_env(
+                RegistryOp::FetchGxChunk {
+                    artifact_hash: hash.clone(),
+                    transfer_id: transfer_id.clone(),
+                    chunk_size,
+                    chunk_index,
+                },
+                CreatureId(2),
+            ));
+            assert_eq!(chunk_out.dispatches.len(), 1, "one request returns one raw GX chunk");
+            let dispatch = &chunk_out.dispatches[0];
+            assert_eq!(dispatch.to, Address::Creature(CreatureId(2)));
+            assert_eq!(dispatch.schema, gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+            assert_eq!(dispatch.corr, Some(42));
+            assembler.accept_binary_frame(&dispatch.payload).expect("valid gx chunk");
+        }
+
+        assert_eq!(assembler.finish().expect("complete artifact"), bytes);
+    }
+
+    /// **Realm-aware publish/fetch round-trip.** A `realm: Some(..)` publish/fetch
+    /// keys entries by `(realm, artifact_hash)`, so the same hash in two Realms is two distinct
     /// entries. The reply echoes the resolved Realm so the caller can confirm.
     #[test]
     fn publish_in_realm_then_fetch_in_realm_round_trips_with_realm_echoed() {
@@ -659,37 +1242,37 @@ mod tests {
         let realm = RealmId::new("crew");
 
         let publish_env = op_env(
-            RegistryOp::PublishInRealm {
+            RegistryOp::Publish {
                 manifest: m.clone(),
                 artifact: bytes.clone(),
-                realm: realm.clone(),
+                realm: Some(realm.clone()),
             },
             CreatureId(1),
         );
         let pub_reply: RegistryReply =
             serde_json::from_slice(&r.handle(publish_env).dispatches[0].payload).unwrap();
         match pub_reply {
-            RegistryReply::PublishedInRealm { artifact_hash, realm: echoed } => {
+            RegistryReply::Published { artifact_hash, realm: echoed } => {
                 assert_eq!(artifact_hash, sha256_hex(&bytes));
                 assert_eq!(echoed, realm, "the reply echoes the resolved Realm");
             }
-            other => panic!("expected PublishedInRealm, got {other:?}"),
+            other => panic!("expected Published, got {other:?}"),
         }
 
         // Fetch from the same Realm — round-trips intact, Realm echoed.
         let fetch_env = op_env(
-            RegistryOp::FetchInRealm { artifact_hash: sha256_hex(&bytes), realm: realm.clone() },
+            RegistryOp::Fetch { artifact_hash: sha256_hex(&bytes), realm: Some(realm.clone()) },
             CreatureId(2),
         );
         let reply: RegistryReply =
             serde_json::from_slice(&r.handle(fetch_env).dispatches[0].payload).unwrap();
         match reply {
-            RegistryReply::FetchedInRealm { manifest, artifact, realm: echoed } => {
+            RegistryReply::Fetched { manifest, artifact, realm: echoed } => {
                 assert_eq!(manifest, m);
                 assert_eq!(artifact, bytes);
                 assert_eq!(echoed, realm);
             }
-            other => panic!("expected FetchedInRealm, got {other:?}"),
+            other => panic!("expected Fetched, got {other:?}"),
         }
     }
 
@@ -712,10 +1295,10 @@ mod tests {
 
         // Publish in alpha realm.
         let env_a = op_env(
-            RegistryOp::PublishInRealm {
+            RegistryOp::Publish {
                 manifest: m_a.clone(),
                 artifact: bytes.clone(),
-                realm: realm_a.clone(),
+                realm: Some(realm_a.clone()),
             },
             CreatureId(1),
         );
@@ -723,10 +1306,10 @@ mod tests {
 
         // Publish (different manifest, same bytes) in beta realm.
         let env_b = op_env(
-            RegistryOp::PublishInRealm {
+            RegistryOp::Publish {
                 manifest: m_b.clone(),
                 artifact: bytes.clone(),
-                realm: realm_b.clone(),
+                realm: Some(realm_b.clone()),
             },
             CreatureId(2),
         );
@@ -736,34 +1319,33 @@ mod tests {
 
         // Fetch from alpha — must return m_a, not m_b.
         let fetch_a = op_env(
-            RegistryOp::FetchInRealm { artifact_hash: hash.clone(), realm: realm_a.clone() },
+            RegistryOp::Fetch { artifact_hash: hash.clone(), realm: Some(realm_a.clone()) },
             CreatureId(3),
         );
         let reply_a: RegistryReply =
             serde_json::from_slice(&r.handle(fetch_a).dispatches[0].payload).unwrap();
         match reply_a {
-            RegistryReply::FetchedInRealm { manifest, .. } => assert_eq!(manifest, m_a),
-            other => panic!("expected FetchedInRealm from alpha, got {other:?}"),
+            RegistryReply::Fetched { manifest, .. } => assert_eq!(manifest, m_a),
+            other => panic!("expected Fetched from alpha, got {other:?}"),
         }
 
         // And from beta — m_b, not m_a.
         let fetch_b = op_env(
-            RegistryOp::FetchInRealm { artifact_hash: hash.clone(), realm: realm_b.clone() },
+            RegistryOp::Fetch { artifact_hash: hash.clone(), realm: Some(realm_b.clone()) },
             CreatureId(4),
         );
         let reply_b: RegistryReply =
             serde_json::from_slice(&r.handle(fetch_b).dispatches[0].payload).unwrap();
         match reply_b {
-            RegistryReply::FetchedInRealm { manifest, .. } => assert_eq!(manifest, m_b),
-            other => panic!("expected FetchedInRealm from beta, got {other:?}"),
+            RegistryReply::Fetched { manifest, .. } => assert_eq!(manifest, m_b),
+            other => panic!("expected Fetched from beta, got {other:?}"),
         }
     }
 
-    /// **Realm-implicit behavior.** A Realm-implicit Publish (no Realm field) is stored
-    /// under the `"local"` Realm. A Realm-implicit Fetch finds it. An explicit `FetchInRealm` with
-    /// `realm: RealmId::local()` finds the same entry (the resolution rule is "absent = local").
-    /// A `FetchInRealm` with a different Realm returns NotFound — the entry is genuinely
-    /// scoped to "local."
+    /// **Realm-implicit behavior.** A `realm: None` Publish is stored under the `"local"`
+    /// Realm. A `realm: None` Fetch finds it. An explicit `realm: Some(local())` finds the same
+    /// entry (the resolution rule is "absent = local"). A fetch with a different Realm returns
+    /// NotFound — the entry is genuinely scoped to "local."
     #[test]
     fn v01_shape_publish_lands_in_local_realm_and_is_only_findable_there() {
         let mut r = RegistryMem::new();
@@ -773,7 +1355,7 @@ mod tests {
 
         // Realm-implicit publish (no realm field).
         let env = op_env(
-            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone() },
+            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone(), realm: None },
             CreatureId(1),
         );
         let reply: RegistryReply =
@@ -781,58 +1363,57 @@ mod tests {
         assert!(matches!(reply, RegistryReply::Published { .. }));
 
         // Realm-implicit fetch finds it (also implicitly local).
-        let env = op_env(RegistryOp::Fetch { artifact_hash: hash.clone() }, CreatureId(2));
+        let env =
+            op_env(RegistryOp::Fetch { artifact_hash: hash.clone(), realm: None }, CreatureId(2));
         let reply: RegistryReply =
             serde_json::from_slice(&r.handle(env).dispatches[0].payload).unwrap();
-        assert!(matches!(reply, RegistryReply::Fetched { .. }), "v0.1 fetch finds v0.1 publish");
+        assert!(matches!(reply, RegistryReply::Fetched { .. }), "implicit fetch finds the entry");
 
-        // Realm-explicit fetch with realm=local also finds it — resolution rule is consistent.
+        // Explicit fetch with realm=local also finds it — resolution rule is consistent.
         let env = op_env(
-            RegistryOp::FetchInRealm { artifact_hash: hash.clone(), realm: RealmId::local() },
+            RegistryOp::Fetch { artifact_hash: hash.clone(), realm: Some(RealmId::local()) },
             CreatureId(3),
         );
         let reply: RegistryReply =
             serde_json::from_slice(&r.handle(env).dispatches[0].payload).unwrap();
         match reply {
-            RegistryReply::FetchedInRealm { manifest, .. } => assert_eq!(manifest, m),
-            other => panic!("v0.2 fetch with realm=local must find a v0.1 publish, got {other:?}"),
+            RegistryReply::Fetched { manifest, .. } => assert_eq!(manifest, m),
+            other => panic!("fetch with realm=local must find a realm-less publish, got {other:?}"),
         }
 
-        // Realm-explicit fetch with a different realm returns NotFound — local entries stay local.
+        // Explicit fetch with a different realm returns NotFound — local entries stay local.
         let env = op_env(
-            RegistryOp::FetchInRealm { artifact_hash: hash, realm: RealmId::new("other") },
+            RegistryOp::Fetch { artifact_hash: hash, realm: Some(RealmId::new("other")) },
             CreatureId(4),
         );
         let reply: RegistryReply =
             serde_json::from_slice(&r.handle(env).dispatches[0].payload).unwrap();
         assert!(
             matches!(reply, RegistryReply::NotFound),
-            "v0.1 publish does NOT leak into other Realms"
+            "a realm-less publish does NOT leak into other Realms"
         );
     }
 
-    /// **Wire compatibility.** A Realm-implicit op's JSON bytes carry no Realm field and
-    /// deserialize cleanly. A Realm-explicit op uses a distinct `"op"` tag so a wire reader that
-    /// only knows the implicit variants ignores it (it unmarshals as the implicit variant, or
-    /// fails tag-matching — both are honest). This test locks the wire shape so a future refactor
-    /// doesn't silently drift.
+    /// **Collapsed Realm grain on the wire.** A realm-less op's JSON bytes carry no Realm field; a
+    /// realm-scoped op of the same kind keeps the same `"op"` tag and adds a `"realm"` field. The
+    /// `*_in_realm` op tags are gone in 0.4.1 (deliberately breaking 0.4.0 compat). This locks the
+    /// collapsed shape so a future refactor doesn't silently drift.
     #[test]
-    fn v01_op_wire_bytes_are_unchanged_at_v02() {
+    fn collapsed_realm_grain_keeps_one_op_tag_with_optional_realm() {
         let m = manifest("compat");
         let bytes = b"a".to_vec();
-        let v01_publish = RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone() };
-        let json = serde_json::to_string(&v01_publish).unwrap();
-        assert!(json.contains("\"op\":\"publish\""), "v0.1 op tag still 'publish'");
-        assert!(!json.contains("\"realm\""), "v0.1 publish wire has no Realm field — by design");
-        // The Realm-explicit variant uses a distinct op tag: 'publish_in_realm'.
-        let v02_publish = RegistryOp::PublishInRealm {
-            manifest: m,
-            artifact: bytes,
-            realm: RealmId::new("crew"),
-        };
-        let json = serde_json::to_string(&v02_publish).unwrap();
-        assert!(json.contains("\"op\":\"publish_in_realm\""), "v0.2 op tag is 'publish_in_realm'");
-        assert!(json.contains("\"realm\":\"crew\""), "v0.2 publish wire carries Realm");
+        let implicit =
+            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone(), realm: None };
+        let json = serde_json::to_string(&implicit).unwrap();
+        assert!(json.contains("\"op\":\"publish\""), "realm-less op tag is 'publish'");
+        assert!(!json.contains("\"realm\""), "realm-less publish wire has no Realm field");
+        // The realm-scoped publish keeps the SAME op tag and just adds the realm field.
+        let scoped =
+            RegistryOp::Publish { manifest: m, artifact: bytes, realm: Some(RealmId::new("crew")) };
+        let json = serde_json::to_string(&scoped).unwrap();
+        assert!(json.contains("\"op\":\"publish\""), "realm-scoped op keeps the 'publish' tag");
+        assert!(json.contains("\"realm\":\"crew\""), "realm-scoped publish wire carries the Realm");
+        assert!(!json.contains("publish_in_realm"), "the split *_in_realm op tag is gone");
     }
 
     /// **Reputation attestation.** AttestFitness on a held entry records the score
@@ -1004,9 +1585,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reputation_signal_shape_is_capped_before_store() {
+        let mut r = RegistryMem::new();
+        let realm = RealmId::new("crew");
+        let hash = r.publish_in(realm.clone(), manifest("rep-shape"), b"rep-shape".to_vec());
+
+        let env = op_env(
+            RegistryOp::AttestFitness {
+                artifact_hash: hash.clone(),
+                realm: RealmId::new("bad:realm"),
+                score: 0.9,
+                attesting_realm: Some(RealmId::new("crew")),
+                signed_by: None,
+                signature: None,
+            },
+            CreatureId(1),
+        );
+        let reply: RegistryReply =
+            serde_json::from_slice(&r.handle(env).dispatches[0].payload).unwrap();
+        assert!(matches!(reply, RegistryReply::NotFound));
+        assert!(
+            r.fetch_in(&realm, &hash).unwrap().reputation.is_none(),
+            "malformed reputation realm was not retained"
+        );
+
+        let direct = r.attest_fitness(
+            &realm,
+            &hash,
+            ReputationScore {
+                score: 0.9,
+                attesting_realm: Some(RealmId::new("crew")),
+                signed_by: Some("selector".into()),
+                signature: None,
+            },
+        );
+        assert!(!direct, "half-signed promotions are rejected");
+        assert!(
+            r.fetch_in(&realm, &hash).unwrap().reputation.is_none(),
+            "half-signed reputation marker was not retained"
+        );
+    }
+
     /// **Anti-entropy snapshot.** ListEntries returns self-contained SyncEntries a
     /// peer federator can merge; realm scoping filters. This is the read side of pull-based
-    /// reconciliation; the federator writes back via PublishInRealm.
+    /// reconciliation; the federator writes back via `Publish { realm: Some(..) }`.
     #[test]
     fn list_entries_snapshots_catalog_for_pull_with_realm_scoping() {
         let mut r = RegistryMem::new();
@@ -1104,7 +1727,7 @@ mod tests {
         let hash = r.publish_in(realm.clone(), manifest("meta"), artifact.clone());
 
         let env = op_env(
-            RegistryOp::FetchMetadataInRealm { artifact_hash: hash.clone(), realm: realm.clone() },
+            RegistryOp::FetchMetadata { artifact_hash: hash.clone(), realm: Some(realm.clone()) },
             CreatureId(1),
         );
         let payload = r.handle(env).dispatches[0].payload.clone();
@@ -1145,15 +1768,15 @@ mod tests {
         assert!(serde_json::to_string(&list).unwrap().contains("\"op\":\"list_entries\""));
         let metadata = RegistryOp::ListMetadata { realm: None };
         assert!(serde_json::to_string(&metadata).unwrap().contains("\"op\":\"list_metadata\""));
-        let fetch_metadata = RegistryOp::FetchMetadata { artifact_hash: "h".into() };
+        let fetch_metadata = RegistryOp::FetchMetadata { artifact_hash: "h".into(), realm: None };
         assert!(serde_json::to_string(&fetch_metadata)
             .unwrap()
             .contains("\"op\":\"fetch_metadata\""));
         let fetch_metadata_in_realm =
-            RegistryOp::FetchMetadataInRealm { artifact_hash: "h".into(), realm: RealmId::local() };
-        assert!(serde_json::to_string(&fetch_metadata_in_realm)
-            .unwrap()
-            .contains("\"op\":\"fetch_metadata_in_realm\""));
+            RegistryOp::FetchMetadata { artifact_hash: "h".into(), realm: Some(RealmId::local()) };
+        let json = serde_json::to_string(&fetch_metadata_in_realm).unwrap();
+        assert!(json.contains("\"op\":\"fetch_metadata\""), "realm-scoped fetch keeps the tag");
+        assert!(json.contains("\"realm\""), "realm-scoped fetch carries the Realm field");
     }
 
     #[test]
@@ -1172,6 +1795,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: b"{ not json".to_vec(),
         };
@@ -1195,6 +1819,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "registry.op".into(),
+                origin: None,
             },
             payload: b"{ not json".to_vec(),
         };
@@ -1215,7 +1840,11 @@ mod tests {
         let hash = sha256_hex(&bytes);
 
         let env = op_env(
-            RegistryOp::Publish { manifest: manifest("too-big"), artifact: bytes.clone() },
+            RegistryOp::Publish {
+                manifest: manifest("too-big"),
+                artifact: bytes.clone(),
+                realm: None,
+            },
             CreatureId(1),
         );
         let reply = r.handle(env);
@@ -1242,7 +1871,7 @@ mod tests {
         m.name = "n".repeat(MAX_MANIFEST_NAME_BYTES + 1);
 
         let env = op_env(
-            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone() },
+            RegistryOp::Publish { manifest: m.clone(), artifact: bytes.clone(), realm: None },
             CreatureId(1),
         );
         let reply = r.handle(env);

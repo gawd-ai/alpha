@@ -11,7 +11,7 @@
 //!    intentionally accept an unbounded route table.
 //! 2. **Pull-based anti-entropy.** On a `PullFrom` control op the federator asks a peer Realm's
 //!    `registry-mem` for its catalog ([`RegistryOp::ListEntries`]) and merges every entry into the
-//!    *local* registry via the [`RegistryOp::PublishInRealm`] write path (tagged with the
+//!    *local* registry via the [`RegistryOp::Publish`] write path (tagged with the
 //!    entry's own Realm). Pull, not gossip — enough for multi-Realm reconciliation; the
 //!    receiving Sanctum's admission gate still re-verifies every artifact on load (T2). In-flight
 //!    unanswered pulls are capped by default; `with_max_pending_pulls(0)` is the explicit lab/demo
@@ -22,8 +22,8 @@
 //!    [`Consensus`](seer::SeerTopic::Consensus)-topic envelope to a peer federator. The
 //!    receiver verifies the signature, applies its **injected** [`ReputationWeigher`] (the weight
 //!    model — substrate ships none; see `cosmos/creatures/prototypes/reputation/reputation-roundrobin`), and writes
-//!    [`RegistryOp::AttestFitness`] tagged with the attesting Realm. Oversized identity fields are
-//!    dropped as malformed before the federator can echo them into audit events or registry writes.
+//!    [`RegistryOp::AttestFitness`] tagged with the attesting Realm. Malformed or oversized identity
+//!    fields are dropped before the federator can echo them into audit events or registry writes.
 //! 4. **Cross-Realm quarantine path.** On a `FederateQuarantine` control op the federator ships a
 //!    [`FederatorMsg::QuarantineNotice`] to a peer federator, which writes
 //!    [`RegistryOp::MarkQuarantine`] (reversible — T5) into its local registry. The federator ships
@@ -57,10 +57,11 @@ use std::collections::HashMap;
 use aether::{
     Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, NodeId, Outcome, RealmId, Topic,
 };
-use bestiary::{QuarantineNotice, MAX_REGISTRY_SIGNAL_FIELD_BYTES};
+use bestiary::{artifact_hash_shape_error, QuarantineNotice, MAX_REGISTRY_SIGNAL_FIELD_BYTES};
 use registry_mem::{RegistryOp, RegistryReply};
 use seer::{SeerEnvelope, SeerKind, SeerTopic};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sigil::{Ed25519KeyMaterial, Ed25519Verifier, Verifier};
 use std::sync::Arc;
 
@@ -639,6 +640,9 @@ impl OmegaFederator {
         if let Some(message) = registry_key_shape_error(&artifact_hash, &realm) {
             return reply(env, FederatorMsg::Rejected { reason: message });
         }
+        if let Some(message) = peer_node_shape_error("federator", "peer_node", &peer_node) {
+            return reply(env, FederatorMsg::Rejected { reason: message });
+        }
         if !score.is_finite() {
             return reply(
                 env,
@@ -686,12 +690,17 @@ impl OmegaFederator {
         let Some(me) = self.me_id() else {
             return reply(env, FederatorMsg::Rejected { reason: "federator not bound yet".into() });
         };
-        if let Some(message) = QuarantineNotice::mark_shape_error(
-            &artifact_hash,
-            &realm,
-            &reason,
-            std::slice::from_ref(&self.cfg.self_node.0),
-        ) {
+        if let Some(message) = registry_key_shape_error(&artifact_hash, &realm).or_else(|| {
+            QuarantineNotice::mark_shape_error(
+                &artifact_hash,
+                &realm,
+                &reason,
+                std::slice::from_ref(&self.cfg.self_node.0),
+            )
+        }) {
+            return reply(env, FederatorMsg::Rejected { reason: message });
+        }
+        if let Some(message) = peer_node_shape_error("federator", "peer_node", &peer_node) {
             return reply(env, FederatorMsg::Rejected { reason: message });
         }
         // Ship the notice to the peer federator. attesting_peers seeded with our own node id.
@@ -719,9 +728,9 @@ impl OmegaFederator {
         reason: String,
         attesting_peers: Vec<String>,
     ) -> Outcome {
-        if let Some(message) =
+        if let Some(message) = registry_key_shape_error(&artifact_hash, &realm).or_else(|| {
             QuarantineNotice::mark_shape_error(&artifact_hash, &realm, &reason, &attesting_peers)
-        {
+        }) {
             eprintln!(
                 "omega-federator: dropped inbound quarantine notice for {artifact_hash} in realm {}: {message}",
                 realm.0
@@ -913,14 +922,14 @@ impl OmegaFederator {
         // can only ever write Realm X locally, so a peer can't smuggle entries into a Realm we
         // didn't pull.
         //
-        // For each entry we emit up to three ops in order: `PublishInRealm` (which resets both
+        // For each entry we emit up to three ops in order: `Publish` (which resets both
         // signals to `None` — for `quarantine` that reset IS the T5 reversibility rule; for
         // `reputation` it's just the clean-slate side effect of a (re)publish), then
         // `AttestFitness` and/or `MarkQuarantine` to re-apply the pulled signals.
         //
         // **Ordering precondition.** `AttestFitness`/`MarkQuarantine` are no-ops
         // (`NotFound`, never a panic) unless the entry already exists, so each re-apply must land
-        // *after* its `PublishInRealm`. We rely on the **documented `aether::Outcome` local-delivery
+        // *after* its `Publish`. We rely on the **documented `aether::Outcome` local-delivery
         // contract**: dispatches in one Outcome drain in push-order into a local module's
         // single-consumer FIFO inbox, so the publish precedes its attest/mark for the same entry.
         // That contract is **local-only** — a reconciler federating to a *remote* registry must
@@ -929,10 +938,18 @@ impl OmegaFederator {
         let realm = pending.source_realm;
         let mut out = Outcome::none();
         for e in entries {
-            let pub_op = RegistryOp::PublishInRealm {
+            if let Some(message) = pulled_sync_entry_shape_error(&e) {
+                self.ingest_rejections.malformed += 1;
+                eprintln!(
+                    "omega-federator: dropped malformed pulled entry for {} in requested realm {}: {message}",
+                    e.artifact_hash, realm.0
+                );
+                continue;
+            }
+            let pub_op = RegistryOp::Publish {
                 manifest: e.manifest,
                 artifact: e.artifact,
-                realm: realm.clone(),
+                realm: Some(realm.clone()),
             };
             out.dispatches.push(
                 Dispatch::to(Address::Creature(self.cfg.local_registry), pub_op.to_bytes())
@@ -947,6 +964,12 @@ impl OmegaFederator {
             if let Some(rep) = e.reputation {
                 if !rep.score.is_finite() {
                     self.ingest_rejections.non_finite_score += 1;
+                } else if let Some(message) = rep.attest_shape_error(&e.artifact_hash, &realm) {
+                    self.ingest_rejections.malformed += 1;
+                    eprintln!(
+                        "omega-federator: dropped malformed pulled reputation for {} in realm {}: {message}",
+                        e.artifact_hash, realm.0
+                    );
                 } else {
                     // Pulled reputation is forwarded **unchanged** — NOT re-weighted by our local
                     // `weigher`. The score in a `SyncEntry` was already weighted by the Realm that
@@ -1032,19 +1055,61 @@ fn field_shape_error(scope: &str, field: &str, value: &str) -> Option<String> {
             value.len(),
             MAX_REGISTRY_SIGNAL_FIELD_BYTES
         ))
+    } else if value.contains('\0') {
+        Some(format!("{scope} {field} contains NUL byte"))
     } else {
         None
     }
 }
 
+fn realm_field_shape_error(scope: &str, field: &str, realm: &RealmId) -> Option<String> {
+    if let Some(message) = field_shape_error(scope, field, &realm.0) {
+        return Some(message);
+    }
+    if !realm.is_valid() {
+        return Some(format!("{scope} {field} is not a valid RealmId"));
+    }
+    None
+}
+
+fn peer_node_shape_error(scope: &str, field: &str, peer_node: &NodeId) -> Option<String> {
+    if !node_id_shape_is_valid(peer_node) {
+        return Some(format!(
+            "{scope} {field} must be 1..={MAX_FEDERATOR_NODE_ID_BYTES} ASCII [A-Za-z0-9._-] bytes"
+        ));
+    }
+    None
+}
+
 fn registry_key_shape_error(artifact_hash: &str, realm: &RealmId) -> Option<String> {
-    field_shape_error("federator", "artifact_hash", artifact_hash)
-        .or_else(|| field_shape_error("federator", "realm", &realm.0))
+    artifact_hash_shape_error(artifact_hash)
+        .map(|message| format!("federator {message}"))
+        .or_else(|| realm_field_shape_error("federator", "realm", realm))
+}
+
+fn pulled_sync_entry_shape_error(entry: &registry_mem::SyncEntry) -> Option<String> {
+    if let Some(message) = artifact_hash_shape_error(&entry.artifact_hash) {
+        return Some(message);
+    }
+    let actual = sha256_hex(&entry.artifact);
+    if actual != entry.artifact_hash {
+        return Some(format!(
+            "artifact_hash does not match artifact bytes: advertised {}, actual {actual}",
+            entry.artifact_hash
+        ));
+    }
+    None
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
 }
 
 fn federation_endpoint_shape_error(source_realm: &RealmId, peer_node: &NodeId) -> Option<String> {
-    field_shape_error("federator", "source_realm", &source_realm.0)
-        .or_else(|| field_shape_error("federator", "peer_node", &peer_node.0))
+    realm_field_shape_error("federator", "source_realm", source_realm)
+        .or_else(|| peer_node_shape_error("federator", "peer_node", peer_node))
 }
 
 fn retain_valid_realm_peers(
@@ -1102,7 +1167,7 @@ fn node_id_shape_is_valid(node: &NodeId) -> bool {
 fn reputation_delta_shape_error(delta: &ReputationDelta) -> Option<String> {
     registry_key_shape_error(&delta.artifact_hash, &delta.realm)
         .or_else(|| {
-            field_shape_error("reputation delta", "observer_realm", &delta.observer_realm.0)
+            realm_field_shape_error("reputation delta", "observer_realm", &delta.observer_realm)
         })
         .or_else(|| field_shape_error("reputation delta", "observer_key", &delta.observer_key))
         .or_else(|| {
@@ -1167,6 +1232,7 @@ mod tests {
             corr,
             commitment: None,
             schema: schema.into(),
+            origin: None,
         }
     }
 
@@ -1181,13 +1247,17 @@ mod tests {
         serde_json::from_slice(&d.payload).unwrap()
     }
 
+    fn artifact_hash(bytes: &[u8]) -> String {
+        sha256_hex(bytes)
+    }
+
     // ----- ReputationDelta sign/verify (T3) ----
 
     #[test]
     fn reputation_delta_sign_then_verify_round_trips() {
         let k = key(0xA1);
         let mut delta = ReputationDelta {
-            artifact_hash: "h".into(),
+            artifact_hash: artifact_hash(b"reputation-target"),
             realm: RealmId::new("crew"),
             score: 0.9,
             observer_realm: RealmId::new("crew"),
@@ -1203,7 +1273,7 @@ mod tests {
     fn reputation_delta_tamper_after_signing_fails_verify() {
         let k = key(0xA2);
         let mut delta = ReputationDelta {
-            artifact_hash: "h".into(),
+            artifact_hash: artifact_hash(b"reputation-target"),
             realm: RealmId::new("crew"),
             score: 0.5,
             observer_realm: RealmId::new("crew"),
@@ -1419,6 +1489,49 @@ mod tests {
     }
 
     #[test]
+    fn outbound_federation_controls_reject_malformed_peer_node_before_dispatch() {
+        let mut f = fed(0xC9);
+        let messages = vec![
+            FederatorMsg::PullFrom {
+                source_realm: RealmId::new("guests"),
+                peer_node: NodeId("bad peer".into()),
+                peer_registry: CreatureId(60),
+            },
+            FederatorMsg::FederateReputation {
+                artifact_hash: artifact_hash(b"reputation-target"),
+                realm: RealmId::new("crew"),
+                score: 0.95,
+                peer_node: NodeId("bad peer".into()),
+                peer_federator: CreatureId(70),
+            },
+            FederatorMsg::FederateQuarantine {
+                artifact_hash: artifact_hash(b"quarantine-target"),
+                realm: RealmId::new("crew"),
+                reason: "apoptosis".into(),
+                peer_node: NodeId("bad peer".into()),
+                peer_federator: CreatureId(70),
+            },
+        ];
+
+        for (idx, msg) in messages.into_iter().enumerate() {
+            let out = f.handle(control_env(msg, 20 + idx as u64));
+
+            assert_eq!(out.dispatches.len(), 1, "only a Rejected reply is emitted");
+            assert!(
+                !out.dispatches.iter().any(|d| matches!(d.to, Address::Node(..))),
+                "malformed peer_node is never promoted into an address header"
+            );
+            match FederatorMsg::parse(&out.dispatches[0].payload).unwrap() {
+                FederatorMsg::Rejected { reason } => {
+                    assert!(reason.contains("peer_node"), "{reason}");
+                }
+                other => panic!("expected Rejected, got {other:?}"),
+            }
+        }
+        assert!(!f.has_pending_pull());
+    }
+
+    #[test]
     fn max_pending_pulls_refuses_new_pull_at_capacity_and_keeps_in_flight() {
         // Cap in-flight pulls at 1. The first PullFrom parks; a second is refused with a Rejected
         // ack (no ListEntries dispatched), and the first pull stays in flight. `0` is the explicit
@@ -1542,8 +1655,9 @@ mod tests {
 
         // Peer returns one entry tagged (deceptively) with realm "crew" — the puller must pin it to
         // the requested realm "guests" (T2 guard).
+        let artifact = b"y-bytes".to_vec();
         let sync = registry_mem::SyncEntry {
-            artifact_hash: "yhash".into(),
+            artifact_hash: artifact_hash(&artifact),
             realm: RealmId::new("crew"),
             manifest: sigil::Manifest::new(
                 "y",
@@ -1551,7 +1665,7 @@ mod tests {
                 sigil::Backend::Daemon,
                 "gawd_creature_v1",
             ),
-            artifact: b"y-bytes".to_vec(),
+            artifact,
             reputation: Some(ReputationScore::unsigned(0.7, Some(RealmId::new("guests")))),
             quarantine: None,
         };
@@ -1561,14 +1675,65 @@ mod tests {
         };
         let out = f.handle(reply_env);
         assert!(!f.has_pending_pull(), "pull resolved");
-        // Expect PublishInRealm(guests) then AttestFitness(guests) — both pinned to requested realm.
+        // Expect Publish(guests) then AttestFitness(guests) — both pinned to requested realm.
         let pubs: Vec<_> = out.dispatches.iter().map(parse_op).collect();
         assert!(
-            matches!(&pubs[0], RegistryOp::PublishInRealm { realm, .. } if *realm == RealmId::new("guests"))
+            matches!(&pubs[0], RegistryOp::Publish { realm: Some(realm), .. } if *realm == RealmId::new("guests"))
         );
         assert!(
             matches!(&pubs[1], RegistryOp::AttestFitness { realm, .. } if *realm == RealmId::new("guests"))
         );
+    }
+
+    #[test]
+    fn registry_entries_reply_drops_entry_when_advertised_hash_mismatches_artifact() {
+        let mut f = fed(0xC8).with_consult_corr_seed(805_000);
+        let out = f.handle(control_env(
+            FederatorMsg::PullFrom {
+                source_realm: RealmId::new("guests"),
+                peer_node: NodeId(PEER_NODE.into()),
+                peer_registry: CreatureId(60),
+            },
+            1,
+        ));
+        let corr = out
+            .dispatches
+            .iter()
+            .find(|d| matches!(d.to, Address::Node(..)))
+            .unwrap()
+            .corr
+            .unwrap();
+
+        let artifact = b"actual-pulled-bytes".to_vec();
+        let sync = registry_mem::SyncEntry {
+            artifact_hash: artifact_hash(b"different-bytes"),
+            realm: RealmId::new("guests"),
+            manifest: sigil::Manifest::new(
+                "mismatch",
+                "0.1.0",
+                sigil::Backend::Daemon,
+                "gawd_creature_v1",
+            ),
+            artifact,
+            reputation: Some(ReputationScore::unsigned(0.8, Some(RealmId::new("crew")))),
+            quarantine: Some(registry_mem::QuarantineNotice {
+                reason: "peer flagged".into(),
+                attesting_peers: vec!["node-B".into()],
+            }),
+        };
+        let reply_env = Envelope {
+            header: header(Address::Creature(ME), REGISTRY_REPLY_SCHEMA, Some(corr)),
+            payload: RegistryReply::Entries { entries: vec![sync] }.to_bytes(),
+        };
+
+        let out = f.handle(reply_env);
+
+        assert!(!f.has_pending_pull(), "terminal Entries reply still resolves the parked pull");
+        assert!(
+            out.dispatches.is_empty(),
+            "a mismatched pulled entry must not publish bytes or replay attached signals"
+        );
+        assert_eq!(f.ingest_rejections().malformed, 1);
     }
 
     #[test]
@@ -1595,7 +1760,7 @@ mod tests {
     /// test only exercises the reputation arm; this proves a single pulled `SyncEntry` carrying
     /// BOTH signals re-applies BOTH — the exact path fitness and quarantine federate through.
     /// Expect three ops in order:
-    /// PublishInRealm → AttestFitness → MarkQuarantine, all pinned to the requested realm.
+    /// Publish → AttestFitness → MarkQuarantine, all pinned to the requested realm.
     #[test]
     fn registry_entries_reply_reapplies_both_reputation_and_quarantine() {
         let mut f = fed(0xC4).with_consult_corr_seed(810_000);
@@ -1615,8 +1780,9 @@ mod tests {
             .corr
             .unwrap();
 
+        let artifact = b"z-bytes".to_vec();
         let sync = registry_mem::SyncEntry {
-            artifact_hash: "zhash".into(),
+            artifact_hash: artifact_hash(&artifact),
             realm: RealmId::new("crew"), // deceptive tag — puller must pin to requested "guests"
             manifest: sigil::Manifest::new(
                 "z",
@@ -1624,7 +1790,7 @@ mod tests {
                 sigil::Backend::Daemon,
                 "gawd_creature_v1",
             ),
-            artifact: b"z-bytes".to_vec(),
+            artifact,
             reputation: Some(ReputationScore::unsigned(0.8, Some(RealmId::new("crew")))),
             quarantine: Some(registry_mem::QuarantineNotice {
                 reason: "peer flagged".into(),
@@ -1638,7 +1804,7 @@ mod tests {
         let ops: Vec<_> = f.handle(reply_env).dispatches.iter().map(parse_op).collect();
         assert_eq!(ops.len(), 3, "publish + attest + quarantine for an entry with both signals");
         assert!(
-            matches!(&ops[0], RegistryOp::PublishInRealm { realm, .. } if *realm == RealmId::new("guests"))
+            matches!(&ops[0], RegistryOp::Publish { realm: Some(realm), .. } if *realm == RealmId::new("guests"))
         );
         assert!(matches!(&ops[1], RegistryOp::AttestFitness { realm, score, .. }
             if *realm == RealmId::new("guests") && (*score - 0.8).abs() < 1e-6));
@@ -1665,8 +1831,9 @@ mod tests {
             .corr
             .unwrap();
 
+        let artifact = b"z-bytes".to_vec();
         let sync = registry_mem::SyncEntry {
-            artifact_hash: "zhash".into(),
+            artifact_hash: artifact_hash(&artifact),
             realm: RealmId::new("guests"),
             manifest: sigil::Manifest::new(
                 "z",
@@ -1674,7 +1841,7 @@ mod tests {
                 sigil::Backend::Daemon,
                 "gawd_creature_v1",
             ),
-            artifact: b"z-bytes".to_vec(),
+            artifact,
             reputation: None,
             quarantine: Some(registry_mem::QuarantineNotice {
                 reason: "x".repeat(MAX_QUARANTINE_REASON_BYTES + 1),
@@ -1687,14 +1854,64 @@ mod tests {
         };
         let ops: Vec<_> = f.handle(reply_env).dispatches.iter().map(parse_op).collect();
 
-        assert_eq!(ops.len(), 1, "only PublishInRealm is forwarded for a malformed marker");
+        assert_eq!(ops.len(), 1, "only Publish is forwarded for a malformed marker");
         assert!(
-            matches!(&ops[0], RegistryOp::PublishInRealm { realm, .. } if *realm == RealmId::new("guests"))
+            matches!(&ops[0], RegistryOp::Publish { realm: Some(realm), .. } if *realm == RealmId::new("guests"))
         );
         assert!(
             !ops.iter().any(|op| matches!(op, RegistryOp::MarkQuarantine { .. })),
             "oversized pulled quarantine signal was not forwarded to the registry"
         );
+    }
+
+    #[test]
+    fn registry_entries_reply_drops_malformed_reputation_signal_before_forwarding() {
+        let mut f = fed(0xC7).with_consult_corr_seed(840_000);
+        let out = f.handle(control_env(
+            FederatorMsg::PullFrom {
+                source_realm: RealmId::new("guests"),
+                peer_node: NodeId(PEER_NODE.into()),
+                peer_registry: CreatureId(60),
+            },
+            1,
+        ));
+        let corr = out
+            .dispatches
+            .iter()
+            .find(|d| matches!(d.to, Address::Node(..)))
+            .unwrap()
+            .corr
+            .unwrap();
+
+        let artifact = b"r-bytes".to_vec();
+        let sync = registry_mem::SyncEntry {
+            artifact_hash: artifact_hash(&artifact),
+            realm: RealmId::new("guests"),
+            manifest: sigil::Manifest::new(
+                "r",
+                "0.1.0",
+                sigil::Backend::Daemon,
+                "gawd_creature_v1",
+            ),
+            artifact,
+            reputation: Some(ReputationScore::unsigned(0.8, Some(RealmId::new("bad:realm")))),
+            quarantine: None,
+        };
+        let reply_env = Envelope {
+            header: header(Address::Creature(ME), REGISTRY_REPLY_SCHEMA, Some(corr)),
+            payload: RegistryReply::Entries { entries: vec![sync] }.to_bytes(),
+        };
+        let ops: Vec<_> = f.handle(reply_env).dispatches.iter().map(parse_op).collect();
+
+        assert_eq!(ops.len(), 1, "only Publish is forwarded for a malformed marker");
+        assert!(
+            matches!(&ops[0], RegistryOp::Publish { realm: Some(realm), .. } if *realm == RealmId::new("guests"))
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, RegistryOp::AttestFitness { .. })),
+            "malformed pulled reputation signal was not forwarded to the registry"
+        );
+        assert_eq!(f.ingest_rejections().malformed, 1);
     }
 
     #[test]
@@ -1758,30 +1975,29 @@ mod tests {
             .unwrap()
             .corr
             .unwrap();
-        let make_reply = || Envelope {
-            header: header(Address::Creature(ME), REGISTRY_REPLY_SCHEMA, Some(corr)),
-            payload: RegistryReply::Entries {
-                entries: vec![registry_mem::SyncEntry {
-                    artifact_hash: "yhash".into(),
-                    realm: RealmId::new("guests"),
-                    manifest: sigil::Manifest::new(
-                        "y",
-                        "0.1.0",
-                        sigil::Backend::Daemon,
-                        "gawd_creature_v1",
-                    ),
-                    artifact: b"y-bytes".to_vec(),
-                    reputation: None,
-                    quarantine: None,
-                }],
+        let make_reply = || {
+            let artifact = b"y-bytes".to_vec();
+            Envelope {
+                header: header(Address::Creature(ME), REGISTRY_REPLY_SCHEMA, Some(corr)),
+                payload: RegistryReply::Entries {
+                    entries: vec![registry_mem::SyncEntry {
+                        artifact_hash: artifact_hash(&artifact),
+                        realm: RealmId::new("guests"),
+                        manifest: sigil::Manifest::new(
+                            "y",
+                            "0.1.0",
+                            sigil::Backend::Daemon,
+                            "gawd_creature_v1",
+                        ),
+                        artifact,
+                        reputation: None,
+                        quarantine: None,
+                    }],
+                }
+                .to_bytes(),
             }
-            .to_bytes(),
         };
-        assert_eq!(
-            f.handle(make_reply()).dispatches.len(),
-            1,
-            "first reply merges (one PublishInRealm)"
-        );
+        assert_eq!(f.handle(make_reply()).dispatches.len(), 1, "first reply merges (one Publish)");
         assert!(!f.has_pending_pull(), "pull resolved");
         assert!(f.handle(make_reply()).dispatches.is_empty(), "duplicate reply is a silent no-op");
     }
@@ -1791,7 +2007,7 @@ mod tests {
     fn signed_delta(seed: u8, score: f32) -> ReputationDelta {
         let k = key(seed);
         let mut d = ReputationDelta {
-            artifact_hash: "xhash".into(),
+            artifact_hash: artifact_hash(b"reputation-target"),
             realm: RealmId::new("crew"),
             score,
             observer_realm: RealmId::new("crew"),
@@ -1813,6 +2029,7 @@ mod tests {
     #[test]
     fn signed_reputation_delta_writes_attest_fitness_tagged_with_observer_realm() {
         let mut f = fed(0xD1);
+        let expected_hash = artifact_hash(b"reputation-target");
         let out = f.handle(seer_consensus_env(&signed_delta(0xEE, 0.95), 1));
         assert_eq!(out.dispatches.len(), 1);
         match parse_op(&out.dispatches[0]) {
@@ -1824,7 +2041,7 @@ mod tests {
                 signed_by,
                 signature,
             } => {
-                assert_eq!(artifact_hash, "xhash");
+                assert_eq!(artifact_hash, expected_hash);
                 assert_eq!(realm, RealmId::new("crew"));
                 assert_eq!(score, 0.95); // UnitWeigher: score * 1.0
                 assert_eq!(attesting_realm, Some(RealmId::new("crew")));
@@ -1864,6 +2081,30 @@ mod tests {
             "oversized claimed key must not be echoed to registry or proprioception"
         );
         assert_eq!(f.ingest_rejections().malformed, 1);
+        assert_eq!(
+            f.ingest_rejections().bad_signature,
+            0,
+            "shape rejection happens before the signature gate"
+        );
+    }
+
+    #[test]
+    fn malformed_reputation_delta_identity_is_rejected_without_echo_event() {
+        let mut f = fed(0xD1);
+        let mut bad_realm = signed_delta(0xEE, 0.95);
+        bad_realm.observer_realm = RealmId::new("bad:realm");
+        let mut nul_key = signed_delta(0xEE, 0.95);
+        nul_key.observer_key.push('\0');
+
+        for delta in [bad_realm, nul_key] {
+            let out = f.handle(seer_consensus_env(&delta, 1));
+
+            assert!(
+                out.dispatches.is_empty(),
+                "malformed claimed identity must not be echoed to registry or proprioception"
+            );
+        }
+        assert_eq!(f.ingest_rejections().malformed, 2);
         assert_eq!(
             f.ingest_rejections().bad_signature,
             0,
@@ -1957,7 +2198,7 @@ mod tests {
         // need a valid signature to prove the guard fires.
         let mut f = fed(0xDB);
         let body = serde_json::json!({
-            "artifact_hash": "h",
+            "artifact_hash": artifact_hash(b"reputation-target"),
             "realm": "crew",
             "score": 1e40,                 // overflows f32 → +∞ after `from_value::<ReputationDelta>`
             "observer_realm": "crew",
@@ -1991,9 +2232,10 @@ mod tests {
     #[test]
     fn federate_reputation_ships_signed_delta_on_seer_consensus_topic() {
         let mut f = fed(0xF1);
+        let hash = artifact_hash(b"reputation-target");
         let out = f.handle(control_env(
             FederatorMsg::FederateReputation {
-                artifact_hash: "xhash".into(),
+                artifact_hash: hash,
                 realm: RealmId::new("crew"),
                 score: 0.95,
                 peer_node: NodeId(PEER_NODE.into()),
@@ -2023,10 +2265,11 @@ mod tests {
     #[test]
     fn federate_quarantine_ships_notice_then_inbound_writes_mark_quarantine() {
         let mut f = fed(0xA9);
+        let hash = artifact_hash(b"quarantine-target");
         // Outbound: FederateQuarantine → a QuarantineNotice to the peer federator.
         let out = f.handle(control_env(
             FederatorMsg::FederateQuarantine {
-                artifact_hash: "bad".into(),
+                artifact_hash: hash.clone(),
                 realm: RealmId::new("crew"),
                 reason: "apoptosis".into(),
                 peer_node: NodeId(PEER_NODE.into()),
@@ -2048,7 +2291,7 @@ mod tests {
         let inbound = Envelope {
             header: header(Address::Creature(ME), SCHEMA, None),
             payload: FederatorMsg::QuarantineNotice {
-                artifact_hash: "bad".into(),
+                artifact_hash: hash.clone(),
                 realm: RealmId::new("crew"),
                 reason: "apoptosis on peer".into(),
                 attesting_peers: vec!["node-B".into()],
@@ -2058,7 +2301,7 @@ mod tests {
         let out = f.handle(inbound);
         match parse_op(&out.dispatches[0]) {
             RegistryOp::MarkQuarantine { artifact_hash, realm, .. } => {
-                assert_eq!(artifact_hash, "bad");
+                assert_eq!(artifact_hash, hash);
                 assert_eq!(realm, RealmId::new("crew"));
             }
             other => panic!("expected MarkQuarantine, got {other:?}"),
@@ -2070,7 +2313,7 @@ mod tests {
         let mut f = fed(0xAA);
         let out = f.handle(control_env(
             FederatorMsg::FederateQuarantine {
-                artifact_hash: "bad".into(),
+                artifact_hash: artifact_hash(b"quarantine-target"),
                 realm: RealmId::new("crew"),
                 reason: "x".repeat(MAX_QUARANTINE_REASON_BYTES + 1),
                 peer_node: NodeId(PEER_NODE.into()),
@@ -2099,7 +2342,7 @@ mod tests {
         let inbound = Envelope {
             header: header(Address::Creature(ME), SCHEMA, None),
             payload: FederatorMsg::QuarantineNotice {
-                artifact_hash: "bad".into(),
+                artifact_hash: artifact_hash(b"quarantine-target"),
                 realm: RealmId::new("crew"),
                 reason: "apoptosis on peer".into(),
                 attesting_peers: vec!["p".repeat(MAX_QUARANTINE_ATTESTING_PEER_BYTES + 1)],

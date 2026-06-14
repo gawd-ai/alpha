@@ -29,7 +29,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aether::{CreatureId, Deadline, NodeId, Role, StubSigner, StubVerifier};
+use aether::{
+    CreatureId, Deadline, Ed25519Signer, Ed25519Verifier, NodeId, Role, Signer, StubSigner,
+    StubVerifier, Verifier,
+};
 use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use sanctum::Kernel;
 
@@ -121,13 +124,34 @@ pub fn run(args: &[String]) {
         }
     };
 
+    // Remote mode joins a mesh, so the hub needs a real ed25519 identity — and the bus signer must
+    // be that same key so the peer can verify the hub's control envelopes under the pubkey it
+    // authenticated at the handshake. Local mode never leaves the process; the stub signer suffices.
+    let node_identity: Option<crate::node::NodeKeyBoot> = if opts.target.is_some() {
+        match crate::node::derive_node_key(opts.cluster_key.as_deref()) {
+            Ok(nk) => Some(nk),
+            Err(e) => {
+                eprintln!("alpha mcp: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    let (signer, verifier): (Arc<dyn Signer>, Arc<dyn Verifier>) = match &node_identity {
+        Some(nk) => (Arc::new(Ed25519Signer::new(nk.key.clone())), Arc::new(Ed25519Verifier)),
+        None => (Arc::new(StubSigner::new("mcp-hub")), Arc::new(StubVerifier)),
+    };
     let kernel = Arc::new(Kernel::new(
         vec![Arc::new(NativeEngine), Arc::new(WasmEngine::new()), Arc::new(ScriptEngine)],
-        Arc::new(StubSigner::new("mcp-hub")),
-        Arc::new(StubVerifier),
+        signer,
+        verifier,
         Arc::new(policy_dev::DevPolicy),
         1024,
     ));
+    if let Some(nk) = &node_identity {
+        kernel.set_node_identity(nk.key.public_hex().to_string());
+    }
 
     // Clean teardown on SIGINT/SIGTERM (the MCP host usually kills the hub at session end).
     {
@@ -147,7 +171,8 @@ pub fn run(args: &[String]) {
     let target = match &opts.target {
         // Remote mode: join the mesh, front the peer's control plane.
         Some((node, control_id)) => {
-            if let Err(e) = join_mesh(&kernel, &opts) {
+            let nk = node_identity.as_ref().expect("node identity derived in remote mode");
+            if let Err(e) = join_mesh(&kernel, &opts, nk) {
                 eprintln!("alpha mcp: could not join the mesh for remote control: {e}");
                 std::process::exit(1);
             }
@@ -199,27 +224,16 @@ pub fn run(args: &[String]) {
 
 /// Boot the `transport-tcp` organ in gossip mode and bind it to `Role::TRANSPORT`, dialing each
 /// `--seed`, so the hub joins the mesh and can reach a peer node's `Role::CONTROL` (remote mode).
-fn join_mesh(kernel: &Arc<Kernel>, opts: &Opts) -> Result<CreatureId, String> {
-    use sigil::{crypto, Ed25519KeyMaterial};
-
+fn join_mesh(
+    kernel: &Arc<Kernel>,
+    opts: &Opts,
+    nk: &crate::node::NodeKeyBoot,
+) -> Result<CreatureId, String> {
     let node_id = opts.node_id.clone().ok_or("--target (remote mode) requires --node-id <id>")?;
     let listen = opts.listen.clone().ok_or("--target (remote mode) requires --listen <addr>")?;
     if opts.seeds.is_empty() {
         return Err("--target (remote mode) requires at least one --seed to reach the peer".into());
     }
-
-    let seed: [u8; 32] = match &opts.cluster_key {
-        Some(hex) => {
-            let bytes = crypto::hex_decode(hex)
-                .filter(|b| b.len() == 32)
-                .ok_or("--cluster-key must be 64 hex chars (a 32-byte seed)")?;
-            let mut s = [0u8; 32];
-            s.copy_from_slice(&bytes);
-            s
-        }
-        None => crypto::fresh_seed()?,
-    };
-    let key = Ed25519KeyMaterial::from_seed(seed).map_err(|e| format!("hub key: {e}"))?;
 
     let mut peers = Vec::new();
     for s in &opts.seeds {
@@ -237,13 +251,14 @@ fn join_mesh(kernel: &Arc<Kernel>, opts: &Opts) -> Result<CreatureId, String> {
     }
 
     let cfg = transport_tcp::TransportConfig {
-        self_key: key,
+        self_key: nk.key.clone(),
         self_node: NodeId(node_id),
         listen_addr: listen.clone(),
         peers,
     };
+    // The boot-only attestation grant: the hub's transport stamps authenticated origins too.
     let transport = kernel
-        .load_instance(
+        .load_transport_instance(
             boot_manifest("transport-tcp"),
             Box::new(transport_tcp::TransportTcp::new(cfg).with_gossip(Some(listen))),
         )

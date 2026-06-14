@@ -17,8 +17,8 @@
 //! - `Watch { module, realm, artifact_hash }` — register the registry key a creature's fitness
 //!   should be promoted *to*. **Required**: a fitness event names only the numeric [`CreatureId`],
 //!   never the content address (the kernel can't — see the watch-map rationale below).
-//! - kernel `Fitness { module, ok }` events (schema `"fitness"`) — each increments
-//!   `handled` (and `ok` if the handle was useful) for that module.
+//! - kernel `Fitness { creature, ok }` events (schema `"fitness"`) — each increments
+//!   `handled` (and `ok` if the handle was useful) for that creature.
 //! - `Observe { module, ok, latency_ms? }` *(operator op)* — inject an observation directly. The
 //!   only path that can feed **latency** (the kernel's fitness event carries `ok` but no timing),
 //!   and the path an operator uses for a fully synthetic feed (a load test, a replayed trace).
@@ -63,7 +63,7 @@
 //!
 //! ## The anti-feedback truth (why the selector must NOT subscribe to FITNESS)
 //!
-//! The kernel publishes a `Fitness { module, ok }` event after **every** creature handles an
+//! The kernel publishes a `Fitness { creature, ok }` event after **every** creature handles an
 //! envelope — *including the selector itself*. So a drain-thread creature that subscribed directly
 //! to [`Topic::FITNESS`](aether::Topic::FITNESS) would feed on its own fitness events: handling one
 //! fitness envelope makes the kernel publish a new fitness event *for the selector*, which the
@@ -102,7 +102,7 @@ pub const SCHEMA: &str = "fitness.selector";
 /// The schema the kernel publishes its per-handle fitness event under (see `sanctum`'s
 /// `publish_fitness`). The selector matches inbound envelopes on this so a relay can forward a raw
 /// kernel fitness event to it verbatim. Mirrors the wire shape of `sanctum::Fitness`
-/// (`{"module":u64,"ok":bool}`) without depending on the kernel crate (modules never depend on the
+/// (`{"creature":u64,"ok":bool}`) without depending on the kernel crate (modules never depend on the
 /// kernel — the crate-layout rule); the integration test pins the shape by driving
 /// real kernel fitness events through the selector, so a drift in the kernel's event breaks the
 /// test rather than silently mis-parsing.
@@ -193,7 +193,7 @@ pub trait FitnessScorer: Send + Sync {
 /// the kernel crate, so the selector mirrors the wire shape rather than importing the type.
 #[derive(Clone, Debug, Deserialize)]
 struct FitnessEvent {
-    module: u64,
+    creature: u64,
     ok: bool,
 }
 
@@ -452,7 +452,7 @@ impl FitnessSelector {
         let Some(ev) = decode_sense_wire::<FitnessEvent>(&env.payload) else {
             return Outcome::none(); // R9: malformed event → drop, never panic.
         };
-        let mid = CreatureId(ev.module);
+        let mid = CreatureId(ev.creature);
         // Anti-feedback (see module docs): never aggregate our own fitness. Defense-in-depth — the
         // correct wiring is a passive relay that never forwards our id, but a mis-wiring degrades to
         // a dropped event here rather than a livelock.
@@ -695,6 +695,7 @@ mod tests {
             corr,
             commitment: None,
             schema: schema.into(),
+            origin: None,
         }
     }
 
@@ -707,7 +708,7 @@ mod tests {
 
     fn fitness_env(module: u64, ok: bool) -> Envelope {
         let payload =
-            serde_json::to_vec(&serde_json::json!({ "module": module, "ok": ok })).unwrap();
+            serde_json::to_vec(&serde_json::json!({ "creature": module, "ok": ok })).unwrap();
         Envelope { header: header(Address::Creature(ME), FITNESS_EVENT_SCHEMA, None), payload }
     }
 

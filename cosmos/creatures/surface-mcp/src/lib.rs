@@ -328,7 +328,8 @@ fn initialize_result(params: &Value) -> Value {
              a Verb envelope routed to Role::CONTROL, and the result rides back. The MCP \
              server is itself a headless Sanctum (a control-hub node). DEV posture: the target node's dev policy \
              admits everything and the bus signer is a stub; not a hardened deployment. Mutating tools \
-             (alpha_author, alpha_author_critter, alpha_load, alpha_registry_publish, alpha_send, \
+             (alpha_author, alpha_author_critter, alpha_load, alpha_registry_publish, \
+             alpha_registry_fetch_load, alpha_send, \
              alpha_intent, alpha_bind, alpha_unload, alpha_cluster_connect) are gated by the target \
              node's allow-AI switch, which a \
              human grants with `allow-ai on` at that node's REPL; while it is off they return an \
@@ -459,6 +460,7 @@ fn tool_list() -> Value {
         tool("alpha_registry_publish", "Publish a creature into the catalogue (the Bestiary) from a manifest + artifact already on the NODE's filesystem (same node-local caveat as alpha_load — not a client upload). Optional `realm` scopes the catalogue. Gated by allow-AI.", json!({ "type": "object", "properties": { "manifest_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES }, "artifact_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit for the local Realm." } }, "required": ["manifest_path", "artifact_path"], "additionalProperties": false }), false),
         tool("alpha_registry_fetch", "Look up a catalogue entry by artifact hash and return its manifest metadata (name, version, content_address) plus the artifact length — NOT the raw bytes. Optional `realm`. Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string", "maxLength": MAX_HASH_ARG_BYTES }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit for the local Realm." } }, "required": ["artifact_hash"], "additionalProperties": false }), true),
         tool("alpha_registry_list", "Snapshot the catalogue (the Bestiary): each entry's artifact hash, name, version, Realm, reputation, and quarantine flag. Optional `realm` scopes to one Realm; omit to list all. Read-only.", json!({ "type": "object", "properties": { "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit to list every Realm." } }, "additionalProperties": false }), true),
+        tool("alpha_registry_fetch_load", "Fetch a creature artifact over GX (bounded, resumable chunks) from a registry, integrity-check it, and LOAD it into this node. Omit `node` to fetch from the local registry; set `node` + `registry_id` to fetch from a peer over the cluster. Optional `realm`. A large transfer can take a while (the call blocks). Loads code → gated by allow-AI.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string", "maxLength": MAX_HASH_ARG_BYTES }, "node": { "type": "string", "maxLength": MAX_NODE_ARG_BYTES, "description": "Optional peer node-id; with registry_id, fetches cross-node over the cluster." }, "registry_id": { "type": "integer", "description": "The peer registry's creature id — required when `node` is set (registry addressing is node-local)." }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit for the local Realm." }, "chunk_size": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "description": "Optional GX chunk size; omit to let the registry choose." } }, "required": ["artifact_hash"], "additionalProperties": false }), false),
         tool("alpha_bestiary_prove", "Ask the durable Bestiary for a standalone, signed EntryProof attestation over (realm, artifact_hash) — survives compaction and is independently verifiable. Only a durable bestiary-daemon answers (the in-memory stub returns an error). Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string", "maxLength": MAX_HASH_ARG_BYTES }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES } }, "required": ["artifact_hash", "realm"], "additionalProperties": false }), true),
         tool("alpha_send", "Send a text message to a creature by creature id and read its reply. Add `node` to route to a creature on a peer node over the cluster. Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" }, "text": { "type": "string", "maxLength": MAX_TEXT_ARG_BYTES }, "node": { "type": "string", "maxLength": MAX_NODE_ARG_BYTES, "description": "Optional peer node-id — routes the send across the cluster." } }, "required": ["id", "text"], "additionalProperties": false }), false),
         tool("alpha_intent", "Express an intent on a Role (outcome + text) and read the reply from whatever creature is bound there. Gated by allow-AI.", json!({ "type": "object", "properties": { "outcome": { "type": "string", "maxLength": omni::MAX_CONTROL_ROLE_NAME_BYTES }, "text": { "type": "string", "maxLength": MAX_TEXT_ARG_BYTES } }, "required": ["outcome", "text"], "additionalProperties": false }), false),
@@ -540,6 +542,19 @@ fn dispatch(state: &SurfaceState, name: &str, args: &Value) -> (bool, Value) {
         "alpha_registry_list" => {
             (Verb::RegistryList { realm: oarg_realm(args, "realm") }, READ_TIMEOUT)
         }
+        "alpha_registry_fetch_load" => (
+            Verb::FetchLoad {
+                artifact_hash: sarg(args, "artifact_hash"),
+                node: args.get("node").and_then(Value::as_str).map(str::to_string),
+                registry_id: args.get("registry_id").and_then(Value::as_u64),
+                realm: oarg_realm(args, "realm"),
+                chunk_size: args
+                    .get("chunk_size")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
+            },
+            AUTHOR_TIMEOUT,
+        ),
         "alpha_bestiary_prove" => (
             Verb::BestiaryProve {
                 artifact_hash: sarg(args, "artifact_hash"),
@@ -592,6 +607,7 @@ fn dispatch(state: &SurfaceState, name: &str, args: &Value) -> (bool, Value) {
 enum ArgType {
     String,
     U64,
+    U32,
     Bool,
 }
 
@@ -600,6 +616,7 @@ impl ArgType {
         match self {
             ArgType::String => "string",
             ArgType::U64 => "non-negative integer",
+            ArgType::U32 => "integer in u32 range",
             ArgType::Bool => "boolean",
         }
     }
@@ -607,6 +624,7 @@ impl ArgType {
         match self {
             ArgType::String => v.is_string(),
             ArgType::U64 => v.as_u64().is_some(),
+            ArgType::U32 => v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()),
             ArgType::Bool => v.is_boolean(),
         }
     }
@@ -626,6 +644,10 @@ impl ArgSpec {
 
     const fn u64(name: &'static str, required: bool) -> Self {
         Self { name, ty: ArgType::U64, required, max_bytes: None }
+    }
+
+    const fn u32(name: &'static str, required: bool) -> Self {
+        Self { name, ty: ArgType::U32, required, max_bytes: None }
     }
 
     const fn bool(name: &'static str, required: bool) -> Self {
@@ -650,6 +672,13 @@ const ARGS_REGISTRY_FETCH: &[ArgSpec] = &[
     ArgSpec::string("realm", false, MAX_REALM_ARG_BYTES),
 ];
 const ARGS_REGISTRY_LIST: &[ArgSpec] = &[ArgSpec::string("realm", false, MAX_REALM_ARG_BYTES)];
+const ARGS_REGISTRY_FETCH_LOAD: &[ArgSpec] = &[
+    ArgSpec::string("artifact_hash", true, MAX_HASH_ARG_BYTES),
+    ArgSpec::string("node", false, MAX_NODE_ARG_BYTES),
+    ArgSpec::u64("registry_id", false),
+    ArgSpec::string("realm", false, MAX_REALM_ARG_BYTES),
+    ArgSpec::u32("chunk_size", false),
+];
 const ARGS_BESTIARY_PROVE: &[ArgSpec] = &[
     ArgSpec::string("artifact_hash", true, MAX_HASH_ARG_BYTES),
     ArgSpec::string("realm", true, MAX_REALM_ARG_BYTES),
@@ -690,6 +719,7 @@ fn known_tool(name: &str) -> bool {
             | "alpha_registry_publish"
             | "alpha_registry_fetch"
             | "alpha_registry_list"
+            | "alpha_registry_fetch_load"
             | "alpha_bestiary_prove"
             | "alpha_send"
             | "alpha_intent"
@@ -709,6 +739,7 @@ fn arg_specs(name: &str) -> &'static [ArgSpec] {
         "alpha_registry_publish" => ARGS_REGISTRY_PUBLISH,
         "alpha_registry_fetch" => ARGS_REGISTRY_FETCH,
         "alpha_registry_list" => ARGS_REGISTRY_LIST,
+        "alpha_registry_fetch_load" => ARGS_REGISTRY_FETCH_LOAD,
         "alpha_bestiary_prove" => ARGS_BESTIARY_PROVE,
         "alpha_send" => ARGS_SEND,
         "alpha_intent" => ARGS_INTENT,
@@ -872,6 +903,21 @@ mod tests {
         assert!(err.contains("artifact_hash"), "names the field: {err}");
         assert!(err.contains("exceeds"), "explains the byte cap: {err}");
         assert!(err.contains(&MAX_HASH_ARG_BYTES.to_string()), "reports the cap: {err}");
+    }
+
+    #[test]
+    fn validate_args_rejects_fetch_load_chunk_size_above_u32() {
+        let err = validate_args(
+            "alpha_registry_fetch_load",
+            &json!({
+                "artifact_hash": "a".repeat(64),
+                "chunk_size": u64::from(u32::MAX) + 1,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("chunk_size"), "names the field: {err}");
+        assert!(err.contains("u32"), "explains the range: {err}");
     }
 
     #[test]

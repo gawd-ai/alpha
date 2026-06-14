@@ -358,10 +358,10 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
 
     // --- Phase 2 — publish into the durable Bestiary + a verifiable proof -------------------------
     banner("Phase 2 · Into the durable Bestiary — publish, then prove");
-    let op = RegistryOp::PublishInRealm {
+    let op = RegistryOp::Publish {
         manifest: manifest_for_pub,
         artifact: artifact_for_pub,
-        realm: realm.clone(),
+        realm: Some(realm.clone()),
     };
     corr += 1;
     let env = request_reply(
@@ -380,8 +380,8 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
     .ok_or("no publish reply from the durable registry")?;
     let artifact_hash =
         match serde_json::from_slice::<RegistryReply>(&env.payload).map_err(|e| e.to_string())? {
-            RegistryReply::PublishedInRealm { artifact_hash, .. } => artifact_hash,
-            other => return Err(format!("expected PublishedInRealm, got {other:?}")),
+            RegistryReply::Published { artifact_hash, .. } => artifact_hash,
+            other => return Err(format!("expected Published, got {other:?}")),
         };
     ok(&format!(
         "published into Realm `{}` — a signed on-disk log + a content-addressed blob ({}…)",

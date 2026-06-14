@@ -290,6 +290,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: SCHEMA_SEER.to_string(),
+                origin: None,
             },
             payload,
         }

@@ -92,7 +92,7 @@ fn wait_for_peer_event(rx: &InboxReceiver, peer: &str, event: &str, budget: Dura
 }
 
 /// Send a registry op to `to` and wait for the `registry.reply` matching `corr`. Used both for
-/// driving (PublishInRealm via the federator is internal; here the probe reads) and for polling.
+/// driving (the federator's realm-scoped Publish is internal; here the probe reads) and for polling.
 fn registry_roundtrip(
     bus: &BusHandle,
     rx: &InboxReceiver,

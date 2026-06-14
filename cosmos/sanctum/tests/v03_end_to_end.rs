@@ -451,7 +451,7 @@ fn v03_end_to_end_loop_proves_m9_m10_m11_m12_compose() {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if v.get("module").and_then(|m| m.as_u64()) == Some(reverse_id.0) {
+                if v.get("creature").and_then(|m| m.as_u64()) == Some(reverse_id.0) {
                     relay_bus
                         .send(
                             Dispatch::to(Address::Creature(selector_id), env.payload.clone())
@@ -525,7 +525,7 @@ fn v03_end_to_end_loop_proves_m9_m10_m11_m12_compose() {
             .send(
                 Dispatch::to(
                     Address::Creature(registry_dst_id),
-                    serde_json::to_vec(&RegistryOp::PublishInRealm {
+                    serde_json::to_vec(&RegistryOp::Publish {
                         manifest: Manifest::new(
                             "specimen",
                             "0.1.0",
@@ -533,7 +533,7 @@ fn v03_end_to_end_loop_proves_m9_m10_m11_m12_compose() {
                             "gawd_creature_v1",
                         ),
                         artifact: b"specimen-artifact-bytes".to_vec(),
-                        realm: realm.clone(),
+                        realm: Some(realm.clone()),
                     })
                     .unwrap(),
                 )
@@ -546,7 +546,7 @@ fn v03_end_to_end_loop_proves_m9_m10_m11_m12_compose() {
             &rx,
             930,
             |e| match serde_json::from_slice::<RegistryReply>(&e.payload).ok()? {
-                RegistryReply::PublishedInRealm { artifact_hash, .. } => Some(artifact_hash),
+                RegistryReply::Published { artifact_hash, .. } => Some(artifact_hash),
                 _ => None,
             },
             scaled(Duration::from_secs(3)),
@@ -597,7 +597,7 @@ fn v03_end_to_end_loop_proves_m9_m10_m11_m12_compose() {
     // Inject a hard budget breach for the specimen on the PROPRIOCEPTION topic (the test stands in
     // for the engine that would emit it on a real breach — same wire).
     let signal = BudgetSignalEvent {
-        module: specimen_id.0,
+        creature: specimen_id.0,
         level: "hard".into(),
         kind: "fuel".into(),
         vector: BudgetVector {

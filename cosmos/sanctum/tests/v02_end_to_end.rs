@@ -9,9 +9,9 @@
 //! 1. **Author + build on A.** `agent-templated` produces source + manifest stub from a
 //!    natural-language request; `build-cargo` compiles, signs, and returns an admissible
 //!    `(manifest, artifact)`. Unchanged from `v01_end_to_end`.
-//! 2. **PublishInRealm on A.** A's `registry-mem` indexes the artifact under realm `"v02-wrap"`
-//!    via the Realm-graned op variant — proves the Realm grain is honored by the publish path.
-//! 3. **FetchInRealm from B across the wire.** B's probe issues `FetchInRealm` for
+//! 2. **Realm-scoped publish on A.** A's `registry-mem` indexes the artifact under realm `"v02-wrap"`
+//!    via `Publish { realm: Some(..) }` — proves the Realm grain is honored by the publish path.
+//! 3. **Realm-scoped fetch from B across the wire.** B's probe issues `Fetch { realm: Some(..) }` for
 //!    `(artifact_hash, "v02-wrap")` addressed at `Node(A, registry_a)`; A's transport delivers
 //!    locally; A's registry replies via `reply_to` (rewritten by the transport so the reply ships
 //!    back); B's transport delivers it. **Real ed25519 handshake; real sha256 integrity check.**
@@ -205,7 +205,7 @@ fn retry_until_reply(
         let want = d.corr; // accept only the reply correlated to THIS request
         let _ = bus.send(d);
         // Corr-filter within the attempt window: a slow cross-node straggler from a *prior* step
-        // (e.g. a `FetchedInRealm` that arrives after the inter-step drain) must not be misread as
+        // (e.g. a realm-scoped `Fetched` that arrives after the inter-step drain) must not be misread as
         // this request's reply. Without this, the next read races that straggler — green in isolation
         // (the reply lands inside the drain window), flaky under full-suite load. Mirrors the
         // corr-filtering `recv_corr`/`request_reply` helpers in `omni` and walkthrough.
@@ -226,7 +226,7 @@ fn retry_until_reply(
 }
 
 // (No `wait_for_peer_event` helper here. Phase 1 demonstrably crosses the wire — the
-// FetchInRealm round-trip can't have succeeded otherwise — so by the time Phase 2 builds the
+// realm-scoped fetch round-trip can't have succeeded otherwise — so by the time Phase 2 builds the
 // distributor + advertisers, the handshake's been up for seconds. We use a brief settle delay
 // in step 12 instead. If a future change makes Phase 1 not exercise the wire, restore the helper
 // from `distributor_cross_node.rs`.)
@@ -468,14 +468,14 @@ fn v02_end_to_end_loop_proves_v01_plus_m6_m7_m8_compose() {
         "build_hash must match the sha256 of the artifact bytes",
     );
 
-    // -- step 3: PublishInRealm on A --
+    // -- step 3: realm-scoped publish on A --
     // The Realm-graned op variant: same publish path, plus a Realm grain. The test publishes under
     // realm "v02-wrap"; step 4 below proves a plain Fetch (implicit "local") does NOT see it.
     let realm_v02 = RealmId::new(REALM_V02_WRAP);
-    let publish_op = RegistryOp::PublishInRealm {
+    let publish_op = RegistryOp::Publish {
         manifest: built_manifest.clone(),
         artifact: built_artifact.clone(),
-        realm: realm_v02.clone(),
+        realm: Some(realm_v02.clone()),
     };
     let publish_payload = serde_json::to_vec(&publish_op).unwrap();
     a.probe_bus
@@ -489,17 +489,17 @@ fn v02_end_to_end_loop_proves_v01_plus_m6_m7_m8_compose() {
         recv_with_corr(&a.probe_rx, 3, scaled(Duration::from_secs(5))).expect("publish reply");
     let pub_reply: RegistryReply = serde_json::from_slice(&pub_env.payload).unwrap();
     let artifact_hash = match pub_reply {
-        RegistryReply::PublishedInRealm { artifact_hash, realm } => {
-            assert_eq!(realm, realm_v02, "M8 echoes the Realm the publish landed in");
+        RegistryReply::Published { artifact_hash, realm } => {
+            assert_eq!(realm, realm_v02, "the reply echoes the Realm the publish landed in");
             artifact_hash
         }
-        other => panic!("expected PublishedInRealm, got {other:?}"),
+        other => panic!("expected Published, got {other:?}"),
     };
     assert_eq!(artifact_hash, expected_artifact_hash);
 
-    // -- step 4: FetchInRealm from B across the wire (proves the Realm grain works cross-node) --
+    // -- step 4: realm-scoped fetch from B across the wire (proves the Realm grain works cross-node) --
     let fetch_in_realm =
-        RegistryOp::FetchInRealm { artifact_hash: artifact_hash.clone(), realm: realm_v02.clone() };
+        RegistryOp::Fetch { artifact_hash: artifact_hash.clone(), realm: Some(realm_v02.clone()) };
     let fetch_payload = serde_json::to_vec(&fetch_in_realm).unwrap();
     let fetch_env = retry_until_reply(
         &b.probe_bus,
@@ -512,15 +512,15 @@ fn v02_end_to_end_loop_proves_v01_plus_m6_m7_m8_compose() {
         scaled(Duration::from_millis(500)),
         20,
     )
-    .expect("FetchInRealm reply arrives from A across the wire");
+    .expect("realm-scoped fetch reply arrives from A across the wire");
     assert_eq!(fetch_env.header.corr, Some(4), "corr preserved across the wire");
     let fetch_reply: RegistryReply = serde_json::from_slice(&fetch_env.payload).unwrap();
     let (m_fetched, art_fetched) = match fetch_reply {
-        RegistryReply::FetchedInRealm { manifest, artifact, realm } => {
-            assert_eq!(realm, realm_v02, "M8 echoes the Realm on the FetchInRealm reply");
+        RegistryReply::Fetched { manifest, artifact, realm } => {
+            assert_eq!(realm, realm_v02, "the reply echoes the Realm on the realm-scoped fetch");
             (manifest, artifact)
         }
-        other => panic!("expected FetchedInRealm, got {other:?}"),
+        other => panic!("expected Fetched, got {other:?}"),
     };
     assert_eq!(m_fetched, built_manifest, "fetched manifest matches what A published");
     assert_eq!(art_fetched, built_artifact, "fetched artifact bytes match what A published");
@@ -534,7 +534,7 @@ fn v02_end_to_end_loop_proves_v01_plus_m6_m7_m8_compose() {
     // RealmId::local()) does not see the entry published under "v02-wrap". The default behavior
     // for a plain Fetch is preserved (it only looks in "local"); the Realm-tagged entry lives in a
     // different catalog and is unreachable without the realm filter.
-    let fetch_v01_shape = RegistryOp::Fetch { artifact_hash: artifact_hash.clone() };
+    let fetch_v01_shape = RegistryOp::Fetch { artifact_hash: artifact_hash.clone(), realm: None };
     let fetch_v01_payload = serde_json::to_vec(&fetch_v01_shape).unwrap();
     let fetch_v01_env = retry_until_reply(
         &b.probe_bus,

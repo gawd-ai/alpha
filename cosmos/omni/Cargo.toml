@@ -36,6 +36,9 @@ registry-mem = { path = "../creatures/registry-mem" }
 # A leaf/contract crate (no creature edge), so the control core can name the wire without pulling a
 # registry creature.
 bestiary = { path = "../bestiary" }
+# The GX transfer primitives (TransferPlan + ChunkAssembler) the `registry fetch-load` verb drives to
+# pull a large artifact in bounded chunks, assemble + verify it, and admit it. A leaf crate.
+gawdxfer = { path = "../gawdxfer" }
 transport-tcp = { path = "../creatures/transport-tcp" }
 monitor = { path = "../creatures/prototypes/monitor" }
 serde = { workspace = true }

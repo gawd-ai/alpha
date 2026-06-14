@@ -1178,6 +1178,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: msg.to_bytes(),
         }
@@ -1262,6 +1263,7 @@ mod tests {
                 corr: Some(77),
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: vec![b'{'; max_message_bytes + 1],
         };
@@ -1500,6 +1502,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: MigratorMsg::RestoreRequest { snapshot, note, challenge }.to_bytes(),
         }
@@ -1560,6 +1563,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: MigratorMsg::RestoreResponse {
                 admitted,
@@ -2103,6 +2107,7 @@ mod tests {
                 corr: Some(7000),
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: MigratorMsg::RestoreRequest { snapshot, note: None, challenge }.to_bytes(),
         };
@@ -2175,6 +2180,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: b"{not json".to_vec(),
         };
@@ -2197,6 +2203,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "some.other.schema".into(),
+                origin: None,
             },
             payload: MigratorMsg::StatusQuery.to_bytes(),
         };

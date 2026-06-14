@@ -197,7 +197,7 @@ fn fitness_promotion_local_real_signal_drives_a_signed_promotion() {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if v.get("module").and_then(|m| m.as_u64()) == Some(target_id.0) {
+                if v.get("creature").and_then(|m| m.as_u64()) == Some(target_id.0) {
                     relay_bus
                         .send(
                             Dispatch::to(Address::Creature(selector_id), env.payload.clone())

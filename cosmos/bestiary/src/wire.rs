@@ -31,6 +31,22 @@ pub const MAX_QUARANTINE_REASON_BYTES: usize = 1024;
 pub const MAX_QUARANTINE_ATTESTING_PEERS: usize = 64;
 /// Maximum bytes retained for one quarantine attesting-peer id.
 pub const MAX_QUARANTINE_ATTESTING_PEER_BYTES: usize = 256;
+/// Lowercase SHA-256 hex bytes in a registry artifact key.
+pub const ARTIFACT_HASH_HEX_BYTES: usize = 64;
+
+/// Validate an artifact hash before using it as a content-addressed registry key.
+#[must_use]
+pub fn artifact_hash_shape_error(artifact_hash: &str) -> Option<String> {
+    if artifact_hash.len() != ARTIFACT_HASH_HEX_BYTES {
+        return Some(format!(
+            "artifact_hash must be {ARTIFACT_HASH_HEX_BYTES} lowercase hex bytes"
+        ));
+    }
+    if !artifact_hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Some("artifact_hash must be lowercase hex".to_string());
+    }
+    None
+}
 
 /// One catalog row.
 ///
@@ -113,6 +129,57 @@ impl ReputationScore {
         ReputationScore { score, attesting_realm, signed_by: None, signature: None }
     }
 
+    /// Validate a complete `AttestFitness` signal before a registry filling retains or persists it.
+    ///
+    /// This is a shape/pressure guard only. It does not decide whether a signer is trusted, nor does
+    /// it alter [`promotion_payload`](Self::promotion_payload); admission policy owns trust roots.
+    pub fn attest_shape_error(&self, artifact_hash: &str, realm: &RealmId) -> Option<String> {
+        if artifact_hash.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
+            return Some(format!(
+                "reputation artifact_hash too large: {} bytes exceeds {} byte limit",
+                artifact_hash.len(),
+                MAX_REGISTRY_SIGNAL_FIELD_BYTES
+            ));
+        }
+        if artifact_hash.contains('\0') {
+            return Some("reputation artifact_hash contains NUL byte".to_string());
+        }
+        if !realm.is_valid() || realm.0.contains('\0') {
+            return Some("reputation realm is not a valid RealmId".to_string());
+        }
+        if realm.0.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
+            return Some(format!(
+                "reputation realm too large: {} bytes exceeds {} byte limit",
+                realm.0.len(),
+                MAX_REGISTRY_SIGNAL_FIELD_BYTES
+            ));
+        }
+        if !self.score.is_finite() {
+            return Some("reputation score is non-finite".to_string());
+        }
+        if let Some(attesting_realm) = &self.attesting_realm {
+            if !attesting_realm.is_valid() || attesting_realm.0.contains('\0') {
+                return Some("reputation attesting_realm is not a valid RealmId".to_string());
+            }
+            if attesting_realm.0.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
+                return Some(format!(
+                    "reputation attesting_realm too large: {} bytes exceeds {} byte limit",
+                    attesting_realm.0.len(),
+                    MAX_REGISTRY_SIGNAL_FIELD_BYTES
+                ));
+            }
+        }
+        match (&self.signed_by, &self.signature) {
+            (None, None) => None,
+            (Some(key), Some(sig)) => signed_promotion_field_shape_error("signed_by", key)
+                .or_else(|| signed_promotion_field_shape_error("signature", sig)),
+            _ => Some(
+                "reputation promotion signature fields must be both present or both absent"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// The canonical bytes a promotion signature commits to: the `(artifact_hash, realm, score,
     /// attesting_realm)` claim, *excluding* the signature/signer themselves (which aren't part of
     /// what's being attested). Binding `artifact_hash` + `realm` stops a signature from being
@@ -156,6 +223,23 @@ impl ReputationScore {
             _ => false,
         }
     }
+}
+
+fn signed_promotion_field_shape_error(field: &str, value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some(format!("reputation {field} is empty"));
+    }
+    if value.len() > MAX_REGISTRY_SIGNAL_FIELD_BYTES {
+        return Some(format!(
+            "reputation {field} too large: {} bytes exceeds {} byte limit",
+            value.len(),
+            MAX_REGISTRY_SIGNAL_FIELD_BYTES
+        ));
+    }
+    if value.contains('\0') {
+        return Some(format!("reputation {field} contains NUL byte"));
+    }
+    None
 }
 
 /// A reversible quarantine marker (the immune-response is the responder). **T5: reversible** —
@@ -247,7 +331,8 @@ impl QuarantineNotice {
 /// federator needs to merge the entry into its own registry without a follow-up fetch: the key
 /// `(realm, artifact_hash)`, the full manifest + artifact bytes (admission re-verifies on load —
 /// T2), and the two optional signals. The federator that pulls these re-publishes each via the
-/// [`RegistryOp::PublishInRealm`] write path, so the registry keeps one ingestion path.
+/// [`RegistryOp::Publish`] write path (with `realm: Some(..)`), so the registry keeps one ingestion
+/// path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncEntry {
     pub artifact_hash: String,
@@ -263,57 +348,111 @@ pub struct SyncEntry {
 
 /// What a caller asks the registry to do. Envelope payload = `serde_json::to_vec(&RegistryOp)`.
 ///
-/// ### Two variant families
+/// ### Realm grain
 ///
-/// **Realm-implicit variants** (`Publish` / `Fetch` / `FetchMetadata`) carry no Realm and operate
-/// in the `"local"` Realm. **Realm-explicit variants** (`PublishInRealm` / `FetchInRealm` /
-/// `FetchMetadataInRealm`) add the Realm grain explicitly. A Realm-aware caller picks the explicit
-/// variant; the wire `"op"` tag disambiguates.
+/// The full-artifact ops (`Publish` / `Fetch` / `FetchMetadata`) carry an optional
+/// `realm: Option<RealmId>`: `None` — the field elides from the wire — operates in
+/// [`RealmId::local()`]; `Some(r)` scopes to a named Realm. The store keys by
+/// `(realm, artifact_hash)`, so identical bytes in two Realms are two distinct entries that never
+/// collide.
 ///
-/// Splitting into separate variants (rather than adding an optional field) is the choice that
-/// honors the "zero retrofits" rule. Adding a field to a struct variant breaks every Rust struct
-/// literal at compile time — even when the wire bytes stay compatible via
-/// `skip_serializing_if`. Variants are forever additive.
+/// The GX bulk-transfer ops keep their explicit `*InRealm` split (a separate, parallel-owned
+/// shape); only these small full-artifact ops fold the Realm into one optional field.
+// `Publish` carries a full `Manifest` (~½ KiB) while every other variant is small; collapsing the
+// old `PublishInRealm` twin (0.4.1) left it the sole large variant. This is a deserialize-target wire
+// enum — it is decoded into owned values, never copied by value on a hot path — so the size delta is
+// not worth boxing the manifest through every publish handler.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RegistryOp {
-    /// Treats the entry as living in [`RealmId::local()`] — the Realm-implicit publish.
+    /// Publish an artifact + manifest. `realm: None` (the field elides from the wire) treats the
+    /// entry as living in [`RealmId::local()`]; `Some(r)` scopes it to a named Realm.
     Publish {
         manifest: Manifest,
         #[serde(with = "sigil::crypto::hex_bytes")]
         artifact: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        realm: Option<RealmId>,
     },
-    /// Looks in [`RealmId::local()`].
+    /// Fetch an artifact by content-address key. `realm: None` looks in [`RealmId::local()`];
+    /// `Some(r)` looks in that Realm and returns [`RegistryReply::NotFound`] if the
+    /// `(realm, artifact_hash)` key is absent, even if the same hash exists in another Realm.
     Fetch {
         /// `sha256(artifact_bytes)` hex — the registry's content-address key. Equals
         /// `provenance.build_hash` for a signed manifest. **Not the same** as
         /// [`Manifest::content_address`](sigil::Manifest::content_address); see this
         /// module's docs.
         artifact_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        realm: Option<RealmId>,
     },
-    /// Looks in [`RealmId::local()`] and returns only catalog metadata plus artifact length. Unlike
-    /// [`Fetch`](Self::Fetch), this never returns artifact bytes; it is the control/operator lookup
-    /// path.
+    /// Looks in [`RealmId::local()`] and returns a GX transfer plan plus manifest, then streams the
+    /// artifact as raw `gx.chunk` frames on the transport chunk lane.
+    FetchGx {
+        /// `sha256(artifact_bytes)` hex — the registry's content-address key.
+        artifact_hash: String,
+        /// Requested GX chunk size. `None` lets the registry use the shared default. Implementations
+        /// may clamp this to their artifact-shipping bounds before returning the transfer plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_size: Option<u32>,
+    },
+    /// Looks in [`RealmId::local()`] and returns only the GX transfer plan plus manifest. The caller
+    /// then pulls individual chunks with [`FetchGxChunk`](Self::FetchGxChunk), which enables
+    /// backpressure and resume without inventing another artifact transfer wire.
+    FetchGxPlan {
+        /// `sha256(artifact_bytes)` hex — the registry's content-address key.
+        artifact_hash: String,
+        /// Requested GX chunk size. `None` lets the registry use the shared default. Implementations
+        /// may clamp this to their artifact-shipping bounds before returning the transfer plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_size: Option<u32>,
+    },
+    /// Pull one GX chunk from a prior transfer plan. Successful replies are raw
+    /// `transport.gx.chunk` dispatches addressed to the requester; errors use
+    /// [`RegistryReply::Error`] or [`RegistryReply::NotFound`].
+    FetchGxChunk {
+        /// `sha256(artifact_bytes)` hex — the registry's content-address key.
+        artifact_hash: String,
+        /// Transfer id returned by [`FetchGxPlan`](Self::FetchGxPlan) or
+        /// [`FetchGx`](Self::FetchGx). It is echoed into the raw GX chunk frame.
+        transfer_id: String,
+        /// Chunk size returned by the plan. Implementations clamp this through the same GX bounds
+        /// they used for the plan.
+        chunk_size: u32,
+        /// Zero-based chunk index to send.
+        chunk_index: u32,
+    },
+    /// Return only catalog metadata plus artifact length — never artifact bytes; the control/operator
+    /// lookup path. `realm: None` looks in [`RealmId::local()`]; `Some(r)` scopes to that Realm.
     FetchMetadata {
         /// `sha256(artifact_bytes)` hex — the registry's content-address key.
         artifact_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        realm: Option<RealmId>,
     },
-    /// Publish into a named Realm. Two creatures with identical artifact bytes in
-    /// different Realms are stored under distinct `(realm, artifact_hash)` keys and do not
-    /// collide.
-    PublishInRealm {
-        manifest: Manifest,
-        #[serde(with = "sigil::crypto::hex_bytes")]
-        artifact: Vec<u8>,
+    /// Realm-explicit GX fetch. See [`FetchGx`](Self::FetchGx).
+    FetchGxInRealm {
+        artifact_hash: String,
         realm: RealmId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_size: Option<u32>,
     },
-    /// Fetch from a named Realm — returns [`RegistryReply::NotFound`] if the
-    /// `(realm, artifact_hash)` key is absent, even if the same hash exists in another Realm.
-    FetchInRealm { artifact_hash: String, realm: RealmId },
-    /// Fetch metadata from a named Realm — returns [`RegistryReply::NotFound`] if the
-    /// `(realm, artifact_hash)` key is absent. Unlike [`FetchInRealm`](Self::FetchInRealm), this
-    /// never returns artifact bytes.
-    FetchMetadataInRealm { artifact_hash: String, realm: RealmId },
+    /// Realm-explicit plan-only GX fetch. See [`FetchGxPlan`](Self::FetchGxPlan).
+    FetchGxPlanInRealm {
+        artifact_hash: String,
+        realm: RealmId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_size: Option<u32>,
+    },
+    /// Realm-explicit single-chunk GX pull. See [`FetchGxChunk`](Self::FetchGxChunk).
+    FetchGxChunkInRealm {
+        artifact_hash: String,
+        realm: RealmId,
+        transfer_id: String,
+        chunk_size: u32,
+        chunk_index: u32,
+    },
     /// Attach/replace a reputation score on an existing `(realm, artifact_hash)`
     /// entry. Reply: [`RegistryReply::Attested`] on success, [`RegistryReply::NotFound`] if the
     /// entry is absent (attest the artifact you hold; the federator publishes first, then attests).
@@ -360,39 +499,51 @@ pub enum RegistryOp {
 
 /// What the registry sends back. Envelope payload = `serde_json::to_vec(&RegistryReply)`.
 ///
-/// The Realm-implicit reply variants (`Published` / `Fetched`) pair with the Realm-implicit full
-/// artifact ops; `PublishedInRealm` / `FetchedInRealm` pair with the Realm-explicit full artifact
-/// ops. Metadata fetch uses [`RegistryReply::FetchedMetadata`] for both implicit and explicit ops
-/// because the embedded [`CatalogEntry`] carries the resolved Realm.
+/// `Published` / `Fetched` always echo the resolved `realm` — the concrete Realm the op landed in
+/// ([`RealmId::local()`] when the op omitted it) — so a caller can confirm which catalog was
+/// touched. Metadata fetch uses [`RegistryReply::FetchedMetadata`], whose embedded
+/// [`CatalogEntry`] carries the resolved Realm.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum RegistryReply {
-    /// Reply to [`RegistryOp::Publish`].
+    /// Reply to [`RegistryOp::Publish`] — echoes the resolved Realm the entry landed in.
     Published {
         /// The artifact-bytes hash (`sha256(artifact)` hex) the registry indexed this entry under.
         /// See the field docs on [`RegistryOp::Fetch`] for the naming rationale.
         artifact_hash: String,
+        realm: RealmId,
     },
-    /// Reply to [`RegistryOp::Fetch`].
+    /// Reply to [`RegistryOp::Fetch`] — echoes the resolved Realm the entry was read from.
     Fetched {
         manifest: Manifest,
         #[serde(with = "sigil::crypto::hex_bytes")]
         artifact: Vec<u8>,
-    },
-    /// Reply to [`RegistryOp::PublishInRealm`] — echoes the Realm so the caller can
-    /// confirm which catalog was touched.
-    PublishedInRealm {
-        artifact_hash: String,
         realm: RealmId,
     },
-    /// Reply to [`RegistryOp::FetchInRealm`].
-    FetchedInRealm {
+    /// Reply to [`RegistryOp::FetchGx`] / [`RegistryOp::FetchGxPlan`]. Carries the manifest and
+    /// transfer plan. `FetchGx` compatibility streams chunks after this reply; `FetchGxPlan`
+    /// leaves chunk pacing to [`RegistryOp::FetchGxChunk`].
+    FetchedGx {
         manifest: Manifest,
-        #[serde(with = "sigil::crypto::hex_bytes")]
-        artifact: Vec<u8>,
+        artifact_hash: String,
+        transfer_id: String,
+        file_size: u64,
+        file_hash: String,
+        chunk_size: u32,
+        total_chunks: u32,
+    },
+    /// Reply to [`RegistryOp::FetchGxInRealm`] / [`RegistryOp::FetchGxPlanInRealm`].
+    FetchedGxInRealm {
+        manifest: Manifest,
+        artifact_hash: String,
+        transfer_id: String,
+        file_size: u64,
+        file_hash: String,
+        chunk_size: u32,
+        total_chunks: u32,
         realm: RealmId,
     },
-    /// Reply to [`RegistryOp::FetchMetadata`] / [`RegistryOp::FetchMetadataInRealm`].
+    /// Reply to [`RegistryOp::FetchMetadata`] (Realm-implicit or `realm: Some(..)`).
     FetchedMetadata {
         entry: CatalogEntry,
         artifact_len: usize,
@@ -482,24 +633,98 @@ mod tests {
         assert!(!ReputationScore::unsigned(0.95, attesting).promotion_verifies(hash, &realm, &v));
     }
 
-    /// **Wire tags + optional-field elision are locked.** The op `"op"` tags are stable and the
-    /// optional promotion-signature fields elide when `None`, so an unsigned `AttestFitness` carries
-    /// no signature bytes (zero-retrofit guarantee).
+    #[test]
+    fn artifact_hash_shape_validator_requires_lowercase_sha256_hex() {
+        assert!(artifact_hash_shape_error(&"a".repeat(ARTIFACT_HASH_HEX_BYTES)).is_none());
+        let err = artifact_hash_shape_error("abc").expect("short hash rejected");
+        assert!(err.contains("64 lowercase hex"));
+        let err =
+            artifact_hash_shape_error(&"A".repeat(ARTIFACT_HASH_HEX_BYTES)).expect("case rejected");
+        assert!(err.contains("lowercase hex"));
+        let err = artifact_hash_shape_error("../escape").expect("path-like hash rejected");
+        assert!(err.contains("64 lowercase hex"));
+    }
+
+    #[test]
+    fn reputation_score_shape_validator_caps_signal_fields() {
+        let rep = ReputationScore::unsigned(0.95, Some(RealmId::new("crew")));
+        assert!(rep.attest_shape_error("h", &RealmId::new("crew")).is_none());
+
+        let err = rep
+            .attest_shape_error(
+                &"h".repeat(MAX_REGISTRY_SIGNAL_FIELD_BYTES + 1),
+                &RealmId::new("crew"),
+            )
+            .expect("oversized key rejected");
+        assert!(err.contains("artifact_hash too large"));
+
+        let err =
+            rep.attest_shape_error("bad\0hash", &RealmId::new("crew")).expect("NUL key rejected");
+        assert!(err.contains("artifact_hash contains NUL"));
+
+        let err = rep
+            .attest_shape_error("h", &RealmId::new("bad:realm"))
+            .expect("invalid realm rejected");
+        assert!(err.contains("realm is not a valid RealmId"));
+
+        let err = ReputationScore::unsigned(f32::INFINITY, None)
+            .attest_shape_error("h", &RealmId::new("crew"))
+            .expect("non-finite score rejected");
+        assert!(err.contains("non-finite"));
+
+        let err = ReputationScore::unsigned(0.95, Some(RealmId::new("bad:realm")))
+            .attest_shape_error("h", &RealmId::new("crew"))
+            .expect("invalid attesting realm rejected");
+        assert!(err.contains("attesting_realm"));
+
+        let half_signed = ReputationScore {
+            score: 0.95,
+            attesting_realm: None,
+            signed_by: Some("selector".into()),
+            signature: None,
+        };
+        let err = half_signed
+            .attest_shape_error("h", &RealmId::new("crew"))
+            .expect("half-signed promotion rejected");
+        assert!(err.contains("both present or both absent"));
+
+        let bad_signed = ReputationScore {
+            score: 0.95,
+            attesting_realm: None,
+            signed_by: Some("selector\0".into()),
+            signature: Some("sig".into()),
+        };
+        let err = bad_signed
+            .attest_shape_error("h", &RealmId::new("crew"))
+            .expect("NUL signed_by rejected");
+        assert!(err.contains("signed_by contains NUL"));
+    }
+
+    /// **Collapsed Realm grain + optional-field elision are locked.** The full-artifact ops carry
+    /// one optional `realm` under a single stable `"op"` tag (the `*_in_realm` tags are gone in
+    /// 0.4.1 — deliberately breaking): `None` elides the field, `Some(r)` adds it. The optional
+    /// promotion-signature fields elide when `None`, so an unsigned `AttestFitness` carries no
+    /// signature bytes.
     #[test]
     fn op_wire_tags_are_stable_and_optional_fields_elide() {
-        let publish = RegistryOp::Publish { manifest: manifest("c"), artifact: b"a".to_vec() };
+        let publish =
+            RegistryOp::Publish { manifest: manifest("c"), artifact: b"a".to_vec(), realm: None };
         let json = serde_json::to_string(&publish).unwrap();
         assert!(json.contains("\"op\":\"publish\""));
-        assert!(!json.contains("\"realm\""), "implicit publish has no Realm field");
+        assert!(!json.contains("\"realm\""), "realm-less publish elides the Realm field");
 
-        let in_realm = RegistryOp::PublishInRealm {
+        let in_realm = RegistryOp::Publish {
             manifest: manifest("c"),
             artifact: b"a".to_vec(),
-            realm: RealmId::new("crew"),
+            realm: Some(RealmId::new("crew")),
         };
         let json = serde_json::to_string(&in_realm).unwrap();
-        assert!(json.contains("\"op\":\"publish_in_realm\""));
+        assert!(
+            json.contains("\"op\":\"publish\""),
+            "realm-scoped publish keeps the 'publish' tag"
+        );
         assert!(json.contains("\"realm\":\"crew\""));
+        assert!(!json.contains("publish_in_realm"), "the split *_in_realm tag is gone");
 
         let attest = RegistryOp::AttestFitness {
             artifact_hash: "h".into(),
@@ -520,18 +745,72 @@ mod tests {
         assert!(json.contains("\"op\":\"list_metadata\""));
         assert!(json.contains("\"realm\":\"crew\""));
 
-        let fetch_metadata = RegistryOp::FetchMetadata { artifact_hash: "h".into() };
+        let fetch_metadata = RegistryOp::FetchMetadata { artifact_hash: "h".into(), realm: None };
         let json = serde_json::to_string(&fetch_metadata).unwrap();
         assert!(json.contains("\"op\":\"fetch_metadata\""));
-        assert!(!json.contains("\"realm\""), "implicit metadata fetch has no Realm field");
+        assert!(!json.contains("\"realm\""), "realm-less metadata fetch elides the Realm field");
 
-        let fetch_metadata_in_realm = RegistryOp::FetchMetadataInRealm {
+        let fetch_metadata_in_realm = RegistryOp::FetchMetadata {
             artifact_hash: "h".into(),
-            realm: RealmId::new("crew"),
+            realm: Some(RealmId::new("crew")),
         };
         let json = serde_json::to_string(&fetch_metadata_in_realm).unwrap();
-        assert!(json.contains("\"op\":\"fetch_metadata_in_realm\""));
+        assert!(json.contains("\"op\":\"fetch_metadata\""), "realm-scoped fetch keeps the tag");
         assert!(json.contains("\"realm\":\"crew\""));
+        assert!(!json.contains("fetch_metadata_in_realm"), "the split *_in_realm tag is gone");
+
+        let fetch_gx = RegistryOp::FetchGx { artifact_hash: "h".into(), chunk_size: None };
+        let json = serde_json::to_string(&fetch_gx).unwrap();
+        assert!(json.contains("\"op\":\"fetch_gx\""));
+        assert!(!json.contains("chunk_size"), "None chunk_size elides");
+
+        let fetch_gx_plan = RegistryOp::FetchGxPlan { artifact_hash: "h".into(), chunk_size: None };
+        let json = serde_json::to_string(&fetch_gx_plan).unwrap();
+        assert!(json.contains("\"op\":\"fetch_gx_plan\""));
+        assert!(!json.contains("chunk_size"), "None chunk_size elides");
+
+        let fetch_gx_chunk = RegistryOp::FetchGxChunk {
+            artifact_hash: "h".into(),
+            transfer_id: "registry.h.1.2".into(),
+            chunk_size: 1024,
+            chunk_index: 3,
+        };
+        let json = serde_json::to_string(&fetch_gx_chunk).unwrap();
+        assert!(json.contains("\"op\":\"fetch_gx_chunk\""));
+        assert!(json.contains("\"transfer_id\":\"registry.h.1.2\""));
+        assert!(json.contains("\"chunk_index\":3"));
+        assert!(!json.contains("file_hash"), "chunk pulls do not carry redundant file_hash");
+
+        let fetch_gx_in_realm = RegistryOp::FetchGxInRealm {
+            artifact_hash: "h".into(),
+            realm: RealmId::new("crew"),
+            chunk_size: Some(1024),
+        };
+        let json = serde_json::to_string(&fetch_gx_in_realm).unwrap();
+        assert!(json.contains("\"op\":\"fetch_gx_in_realm\""));
+        assert!(json.contains("\"chunk_size\":1024"));
+
+        let fetch_gx_plan_in_realm = RegistryOp::FetchGxPlanInRealm {
+            artifact_hash: "h".into(),
+            realm: RealmId::new("crew"),
+            chunk_size: Some(1024),
+        };
+        let json = serde_json::to_string(&fetch_gx_plan_in_realm).unwrap();
+        assert!(json.contains("\"op\":\"fetch_gx_plan_in_realm\""));
+        assert!(json.contains("\"realm\":\"crew\""));
+
+        let fetch_gx_chunk_in_realm = RegistryOp::FetchGxChunkInRealm {
+            artifact_hash: "h".into(),
+            realm: RealmId::new("crew"),
+            transfer_id: "registry.h.1.2".into(),
+            chunk_size: 1024,
+            chunk_index: 3,
+        };
+        let json = serde_json::to_string(&fetch_gx_chunk_in_realm).unwrap();
+        assert!(json.contains("\"op\":\"fetch_gx_chunk_in_realm\""));
+        assert!(json.contains("\"realm\":\"crew\""));
+        assert!(json.contains("\"chunk_index\":3"));
+        assert!(!json.contains("file_hash"), "chunk pulls do not carry redundant file_hash");
     }
 
     /// **`SyncEntry` round-trips** with the hex-encoded artifact bytes and elided absent signals.

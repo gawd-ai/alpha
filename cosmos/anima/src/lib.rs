@@ -145,26 +145,79 @@ fn read_artifact_path_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, En
 #[derive(Clone)]
 pub struct BudgetControl {
     fuel_cap: Arc<AtomicU64>,
+    mem_cap: Arc<AtomicU64>,
+    wall_ms_cap: Arc<AtomicU64>,
+    enforces_fuel: bool,
+    enforces_mem: bool,
+    enforces_wall: bool,
 }
 
 impl BudgetControl {
-    /// Create a control seeded with the creature's initial per-handle fuel ceiling.
-    pub fn new(initial_fuel: u64) -> Self {
-        BudgetControl { fuel_cap: Arc::new(AtomicU64::new(initial_fuel)) }
+    /// Create a control seeded with the creature's initial per-handle ceilings — `0` is the tier's
+    /// "unlimited" sentinel for each dimension (matching the `cpu_ms == 0` / `mem_bytes == 0` /
+    /// `wall_ms` unset manifest conventions). All three dimensions start **unenforced**; the engine
+    /// declares what it can actually honor a *live* lift on via [`enforcing`](Self::enforcing), so the
+    /// kernel can report honestly which `ExtendBudget` dimensions took effect vs. which the tier
+    /// cannot honor (never a silent lie).
+    pub fn new(initial_fuel: u64, initial_mem_bytes: u64, initial_wall_ms: u64) -> Self {
+        BudgetControl {
+            fuel_cap: Arc::new(AtomicU64::new(initial_fuel)),
+            mem_cap: Arc::new(AtomicU64::new(initial_mem_bytes)),
+            wall_ms_cap: Arc::new(AtomicU64::new(initial_wall_ms)),
+            enforces_fuel: false,
+            enforces_mem: false,
+            enforces_wall: false,
+        }
     }
-    /// The shared cell the running instance reads each handle. The engine passes this into the
-    /// instance so both ends point at the same atomic.
+    /// Declare which dimensions this tier enforces a **live** lift on (builder). The kernel reads
+    /// these in [`Kernel::extend_budget`](../sanctum) to report a per-dimension outcome.
+    pub fn enforcing(mut self, fuel: bool, mem: bool, wall: bool) -> Self {
+        self.enforces_fuel = fuel;
+        self.enforces_mem = mem;
+        self.enforces_wall = wall;
+        self
+    }
+    /// The shared per-handle fuel cell the running instance reads each handle. The engine passes
+    /// this into the instance so both ends point at the same atomic.
     pub fn cell(&self) -> Arc<AtomicU64> {
         self.fuel_cap.clone()
+    }
+    /// The shared memory-ceiling cell (bytes; `0` = unlimited). The wasm `ResourceLimiter` reads it
+    /// live on every grow, so an `ExtendBudget` mem lift takes effect without touching the store.
+    pub fn mem_cell(&self) -> Arc<AtomicU64> {
+        self.mem_cap.clone()
+    }
+    /// The shared wall-clock-ceiling cell (ms; `0` = unlimited). The instance reads it each handle
+    /// (beast: arms the epoch deadline; critter: the `on_progress` watchdog).
+    pub fn wall_cell(&self) -> Arc<AtomicU64> {
+        self.wall_ms_cap.clone()
     }
     /// The current per-handle fuel ceiling.
     pub fn current_fuel(&self) -> u64 {
         self.fuel_cap.load(Ordering::Relaxed)
     }
+    /// Whether a live fuel/mem/wall lift is actually honored by this creature's tier.
+    pub fn enforces_fuel(&self) -> bool {
+        self.enforces_fuel
+    }
+    pub fn enforces_mem(&self) -> bool {
+        self.enforces_mem
+    }
+    pub fn enforces_wall(&self) -> bool {
+        self.enforces_wall
+    }
     /// Lift (or set) the per-handle fuel ceiling — the creature's **next** handle gets it.
     /// A policy grants grace by raising this after a `Warn` (or anticipating a `Hard`).
     pub fn set_fuel(&self, fuel: u64) {
         self.fuel_cap.store(fuel, Ordering::Relaxed);
+    }
+    /// Lift (or set) the per-handle memory ceiling (bytes; `0` = unlimited).
+    pub fn set_mem(&self, mem_bytes: u64) {
+        self.mem_cap.store(mem_bytes, Ordering::Relaxed);
+    }
+    /// Lift (or set) the per-handle wall-clock ceiling (ms; `0` = unlimited).
+    pub fn set_wall_ms(&self, wall_ms: u64) {
+        self.wall_ms_cap.store(wall_ms, Ordering::Relaxed);
     }
 }
 
@@ -446,6 +499,28 @@ mod tests {
         e.unload(loaded, Deadline::default()).expect("critter unloads");
     }
 
+    /// **Critter wall-clock enforcement.** A critter with *unlimited ops* (`cpu_ms == 0`) but a tight
+    /// `wall_ms` cap trips the `on_progress` wall watchdog → a `Hard`/`Wall` breach (the critter analog
+    /// of the beast's epoch trap), distinct from a Fuel op-budget trap. The loop is bounded (not
+    /// `loop {}`) so a regressed watchdog fails the assertion rather than hanging.
+    #[test]
+    fn script_wall_ms_budget_terminates_with_wall_signal() {
+        let _spin = budget_spin_lock().lock().unwrap_or_else(|p| p.into_inner());
+        use aether::{LimitKind, SignalLevel};
+        let (e, mut m, art) =
+            critter("fn handle(env) { let i = 0; while i < 10000000 { i += 1; } env.payload }", 0);
+        m.capabilities.wall_ms = Some(10);
+        let mut loaded = e.load(&art, &m).expect("critter loads");
+        let out = loaded.instance.handle(test_envelope(b""));
+        assert!(out.dispatches.is_empty(), "a wall-tripped handle produces no reply");
+        let signal = out.budget_signal.expect("engine must emit a BudgetSignal on the wall trip");
+        assert_eq!(signal.level, SignalLevel::Hard);
+        assert_eq!(signal.kind, LimitKind::Wall, "wall-watchdog termination classifies as Wall");
+        assert_eq!(signal.vector.limit, 10, "limit reflects the wall_ms cap");
+        assert!(signal.vector.wall_ms_elapsed >= 1, "Hard signal reports elapsed wall time");
+        e.unload(loaded, Deadline::default()).expect("critter unloads after the wall trip");
+    }
+
     #[test]
     fn script_budget_warn_at_emits_warn_alongside_reply() {
         use aether::SignalLevel;
@@ -690,6 +765,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: String::new(),
+                origin: None,
             },
             payload: payload.to_vec(),
         }
@@ -849,6 +925,39 @@ mod tests {
         assert_eq!(out.dispatches.len(), 1, "with the lifted ceiling the same handle succeeds");
         assert_eq!(out.dispatches[0].payload, b"hi", "and echoes its payload");
         assert!(out.budget_signal.is_none(), "no breach after the grant");
+
+        e.unload(loaded, Deadline::default()).expect("beast unloads");
+    }
+
+    /// **Beast memory lift is live.** A `mem_bytes` grant lifts the `ResourceLimiter`'s ceiling cell,
+    /// which `memory_growing` reads on the *very next* grow — survival via grace on the memory
+    /// dimension, exactly as fuel lifts. Proves the mem cell is genuinely shared (not captured by
+    /// value at load), the gap the honest-fail floor used to have to report as unenforceable.
+    #[test]
+    fn wasm_extend_budget_lifts_the_live_mem_cap_mid_life() {
+        let _spin = budget_spin_lock().lock().unwrap_or_else(|p| p.into_inner());
+        use aether::LimitKind;
+        let wasm = wat::parse_str(GROW_MEM_WAT).expect("valid wat");
+        let e = WasmEngine::new();
+        let mut m = manifest(Backend::Beast, "gawd_creature_v1");
+        // One page initial + cap, so the per-handle `memory.grow(1)` to a second page is refused.
+        m.capabilities.mem_bytes = 64 * 1024;
+        let mut loaded = e.load(&Artifact::Bytes(wasm), &m).expect("beast loads at cap");
+        let budget = loaded.budget.clone().expect("wasm tier exposes a BudgetControl");
+
+        // Before the grant: the grow to a second page is refused → Hard/Memory.
+        let out = loaded.instance.handle(test_envelope(b""));
+        assert_eq!(out.budget_signal.expect("Hard on the grow refusal").kind, LimitKind::Memory);
+
+        // The grant: lift the live mem ceiling to three pages.
+        budget.set_mem(3 * 64 * 1024);
+
+        // After the grant: the SAME handle's grow now succeeds — no Memory breach.
+        let out = loaded.instance.handle(test_envelope(b""));
+        assert!(
+            out.budget_signal.is_none(),
+            "with the lifted mem ceiling the grow no longer traps"
+        );
 
         e.unload(loaded, Deadline::default()).expect("beast unloads");
     }

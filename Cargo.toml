@@ -10,6 +10,7 @@ members = [
     # ---- narrated, runnable demos (stay at the root, alongside the door they exercise) ----
     "demos/walkthrough",
     "demos/federation",
+    "demos/distribute",
     "demos/bestiary-live",
 
     # ---- everything between α and Ω lives under cosmos/ ----
@@ -29,6 +30,7 @@ members = [
     "cosmos/realm",
     "cosmos/bestiary",
     "cosmos/omega",
+    "cosmos/gawdxfer",
 
     # ---- the injected model seam: a leaf crate (depends on no creature) carrying the `Model`
     #      contract so BOTH the model-backed author (agent-mind) and the Bestiary curator can consume
@@ -72,6 +74,7 @@ members = [
     "cosmos/creatures/prototypes/policies/policy-quarantine-aware",
     "cosmos/creatures/prototypes/policies/policy-quarantine-trust-all",
     "cosmos/creatures/prototypes/policies/policy-quarantine-trust-realm",
+    "cosmos/creatures/prototypes/policies/policy-origin",
     "cosmos/creatures/prototypes/scorers/scorer-success-rate",
     "cosmos/creatures/prototypes/scorers/scorer-latency",
     "cosmos/creatures/prototypes/scorers/scorer-roundrobin",

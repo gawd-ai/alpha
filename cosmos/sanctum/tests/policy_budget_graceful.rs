@@ -161,7 +161,7 @@ fn publish_budget_signal(
 ) {
     let (_id, bus, _rx) = k.open_endpoint(Capabilities::default());
     let payload = serde_json::to_vec(&BudgetSignalEvent {
-        module,
+        creature: module,
         level: level.into(),
         kind: kind.into(),
         vector,
@@ -553,10 +553,10 @@ impl Creature for WarnRelayAsApoptosis {
         if b.level != "warn" {
             return Outcome::none();
         }
-        if !self.watch.lock().unwrap().contains(&b.module) {
+        if !self.watch.lock().unwrap().contains(&b.creature) {
             return Outcome::none();
         }
-        let op = KernelControl::Unload { module: b.module };
+        let op = KernelControl::Unload { module: b.creature };
         let Ok(payload) = serde_json::to_vec(&op) else { return Outcome::none() };
         Outcome::send(Dispatch::to(Address::Kernel, payload).with_schema("kernel_control"))
     }

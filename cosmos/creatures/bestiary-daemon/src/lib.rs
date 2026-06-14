@@ -34,6 +34,12 @@
 //! - **The PUSH is a bounded full live-set push each cadence, not a head diff.** The lattice merge is
 //!   idempotent, so a full push converges; the daemon refuses over-cap snapshots before reading blob
 //!   bytes or serializing the batch. A high-volume Bestiary would diff by log head.
+//! - **A refused snapshot is observable, not silent.** When the live set outgrows
+//!   [`BestiaryConfig::max_snapshot_artifact_bytes`] the daemon skips that cadence's PUSH and curation
+//!   `observe` pass (fail-closed) and publishes a [`MaintenanceStallEvent`] on
+//!   [`Topic::PROPRIOCEPTION`], so a long-lived node that has grown past its cap surfaces a steady bus
+//!   signal — for a monitor, the immune system, or an operator — rather than ceasing to replicate
+//!   behind only a stderr line. Recovery is operator action: raise the cap or set it to `0`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,14 +48,16 @@ use std::time::{Duration, Instant};
 
 use aether::{
     Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, NodeId, Outcome,
+    Topic,
 };
 use bestiary::{
-    bestiary_op_too_large_message, registry_artifact_too_large_message,
+    artifact_hash_shape_error, bestiary_op_too_large_message, registry_artifact_too_large_message,
     registry_op_too_large_message, BestiaryOp, BestiaryReply, BestiaryStore, CurationContext,
     Curator, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, BESTIARY_OP_SCHEMA,
     BESTIARY_REPLY_SCHEMA, DEFAULT_MAX_BESTIARY_ENTRIES, MAX_BESTIARY_OP_BYTES,
     MAX_REGISTRY_ARTIFACT_BYTES, MAX_REGISTRY_OP_BYTES, REGISTRY_REPLY_SCHEMA,
 };
+use serde::{Deserialize, Serialize};
 use sigil::RealmId;
 
 /// Default maximum number of self-verifying entries accepted in one `PushEntries` batch. A normal
@@ -71,6 +79,33 @@ pub const DEFAULT_MAX_REPLICATION_PEERS: usize = 1024;
 pub const MAX_BESTIARY_REPLICATION_NODE_ID_BYTES: usize = 256;
 /// Maximum bytes in a replication Realm selector.
 pub const MAX_BESTIARY_REPLICATION_REALM_BYTES: usize = sigil::MAX_MANIFEST_REALM_BYTES;
+
+/// Schema for [`MaintenanceStallEvent`], published on [`Topic::PROPRIOCEPTION`].
+pub const BESTIARY_MAINTENANCE_STALL_SCHEMA: &str = "bestiary_maintenance_stall";
+
+/// An off-drain maintenance pass was **refused** this cadence and made no progress.
+///
+/// The common cause is a live set whose total artifact bytes exceed
+/// [`BestiaryConfig::max_snapshot_artifact_bytes`]: the daemon refuses the snapshot *before* cloning
+/// the whole catalog into one payload (the deliberate fail-closed bound), so an over-cap node skips
+/// its anti-entropy PUSH and its curation `observe` pass each cadence. That stall persists — and
+/// anti-entropy/GC stop converging — until the operator raises the cap or sets it to `0` to opt out.
+///
+/// Publishing it on the proprioception topic makes the stall **observable on the substrate's own
+/// nervous system** (a monitor, an operator dashboard, the immune system) instead of being buried in
+/// a stderr line a long-lived node's operator may never read. It is emitted once per refused pass
+/// per cadence, so a node that has outgrown its cap surfaces a steady, visible signal rather than
+/// silently ceasing to replicate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaintenanceStallEvent {
+    /// Which pass was refused: `"anti_entropy"`, `"curation"`, or `"compaction"`.
+    pub stage: String,
+    /// The store error that refused the pass (typically the snapshot byte/entry-cap message).
+    pub reason: String,
+    /// The peer this PUSH targeted, when `stage == "anti_entropy"` (`None` for catalog-wide passes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+}
 
 /// A peer this daemon PUSHes its catalog to.
 #[derive(Clone, Debug)]
@@ -100,7 +135,9 @@ pub struct BestiaryConfig {
     /// Maximum artifact bytes retained per registry publish or pushed entry. `0` means unbounded.
     pub max_artifact_bytes: usize,
     /// Maximum total artifact bytes read into one `ListEntries` reply, autonomous PUSH batch, or
-    /// curation snapshot. `0` means unbounded.
+    /// curation snapshot. `0` means unbounded. When the live set exceeds this, the autonomous PUSH
+    /// and curation passes are refused fail-closed and a [`MaintenanceStallEvent`] is published on
+    /// [`Topic::PROPRIOCEPTION`] each cadence until an operator raises the cap or sets it to `0`.
     pub max_snapshot_artifact_bytes: usize,
     /// Maximum self-verifying entries accepted in or sent as one `PushEntries` batch. `0` means
     /// unbounded.
@@ -205,6 +242,13 @@ struct Shared {
     stop: Arc<AtomicBool>,
 }
 
+struct GxChunkPull {
+    artifact_hash: String,
+    transfer_id: String,
+    chunk_size: u32,
+    chunk_index: u32,
+}
+
 /// The durable Bestiary creature.
 pub struct BestiaryDaemon {
     store: Arc<dyn BestiaryStore>,
@@ -263,48 +307,87 @@ impl BestiaryDaemon {
             RegistryReply::Error { message }
         } else {
             match serde_json::from_slice::<RegistryOp>(&env.payload) {
-                Ok(RegistryOp::Publish { manifest, artifact }) => {
-                    if let Some(message) = self.artifact_too_large(artifact.len()) {
-                        RegistryReply::Error { message }
-                    } else {
-                        match self.store.put(&RealmId::local(), manifest, artifact) {
-                            Ok(artifact_hash) => RegistryReply::Published { artifact_hash },
-                            Err(e) => RegistryReply::Error { message: e.to_string() },
-                        }
-                    }
-                }
-                Ok(RegistryOp::Fetch { artifact_hash }) => {
-                    self.fetched(&RealmId::local(), &artifact_hash)
-                }
-                Ok(RegistryOp::FetchMetadata { artifact_hash }) => {
-                    self.fetched_metadata(&RealmId::local(), &artifact_hash)
-                }
-                Ok(RegistryOp::PublishInRealm { manifest, artifact, realm }) => {
+                Ok(RegistryOp::Publish { manifest, artifact, realm }) => {
+                    let realm = realm.unwrap_or_else(RealmId::local);
                     if let Some(message) = self.artifact_too_large(artifact.len()) {
                         RegistryReply::Error { message }
                     } else {
                         match self.store.put(&realm, manifest, artifact) {
-                            Ok(artifact_hash) => {
-                                RegistryReply::PublishedInRealm { artifact_hash, realm }
-                            }
+                            Ok(artifact_hash) => RegistryReply::Published { artifact_hash, realm },
                             Err(e) => RegistryReply::Error { message: e.to_string() },
                         }
                     }
                 }
-                Ok(RegistryOp::FetchInRealm { artifact_hash, realm }) => {
-                    let r = realm.clone();
-                    match self.store.get(&realm, &artifact_hash) {
-                        Ok(Some(entry)) => RegistryReply::FetchedInRealm {
-                            manifest: entry.manifest,
-                            artifact: entry.artifact,
-                            realm: r,
-                        },
-                        Ok(None) => RegistryReply::NotFound,
-                        Err(e) => RegistryReply::Error { message: e.to_string() },
-                    }
+                Ok(RegistryOp::Fetch { artifact_hash, realm }) => {
+                    self.fetched(&realm.unwrap_or_else(RealmId::local), &artifact_hash)
                 }
-                Ok(RegistryOp::FetchMetadataInRealm { artifact_hash, realm }) => {
-                    self.fetched_metadata(&realm, &artifact_hash)
+                Ok(RegistryOp::FetchGx { artifact_hash, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        env,
+                        RealmId::local(),
+                        artifact_hash,
+                        chunk_size,
+                        false,
+                        true,
+                    );
+                }
+                Ok(RegistryOp::FetchGxPlan { artifact_hash, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        env,
+                        RealmId::local(),
+                        artifact_hash,
+                        chunk_size,
+                        false,
+                        false,
+                    );
+                }
+                Ok(RegistryOp::FetchGxChunk {
+                    artifact_hash,
+                    transfer_id,
+                    chunk_size,
+                    chunk_index,
+                }) => {
+                    return self.fetch_gx_chunk_outcome(
+                        env,
+                        RealmId::local(),
+                        GxChunkPull { artifact_hash, transfer_id, chunk_size, chunk_index },
+                    );
+                }
+                Ok(RegistryOp::FetchMetadata { artifact_hash, realm }) => {
+                    self.fetched_metadata(&realm.unwrap_or_else(RealmId::local), &artifact_hash)
+                }
+                Ok(RegistryOp::FetchGxInRealm { artifact_hash, realm, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        env,
+                        realm,
+                        artifact_hash,
+                        chunk_size,
+                        true,
+                        true,
+                    );
+                }
+                Ok(RegistryOp::FetchGxPlanInRealm { artifact_hash, realm, chunk_size }) => {
+                    return self.fetch_gx_outcome(
+                        env,
+                        realm,
+                        artifact_hash,
+                        chunk_size,
+                        true,
+                        false,
+                    );
+                }
+                Ok(RegistryOp::FetchGxChunkInRealm {
+                    artifact_hash,
+                    realm,
+                    transfer_id,
+                    chunk_size,
+                    chunk_index,
+                }) => {
+                    return self.fetch_gx_chunk_outcome(
+                        env,
+                        realm,
+                        GxChunkPull { artifact_hash, transfer_id, chunk_size, chunk_index },
+                    );
                 }
                 Ok(RegistryOp::AttestFitness {
                     artifact_hash,
@@ -404,16 +487,279 @@ impl BestiaryDaemon {
     }
 
     fn fetched(&self, realm: &RealmId, artifact_hash: &str) -> RegistryReply {
+        if let Some(message) = artifact_hash_shape_error(artifact_hash) {
+            return RegistryReply::Error { message };
+        }
         match self.store.get(realm, artifact_hash) {
-            Ok(Some(entry)) => {
-                RegistryReply::Fetched { manifest: entry.manifest, artifact: entry.artifact }
-            }
+            Ok(Some(entry)) => RegistryReply::Fetched {
+                manifest: entry.manifest,
+                artifact: entry.artifact,
+                realm: realm.clone(),
+            },
             Ok(None) => RegistryReply::NotFound,
             Err(e) => RegistryReply::Error { message: e.to_string() },
         }
     }
 
+    fn fetch_gx_outcome(
+        &self,
+        env: &Envelope,
+        realm: RealmId,
+        artifact_hash: String,
+        chunk_size: Option<u32>,
+        include_realm: bool,
+        push_chunks: bool,
+    ) -> Outcome {
+        if let Some(message) = artifact_hash_shape_error(&artifact_hash) {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::Error { message }.to_bytes())
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+            );
+        }
+        let chunk_size = if push_chunks {
+            registry_gx_push_chunk_size(chunk_size)
+        } else {
+            registry_gx_chunk_size(chunk_size)
+        };
+        let (manifest, artifact_len, artifact) = if push_chunks {
+            match self.store.get(&realm, &artifact_hash) {
+                Ok(Some(entry)) => {
+                    let artifact_len = entry.artifact.len();
+                    (entry.manifest, artifact_len, Some(entry.artifact))
+                }
+                Ok(None) => {
+                    return Outcome::send(
+                        Dispatch::reply_to_env(env, RegistryReply::NotFound.to_bytes())
+                            .with_schema(REGISTRY_REPLY_SCHEMA),
+                    );
+                }
+                Err(e) => {
+                    return Outcome::send(
+                        Dispatch::reply_to_env(
+                            env,
+                            RegistryReply::Error { message: e.to_string() }.to_bytes(),
+                        )
+                        .with_schema(REGISTRY_REPLY_SCHEMA),
+                    );
+                }
+            }
+        } else {
+            match self.store.get_fetch_metadata(&realm, &artifact_hash) {
+                Ok(Some((entry, artifact_len))) => (entry.manifest, artifact_len, None),
+                Ok(None) => {
+                    return Outcome::send(
+                        Dispatch::reply_to_env(env, RegistryReply::NotFound.to_bytes())
+                            .with_schema(REGISTRY_REPLY_SCHEMA),
+                    );
+                }
+                Err(e) => {
+                    return Outcome::send(
+                        Dispatch::reply_to_env(
+                            env,
+                            RegistryReply::Error { message: e.to_string() }.to_bytes(),
+                        )
+                        .with_schema(REGISTRY_REPLY_SCHEMA),
+                    );
+                }
+            }
+        };
+        let transfer_id = registry_gx_transfer_id(&artifact_hash, chunk_size, env);
+        let plan = match gawdxfer::TransferPlan::new(
+            &transfer_id,
+            artifact_len as u64,
+            &artifact_hash,
+            chunk_size,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: format!("GX fetch refused: {e}") }
+                            .to_bytes(),
+                    )
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+        };
+
+        let reply = if include_realm {
+            RegistryReply::FetchedGxInRealm {
+                manifest: manifest.clone(),
+                artifact_hash,
+                transfer_id: plan.transfer_id.clone(),
+                file_size: plan.file_size,
+                file_hash: plan.file_hash.clone(),
+                chunk_size: plan.chunk_size,
+                total_chunks: plan.total_chunks,
+                realm,
+            }
+        } else {
+            RegistryReply::FetchedGx {
+                manifest,
+                artifact_hash,
+                transfer_id: plan.transfer_id.clone(),
+                file_size: plan.file_size,
+                file_hash: plan.file_hash.clone(),
+                chunk_size: plan.chunk_size,
+                total_chunks: plan.total_chunks,
+            }
+        };
+
+        let mut out = Outcome::send(
+            Dispatch::reply_to_env(env, reply.to_bytes()).with_schema(REGISTRY_REPLY_SCHEMA),
+        );
+        if !push_chunks {
+            return out;
+        }
+        let Some(artifact) = artifact else {
+            return out;
+        };
+        let target = env.reply_target();
+        for chunk_index in 0..plan.total_chunks {
+            match plan.encode_chunk(&artifact, chunk_index) {
+                Ok(frame) => {
+                    let mut dispatch = Dispatch::to(target.clone(), frame)
+                        .with_schema(gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+                    if let Some(corr) = env.header.corr {
+                        dispatch = dispatch.with_corr(corr);
+                    }
+                    out.push(dispatch);
+                }
+                Err(e) => {
+                    return Outcome::send(
+                        Dispatch::reply_to_env(
+                            env,
+                            RegistryReply::Error {
+                                message: format!("GX fetch chunk encode failed: {e}"),
+                            }
+                            .to_bytes(),
+                        )
+                        .with_schema(REGISTRY_REPLY_SCHEMA),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    fn fetch_gx_chunk_outcome(&self, env: &Envelope, realm: RealmId, pull: GxChunkPull) -> Outcome {
+        if let Some(message) = artifact_hash_shape_error(&pull.artifact_hash) {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::Error { message }.to_bytes())
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+            );
+        }
+        if let Some(message) = registry_gx_pull_shape_error(&pull) {
+            return Outcome::send(
+                Dispatch::reply_to_env(env, RegistryReply::Error { message }.to_bytes())
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+            );
+        }
+        let artifact_len = match self.store.get_fetch_metadata(&realm, &pull.artifact_hash) {
+            Ok(Some((_entry, artifact_len))) => artifact_len,
+            Ok(None) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(env, RegistryReply::NotFound.to_bytes())
+                        .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: e.to_string() }.to_bytes(),
+                    )
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+        };
+        let chunk_size = registry_gx_chunk_size(Some(pull.chunk_size));
+        let plan = match gawdxfer::TransferPlan::new(
+            pull.transfer_id,
+            artifact_len as u64,
+            pull.artifact_hash.clone(),
+            chunk_size,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: format!("GX chunk refused: {e}") }
+                            .to_bytes(),
+                    )
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+        };
+        let range = match plan.chunk_bounds(pull.chunk_index) {
+            Ok(range) => range,
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: format!("GX chunk refused: {e}") }
+                            .to_bytes(),
+                    )
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+        };
+        let payload = match self.store.get_artifact_chunk(
+            &realm,
+            &pull.artifact_hash,
+            range.start as u64,
+            range.len(),
+        ) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(env, RegistryReply::NotFound.to_bytes())
+                        .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: e.to_string() }.to_bytes(),
+                    )
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+        };
+        let header = gawdxfer::ChunkFrameHeader::new(
+            plan.transfer_id.clone(),
+            pull.chunk_index,
+            gawdxfer::hash_bytes(&payload),
+        )
+        .with_total_chunks(plan.total_chunks);
+        let frame = match gawdxfer::encode_binary_frame(&header, &payload) {
+            Ok(frame) => frame,
+            Err(e) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(
+                        env,
+                        RegistryReply::Error { message: format!("GX chunk encode failed: {e}") }
+                            .to_bytes(),
+                    )
+                    .with_schema(REGISTRY_REPLY_SCHEMA),
+                );
+            }
+        };
+        let mut dispatch = Dispatch::to(env.reply_target(), frame)
+            .with_schema(gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+        if let Some(corr) = env.header.corr {
+            dispatch = dispatch.with_corr(corr);
+        }
+        Outcome::send(dispatch)
+    }
+
     fn fetched_metadata(&self, realm: &RealmId, artifact_hash: &str) -> RegistryReply {
+        if let Some(message) = artifact_hash_shape_error(artifact_hash) {
+            return RegistryReply::Error { message };
+        }
         match self.store.get_metadata(realm, artifact_hash) {
             Ok(Some((entry, artifact_len))) => {
                 RegistryReply::FetchedMetadata { entry, artifact_len }
@@ -596,11 +942,37 @@ fn curate_and_compact(shared: &Shared) {
                 shared.curator.observe(&ctx);
             }
         }
-        Err(e) => eprintln!("bestiary-daemon: curation snapshot failed: {e}"),
+        Err(e) => {
+            let reason = e.to_string();
+            eprintln!("bestiary-daemon: curation snapshot failed: {reason}");
+            publish_maintenance_stall(shared, "curation", &reason, None);
+        }
     }
     if let Err(e) = shared.store.compact(&*shared.curator) {
-        eprintln!("bestiary-daemon: compaction failed: {e}");
+        let reason = e.to_string();
+        eprintln!("bestiary-daemon: compaction failed: {reason}");
+        publish_maintenance_stall(shared, "compaction", &reason, None);
     }
+}
+
+/// Surface a refused maintenance pass on the proprioception topic so the stall is observable on the
+/// bus (a monitor/operator/immune creature), not only in stderr. Emitted off the drain thread, after
+/// the store lock has been released by the failing call — never holds a lock across `emit`.
+fn publish_maintenance_stall(shared: &Shared, stage: &str, reason: &str, peer: Option<&NodeId>) {
+    let ev = MaintenanceStallEvent {
+        stage: stage.to_string(),
+        reason: reason.to_string(),
+        peer: peer.map(|p| p.0.clone()),
+    };
+    let dispatch = Dispatch::to(
+        Address::Topic(Topic::new(Topic::PROPRIOCEPTION)),
+        aether::wire::to_bytes(&ev),
+    )
+    .with_schema(BESTIARY_MAINTENANCE_STALL_SCHEMA);
+    // Best-effort, exactly like `transport-tcp`'s `publish_peer_event`: the stall is already on stderr
+    // at the call site, so a topic with no subscriber (the common single-node case) is not worth a
+    // second line every cadence.
+    let _ = shared.bus.emit(dispatch);
 }
 
 /// PUSH the local catalog to every configured peer (full live set + tombstones; the merge is
@@ -614,7 +986,9 @@ fn push_once(shared: &Shared) {
         ) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("bestiary-daemon: bounded signed_entries for push failed: {e}");
+                let reason = e.to_string();
+                eprintln!("bestiary-daemon: bounded signed_entries for push failed: {reason}");
+                publish_maintenance_stall(shared, "anti_entropy", &reason, Some(&peer.node));
                 continue;
             }
         };
@@ -632,6 +1006,31 @@ fn push_once(shared: &Shared) {
             }
         }
     }
+}
+
+fn registry_gx_transfer_id(artifact_hash: &str, chunk_size: u32, env: &Envelope) -> String {
+    let corr = env.header.corr.unwrap_or(0);
+    gawdxfer::registry_transfer_id(artifact_hash, chunk_size, env.header.seq, corr)
+}
+
+fn registry_gx_chunk_size(requested: Option<u32>) -> u32 {
+    requested
+        .unwrap_or(gawdxfer::DEFAULT_CHUNK_SIZE)
+        .clamp(gawdxfer::MIN_CHUNK_SIZE, gawdxfer::MAX_CHUNK_SIZE)
+}
+
+fn registry_gx_push_chunk_size(requested: Option<u32>) -> u32 {
+    requested
+        .unwrap_or(gawdxfer::DEFAULT_CHUNK_SIZE)
+        .clamp(gawdxfer::DEFAULT_CHUNK_SIZE, gawdxfer::MAX_CHUNK_SIZE)
+}
+
+fn registry_gx_pull_shape_error(pull: &GxChunkPull) -> Option<String> {
+    gawdxfer::registry_transfer_id_shape_error(
+        &pull.transfer_id,
+        &pull.artifact_hash,
+        pull.chunk_size,
+    )
 }
 
 #[cfg(test)]
@@ -682,5 +1081,558 @@ mod tests {
         let cfg = sanitize_replication_peer_config(cfg, 0);
 
         assert_eq!(cfg.replication_peers.len(), 2);
+    }
+
+    // ---- maintenance-stall observability -------------------------------------------------------
+
+    use std::sync::atomic::AtomicU64;
+
+    use aether::BusError;
+    use bestiary::{BestiaryStore, DeterministicCurator, FsBestiaryStore};
+    use sigil::{Backend, Ed25519KeyMaterial, Manifest};
+
+    /// A `Bus` that records every emitted dispatch — enough to observe what a maintenance pass put on
+    /// the proprioception topic.
+    struct CapturingBus {
+        emitted: Mutex<Vec<Dispatch>>,
+    }
+    impl Bus for CapturingBus {
+        fn emit(&self, d: Dispatch) -> Result<(), BusError> {
+            self.emitted.lock().unwrap_or_else(|p| p.into_inner()).push(d);
+            Ok(())
+        }
+        fn whoami(&self) -> CreatureId {
+            CreatureId(0)
+        }
+    }
+
+    /// A self-cleaning temp dir (no external tempdir dep — same approach the store tests take).
+    struct TempRoot(std::path::PathBuf);
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("bestiary-daemon-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempRoot(dir)
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn manifest(name: &str) -> Manifest {
+        Manifest::new(name, "0.1.0", Backend::Daemon, "gawd_creature_v1")
+    }
+
+    fn registry_env(op: RegistryOp) -> Envelope {
+        Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::Creature(CreatureId(7)),
+                reply_to: Some(Address::Creature(CreatureId(1))),
+                seq: 9,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(42),
+                commitment: None,
+                schema: "registry.op".into(),
+                origin: None,
+            },
+            payload: op.to_bytes(),
+        }
+    }
+
+    #[test]
+    fn gx_chunk_size_policy_preserves_small_pull_chunks_but_bounds_push() {
+        let small_valid = 64 * 1024;
+
+        assert_eq!(registry_gx_chunk_size(Some(32)), gawdxfer::MIN_CHUNK_SIZE);
+        assert_eq!(registry_gx_chunk_size(Some(small_valid)), small_valid);
+        assert_eq!(
+            registry_gx_chunk_size(Some(gawdxfer::MAX_CHUNK_SIZE + 1)),
+            gawdxfer::MAX_CHUNK_SIZE
+        );
+
+        assert_eq!(registry_gx_push_chunk_size(Some(32)), gawdxfer::DEFAULT_CHUNK_SIZE);
+        assert_eq!(registry_gx_push_chunk_size(Some(small_valid)), gawdxfer::DEFAULT_CHUNK_SIZE);
+        assert_eq!(
+            registry_gx_push_chunk_size(Some(gawdxfer::MAX_CHUNK_SIZE + 1)),
+            gawdxfer::MAX_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn registry_fetch_gx_returns_plan_then_raw_chunk_dispatches() {
+        let root = TempRoot::new("fetch-gx");
+        let key = Ed25519KeyMaterial::from_seed([0x43; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let m = manifest("gx");
+        let bytes = b"durable-gx-artifact".repeat(16);
+        let hash = store.put(&RealmId::local(), m.clone(), bytes.clone()).unwrap();
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+
+        let out = daemon.serve_registry(&registry_env(RegistryOp::FetchGx {
+            artifact_hash: hash.clone(),
+            chunk_size: Some(32),
+        }));
+
+        assert!(out.dispatches.len() > 1, "GX fetch returns an init reply plus chunks");
+        let init: RegistryReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        let (manifest, transfer_id, file_size, file_hash, chunk_size, total_chunks) = match init {
+            RegistryReply::FetchedGx {
+                manifest,
+                artifact_hash,
+                transfer_id,
+                file_size,
+                file_hash,
+                chunk_size,
+                total_chunks,
+            } => {
+                assert_eq!(artifact_hash, hash);
+                (manifest, transfer_id, file_size, file_hash, chunk_size, total_chunks)
+            }
+            other => panic!("expected FetchedGx, got {other:?}"),
+        };
+        assert_eq!(manifest, m);
+        assert_eq!(file_hash, hash, "GX plan file_hash is the registry artifact key");
+        assert_eq!(
+            chunk_size,
+            gawdxfer::DEFAULT_CHUNK_SIZE,
+            "compatibility GX push clamps tiny chunks to the default to avoid dispatch floods"
+        );
+        let plan = gawdxfer::TransferPlan::new(transfer_id, file_size, file_hash, chunk_size)
+            .expect("valid returned plan");
+        assert_eq!(plan.total_chunks, total_chunks);
+
+        let mut assembler = gawdxfer::ChunkAssembler::new(plan).expect("assembler");
+        for dispatch in &out.dispatches[1..] {
+            assert_eq!(dispatch.to, Address::Creature(CreatureId(1)));
+            assert_eq!(dispatch.schema, gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+            assert_eq!(dispatch.corr, Some(42));
+            assembler.accept_binary_frame(&dispatch.payload).expect("valid gx chunk");
+        }
+        assert_eq!(assembler.finish().expect("complete artifact"), bytes);
+    }
+
+    #[test]
+    fn registry_fetch_gx_rejects_malformed_artifact_hash_before_lookup() {
+        let root = TempRoot::new("fetch-gx-shape");
+        let key = Ed25519KeyMaterial::from_seed([0x45; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+        let bad_hash = "../escape".to_string();
+
+        for op in [
+            RegistryOp::FetchGx { artifact_hash: bad_hash.clone(), chunk_size: None },
+            RegistryOp::FetchGxPlan { artifact_hash: bad_hash.clone(), chunk_size: None },
+            RegistryOp::FetchGxChunk {
+                artifact_hash: bad_hash.clone(),
+                transfer_id: format!("registry.bad.{}.9.42", gawdxfer::DEFAULT_CHUNK_SIZE),
+                chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+                chunk_index: 0,
+            },
+        ] {
+            let out = daemon.serve_registry(&registry_env(op));
+            assert_eq!(out.dispatches.len(), 1);
+            let reply: RegistryReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+            match reply {
+                RegistryReply::Error { message } => {
+                    assert!(message.contains("artifact_hash"), "{message}");
+                    assert!(message.contains("64 lowercase hex"), "{message}");
+                }
+                other => panic!("expected malformed GX artifact_hash error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn registry_legacy_fetch_rejects_malformed_artifact_hash_before_lookup() {
+        let root = TempRoot::new("fetch-shape");
+        let key = Ed25519KeyMaterial::from_seed([0x4B; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+        let bad_hash = "../escape".to_string();
+
+        for op in [
+            RegistryOp::Fetch { artifact_hash: bad_hash.clone(), realm: None },
+            RegistryOp::FetchMetadata { artifact_hash: bad_hash.clone(), realm: None },
+            RegistryOp::Fetch {
+                artifact_hash: bad_hash.clone(),
+                realm: Some(RealmId::new("crew")),
+            },
+            RegistryOp::FetchMetadata {
+                artifact_hash: bad_hash.clone(),
+                realm: Some(RealmId::new("crew")),
+            },
+        ] {
+            let out = daemon.serve_registry(&registry_env(op));
+            assert_eq!(out.dispatches.len(), 1);
+            let reply: RegistryReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+            match reply {
+                RegistryReply::Error { message } => {
+                    assert!(message.contains("artifact_hash"), "{message}");
+                    assert!(message.contains("64 lowercase hex"), "{message}");
+                }
+                other => {
+                    panic!("expected malformed artifact_hash error before lookup, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registry_fetch_gx_chunk_rejects_malformed_transfer_id_before_lookup() {
+        let root = TempRoot::new("fetch-gx-xfer-shape");
+        let key = Ed25519KeyMaterial::from_seed([0x46; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+
+        let out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxChunk {
+            artifact_hash: "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES),
+            transfer_id: "not printable".into(),
+            chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+            chunk_index: 0,
+        }));
+
+        assert_eq!(out.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("printable ASCII"), "{message}");
+            }
+            other => panic!("expected malformed GX transfer_id error before lookup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_fetch_gx_chunk_rejects_transfer_id_for_another_artifact_before_lookup() {
+        let root = TempRoot::new("fetch-gx-xfer-artifact");
+        let key = Ed25519KeyMaterial::from_seed([0x47; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+        let artifact_hash = "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+        let other_hash = "b".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+
+        let out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxChunk {
+            artifact_hash,
+            transfer_id: format!("registry.{other_hash}.{}.9.42", gawdxfer::DEFAULT_CHUNK_SIZE),
+            chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+            chunk_index: 0,
+        }));
+
+        assert_eq!(out.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("artifact_hash"), "{message}");
+            }
+            other => {
+                panic!("expected artifact-bound GX transfer_id error before lookup, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn registry_fetch_gx_chunk_rejects_transfer_id_for_another_chunk_size_before_lookup() {
+        let root = TempRoot::new("fetch-gx-xfer-chunk-size");
+        let key = Ed25519KeyMaterial::from_seed([0x49; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+        let artifact_hash = "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+
+        let out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxChunk {
+            artifact_hash: artifact_hash.clone(),
+            transfer_id: format!("registry.{artifact_hash}.1024.9.42"),
+            chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+            chunk_index: 0,
+        }));
+
+        assert_eq!(out.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("chunk_size"), "{message}");
+            }
+            other => {
+                panic!(
+                    "expected chunk-size-bound GX transfer_id error before lookup, got {other:?}"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn registry_fetch_gx_chunk_rejects_non_issued_transfer_id_before_lookup() {
+        let root = TempRoot::new("fetch-gx-xfer-issued");
+        let key = Ed25519KeyMaterial::from_seed([0x48; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+        let artifact_hash = "a".repeat(bestiary::ARTIFACT_HASH_HEX_BYTES);
+
+        let out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxChunk {
+            artifact_hash: artifact_hash.clone(),
+            transfer_id: format!("registry.{artifact_hash}.not-decimal.9.42"),
+            chunk_size: gawdxfer::DEFAULT_CHUNK_SIZE,
+            chunk_index: 0,
+        }));
+
+        assert_eq!(out.dispatches.len(), 1);
+        let reply: RegistryReply = serde_json::from_slice(&out.dispatches[0].payload).unwrap();
+        match reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("transfer_id"), "{message}");
+                assert!(message.contains("decimal"), "{message}");
+            }
+            other => {
+                panic!("expected non-issued GX transfer_id error before lookup, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn registry_fetch_gx_refuses_over_cap_recovered_artifact_without_hiding_metadata() {
+        let root = TempRoot::new("fetch-gx-over-cap");
+        let realm = RealmId::local();
+        let bytes = b"12345".to_vec();
+        let hash;
+        {
+            let key = Ed25519KeyMaterial::from_seed([0x4A; 32]).unwrap();
+            let writer = FsBestiaryStore::new(&root.0, key).unwrap();
+            hash = writer.put(&realm, manifest("gx-over-cap"), bytes).unwrap();
+        }
+
+        let key = Ed25519KeyMaterial::from_seed([0x4A; 32]).unwrap();
+        let store = FsBestiaryStore::new(&root.0, key).unwrap().with_max_artifact_bytes(4);
+        store.recover().unwrap();
+        let mut daemon = BestiaryDaemon::new(
+            Arc::new(store),
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+
+        let metadata_out = daemon.serve_registry(&registry_env(RegistryOp::FetchMetadata {
+            artifact_hash: hash.clone(),
+            realm: None,
+        }));
+        assert_eq!(metadata_out.dispatches.len(), 1);
+        let metadata: RegistryReply =
+            serde_json::from_slice(&metadata_out.dispatches[0].payload).unwrap();
+        match metadata {
+            RegistryReply::FetchedMetadata { entry, artifact_len } => {
+                assert_eq!(entry.artifact_hash, hash);
+                assert_eq!(artifact_len, 5, "metadata remains a byte-light catalog lookup");
+            }
+            other => panic!("expected metadata lookup to remain visible, got {other:?}"),
+        }
+
+        let plan_out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxPlan {
+            artifact_hash: hash.clone(),
+            chunk_size: None,
+        }));
+        assert_eq!(plan_out.dispatches.len(), 1);
+        let plan_reply: RegistryReply =
+            serde_json::from_slice(&plan_out.dispatches[0].payload).unwrap();
+        match plan_reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("too large"), "{message}");
+                assert!(message.contains("limit 4"), "{message}");
+            }
+            other => panic!("expected over-cap GX plan refusal, got {other:?}"),
+        }
+
+        let chunk_size = gawdxfer::DEFAULT_CHUNK_SIZE;
+        let chunk_out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxChunk {
+            artifact_hash: hash.clone(),
+            transfer_id: format!("registry.{hash}.{chunk_size}.9.42"),
+            chunk_size,
+            chunk_index: 0,
+        }));
+        assert_eq!(chunk_out.dispatches.len(), 1);
+        let chunk_reply: RegistryReply =
+            serde_json::from_slice(&chunk_out.dispatches[0].payload).unwrap();
+        match chunk_reply {
+            RegistryReply::Error { message } => {
+                assert!(message.contains("too large"), "{message}");
+                assert!(message.contains("limit 4"), "{message}");
+            }
+            other => panic!("expected over-cap GX chunk refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_fetch_gx_plan_then_chunk_pull_reassembles_out_of_order() {
+        let root = TempRoot::new("fetch-gx-pull");
+        let key = Ed25519KeyMaterial::from_seed([0x44; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let m = manifest("gx-pull");
+        let requested_chunk_size = 64 * 1024;
+        let bytes = vec![0xCD; requested_chunk_size as usize + 17];
+        let hash = store.put(&RealmId::local(), m.clone(), bytes.clone()).unwrap();
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+
+        let plan_out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxPlan {
+            artifact_hash: hash.clone(),
+            chunk_size: Some(requested_chunk_size),
+        }));
+
+        assert_eq!(plan_out.dispatches.len(), 1, "plan-only fetch does not push chunks");
+        let init: RegistryReply = serde_json::from_slice(&plan_out.dispatches[0].payload).unwrap();
+        let (transfer_id, file_size, file_hash, chunk_size, total_chunks) = match init {
+            RegistryReply::FetchedGx {
+                manifest,
+                artifact_hash,
+                transfer_id,
+                file_size,
+                file_hash,
+                chunk_size,
+                total_chunks,
+            } => {
+                assert_eq!(manifest, m);
+                assert_eq!(artifact_hash, hash);
+                (transfer_id, file_size, file_hash, chunk_size, total_chunks)
+            }
+            other => panic!("expected FetchedGx plan, got {other:?}"),
+        };
+        assert_eq!(total_chunks, 2, "fixture spans multiple GX chunks");
+        assert_eq!(
+            chunk_size, requested_chunk_size,
+            "registry preserves valid chunk sizes below the default"
+        );
+        assert_eq!(file_hash, hash, "GX plan file_hash is the registry artifact key");
+        let plan = gawdxfer::TransferPlan::new(
+            transfer_id.clone(),
+            file_size,
+            file_hash.clone(),
+            chunk_size,
+        )
+        .expect("valid returned plan");
+        let mut assembler = gawdxfer::ChunkAssembler::new(plan).expect("assembler");
+
+        for chunk_index in (0..total_chunks).rev() {
+            let chunk_out = daemon.serve_registry(&registry_env(RegistryOp::FetchGxChunk {
+                artifact_hash: hash.clone(),
+                transfer_id: transfer_id.clone(),
+                chunk_size,
+                chunk_index,
+            }));
+            assert_eq!(chunk_out.dispatches.len(), 1, "one request returns one raw GX chunk");
+            let dispatch = &chunk_out.dispatches[0];
+            assert_eq!(dispatch.to, Address::Creature(CreatureId(1)));
+            assert_eq!(dispatch.schema, gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA);
+            assert_eq!(dispatch.corr, Some(42));
+            assembler.accept_binary_frame(&dispatch.payload).expect("valid gx chunk");
+        }
+
+        assert_eq!(assembler.finish().expect("complete artifact"), bytes);
+    }
+
+    /// A daemon whose live set already exceeds its snapshot cap, wired to a capturing bus. Returns the
+    /// `Shared` the maintenance free-functions take plus the bus to inspect.
+    fn over_cap_shared(
+        root: &TempRoot,
+        peers: Vec<ReplicationPeer>,
+    ) -> (Shared, Arc<CapturingBus>) {
+        let key = Ed25519KeyMaterial::from_seed([0x42; 32]).unwrap();
+        let store = FsBestiaryStore::new(&root.0, key).unwrap();
+        let realm = RealmId::new("crew");
+        // Two entries, 8 artifact bytes each: a snapshot cap of 4 refuses on the first blob.
+        store.put(&realm, manifest("alpha"), b"AAAAAAAA".to_vec()).unwrap();
+        store.put(&realm, manifest("beta"), b"BBBBBBBB".to_vec()).unwrap();
+        let cfg = BestiaryConfig {
+            replication_peers: peers,
+            max_snapshot_artifact_bytes: 4,
+            ..BestiaryConfig::local()
+        };
+        let bus = Arc::new(CapturingBus { emitted: Mutex::new(Vec::new()) });
+        let shared = Shared {
+            store: Arc::new(store),
+            curator: Arc::new(DeterministicCurator::default()),
+            cfg,
+            bus: bus.clone(),
+            me: CreatureId(7),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        (shared, bus)
+    }
+
+    fn stall_events(bus: &CapturingBus) -> Vec<MaintenanceStallEvent> {
+        bus.emitted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|d| {
+                matches!(&d.to, Address::Topic(t) if t.0 == Topic::PROPRIOCEPTION)
+                    && d.schema == BESTIARY_MAINTENANCE_STALL_SCHEMA
+            })
+            .map(|d| serde_json::from_slice::<MaintenanceStallEvent>(&d.payload).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn over_cap_push_publishes_an_observable_anti_entropy_stall() {
+        let root = TempRoot::new("push-stall");
+        let (shared, bus) = over_cap_shared(&root, vec![peer("node-z", 9, Some("crew"))]);
+
+        push_once(&shared);
+
+        let events = stall_events(&bus);
+        assert_eq!(events.len(), 1, "exactly one stall signal for the one over-cap peer");
+        assert_eq!(events[0].stage, "anti_entropy");
+        assert_eq!(events[0].peer.as_deref(), Some("node-z"));
+        assert!(!events[0].reason.is_empty(), "the refusing store error is carried for operators");
+    }
+
+    #[test]
+    fn over_cap_curation_publishes_an_observable_curation_stall() {
+        let root = TempRoot::new("curation-stall");
+        let (shared, bus) = over_cap_shared(&root, Vec::new());
+
+        curate_and_compact(&shared);
+
+        let events = stall_events(&bus);
+        assert!(
+            events.iter().any(|e| e.stage == "curation" && e.peer.is_none()),
+            "the refused curation snapshot is surfaced on the proprioception topic, got {events:?}"
+        );
     }
 }

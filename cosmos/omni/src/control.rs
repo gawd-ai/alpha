@@ -136,6 +136,7 @@ fn needs_probe(verb: &Verb) -> bool {
             | Verb::RegistryPublish { .. }
             | Verb::RegistryFetch { .. }
             | Verb::RegistryList { .. }
+            | Verb::FetchLoad { .. }
             | Verb::BestiaryProve { .. }
             | Verb::Send { .. }
             | Verb::Intent { .. }

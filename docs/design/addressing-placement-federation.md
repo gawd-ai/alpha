@@ -81,20 +81,39 @@ the source clones entries into a reply; `with_max_snapshot_artifact_bytes(0)` is
 - **Keyed by `(RealmId, artifact_hash)`.** `artifact_hash` is `sha256(artifact_bytes)`. Two
   creatures with identical bytes in different Realms are distinct entries by construction — Realm
   grain is load-bearing, not cosmetic.
-- **Ops are JSON in the envelope payload.** `Publish` / `Fetch` / `FetchMetadata` operate in the
-  local Realm; `PublishInRealm` / `FetchInRealm` / `FetchMetadataInRealm` name a Realm explicitly.
-  Full fetch carries artifact bytes for load/replication paths. Metadata fetch carries only the
-  catalog row plus artifact length for operator/control lookups. Artifact bytes ride **hex-encoded**,
-  not as a serde number array — the latter expands ~4× and parses orders of magnitude slower, enough
-  to blow a publish RPC's timeout on a multi-megabyte `.so`.
+- **Ops are JSON in the envelope payload.** `Publish` / `Fetch` / `FetchMetadata` each carry an
+  optional `realm`: absent (the field elides from the wire) means the local Realm, `Some(r)` names a
+  Realm explicitly. The reply always echoes the resolved Realm.
+  Legacy full fetch carries artifact bytes in the reply for compatibility. The preferred ship path is
+  `FetchGxPlan` / `FetchGxPlanInRealm` followed by `FetchGxChunk` / `FetchGxChunkInRealm`: the
+  registry replies with a manifest plus GX transfer plan, and the requester pulls bounded
+  `gawdxfer` chunks on the `transport.gx.chunk` lane at its own pace. Each chunk request echoes the
+  plan's `transfer_id`, `chunk_size`, and `chunk_index`; the registry derives the plan's whole-file
+  hash from its `(realm, artifact_hash)` key, so plan creation and chunk serving do not re-hash the
+  whole artifact per request and do not trust redundant caller-supplied hash metadata. GX fetch
+  plan/chunk-pull path clamps requested chunk sizes to the shared GX min/max bounds, preserving valid
+  sizes below the default (for example sctl's 64 KiB flaky-link setting) rather than forcing every
+  request to 256 KiB. The compatibility push shortcut clamps tiny chunks up to the default, because
+  it emits every chunk into one `Outcome` and must not let one request create a dispatch flood. All
+  fetch-family lookup variants reject malformed lookup metadata before touching the store:
+  `artifact_hash` must be exactly lowercase SHA-256 hex, and chunk pulls also validate that the GX
+  `transfer_id` has the registry-issued `registry.{artifact_hash}.{chunk_size}.{seq}.{corr}` shape
+  and belongs to that artifact's returned plan and chunk-size policy, because the general registry op
+  payload cap is large enough for legacy artifact publish bodies.
+  `FetchGx` / `FetchGxInRealm` remain compatibility push shortcuts that return the same plan and then
+  stream every chunk. Metadata fetch carries only the catalog row plus artifact length for
+  operator/control lookups. Artifact bytes that still ride inside JSON are **hex-encoded**, not as a
+  serde number array — the latter expands ~4× and parses orders of magnitude slower, enough to blow a
+  publish RPC's timeout on a multi-megabyte `.so`.
 - **The `Entry` carries two optional slots** beyond `(manifest, artifact)`: a `reputation`
   (`ReputationScore`) and a reversible `quarantine` (`QuarantineNotice`). Both default to `None`, so
   the wire bytes of a slot-less entry are unchanged. A (re)publish of a `(realm, artifact_hash)`
   resets both — the registry-layer form of reversibility.
 - **Signal-only metadata is separately shape-capped.** Registry op payloads allow large
-  hex-encoded artifacts, but `MarkQuarantine` keys, reasons, and attesting-peer lists are short
-  audit/control metadata. The shared `bestiary` wire contract owns those caps, and both registry
-  fillings reject malformed quarantine markers before retention or persistence.
+  hex-encoded artifacts, but reputation/quarantine keys, provenance labels, signatures, reasons, and
+  attesting-peer lists are short audit/control metadata. The shared `bestiary` wire contract owns
+  those caps, and both registry fillings reject malformed signal markers before retention or
+  persistence.
 
 **Publish never grants trust.** The registry stores and retrieves; it does not authorize. Every byte
 arriving via `fetch` runs the *receiver's* full admission gate (provenance signature + artifact-bytes
@@ -118,10 +137,15 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
 - **On-disk, integrity-first.** The reference `FsBestiaryStore` lays an artifact out as a
   content-addressed, deduplicated blob (`<root>/blobs/<artifact_hash>`, atomic temp-then-rename) and a
   per-Realm **tamper-evident signed log** (`<root>/log/<realm_hash>.jsonl`). Each `LogRecord` chains to
-  the prior record's hash and is signed by the daemon's Abode key, so a flipped byte or a spliced entry
-  is caught on replay. The Realm name is **only ever hashed**, never path-joined — a `RealmId` from the
-  wire may contain `/` or `..`, so joining it into a path would be a remote arbitrary-file-write
-  primitive; hashing closes it.
+  the prior record's hash and is signed by the daemon's Abode key, so a flipped log byte or a spliced
+  entry is caught on replay. Blob reads are bounded by the configured artifact cap (or, for snapshots,
+  by the remaining snapshot byte budget) and recompute the content address before returning full
+  artifact bytes; GX chunk serving uses bounded range reads instead of re-reading and re-hashing the
+  whole blob per chunk, with the transfer plan and receiver final hash check preserving admission
+  integrity. A later publish of the same content rewrites a corrupt existing blob rather than trusting
+  the filename as valid dedupe. The Realm name is **only ever hashed**, never path-joined — a
+  `RealmId` from the wire may contain `/` or `..`, so joining it into a path would be a remote
+  arbitrary-file-write primitive; hashing closes it.
 - **A self-owned journal.** `recover()` replays the log at bind and **rejects any record not authored by
   the daemon's own key** (`ForeignAuthor`). The on-disk log is a self-owned journal, not a federation
   inbox: peer entries never arrive as foreign records replayed at bind — they arrive only through
@@ -137,9 +161,11 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
   anti-entropy reply, the daemon's autonomous `PushEntries` snapshot, and the curator's artifact-byte
   snapshot are also capped by total artifact bytes before the store reads/clones blobs into the
   payload. A `PushEntries` batch is count-capped before the daemon iterates entries or calls the store;
-  the autonomous outbound batch uses the same count cap before blob stats/reads. The retained
-  replication-peer list is also capped and shape-checked at daemon construction. `0` in daemon config
-  is the explicit unbounded opt-out. A publish past the entry cap is a
+  the autonomous outbound batch uses the same count cap before blob stats/reads. Metadata lookup stays
+  byte-light for catalog visibility, but fetch/GX planning separately proves the backing blob is under
+  the active artifact cap before advertising bytes or chunks. The retained replication-peer list is
+  also capped and shape-checked at daemon construction. `0` in daemon config is the explicit
+  unbounded opt-out. A publish past the entry cap is a
   wire-honest error (not a false `Published`); a federation `PushEntries` of a *new* key into a full
   catalogue is skipped (best-effort lattice merge) rather than failing the whole batch.
   Quarantine markers use the same shared shape caps, and the durable store refuses a sticky
@@ -171,6 +197,12 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
 provable*, never *authorized*. Every fetched byte runs the receiver's full admission gate on load, so a
 forged `Put` smuggled past at-rest integrity is still refused at the creature-load signature/calls
 gate. Durability is at-rest hardening; admission stays the choke point.
+
+Pull-based federation applies the same content-address discipline before it writes locally: an
+`omega-federator` merge pins entries to the requested Realm, rejects a pulled row whose
+`artifact_hash` is not canonical lowercase SHA-256 or does not match `sha256(artifact_bytes)`, and
+only then emits a realm-scoped `Publish` plus any reputation/quarantine re-apply ops. A malformed peer catalog
+therefore cannot use anti-entropy to smuggle an inconsistent registry row into the local Bestiary.
 
 ## Embodiment and placement: the Distributor
 
@@ -315,7 +347,7 @@ four things, and admission gates them all:
    or non-creature target yields a structured `omega.no_route` reply.
 2. **Pull-based anti-entropy.** A `PullFrom` control op sends `RegistryOp::ListEntries` to a peer's
    registry and merges the returned catalog into the *local* registry through the existing
-   `PublishInRealm` write path. The merge is **pinned to the requested Realm**, not the Realm a peer
+   realm-scoped `Publish` write path. The merge is **pinned to the requested Realm**, not the Realm a peer
    tags on each entry — a scoped pull of Realm X can only ever write Realm X locally, so a peer
    cannot smuggle entries into a Realm that was not pulled. Pull, not gossip: a pull happens when an
    operator or scheduler sends `PullFrom`; the substrate ships no clock. Unanswered pulls are parked
@@ -327,8 +359,10 @@ four things, and admission gates them all:
    `ReputationWeigher` (the operator's "how much does Realm X's word count?"), and writes
    `AttestFitness` tagged with the attesting Realm; the stored score is `observed_score × weight`. A
    non-finite score or weight is dropped and surfaced on a proprioception event, so a peer spraying
-   junk attestations is observable; oversized delta identity fields are dropped as malformed without
-   echoing attacker-sized audit strings.
+   junk attestations is observable; oversized, NUL-bearing, or invalid delta identity fields are
+   dropped as malformed without echoing attacker-sized audit strings. Pulled registry reputation
+   slots are re-checked for bounded, NUL-free shape before the federator forwards them back into the
+   local registry.
 4. **Cross-Realm quarantine.** A `FederateQuarantine` op ships a `QuarantineNotice` to a peer
    federator, which writes a reversible `MarkQuarantine` into its local registry. The federation
    carries the *path*; what triggers a notice and how a Sanctum reacts is the immune-response

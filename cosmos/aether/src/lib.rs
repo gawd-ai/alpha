@@ -23,6 +23,7 @@ mod envelope;
 /// (`anima`) and the authoring SDK (`forge`).
 pub mod ffi;
 mod instance;
+mod origin;
 mod router;
 /// Shared wire-serialization helpers (`to_bytes` / `to_value`) with a `debug_assert!` tripwire on
 /// the cannot-happen serialize-failure path. The single disposition for the serialize-failure
@@ -39,11 +40,14 @@ pub use address::{
     Address, CreatureId, Intent, NodeId, RealmId, Role, Topic, MAX_ADDRESS_NESTING_DEPTH,
 };
 pub use bus::{Bus, BusError, BusHandle, Ed25519Signer, Signer, StubSigner};
-pub use envelope::{Envelope, EnvelopeError, Header, MAX_ENVELOPE_HEADER_BYTES};
+pub use envelope::{
+    Envelope, EnvelopeError, Header, ENVELOPE_SIGNING_DOMAIN, MAX_ENVELOPE_HEADER_BYTES,
+};
 pub use instance::{
     BudgetSignal, BudgetVector, Creature, CreatureCtx, Deadline, Dispatch, LimitKind, Outcome,
     SignalLevel,
 };
+pub use origin::{Origin, OriginEvent, OriginVerdict, ORIGIN_EVENT_SCHEMA};
 pub use router::{InboxReceiver, JournalEntry, RouteError, Router, KERNEL_ID};
 
 /// Default maximum JSON payload size for high-volume sense-topic events.
@@ -105,6 +109,109 @@ mod tests {
         assert_eq!(env.header.from, Address::Creature(sender)); // fabric-set identity
         assert!(!env.header.sig.is_empty()); // sig present (R5)
         assert!(env.header.stamp > 0); // router-set logical time
+        assert_eq!(env.header.origin, None, "an ordinary send carries no cross-node origin");
+    }
+
+    #[test]
+    fn an_ordinary_handle_cannot_attest_a_cross_node_origin() {
+        // Forging a cross-node origin is structurally impossible for a normal creature: `Dispatch`
+        // can't express one, and the only door — `emit_attested` — refuses on a non-attesting
+        // handle. So a local creature can never make a recipient believe a message came from a peer.
+        let r = router();
+        let (_target, _rx) = r.register(Capabilities::default());
+        let (sender, _s) = r.register(Capabilities::default());
+        let b = bus(&r, sender);
+        assert!(!b.may_attest(), "the default handle has no attestation grant");
+        let denied = b.emit_attested(
+            Dispatch::to(Address::Creature(_target), b"forge".to_vec()),
+            Origin::node(NodeId("victim-node".into())),
+        );
+        assert!(matches!(denied, Err(BusError::Denied)), "non-attesting emit_attested is refused");
+    }
+
+    #[test]
+    fn an_attesting_handle_seals_the_origin_into_the_signed_envelope() {
+        // The transport's grant (`new_attesting`) is the one handle that may stamp origin. The
+        // origin reaches the recipient *and* rides inside the signed bytes — re-signing the
+        // delivered envelope reproduces its `sig`, but doing so after clearing `origin` does not.
+        let r = router();
+        let (target, rx) = r.register(Capabilities::default());
+        let (sender, _s) = r.register(Capabilities::default());
+        let signer = Arc::new(StubSigner::new("transport"));
+        let b = BusHandle::new_attesting(sender, r.clone(), signer.clone());
+        assert!(b.may_attest());
+
+        let origin = Origin::node(NodeId("node-A".into()));
+        b.emit_attested(Dispatch::to(Address::Creature(target), b"hi".to_vec()), origin.clone())
+            .unwrap();
+        let env = rx.recv().unwrap();
+        assert_eq!(
+            env.header.origin,
+            Some(origin),
+            "the authenticated origin reached the recipient"
+        );
+
+        // `origin` is covered by the signature: the present sig matches signing_payload with origin,
+        // and a tampered (origin-stripped) view would not reproduce it.
+        assert_eq!(signer.sign(&env.signing_payload()), env.header.sig);
+        let mut stripped = env.clone();
+        stripped.header.origin = None;
+        assert_ne!(
+            signer.sign(&stripped.signing_payload()),
+            env.header.sig,
+            "clearing origin must change the signed bytes — origin is inside the signature"
+        );
+    }
+
+    #[test]
+    fn local_verify_on_route_is_real_once_a_node_identity_is_set() {
+        // The router's verify-on-delivery used to always run against an empty key (a no-op negative
+        // branch). With a node identity, `public_key_of` resolves the local sender's key, so a
+        // genuine ed25519 signature actually verifies — and an absent identity demonstrably does not.
+        use std::sync::Mutex;
+        struct Recording {
+            inner: Ed25519Verifier,
+            last: Mutex<Option<(String, bool)>>,
+        }
+        impl Verifier for Recording {
+            fn verify(&self, pk: &str, payload: &[u8], sig: &str) -> bool {
+                let ok = self.inner.verify(pk, payload, sig);
+                *self.last.lock().unwrap() = Some((pk.to_string(), ok));
+                ok
+            }
+        }
+
+        let key = Ed25519KeyMaterial::from_seed([7u8; 32]).unwrap();
+
+        // With the identity set: the local pubkey is resolved and the real signature verifies.
+        let rec = Arc::new(Recording { inner: Ed25519Verifier, last: Mutex::new(None) });
+        let r = Arc::new(Router::new(rec.clone(), 16));
+        r.set_local_pubkey(key.public_hex().to_string());
+        let (target, rx) = r.register(Capabilities::default());
+        let (sender, _s) = r.register(Capabilities::default());
+        let b = BusHandle::new(sender, r.clone(), Arc::new(Ed25519Signer::new(key.clone())));
+        b.send(Dispatch::to(Address::Creature(target), b"payload".to_vec())).unwrap();
+        rx.recv().unwrap();
+        let (pk, ok) = rec.last.lock().unwrap().clone().expect("verify was invoked");
+        assert_eq!(
+            pk,
+            key.public_hex(),
+            "router resolves the local node pubkey for a local sender"
+        );
+        assert!(ok, "a genuine local signature verifies under the resolved key");
+
+        // Without the identity: the key is empty and the same genuine signature cannot verify —
+        // proving the resolution is load-bearing, not incidental.
+        let rec2 = Arc::new(Recording { inner: Ed25519Verifier, last: Mutex::new(None) });
+        let r2 = Arc::new(Router::new(rec2.clone(), 16));
+        let (target2, rx2) = r2.register(Capabilities::default());
+        let (sender2, _s2) = r2.register(Capabilities::default());
+        let b2 = BusHandle::new(sender2, r2.clone(), Arc::new(Ed25519Signer::new(key)));
+        b2.send(Dispatch::to(Address::Creature(target2), b"payload".to_vec())).unwrap();
+        rx2.recv().unwrap();
+        let (pk2, ok2) = rec2.last.lock().unwrap().clone().expect("verify was invoked");
+        assert_eq!(pk2, "", "no node identity → no resolvable local key");
+        assert!(!ok2, "an empty key cannot verify a real signature");
     }
 
     #[test]
@@ -186,6 +293,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: String::new(),
+                origin: None,
             },
             payload: Vec::new(),
         };
@@ -411,6 +519,7 @@ mod tests {
                 corr: Some(42),
                 commitment: None,
                 schema: "text".into(),
+                origin: None,
             },
             payload: b"payload".to_vec(),
         };
@@ -599,6 +708,12 @@ mod tests {
     /// version: a future field whose serialization isn't byte-stable (a `HashMap`, a float, etc.)
     /// would silently break cross-node signature verification — this test fires the alarm
     /// before that lands.
+    ///
+    /// This hash was deliberately re-pinned in 0.4.1 when envelope signing gained the
+    /// `GAWD-ENVELOPE-v1:` domain prefix ([`ENVELOPE_SIGNING_DOMAIN`]) and the `origin` field. For a
+    /// **local** envelope (`origin: None`) the `origin` field serializes to nothing (it's
+    /// `skip_serializing_if` and last), so the *only* byte that moved versus 0.4.0 is the domain
+    /// prefix. The companion `..._with_origin_is_locked` test pins the cross-node shape.
     #[test]
     fn envelope_signing_payload_hash_is_locked_to_a_known_fixture() {
         use sha2::{Digest, Sha256};
@@ -614,6 +729,7 @@ mod tests {
                 corr: Some(42),
                 commitment: Some("commit-abc".into()),
                 schema: "test".into(),
+                origin: None,
             },
             payload: b"hello world".to_vec(),
         };
@@ -621,11 +737,44 @@ mod tests {
         h.update(env.signing_payload());
         let hex = format!("{:x}", h.finalize());
         // The `Address::Creature` serde variant tag carried in the envelope header's `from`/`to`
-        // is part of the signed bytes this hash commits to.
-        const EXPECTED: &str = "5d33ccda105238d47fa824d5c0a6598b9c4a4512fee7b23ca3042001d7aa51be";
+        // is part of the signed bytes this hash commits to, as is the `GAWD-ENVELOPE-v1:` prefix.
+        const EXPECTED: &str = "c63fcfe37530a7921f7fd54edd8b9ed370088e41a6ba808f0a3e024d303747ac";
         assert_eq!(
             hex, EXPECTED,
             "envelope signing_payload tripwire fired; investigate field changes"
+        );
+    }
+
+    /// Determinism tripwire for the **cross-node** signing payload — an envelope carrying an
+    /// authenticated [`Origin`]. Locks the byte layout the receiving transport verifies against
+    /// (origin is the last signed field), so a drift in `Origin`'s serialization that would make a
+    /// legitimate cross-node frame read as `BadSig` fails CI here instead of in the field.
+    #[test]
+    fn envelope_signing_payload_with_origin_is_locked() {
+        use sha2::{Digest, Sha256};
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::Creature(CreatureId(2)),
+                reply_to: Some(Address::Creature(CreatureId(99))),
+                seq: 7,
+                causal: vec![3, 5],
+                stamp: 1234,
+                sig: "must-be-stripped".into(),
+                corr: Some(42),
+                commitment: Some("commit-abc".into()),
+                schema: "test".into(),
+                origin: Some(Origin::node(NodeId("node-A".into()))),
+            },
+            payload: b"hello world".to_vec(),
+        };
+        let mut h = Sha256::new();
+        h.update(env.signing_payload());
+        let hex = format!("{:x}", h.finalize());
+        const EXPECTED: &str = "4d2916603060eae997dd0cdb904f49de0e81e5c6d36e92be8193ca1cc976de0d";
+        assert_eq!(
+            hex, EXPECTED,
+            "with-origin signing_payload tripwire fired; investigate Origin serialization"
         );
     }
 }

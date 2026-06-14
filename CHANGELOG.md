@@ -29,6 +29,12 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   silently-permissive default). The author is contained at the **route + admission layer**, not the
   prompt — the live path defaults to the sandboxed tier — and emits a structured audit line per
   completion.
+- First-run ergonomics: the default templated author now reports a guidance-friendly miss instead of a
+  raw Debug dump. `AuthoringError` gains a `Display` that, on a no-template-match, names the recognized
+  keywords and points to `--features openai` for free-form English authoring (single source of truth in
+  `agent_templated::recognized_templates_hint`); the control surfaces render it via `Display`. The
+  operator/daemon quickstarts and the README example are corrected to say the default author is
+  keyword-matched, not arbitrary English.
 
 ### Bestiary — durable, distributed, AI-curated
 - `bestiary`, a contract crate that now owns the registry wire types (`registry-mem` re-exports them),
@@ -53,6 +59,14 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   mutating/gated), `registry fetch` (metadata, not raw bytes), `registry list`, and `bestiary prove`
   (a verifiable `EntryProof`; only a `bestiary-daemon` answers, the stub returns a structured error).
   Each round-trips a `RegistryOp` / `BestiaryOp` on the orchestration lane; the three reads are ungated.
+- New **`registry fetch-load`** operator verb (`omni` + `POST /api/registry/fetch-load` +
+  `alpha_registry_fetch_load`): fetch a creature artifact over GX from a local or peer registry,
+  assemble + integrity-check it (per-chunk + whole-file SHA-256), and admit + load it — the one command
+  that wraps the choreography `m2_two_node` used to hand-script. It drives `FetchGxPlan` → a windowed
+  `FetchGxChunk` pull that re-requests only the missing chunks on a stall (resume without restart, via a
+  new additive `gawdxfer::ChunkAssembler::missing_chunks()`; the content-addressed registry needs no
+  `Resume` wire op) → `kernel.load` (which re-verifies at admission, so a tampered fetch is refused).
+  Loads code → gated. New runnable `demos/distribute` shows it cross-node over real ed25519 TCP.
 
 ### Abode — authenticated migration (M9-2)
 - A migration responder now returns a **cryptographic witness**: having passed all six admission gates,
@@ -63,6 +77,31 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   any failure keeps the source authoritative and re-parks the pending. Closes the gap where the source
   verified only an echoed challenge.
 
+### Cross-node sender authentication (node grain)
+- A clustered node now signs its **bus envelopes with the same ed25519 key it authenticates links
+  with** (its bus signer is `Ed25519Signer(node_key)`, not an unrelated stub). A peer that
+  authenticated the node at the handshake can therefore verify the envelopes it signs. The receiving
+  transport does exactly that **at the wire boundary** — before it reseals `from`, while the inbound
+  bytes are still what the sender signed — and stamps the proven node into a new sealed
+  `Header.origin` (`Origin { node }`). `origin` is unforgeable by construction: it is absent from
+  `Dispatch`, so a creature cannot express it; it is set only through the transport's privileged
+  `Bus::emit_attested`, reachable only from the boot-only grant the kernel hands the transport
+  (`Kernel::load_transport_instance` → `BusHandle::new_attesting`) — there is no manifest capability
+  for it. It rides inside the signing payload, so the local re-seal covers it.
+- The transport publishes a non-enforcing **`OriginVerdict`** (`Verified` / `BadSig` / `Unresolved`;
+  `Local` is inferred from `origin == None`) per cross-node frame on `PROPRIOCEPTION`. The spine never
+  rejects on it — enforcement is injected. The reference **`policy-origin`** creature counts a peer's
+  non-`Verified` verdicts and, past an injected threshold, pulls the new reversible
+  **`TransportCtl::Forget`** lever (drop a peer from the allowlist + tear down its link until an
+  operator re-`Connect`s it — the missing inverse of `Connect`). A receiver-side **replay guard**
+  drops a cross-node frame whose `seq` does not advance its per-`(node, sender)` high-water mark
+  (reset on reconnect).
+- The router's verify-on-delivery is now **real for local senders**: `Kernel::set_node_identity`
+  records the node's own public key, which `public_key_of` resolves so a genuine local signature
+  actually validates instead of always exercising the stub's negative branch.
+- Honestly deferred: per-creature portable identity, end-to-end proof across an untrusted relay (the
+  mesh is direct authenticated links — there is none today), revocation, and signed membership gossip.
+
 ### Budgets — real enforcement
 - The **beast** tier now enforces a per-envelope `wall_ms` wall-clock cap via `wasmtime` epoch
   interruption (one engine-global ticker; a per-handle `ceil(wall_ms / tick)` deadline), surfacing an
@@ -71,6 +110,17 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   `Capabilities.wall_ms` is a new serde-optional manifest field (`LimitKind::Wall` is no longer
   reserved). A failing-first regression pins beast initial-memory-over-cap rejection, and post-apoptosis
   `NoSuchModule` assertions prove the kill actually stops the creature on the beast and critter tiers.
+- **`ExtendBudget` is honest, per dimension — it can no longer silently no-op.** `Kernel::extend_budget`
+  now returns a per-dimension `ExtendOutcome` (`Applied` / `Unenforceable` / `NotRequested`, plus an
+  `unknown_creature` flag), and the control listener surfaces every requested dimension the creature's
+  tier cannot live-lift. Enforcement was widened to match: the **beast** tier now live-lifts memory (the
+  `ResourceLimiter` reads a shared mem cell) and wall-clock (a shared epoch-deadline cell) in addition to
+  fuel; the **critter** tier now enforces wall-clock via the Rhai `on_progress` watchdog (a `Hard`/`Wall`
+  breach distinct from a Fuel op-budget trap) and lifts fuel + wall live (its structural memory caps stay
+  fixed at load, so a critter memory lift is honestly reported `Unenforceable`); **native** is
+  trusted-by-admission and reports every dimension `Unenforceable`. `BudgetControl` carries the live
+  mem/wall cells and per-tier enforceability flags (a runtime handle — no wire-shape change). New tests
+  cover each tier×dimension, a live beast memory lift, and a critter wall trip.
 
 ### Resilience — hostile-input & resource bounds
 - A uniform resource-exhaustion pass across the substrate: every consumer that decodes a wire payload
@@ -88,7 +138,7 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   **Behavior note:** these defaults flip the affected reference creatures from *unbounded* to *bounded*;
   embedders that relied on unbounded growth opt back in with the matching `with_max_*(0)` builder.
 - New **byte-light** read paths so control surfaces inspect the catalogue without dragging artifact
-  bytes across the bus: additive `RegistryOp::{FetchMetadata, FetchMetadataInRealm, ListMetadata}` →
+  bytes across the bus: additive `RegistryOp::{FetchMetadata, ListMetadata}` →
   `RegistryReply::{FetchedMetadata, Metadata}` over a new `CatalogEntry` (artifact-carrying `Fetch` /
   `ListEntries` stay for load and anti-entropy). A publish into a full catalogue is a wire-honest error,
   not a false `Published`.
@@ -140,6 +190,41 @@ strictly additive (serde-optional fields, a new `bestiary.op` schema, byte-ident
   --critter` reports its effective limit honestly); and a native load fails loudly when the manifest
   would exceed the guest's re-parse cap after JSON escaping, rather than silently binding a creature
   with a placeholder self-view.
+- A durable Bestiary that outgrows its `max_snapshot_artifact_bytes` no longer stalls *silently*: when
+  the live set exceeds the cap the daemon still skips that cadence's anti-entropy PUSH and curation
+  `observe` pass (the deliberate fail-closed bound), but now publishes a `MaintenanceStallEvent`
+  (`bestiary_maintenance_stall`) on the proprioception topic, so a long-lived node that has grown past
+  its cap surfaces a steady, observable signal — for a monitor, the immune system, or an operator —
+  instead of ceasing to replicate behind only a stderr line. Recovery stays operator-driven (raise the
+  cap or set it to `0` to opt out).
+
+### Shape corrections (deliberately breaking — 0.4.0 wire compatibility is intentionally dropped)
+This release takes the wire/type-shape corrections that were previously deferred to keep 0.4.0
+compatibility, so 0.5.0 starts from a clean baseline. Each correction re-pins or updates the
+determinism/round-trip test that locks its new shape.
+- The kernel's proprioception/fitness sense events rename their `module` field to **`creature`** —
+  the last vestige of the old "module" vocabulary on the wire. `Proprioception`, `Fitness`,
+  `BudgetSignalEvent`, and `BudgetRequest` now serialize `creature`, and every consumer follows: the
+  `immune-response` / `fitness-selector` deserialize mirrors, the `monitor` sense-tape renderer, and
+  `policy-budget`. (The `KernelControl` control ops and each creature's own control protocol keep their
+  own `module` field — only the kernel *sense events* are renamed.)
+- The reserved SEER `budget` and `fitness` consult-topic bodies get their shapes corrected before any
+  consumer ships: `fitness::QueryBody.candidate` → `candidate_hash` (the content-addressed registry
+  artifact hash, so a selector and a rater always agree on which artifact a score is about), and
+  `budget::AnswerBody` gains an explicit `granted: bool` so a denial is distinct from a deliberate
+  grant-nothing (`granted: true, granted_units: 0`).
+- The registry's full-artifact ops **collapse their `*InRealm` variant pairs** into one variant with an
+  optional `realm`: `RegistryOp::{Publish, Fetch, FetchMetadata}` now carry `realm: Option<RealmId>`
+  (absent = the local Realm, eliding from the wire), and the matching `RegistryReply::{Published,
+  Fetched}` always echo the resolved Realm. The separate `PublishInRealm` / `FetchInRealm` /
+  `FetchMetadataInRealm` ops and `PublishedInRealm` / `FetchedInRealm` replies are gone. (The GX
+  bulk-transfer ops keep their explicit `*InRealm` split for now.)
+- The **envelope signing payload** is domain-separated and gains the cross-node `origin`. Every
+  envelope signature now commits to a `GAWD-ENVELOPE-v1:` prefix (so a node key's envelope signatures
+  can never be confused with its handshake signatures) plus the new sealed `Header.origin` field
+  (omitted from the bytes when absent, so a *local* envelope's signing payload moves only by the
+  prefix). Both determinism tripwires are deliberately re-pinned. This is a cross-node-coordinated
+  break: a 0.4.1 node verifies a 0.4.0 node's frames as `BadSig`, so a cluster upgrades together.
 
 ## 0.4.0 - 2026-06-04
 

@@ -12,6 +12,7 @@ description = "The durable Bestiary creature. Binds an injected BestiaryStore + 
 aether = { path = "../../aether" }
 sigil = { path = "../../sigil" }
 bestiary = { path = "../../bestiary" }
+gawdxfer = { path = "../../gawdxfer" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

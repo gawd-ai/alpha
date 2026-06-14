@@ -180,7 +180,7 @@ fn immune_response_local_hard_budget_breach_quarantines_a_watched_creature() {
     // wire (`sanctum::BudgetSignalEvent`, schema "budget_signal", on the PROPRIOCEPTION topic). The
     // kernel fans it out to every PROPRIOCEPTION subscriber, including the immune-response.
     let signal = BudgetSignalEvent {
-        module: target_id.0,
+        creature: target_id.0,
         level: "hard".into(),
         kind: "fuel".into(),
         vector: BudgetVector {

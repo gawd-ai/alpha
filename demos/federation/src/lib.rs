@@ -439,10 +439,8 @@ fn run_scenario(nodes: &[Node], realms: usize, sanctums: usize) -> Result<(), St
             short(&hash),
             gw.realm,
         ));
-        let op = RegistryOp::FetchInRealm {
-            artifact_hash: hash.clone(),
-            realm: RealmId::new(&gw.realm),
-        };
+        let op =
+            RegistryOp::Fetch { artifact_hash: hash.clone(), realm: Some(RealmId::new(&gw.realm)) };
         let reply = roundtrip(
             worker,
             Address::Node(NodeId(gw.name.clone()), gw.registry_id),
@@ -452,12 +450,12 @@ fn run_scenario(nodes: &[Node], realms: usize, sanctums: usize) -> Result<(), St
         )
         .ok_or("no fetch reply across the wire")?;
         match reply {
-            RegistryReply::FetchedInRealm { artifact, .. } => ok(&format!(
+            RegistryReply::Fetched { artifact, .. } => ok(&format!(
                 "fetched {} bytes (\"{}\") over the peer-authenticated TCP channel — admission (the integrity gate) runs at load time, which walkthrough shows",
                 artifact.len(),
                 String::from_utf8_lossy(&artifact)
             )),
-            other => return Err(format!("expected FetchedInRealm across the wire, got {other:?}")),
+            other => return Err(format!("expected Fetched across the wire, got {other:?}")),
         }
     }
 

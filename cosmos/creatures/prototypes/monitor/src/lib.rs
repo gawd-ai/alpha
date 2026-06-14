@@ -37,18 +37,18 @@ impl Monitor {
         let prefix = if self.tag.is_empty() { String::new() } else { format!("[{}] ", self.tag) };
         match env.header.schema.as_str() {
             "proprioception" => {
-                let m = body.get("module").and_then(Value::as_u64).unwrap_or(0);
+                let m = body.get("creature").and_then(Value::as_u64).unwrap_or(0);
                 let event = body.get("event").and_then(Value::as_str).unwrap_or("?");
                 format!("{prefix}sense    · creature #{m}: {event}")
             }
             "fitness" => {
-                let m = body.get("module").and_then(Value::as_u64).unwrap_or(0);
+                let m = body.get("creature").and_then(Value::as_u64).unwrap_or(0);
                 let ok = body.get("ok").and_then(Value::as_bool).unwrap_or(false);
                 let verdict = if ok { "useful" } else { "fault" };
                 format!("{prefix}fitness  · creature #{m}: {verdict}")
             }
             "budget_signal" => {
-                let m = body.get("module").and_then(Value::as_u64).unwrap_or(0);
+                let m = body.get("creature").and_then(Value::as_u64).unwrap_or(0);
                 let level = body.get("level").and_then(Value::as_str).unwrap_or("?");
                 let kind = body.get("kind").and_then(Value::as_str).unwrap_or("?");
                 let consumed =
@@ -88,6 +88,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: schema.into(),
+                origin: None,
             },
             payload: payload.to_vec(),
         }
@@ -97,14 +98,14 @@ mod tests {
     fn renders_each_sense_schema_into_a_tape_line() {
         let m = Monitor::default();
         assert!(m
-            .render(&env("proprioception", br#"{"module":7,"event":"loaded"}"#))
+            .render(&env("proprioception", br#"{"creature":7,"event":"loaded"}"#))
             .contains("creature #7: loaded"));
-        assert!(m.render(&env("fitness", br#"{"module":7,"ok":true}"#)).contains("useful"));
-        assert!(m.render(&env("fitness", br#"{"module":7,"ok":false}"#)).contains("fault"));
+        assert!(m.render(&env("fitness", br#"{"creature":7,"ok":true}"#)).contains("useful"));
+        assert!(m.render(&env("fitness", br#"{"creature":7,"ok":false}"#)).contains("fault"));
         assert!(m
             .render(&env(
                 "budget_signal",
-                br#"{"module":7,"level":"hard","kind":"fuel","vector":{"consumed":900,"limit":1000}}"#
+                br#"{"creature":7,"level":"hard","kind":"fuel","vector":{"consumed":900,"limit":1000}}"#
             ))
             .contains("hard fuel (900/1000)"));
         // Unknown schema degrades to a generic line, never panics.
@@ -114,7 +115,7 @@ mod tests {
     #[test]
     fn tag_prefixes_the_tape_when_set() {
         let m = Monitor::new("realm-a");
-        assert!(m.render(&env("fitness", br#"{"module":1,"ok":true}"#)).starts_with("[realm-a]"));
+        assert!(m.render(&env("fitness", br#"{"creature":1,"ok":true}"#)).starts_with("[realm-a]"));
     }
 
     #[test]
@@ -130,7 +131,7 @@ mod tests {
     #[test]
     fn handle_emits_nothing_pure_observer() {
         let mut m = Monitor::default();
-        let out = m.handle(env("fitness", br#"{"module":1,"ok":true}"#));
+        let out = m.handle(env("fitness", br#"{"creature":1,"ok":true}"#));
         assert!(out.dispatches.is_empty(), "the monitor must never emit — it only observes");
     }
 }

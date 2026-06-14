@@ -1,0 +1,30 @@
+[package]
+name = "distribute"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Narrated, runnable demo of the GAWD distribution path: node A publishes a creature into its registry; node B issues a single `registry fetch-load` over real ed25519-authenticated TCP (loopback), which pulls the artifact in bounded GX chunks, integrity-checks it, and admits + loads it — then runs it. The m2 cross-node ship→admit→load, as one operator command instead of a hand-rolled pull loop."
+
+# The demo body (`run`) lives in the lib so `alpha demo distribute` can run it in-process; the binary
+# is a thin wrapper.
+[lib]
+name = "distribute"
+path = "src/lib.rs"
+
+[[bin]]
+name = "distribute"
+path = "src/main.rs"
+
+[dependencies]
+aether = { path = "../../cosmos/aether" }
+sigil = { path = "../../cosmos/sigil" }
+anima = { path = "../../cosmos/anima" }
+sanctum = { path = "../../cosmos/sanctum" }
+omni = { path = "../../cosmos/omni" }
+policy-dev = { path = "../../cosmos/creatures/prototypes/policies/policy-dev" }
+transport-tcp = { path = "../../cosmos/creatures/transport-tcp" }
+registry-mem = { path = "../../cosmos/creatures/registry-mem" }
+serde_json = { workspace = true }

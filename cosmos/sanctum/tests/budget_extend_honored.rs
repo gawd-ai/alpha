@@ -82,7 +82,7 @@ fn recv_budget_signal(rx: &InboxReceiver, module: u64, level: &str, budget: Dura
         match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
             Ok(env) if env.header.schema == "budget_signal" => {
                 if let Ok(ev) = serde_json::from_slice::<BudgetSignalEvent>(&env.payload) {
-                    if ev.module == module && ev.level == level {
+                    if ev.creature == module && ev.level == level {
                         return true;
                     }
                 }

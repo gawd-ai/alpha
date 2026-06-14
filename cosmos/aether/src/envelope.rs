@@ -6,6 +6,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sigil::crypto::{hex_decode, hex_encode};
 
 use crate::address::Address;
+use crate::origin::Origin;
+
+/// Domain-separation tag prepended to every envelope's [`signing_payload`](Envelope::signing_payload).
+///
+/// A node signs its bus envelopes with the **same** ed25519 key it authenticates transport links
+/// with (the handshake). ed25519 has no inherent domain separation — a signature is valid for *any*
+/// message whose bytes match — so this constant fences the envelope grammar off from the transport
+/// handshake grammar (which carries its own `GAWD-NODE-AUTH-v1:` tag). Today both verifiers
+/// reconstruct the signed bytes from structured inputs, so the two can't collide in practice; this
+/// prefix makes that a guarantee by construction, surviving any future protocol that reuses the node
+/// key. Changing it is a deliberate, cross-node-coordinated wire break (the determinism tripwires
+/// re-pin loudly).
+pub const ENVELOPE_SIGNING_DOMAIN: &[u8] = b"GAWD-ENVELOPE-v1:";
 
 /// Maximum serialized bytes in an envelope header.
 ///
@@ -49,6 +62,16 @@ pub struct Header {
     /// Schema / content-type of the payload, for typed send/recv across the dynamic boundary.
     #[serde(default)]
     pub schema: String,
+    /// **Authenticated cross-node origin.** `None` ⟺ the envelope is local (same-node) — its `from`
+    /// is a local creature. `Some` is set *only* by the transport at the wire boundary, from the
+    /// handshake-authenticated peer (never the frame's own claim), through the privileged
+    /// [`emit_attested`](crate::Bus::emit_attested) path that an ordinary creature cannot reach.
+    /// Like `from`/`seq`/`sig` it is fabric-sealed; unlike them it rides in
+    /// [`signing_payload`](Envelope::signing_payload) so it cannot be altered in-fabric without
+    /// breaking the signature. `skip_serializing_if` keeps the wire compact and leaves the
+    /// signing-payload bytes byte-identical for local (`None`) envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
 }
 
 /// A message in motion: header + opaque payload bytes.
@@ -141,6 +164,10 @@ impl Envelope {
             corr: &'a Option<u64>,
             commitment: &'a Option<String>,
             schema: &'a str,
+            // Last field, `skip_serializing_if` None: a local envelope (`origin: None`) serializes
+            // exactly as before this field existed, so only the domain prefix moves its bytes.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            origin: &'a Option<Origin>,
         }
         let h = &self.header;
         let view = SigningHeader {
@@ -154,8 +181,12 @@ impl Envelope {
             corr: &h.corr,
             commitment: &h.commitment,
             schema: &h.schema,
+            origin: &h.origin,
         };
-        let mut out = crate::wire::to_bytes(&view);
+        // Domain-separate the envelope grammar from the transport handshake grammar (both signed
+        // by the node key) — see [`ENVELOPE_SIGNING_DOMAIN`].
+        let mut out = ENVELOPE_SIGNING_DOMAIN.to_vec();
+        out.extend_from_slice(&crate::wire::to_bytes(&view));
         out.extend_from_slice(&self.payload);
         out
     }
@@ -213,6 +244,7 @@ mod tests {
             corr: None,
             commitment: None,
             schema: String::new(),
+            origin: None,
         }
     }
 

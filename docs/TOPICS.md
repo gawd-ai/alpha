@@ -36,7 +36,7 @@ The substrate publishes; what the signal *means for action* is the subscribing c
 | Topic | Const | Meaning | Publisher | Typical subscribers | Payload |
 |---|---|---|---|---|---|
 | `proprioception` | `Topic::PROPRIOCEPTION` | Liveness / sense stream — Loops **1** (Sense) & **4** (Defend) | kernel, on creature **load / unload / leak**, plus the `BudgetSignalEvent` | [`cosmos/creatures/immune-response`](../cosmos/creatures/immune-response) (senses faults), [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor) (the nervous-system observer) | kernel sense events; `BudgetSignalEvent` |
-| `fitness` | `Topic::FITNESS` | Outcome stream — Loop **2** (Select). Kernel emits `Fitness{module, ok}` after **every** handle (`module` is the creature id field) | kernel (only when a subscriber exists — no-listener short-circuit) | **passive observers only** — [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor); and a passive relay → [`cosmos/creatures/fitness-selector`](../cosmos/creatures/fitness-selector) (see note) | `{ module, ok }`, schema `"fitness"` |
+| `fitness` | `Topic::FITNESS` | Outcome stream — Loop **2** (Select). Kernel emits `Fitness{creature, ok}` after **every** handle (`creature` is the creature id field) | kernel (only when a subscriber exists — no-listener short-circuit) | **passive observers only** — [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor); and a passive relay → [`cosmos/creatures/fitness-selector`](../cosmos/creatures/fitness-selector) (see note) | `{ creature, ok }`, schema `"fitness"` |
 
 Sense-topic consumers bound JSON parsing with `aether::MAX_SENSE_EVENT_BYTES` (1 MiB) before
 decoding `proprioception`, `fitness`, or `budget_signal` payloads.
@@ -45,9 +45,9 @@ its observed-module tally by default; operators can explicitly opt out of retain
 `with_max_watched_modules(0)` / `with_max_obs(0)` for unbounded replay or lab workloads.
 The reference `immune-response` bounds its control payloads, watch map, retained watch fields,
 quarantine reasons, and inbound notice peer lists before writing registry/federation markers.
-Registry fillings and the Omega federator also reject oversized quarantine keys/reasons/peer lists
-at the shared `QuarantineNotice` wire shape, so malformed defense markers are not retained just
-because they bypassed the reference immune-response creature.
+Registry fillings and the Omega federator also reject malformed reputation/quarantine signal
+metadata at the shared bestiary wire shapes: oversized, NUL-bearing, or invalid Realm labels cannot
+be retained just because they bypassed the reference selector/immune-response creatures.
 The reference `policy-budget` bounds its tracked-module grace/decision state by default; operators can
 explicitly opt out with `with_max_tracked_modules(0)`.
 

@@ -291,6 +291,7 @@ mod tests {
                 corr: Some(5),
                 commitment: None,
                 schema: "test".into(),
+                origin: None,
             },
             payload: payload.to_vec(),
         }
@@ -353,6 +354,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: String::new(),
+                origin: None,
             },
             payload: b"x".to_vec(),
         };

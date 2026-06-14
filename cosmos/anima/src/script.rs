@@ -119,7 +119,12 @@ impl Engine for ScriptEngine {
         // `cpu_ms == 0` ⇒ 0 ops ⇒ Rhai's "unlimited" sentinel (`set_max_operations(0)`), the same
         // operator opt-out the beast's `cpu_ms == 0` ⇒ unbounded-fuel gives.
         let ops_cap = budget_to_ops(manifest.capabilities.cpu_ms, DEFAULT_OPS_PER_MS);
-        let budget = BudgetControl::new(ops_cap);
+        // The critter enforces fuel (ops) and wall (the `on_progress` watchdog below) live; its
+        // `mem_bytes` maps to Rhai *structural* caps installed once at load (Rhai has no live
+        // structural setter), so a mem lift is honestly reported unenforceable by the kernel rather
+        // than silently dropped.
+        let budget = BudgetControl::new(ops_cap, 0, manifest.capabilities.wall_ms.unwrap_or(0))
+            .enforcing(true, false, true);
 
         // Per-handle observability shared with the running instance: `outbox` collects the dispatches
         // the script `emit`s (the kernel sends them, so its `calls` gate and local-FIFO ordering
@@ -127,6 +132,9 @@ impl Engine for ScriptEngine {
         // `consumed` for the budget vector.
         let outbox: Arc<Mutex<Vec<Dispatch>>> = Arc::new(Mutex::new(Vec::new()));
         let ops_observed = Arc::new(AtomicU64::new(0));
+        // The current handle's wall deadline (`None` = no wall cap this handle), shared with the
+        // `on_progress` watchdog below; `handle` arms it each call from the live wall cell.
+        let wall_deadline: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
 
         let mut engine = RhaiEngine::new();
         // Runtime `eval(string)` is dynamic code-gen. It is *not* a sandbox escape — the inner script
@@ -164,8 +172,23 @@ impl Engine for ScriptEngine {
         // this hook only measures.
         {
             let obs = ops_observed.clone();
+            let deadline = wall_deadline.clone();
             engine.on_progress(move |ops| {
                 obs.store(ops, Ordering::Relaxed);
+                // Wall watchdog: terminate the script if the per-handle wall deadline has passed.
+                // Sampled ~every 256 ops so the clock read never dominates a hot loop (enforcement
+                // slack is bounded by those ops). When there is no wall cap this handle the deadline
+                // is `None` and no clock is read. A termination here surfaces as `ErrorTerminated`,
+                // which `handle` maps to a Hard/Wall breach (distinct from a Fuel op-budget trap).
+                if ops & 0xff == 0 {
+                    if let Ok(guard) = deadline.lock() {
+                        if let Some(dl) = *guard {
+                            if std::time::Instant::now() >= dl {
+                                return Some(rhai::Dynamic::UNIT);
+                            }
+                        }
+                    }
+                }
                 None
             });
         }
@@ -213,6 +236,8 @@ impl Engine for ScriptEngine {
             ast,
             me: None,
             live_ops_cap: budget.cell(),
+            live_wall_ms_cap: budget.wall_cell(),
+            wall_deadline,
             ops_observed,
             outbox,
             mem_cap,
@@ -235,6 +260,13 @@ struct ScriptInstance {
     /// The live per-handle operation ceiling, shared with the kernel via [`BudgetControl`]. Read
     /// fresh each `handle` so a granted `ExtendBudget` lifts the next call.
     live_ops_cap: Arc<AtomicU64>,
+    /// The live per-handle wall-clock ceiling (ms; `0` = unlimited), shared with the kernel via
+    /// [`BudgetControl`]. Read fresh each `handle` to arm [`Self::wall_deadline`]; a granted
+    /// `ExtendBudget` wall lift takes effect on the next call.
+    live_wall_ms_cap: Arc<AtomicU64>,
+    /// The current handle's absolute wall deadline (`None` = no cap this handle), read by the
+    /// engine's `on_progress` watchdog and re-armed by `handle`.
+    wall_deadline: Arc<Mutex<Option<std::time::Instant>>>,
     /// Written by the engine's progress hook every operation; read after a handle to report
     /// `consumed`.
     ops_observed: Arc<AtomicU64>,
@@ -263,6 +295,13 @@ impl Creature for ScriptInstance {
         let ops_cap = self.live_ops_cap.load(Ordering::Relaxed);
         self.engine.set_max_operations(ops_cap);
         self.ops_observed.store(0, Ordering::Relaxed);
+        // Arm the per-handle wall deadline from the *live* wall cell (`0` = no cap), read fresh so a
+        // granted `ExtendBudget` wall lift takes effect here. The `on_progress` watchdog enforces it.
+        let wall_cap_ms = self.live_wall_ms_cap.load(Ordering::Relaxed);
+        if let Ok(mut g) = self.wall_deadline.lock() {
+            *g = (wall_cap_ms > 0)
+                .then(|| std::time::Instant::now() + std::time::Duration::from_millis(wall_cap_ms));
+        }
         if let Ok(mut guard) = self.outbox.lock() {
             guard.clear();
         }
@@ -308,9 +347,7 @@ impl Creature for ScriptInstance {
             Err(err) => match &*err {
                 // The operation budget ran out: a structured `Hard`/`Fuel` breach, no reply, no
                 // partial sends — exactly what the apoptosis chain observes for a beast fuel trap.
-                // `ErrorTerminated` is matched alongside defensively (a future
-                // progress-hook abort path); today the hook only measures and never terminates.
-                EvalAltResult::ErrorTooManyOperations(_) | EvalAltResult::ErrorTerminated(_, _) => {
+                EvalAltResult::ErrorTooManyOperations(_) => {
                     let vector = BudgetVector {
                         // On a too-many-ops trap the observed count is ≈ the cap; guarantee it is
                         // non-zero so a `Hard`/`Fuel` signal always reports work consumed.
@@ -321,6 +358,19 @@ impl Creature for ScriptInstance {
                         envelopes_since_load: self.envelopes_handled,
                     };
                     Outcome::budget_signal(BudgetSignal::hard(LimitKind::Fuel, vector))
+                }
+                // The wall watchdog (`on_progress`) terminated the handle: the per-envelope wall-clock
+                // cap was exceeded. The critter analog of a beast's `Wall` epoch trap — a structured
+                // `Hard`/`Wall` breach, no reply, no partial sends.
+                EvalAltResult::ErrorTerminated(_, _) => {
+                    let vector = BudgetVector {
+                        consumed: wall_ms_elapsed.max(1),
+                        limit: self.live_wall_ms_cap.load(Ordering::Relaxed),
+                        dispatches_this_envelope: 0,
+                        wall_ms_elapsed,
+                        envelopes_since_load: self.envelopes_handled,
+                    };
+                    Outcome::budget_signal(BudgetSignal::hard(LimitKind::Wall, vector))
                 }
                 // A structural-size cap breach (`mem_bytes` → string/array/map size, or the always-on
                 // default backstop): the critter analog of the beast's memory trap. Best-effort

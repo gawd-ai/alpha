@@ -9,20 +9,21 @@
 //!   A waits to accept (one direction is enough — the channel is bidirectional once up).
 //!
 //! Flow:
-//! 1. A signs an `echo-daemon` manifest with its Abode authoring key and publishes
-//!    `(manifest, artifact_bytes)` to its local registry over the bus.
-//! 2. B sends a `RegistryOp::Fetch { artifact_hash }` addressed to
+//! 1. A signs an `echo-daemon` manifest with its Abode authoring key and seeds
+//!    `(manifest, artifact_bytes)` into its local registry.
+//! 2. B sends a `RegistryOp::FetchGxPlan { artifact_hash, chunk_size }` addressed to
 //!    `Address::Node(NODE_A, registry_id_on_a)`. The envelope crosses the wire through the
-//!    handshake-authenticated TCP channel; A's transport re-routes it locally; A's registry
-//!    replies via `reply_to` (which the transport rewrote to a `Node(NODE_B, …)` address); A's
-//!    transport ships the reply back; B's transport delivers it to B's probe.
+//!    handshake-authenticated TCP channel; A's transport re-routes it locally; A's registry replies
+//!    with a GX transfer plan. B then pulls each `RegistryOp::FetchGxChunk` by index; each chunk
+//!    returns as a raw GX frame via `reply_to` (which the transport rewrote to a `Node(NODE_B, …)`
+//!    address), so B controls transfer pacing and can resume missing chunks.
 //! 3. B's kernel admits the fetched manifest (real ed25519 verify + artifact-bytes hash recompute)
 //!    and loads it via the safe loader (native-from-bytes spills to a tempfile, dlopens).
 //! 4. B sends a payload to the loaded creature; the reply confirms the creature is running on B.
 //!
 //! Exit (a): step 4 returns the correct reply.
-//! Exit (d): step 1 + step 2 prove publish/fetch round-trip with integrity + auth gates honored
-//! at both ends.
+//! Exit (d): step 1 + step 2 prove registry fetch round-trip with integrity + auth gates honored at
+//! both ends.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -164,10 +165,24 @@ fn end_to_end_ship_admit_load_run_across_two_nodes() {
     cleanup.push(&k_a);
     let (events_a, _events_bus_a, rx_events_a) = k_a.open_endpoint(Capabilities::default());
     k_a.subscribe(Topic::new(Topic::PROPRIOCEPTION), events_a);
+    // ---- author the artifact on A + seed A's registry ----
+    //
+    // The behavior under test starts at B's cross-node fetch below. Seed the source registry before
+    // installing it as a creature so this test does not spend its setup budget serializing the debug
+    // native artifact through a local JSON bus publish.
+    let echo_so = native_cdylib("echo_daemon");
+    let echo_bytes = std::fs::read(&echo_so).expect("read echo-daemon .so");
+    let echo_manifest = signed_artifact_manifest("echo-daemon", &echo_bytes, &abode);
+    let expected_hash = sha256_hex(&echo_bytes);
+    let registry_a_instance = RegistryMem::new();
+    let artifact_hash = registry_a_instance.publish(echo_manifest.clone(), echo_bytes.clone());
+    // The registry indexes by artifact-bytes sha256 — same value `provenance.build_hash` carries,
+    // distinct from `Manifest::content_address` (the identity-shape hash).
+    assert_eq!(artifact_hash, expected_hash, "registry artifact_hash = sha256(artifact)");
     let registry_a = k_a
         .load_instance(
             signed_boot_manifest("registry-mem", &node_a_key),
-            Box::new(RegistryMem::new()),
+            Box::new(registry_a_instance),
         )
         .expect("registry-A admits");
     k_a.bind_role(Role::new(Role::REGISTRY), registry_a);
@@ -238,48 +253,20 @@ fn end_to_end_ship_admit_load_run_across_two_nodes() {
         "B did not observe A connecting"
     );
 
-    // ---- author the artifact on A + publish ----
-    let echo_so = native_cdylib("echo_daemon");
-    let echo_bytes = std::fs::read(&echo_so).expect("read echo-daemon .so");
-    let echo_manifest = signed_artifact_manifest("echo-daemon", &echo_bytes, &abode);
-    let expected_hash = sha256_hex(&echo_bytes);
-
-    let (probe_a, bus_a, rx_a) = k_a.open_endpoint(Capabilities::default());
-    let publish =
-        RegistryOp::Publish { manifest: echo_manifest.clone(), artifact: echo_bytes.clone() };
-    let publish_payload = serde_json::to_vec(&publish).unwrap();
-    bus_a
-        .emit(
-            Dispatch::to(Address::Role(Role::new(Role::REGISTRY)), publish_payload)
-                .with_reply_to(Address::Creature(probe_a))
-                .with_corr(1),
-        )
-        .expect("publish to local registry");
-    // 5s is generous for a local handoff; the registry deserializes the hex-encoded artifact
-    // (one JSON string token), inserts into a HashMap, and replies — sub-second on a debug build.
-    // Under valgrind (GAWD_SLOW_TEST=30) this becomes 150s.
-    let pub_reply_env = rx_a.recv_timeout(scaled(Duration::from_secs(5))).expect("publish reply");
-    let pub_reply: RegistryReply = serde_json::from_slice(&pub_reply_env.payload).unwrap();
-    let artifact_hash = match pub_reply {
-        RegistryReply::Published { artifact_hash } => artifact_hash,
-        other => panic!("expected Published, got {other:?}"),
-    };
-    // The registry indexes by artifact-bytes sha256 — same value `provenance.build_hash` carries,
-    // distinct from `Manifest::content_address` (the identity-shape hash).
-    assert_eq!(artifact_hash, expected_hash, "registry artifact_hash = sha256(artifact)");
-
     // ---- fetch from B over the wire ----
     let (probe_b, bus_b, rx_b) = k_b.open_endpoint(Capabilities::default());
-    let fetch_op = RegistryOp::Fetch { artifact_hash: artifact_hash.clone() };
+    let fetch_op = RegistryOp::FetchGxPlan {
+        artifact_hash: artifact_hash.clone(),
+        chunk_size: Some(gawdxfer::DEFAULT_CHUNK_SIZE),
+    };
     let fetch_payload = serde_json::to_vec(&fetch_op).unwrap();
 
-    // The peer-connected events above prove the transport writer is installed, so send one fetch and
-    // wait for its correlated reply. Retrying here is counterproductive: the reply carries the debug
-    // native artifact as JSON bytes, so repeated fetches can queue multiple large TCP frames and make
-    // a slow CI host look like a transport failure.
+    // The peer-connected events above prove the transport writer is installed, so ask for a plan,
+    // then pull chunks by index. The artifact bytes must move over GX chunks, not as one giant
+    // hex-encoded registry reply, and B controls pacing instead of A dumping the whole transfer.
     bus_b
         .send(
-            Dispatch::to(Address::Node(NodeId(NODE_A.into()), registry_a), fetch_payload.clone())
+            Dispatch::to(Address::Node(NodeId(NODE_A.into()), registry_a), fetch_payload)
                 .with_reply_to(Address::Creature(probe_b))
                 .with_corr(7),
         )
@@ -290,11 +277,87 @@ fn end_to_end_ship_admit_load_run_across_two_nodes() {
     assert_eq!(fetch_env.header.corr, Some(7), "corr preserved across the wire");
 
     let reply: RegistryReply = serde_json::from_slice(&fetch_env.payload).unwrap();
-    let (m_fetched, art_fetched) = match reply {
-        RegistryReply::Fetched { manifest, artifact } => (manifest, artifact),
-        other => panic!("expected Fetched across the wire, got {other:?}"),
+    let (m_fetched, plan) = match reply {
+        RegistryReply::FetchedGx {
+            manifest,
+            artifact_hash: fetched_hash,
+            transfer_id,
+            file_size,
+            file_hash,
+            chunk_size,
+            total_chunks,
+        } => {
+            assert_eq!(fetched_hash, artifact_hash);
+            let plan = gawdxfer::TransferPlan::new(transfer_id, file_size, file_hash, chunk_size)
+                .expect("registry returned a valid GX transfer plan");
+            assert_eq!(plan.total_chunks, total_chunks);
+            (manifest, plan)
+        }
+        other => panic!("expected FetchedGx across the wire, got {other:?}"),
     };
     assert_eq!(m_fetched, echo_manifest, "fetched manifest equals what A published");
+    let mut assembler = gawdxfer::ChunkAssembler::new(plan).expect("GX assembler");
+    let transfer_id = assembler.plan().transfer_id.clone();
+    let chunk_size = assembler.plan().chunk_size;
+    let total_chunks = assembler.plan().total_chunks;
+    const GX_PULL_WINDOW: u32 = 8;
+    let send_chunk_request = |chunk_index: u32| {
+        let chunk_op = RegistryOp::FetchGxChunk {
+            artifact_hash: artifact_hash.clone(),
+            transfer_id: transfer_id.clone(),
+            chunk_size,
+            chunk_index,
+        };
+        bus_b
+            .send(
+                Dispatch::to(
+                    Address::Node(NodeId(NODE_A.into()), registry_a),
+                    serde_json::to_vec(&chunk_op).unwrap(),
+                )
+                .with_reply_to(Address::Creature(probe_b))
+                .with_corr(7),
+            )
+            .expect("send GX chunk request over the node transport");
+    };
+
+    let mut next_chunk = 0;
+    let mut in_flight = 0;
+    while next_chunk < total_chunks && in_flight < GX_PULL_WINDOW {
+        send_chunk_request(next_chunk);
+        next_chunk += 1;
+        in_flight += 1;
+    }
+
+    let chunk_deadline = std::time::Instant::now() + scaled(Duration::from_secs(30));
+    while !assembler.is_complete() {
+        let remaining = chunk_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "timeout waiting for GX artifact chunks");
+        match rx_b.recv_timeout(remaining) {
+            Ok(env)
+                if env.header.corr == Some(7)
+                    && env.header.schema == gawdxfer::TRANSPORT_GX_CHUNK_SCHEMA =>
+            {
+                assembler
+                    .accept_binary_frame(&env.payload)
+                    .expect("transport delivered a valid GX artifact chunk");
+                in_flight = in_flight.saturating_sub(1);
+                while next_chunk < total_chunks && in_flight < GX_PULL_WINDOW {
+                    send_chunk_request(next_chunk);
+                    next_chunk += 1;
+                    in_flight += 1;
+                }
+            }
+            Ok(env) if env.header.corr == Some(7) && env.header.schema == "registry.reply" => {
+                let reply: RegistryReply = serde_json::from_slice(&env.payload)
+                    .expect("registry reply after GX init should parse");
+                panic!("unexpected registry reply while waiting for GX chunk: {reply:?}");
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("timeout waiting for GX artifact chunks: {e}"),
+        }
+    }
+    assert!(assembler.is_complete(), "all requested GX chunks arrived");
+    let art_fetched = assembler.finish().expect("complete GX artifact verifies");
     assert_eq!(art_fetched, echo_bytes, "fetched artifact bytes equal what A published");
 
     // ---- admit + load on B via the safe path ----

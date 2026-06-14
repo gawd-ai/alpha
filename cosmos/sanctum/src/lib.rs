@@ -98,14 +98,14 @@ pub struct Admission {
 /// Liveness sense (proprioception) — operating-model Loops 1/4. Published on load/unload.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Proprioception {
-    pub module: u64,
+    pub creature: u64,
     pub event: String,
 }
 
 /// Outcome sense (fitness) — operating-model Loop 2 (selection). Published per handled envelope.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Fitness {
-    pub module: u64,
+    pub creature: u64,
     pub ok: bool,
 }
 
@@ -122,7 +122,7 @@ pub struct Fitness {
 /// emit both `"warn"` and `"hard"` where the operator opts in; `Wall` remains reserved.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BudgetSignalEvent {
-    pub module: u64,
+    pub creature: u64,
     pub level: String,
     pub kind: String,
     pub vector: BudgetVector,
@@ -139,7 +139,7 @@ pub struct BudgetSignalEvent {
 /// consumes it and may grant `ExtendBudget`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BudgetRequest {
-    pub module: u64,
+    pub creature: u64,
     pub fuel: Option<u64>,
     pub mem_bytes: Option<u64>,
     pub wall_ms: Option<u64>,
@@ -240,17 +240,70 @@ pub enum KernelControl {
     /// no synchronous reply (control is fire-and-forget by design — an answer would need a
     /// reply_to / corr round-trip the requester is free to add later).
     Unload { module: u64 },
-    /// **Honored.** Raise a live creature's resource caps so an injected
+    /// **Honored, per dimension.** Raise a live creature's resource caps so an injected
     /// policy can grant grace after a `Warn`-level [`BudgetSignalEvent`] (or a creature's
     /// `BudgetRequest`). Each field is `Option<u64>`: `Some(new_cap)` lifts the named dimension to
     /// that value, `None` leaves it untouched. The control listener calls [`Kernel::extend_budget`],
-    /// which lifts a live per-handle ceiling — the wasm tier's **fuel** or the critter tier's
-    /// **operation budget** — so the creature's next handle runs with the new budget. Tier-honest:
-    /// native (trusted-by-admission) exposes no live control, so a grant to it is an explicit no-op
-    /// (`extend_budget` returns `false`). `mem_bytes` / `wall_ms` lifts are accepted by the wire but
-    /// not yet honored (the wasm `StoreLimiter` isn't live-mutable) — a documented limit, not a
-    /// silent drop.
+    /// which returns a per-dimension [`ExtendOutcome`]. What each tier can live-lift: **beast (wasm)**
+    /// — fuel, memory, and wall (the live fuel cell, the live `ResourceLimiter` mem cell, and the live
+    /// epoch wall cell); **critter (Rhai)** — fuel (operation budget) and wall (the `on_progress`
+    /// watchdog), but **not** memory (its structural caps are fixed at load); **native** — none
+    /// (trusted-by-admission, no live control). A dimension a tier cannot honor is reported
+    /// `Unenforceable` and surfaced by the listener — never a silent no-op.
     ExtendBudget { module: u64, fuel: Option<u64>, mem_bytes: Option<u64>, wall_ms: Option<u64> },
+}
+
+/// One dimension's result inside an [`ExtendOutcome`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtendDim {
+    /// The grant left this dimension untouched (`None` on the wire).
+    NotRequested,
+    /// The tier honored the live lift — the creature's next handle runs with the new cap.
+    Applied,
+    /// The tier accepts this dimension on the wire but cannot honor a *live* lift (e.g. native's
+    /// no-metering, or a critter memory lift). Reported, never silently dropped.
+    Unenforceable,
+}
+
+impl ExtendDim {
+    fn for_request(requested: bool, enforces: bool) -> Self {
+        match (requested, enforces) {
+            (false, _) => ExtendDim::NotRequested,
+            (true, true) => ExtendDim::Applied,
+            (true, false) => ExtendDim::Unenforceable,
+        }
+    }
+}
+
+/// The per-dimension outcome of a [`Kernel::extend_budget`] grant. The honest-fail floor: an
+/// `ExtendBudget` can never silently no-op — the caller learns exactly which dimensions took effect,
+/// which the tier cannot honor, and whether the creature was even live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtendOutcome {
+    /// No live creature matched the id — the whole grant was a no-op.
+    pub unknown_creature: bool,
+    pub fuel: ExtendDim,
+    pub mem: ExtendDim,
+    pub wall: ExtendDim,
+}
+
+impl ExtendOutcome {
+    fn unknown() -> Self {
+        ExtendOutcome {
+            unknown_creature: true,
+            fuel: ExtendDim::NotRequested,
+            mem: ExtendDim::NotRequested,
+            wall: ExtendDim::NotRequested,
+        }
+    }
+    /// Whether at least one requested dimension was actually applied.
+    pub fn any_applied(&self) -> bool {
+        [self.fuel, self.mem, self.wall].contains(&ExtendDim::Applied)
+    }
+    /// Whether any requested dimension could not be honored by the creature's tier.
+    pub fn any_unenforceable(&self) -> bool {
+        [self.fuel, self.mem, self.wall].contains(&ExtendDim::Unenforceable)
+    }
 }
 
 impl Kernel {
@@ -359,7 +412,7 @@ impl Kernel {
             .ok_or(KernelError::NoEngine(manifest.abi.backend))?
             .clone();
         let loaded = engine.load(&artifact, &manifest)?;
-        Ok(self.install(manifest, loaded))
+        Ok(self.install(manifest, loaded, false))
     }
 
     /// Install an already-constructed **in-process** creature (a boot creature: the transport
@@ -371,18 +424,49 @@ impl Kernel {
         instance: Box<dyn Creature>,
     ) -> Result<CreatureId, KernelError> {
         self.admit(&manifest, None)?;
-        Ok(self.install(manifest, LoadedModule::new(instance, Box::new(()))))
+        Ok(self.install(manifest, LoadedModule::new(instance, Box::new(())), false))
+    }
+
+    /// Like [`load_instance`](Kernel::load_instance), but grants this creature the **boot-only
+    /// origin-attestation** capability — the privilege to seal an authenticated cross-node
+    /// [`Origin`](aether::Origin) on inbound frames via [`Bus::emit_attested`](aether::Bus::emit_attested).
+    /// This is the *only* way to obtain that grant; reserved for the transport gateway. A transport
+    /// loaded through the ordinary path still relays, but without origin attribution.
+    pub fn load_transport_instance(
+        &self,
+        manifest: Manifest,
+        instance: Box<dyn Creature>,
+    ) -> Result<CreatureId, KernelError> {
+        self.admit(&manifest, None)?;
+        Ok(self.install(manifest, LoadedModule::new(instance, Box::new(())), true))
+    }
+
+    /// Record this node's bus-signing public key — its ed25519 node identity, the same key the
+    /// transport authenticates links with. With it set, the router's verify-on-delivery resolves the
+    /// local sender's key and becomes a real check (instead of always exercising the negative
+    /// branch). Call once at boot, after [`new`](Kernel::new), when the node has a cluster identity.
+    pub fn set_node_identity(&self, pubkey: impl Into<String>) {
+        self.router.set_local_pubkey(pubkey.into());
     }
 
     /// Register + spawn the drain thread. The kernel owns the thread (kernel-driven lifecycle).
-    fn install(&self, manifest: Manifest, mut loaded: LoadedModule) -> CreatureId {
+    ///
+    /// `attesting` grants the **boot-only origin-attestation** capability to this creature's
+    /// `BusHandle` (see [`BusHandle::new_attesting`]). It is `true` only for the transport, loaded
+    /// through [`load_transport_instance`](Kernel::load_transport_instance) — never for a dynamic
+    /// artifact — so a loaded creature can never seal a cross-node origin.
+    fn install(&self, manifest: Manifest, mut loaded: LoadedModule, attesting: bool) -> CreatureId {
         // Lift the live fuel-ceiling control out BEFORE the LoadedModule moves into the
         // drain thread — the kernel keeps it (keyed by CreatureId) so a later ExtendBudget reaches the
         // creature; the drain only needs instance + resources for unload.
         let budget = loaded.budget.take();
         let caps = manifest.capabilities.clone();
         let (id, rx) = self.router.register(caps);
-        let bus = BusHandle::new(id, self.router.clone(), self.signer.clone());
+        let bus = if attesting {
+            BusHandle::new_attesting(id, self.router.clone(), self.signer.clone())
+        } else {
+            BusHandle::new(id, self.router.clone(), self.signer.clone())
+        };
         let ctx = CreatureCtx { me: id, bus: Arc::new(bus.clone()), manifest: manifest.clone() };
         let deadline_ms = Arc::new(AtomicU64::new(Deadline::default().0.as_millis() as u64));
         let router = self.router.clone();
@@ -407,31 +491,46 @@ impl Kernel {
         id
     }
 
-    /// **Honor a budget grant.** Lift a live creature's per-handle fuel ceiling so its
-    /// next handle runs with the new budget. Tier-honest + best-effort: the wasm tier (live fuel
-    /// ceiling) and the critter tier (live operation-budget ceiling) expose a [`BudgetControl`];
-    /// native is trusted-by-admission with no metering and exposes none, so a grant to a creature
-    /// without one is a no-op and returns `false` (the caller learns it was not honored, rather than a
-    /// silent lie). `fuel = Some(cap)` sets the per-handle fuel ceiling;
-    /// `mem_bytes` / `wall_ms` lifts are accepted by the wire but **not yet honored** (the wasm
-    /// `StoreLimiter` isn't live-mutable) — documented, not silently dropped. Returns `true`
-    /// iff a fuel ceiling was actually applied.
+    /// **Honor a budget grant, per dimension.** Lift a live creature's per-handle ceilings so its
+    /// next handle runs with the new budget, and report — per dimension — what actually took effect.
+    /// Each tier declares which dimensions it can live-lift on its [`BudgetControl`]: the beast (wasm)
+    /// tier lifts fuel + memory + wall; the critter tier lifts fuel + wall (not memory); native is
+    /// trusted-by-admission with no metering and exposes no control. A requested dimension a tier
+    /// cannot honor returns [`ExtendDim::Unenforceable`] (the caller learns it was not honored, never
+    /// a silent lie); an unknown creature returns [`ExtendOutcome::unknown_creature`].
     pub fn extend_budget(
         &self,
         module: CreatureId,
         fuel: Option<u64>,
-        _mem_bytes: Option<u64>,
-        _wall_ms: Option<u64>,
-    ) -> bool {
+        mem_bytes: Option<u64>,
+        wall_ms: Option<u64>,
+    ) -> ExtendOutcome {
         let loaded = mlock(&self.loaded);
-        let Some(entry) = loaded.get(&module) else { return false };
-        let Some(budget) = &entry.budget else { return false };
-        match fuel {
-            Some(cap) => {
-                budget.set_fuel(cap);
-                true
-            }
-            None => false,
+        let Some(entry) = loaded.get(&module) else { return ExtendOutcome::unknown() };
+        let Some(budget) = &entry.budget else {
+            // Native: no live budget control, so every requested dimension is unenforceable.
+            return ExtendOutcome {
+                unknown_creature: false,
+                fuel: ExtendDim::for_request(fuel.is_some(), false),
+                mem: ExtendDim::for_request(mem_bytes.is_some(), false),
+                wall: ExtendDim::for_request(wall_ms.is_some(), false),
+            };
+        };
+        // Apply each requested-and-enforceable dimension to the live cell; report the rest honestly.
+        if let (Some(cap), true) = (fuel, budget.enforces_fuel()) {
+            budget.set_fuel(cap);
+        }
+        if let (Some(cap), true) = (mem_bytes, budget.enforces_mem()) {
+            budget.set_mem(cap);
+        }
+        if let (Some(cap), true) = (wall_ms, budget.enforces_wall()) {
+            budget.set_wall_ms(cap);
+        }
+        ExtendOutcome {
+            unknown_creature: false,
+            fuel: ExtendDim::for_request(fuel.is_some(), budget.enforces_fuel()),
+            mem: ExtendDim::for_request(mem_bytes.is_some(), budget.enforces_mem()),
+            wall: ExtendDim::for_request(wall_ms.is_some(), budget.enforces_wall()),
         }
     }
 
@@ -794,7 +893,7 @@ fn run_drain(
 }
 
 fn publish_proprio(bus: &BusHandle, me: CreatureId, event: &str) {
-    let p = Proprioception { module: me.0, event: event.to_string() };
+    let p = Proprioception { creature: me.0, event: event.to_string() };
     let payload = aether::wire::to_bytes(&p);
     let _ = bus.send(
         Dispatch::to(Address::Topic(Topic::new(Topic::PROPRIOCEPTION)), payload)
@@ -810,7 +909,7 @@ fn publish_fitness(bus: &BusHandle, router: &Router, me: CreatureId, ok: bool) {
     if !router.has_subscribers(fitness_topic()) {
         return;
     }
-    let f = Fitness { module: me.0, ok };
+    let f = Fitness { creature: me.0, ok };
     let payload = aether::wire::to_bytes(&f);
     let _ = bus.send(
         Dispatch::to(Address::Topic(fitness_topic().clone()), payload).with_schema("fitness"),
@@ -862,18 +961,22 @@ fn run_control_listener(kernel: std::sync::Weak<Kernel>, rx: InboxReceiver) {
                 }
             }
             KernelControl::ExtendBudget { module, fuel, mem_bytes, wall_ms } => {
-                // Lift the creature's live per-handle fuel/op ceiling so
-                // an injected policy's grace grant (after a `Warn`, or anticipating a `Hard`)
-                // actually takes effect on the next handle. Best-effort + tier-honest: wasm + script
-                // expose a BudgetControl; native does not.
-                let honored = k.extend_budget(CreatureId(module), fuel, mem_bytes, wall_ms);
-                if !honored {
-                    // The documented contract is "not a silent lie": surface the no-op so an
-                    // injected policy that granted grace can tell it didn't take (unknown module,
-                    // metering-less tier, or only mem/wall asked — not yet live-honored).
+                // Lift the creature's live per-handle ceilings so an injected policy's grace grant
+                // (after a `Warn`, or anticipating a `Hard`) actually takes effect on the next handle.
+                // The honest-fail floor: `extend_budget` reports per dimension, and any dimension the
+                // creature's tier cannot live-lift is surfaced here — never a silent no-op.
+                let outcome = k.extend_budget(CreatureId(module), fuel, mem_bytes, wall_ms);
+                if outcome.unknown_creature {
                     eprintln!(
-                        "sanctum: control ExtendBudget for module {module} was a no-op \
-                         (fuel={fuel:?}, mem_bytes={mem_bytes:?}, wall_ms={wall_ms:?})"
+                        "sanctum: control ExtendBudget for module {module} matched no live creature \
+                         (no-op; fuel={fuel:?}, mem_bytes={mem_bytes:?}, wall_ms={wall_ms:?})"
+                    );
+                } else if outcome.any_unenforceable() {
+                    eprintln!(
+                        "sanctum: control ExtendBudget for module {module} was only partly honored — \
+                         this creature's tier cannot live-lift every requested dimension \
+                         (fuel={:?}, mem={:?}, wall={:?})",
+                        outcome.fuel, outcome.mem, outcome.wall
                     );
                 }
             }
@@ -920,7 +1023,7 @@ fn publish_budget_signal(bus: &BusHandle, me: CreatureId, signal: BudgetSignal) 
         LimitKind::Wall => "wall",
     };
     let p = BudgetSignalEvent {
-        module: me.0,
+        creature: me.0,
         level: level_str.to_string(),
         kind: kind_str.to_string(),
         vector: signal.vector,
@@ -992,12 +1095,13 @@ mod tests {
         )
     }
 
-    /// `extend_budget` is tier-honest: it returns `true` only when the
-    /// module exists AND its tier exposes a live `BudgetControl` (wasm fuel or critter op-budget), and
-    /// `false` otherwise. The docs promise the no-op is *reported* ("not a silent lie"); this locks
-    /// both `false` paths (unknown module + the metering-less native tier).
+    /// `extend_budget` is tier-honest **per dimension** — the honest-fail floor. It reports, for each
+    /// of fuel/mem/wall, whether the lift was applied, is unenforceable on that creature's tier, or
+    /// wasn't requested, plus whether the creature was even live. This locks: the unknown-creature
+    /// no-op, native (no metering → every dimension unenforceable), the beast (fuel + mem + wall all
+    /// live), and the critter (fuel + wall live, mem unenforceable).
     #[test]
-    fn extend_budget_reports_no_op_paths_and_honors_metered_tiers() {
+    fn extend_budget_reports_each_dimension_per_tier() {
         struct Noop;
         impl Creature for Noop {
             fn bind(&mut self, _ctx: CreatureCtx) {}
@@ -1007,43 +1111,45 @@ mod tests {
         }
         let k = kernel(Arc::new(AllowAll));
 
-        // (1) A module that doesn't exist → false (no panic).
-        assert!(
-            !k.extend_budget(CreatureId(9999), Some(1_000), None, None),
-            "unknown module → false"
-        );
+        // (1) A creature that doesn't exist → the whole grant is a no-op.
+        let unknown = k.extend_budget(CreatureId(9999), Some(1_000), None, None);
+        assert!(unknown.unknown_creature && !unknown.any_applied(), "unknown creature → no-op");
 
-        // (2) A native (in-process) creature has no BudgetControl → false (an honest no-op, not a
-        // lie). This is the metering-less tier; the critter tier, by contrast, DOES expose one and is
-        // proven to lift on a grant by anima's `script_extend_budget_lifts_the_live_ops_cap`.
+        // (2) Native has no live BudgetControl → every requested dimension is Unenforceable (an honest
+        // report, never a silent lie), and nothing is applied.
         let native_id = k
             .load_instance(
                 Manifest::new("noop", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
                 Box::new(Noop),
             )
             .expect("native admits");
-        assert!(
-            !k.extend_budget(native_id, Some(1_000), None, None),
-            "native tier → false (no fuel metering)"
-        );
+        let native = k.extend_budget(native_id, Some(1_000), Some(1), Some(1));
+        assert!(!native.unknown_creature && !native.any_applied(), "native applies nothing");
+        assert_eq!(native.fuel, ExtendDim::Unenforceable);
+        assert_eq!(native.mem, ExtendDim::Unenforceable);
+        assert_eq!(native.wall, ExtendDim::Unenforceable);
 
-        // (3) Contrast: a wasm beast DOES expose a control → a fuel grant returns true.
+        // (3) The beast (wasm) tier live-lifts ALL THREE dimensions now (live fuel cell, live
+        // ResourceLimiter mem cell, live epoch wall cell). A dimension left `None` is NotRequested.
         let (m, a) = beast();
         let beast_id = k.load(m, a).expect("beast loads");
-        assert!(
-            k.extend_budget(beast_id, Some(50_000), None, None),
-            "wasm tier → true (fuel lifted)"
-        );
-        // …and a grant with no fuel dimension is a no-op even on wasm.
-        assert!(!k.extend_budget(beast_id, None, Some(1), Some(1)), "no fuel ask → false");
+        let beast = k.extend_budget(beast_id, Some(50_000), Some(64 * 1024), Some(20));
+        assert_eq!(beast.fuel, ExtendDim::Applied, "beast fuel lifts");
+        assert_eq!(beast.mem, ExtendDim::Applied, "beast memory lifts (live ResourceLimiter cell)");
+        assert_eq!(beast.wall, ExtendDim::Applied, "beast wall lifts (live epoch cell)");
+        let beast_partial = k.extend_budget(beast_id, None, Some(1), None);
+        assert_eq!(beast_partial.fuel, ExtendDim::NotRequested);
+        assert_eq!(beast_partial.mem, ExtendDim::Applied);
+        assert!(beast_partial.any_applied() && !beast_partial.any_unenforceable());
 
-        // (4) A script critter also exposes a control → a fuel/op grant returns true.
+        // (4) The critter tier live-lifts fuel + wall, but its memory caps are structural and fixed at
+        // load → a mem lift is honestly Unenforceable, not silently dropped.
         let (m, a) = critter();
         let critter_id = k.load(m, a).expect("critter loads");
-        assert!(
-            k.extend_budget(critter_id, Some(50_000), None, None),
-            "critter tier → true (op budget lifted)"
-        );
+        let critter = k.extend_budget(critter_id, Some(50_000), Some(1), Some(20));
+        assert_eq!(critter.fuel, ExtendDim::Applied, "critter op budget lifts");
+        assert_eq!(critter.wall, ExtendDim::Applied, "critter wall lifts (on_progress watchdog)");
+        assert_eq!(critter.mem, ExtendDim::Unenforceable, "critter memory cap is fixed at load");
 
         k.unload(critter_id, Deadline::default()).unwrap();
         k.unload(beast_id, Deadline::default()).unwrap();
@@ -1275,7 +1381,7 @@ mod tests {
     #[test]
     fn budget_signal_event_roundtrips_with_full_vector() {
         let ev = BudgetSignalEvent {
-            module: 12,
+            creature: 12,
             level: "hard".into(),
             kind: "fuel".into(),
             vector: aether::BudgetVector {
@@ -1288,7 +1394,7 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&ev).unwrap();
         let back: BudgetSignalEvent = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.module, 12);
+        assert_eq!(back.creature, 12);
         assert_eq!(back.level, "hard");
         assert_eq!(back.kind, "fuel");
         assert_eq!(back.vector.consumed, 8_000);
@@ -1310,7 +1416,7 @@ mod tests {
     #[test]
     fn budget_request_roundtrips_with_optional_dimensions() {
         let r = BudgetRequest {
-            module: 7,
+            creature: 7,
             fuel: Some(50_000),
             mem_bytes: None,
             wall_ms: Some(500),
@@ -1318,7 +1424,7 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&r).unwrap();
         let back: BudgetRequest = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.module, 7);
+        assert_eq!(back.creature, 7);
         assert_eq!(back.fuel, Some(50_000));
         assert!(back.mem_bytes.is_none());
         assert_eq!(back.wall_ms, Some(500));
@@ -1327,7 +1433,7 @@ mod tests {
     #[test]
     fn budget_request_decode_accepts_valid_payload_under_limit() {
         let r = BudgetRequest {
-            module: 7,
+            creature: 7,
             fuel: Some(50_000),
             mem_bytes: None,
             wall_ms: None,
@@ -1335,7 +1441,7 @@ mod tests {
         };
         let bytes = serde_json::to_vec(&r).unwrap();
         let back = decode_budget_request(&bytes).unwrap();
-        assert_eq!(back.module, 7);
+        assert_eq!(back.creature, 7);
         assert_eq!(back.fuel, Some(50_000));
     }
 
@@ -1391,6 +1497,7 @@ mod tests {
                 corr: Some(7),
                 commitment: None,
                 schema: "kernel_control".into(),
+                origin: None,
             },
             payload,
         };

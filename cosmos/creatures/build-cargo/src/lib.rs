@@ -1644,6 +1644,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: b"{ not json".to_vec(),
         };
@@ -1675,6 +1676,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: vec![b'{'; MAX_BUILD_OP_BYTES + 1],
         };

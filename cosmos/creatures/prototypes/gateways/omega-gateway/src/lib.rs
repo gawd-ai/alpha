@@ -111,6 +111,7 @@ mod tests {
                 corr: Some(11),
                 commitment: None,
                 schema: "ping".into(),
+                origin: None,
             },
             payload: b"ping-body".to_vec(),
         }
@@ -150,6 +151,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: "".into(),
+                origin: None,
             },
             payload: b"x".to_vec(),
         };

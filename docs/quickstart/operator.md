@@ -63,8 +63,9 @@ alpha> journal          # the last bus envelopes (seq · stamp · from → to)
 
 ## 3. Make it do something — author a creature, live
 
-The headline move: ask, in English, for a capability and the substrate writes, signs, admits, and
-hot-loads it. Start with a **critter** (a sandboxed script — milliseconds, no compiler):
+The headline move: ask for a capability (a keyword the bundled matcher recognizes — see the note
+below, or build with `--features openai` for free-form English) and the substrate writes, signs,
+admits, and hot-loads it. Start with a **critter** (a sandboxed script — milliseconds, no compiler):
 
 ```
 alpha> author --critter reverse a string
@@ -90,7 +91,10 @@ already have on disk, use `load <manifest-path> <artifact-path>`.
 > author → compile → sign → admit → load *seam*. An LLM-backed author binds the same `AUTHORING`
 > socket. Native `author` matches requests containing `reverse` (→ the native daemon); the bundled
 > *critter* templates are reached via `author --critter <request>` (e.g. `reverse a string` or
-> `uppercase a message`), which injects the keyword the matcher keys on.
+> `uppercase a message`), which injects the keyword the matcher keys on. A request that matches no
+> template fails with a message naming the recognized keywords — it does **not** invent code. For
+> free-form English authoring, build with `--features openai` and select a model (`--author-model
+> <id>`); the same live LLM then binds `AUTHORING`.
 
 ## 4. Watch the substrate's senses
 

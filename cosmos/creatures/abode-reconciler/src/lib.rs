@@ -452,6 +452,7 @@ mod tests {
                 corr: Some(corr),
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: ReconcilerMsg::Reconcile { fork_a, fork_b }.to_bytes(),
         }
@@ -651,6 +652,7 @@ mod tests {
                 corr: None,
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: b"{not json".to_vec(),
         };
@@ -676,6 +678,7 @@ mod tests {
                 corr: Some(99),
                 commitment: None,
                 schema: SCHEMA.into(),
+                origin: None,
             },
             payload: vec![b'{'; max_message_bytes + 1],
         };

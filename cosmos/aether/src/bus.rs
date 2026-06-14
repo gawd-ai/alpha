@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::address::{Address, CreatureId};
 use crate::envelope::{address_depth_error, header_size_error, Envelope, Header};
 use crate::instance::Dispatch;
+use crate::origin::Origin;
 use crate::router::{RouteError, Router};
 
 /// The signing **mechanism** (permission primitive). The *model* — what keys mean, the scheme — is
@@ -82,26 +83,54 @@ impl Signer for Ed25519Signer {
 /// A creature's only ambient authority: the ability to put sealed envelopes onto the bus. Handed in
 /// `CreatureCtx` at `bind`. Cloning shares the per-sender `seq` counter, so order stays monotone
 /// across a creature's own threads.
+///
+/// `may_attest` is the **boot-only origin-attestation grant**: a handle made with [`Self::new_attesting`]
+/// (the transport's load path) may seal an [`Origin`] via [`emit_attested`](Bus::emit_attested); an
+/// ordinary handle ([`new`](BusHandle::new)) cannot. There is no manifest capability for this — the
+/// privilege is conferred by *how the kernel loads the creature*, never declared by the artifact, so
+/// a signed/authored creature can never grant itself the power to forge a cross-node origin.
 #[derive(Clone)]
 pub struct BusHandle {
     me: CreatureId,
     seq: Arc<AtomicU64>,
     router: Arc<Router>,
     signer: Arc<dyn Signer>,
+    may_attest: bool,
 }
 
 impl BusHandle {
     pub fn new(me: CreatureId, router: Arc<Router>, signer: Arc<dyn Signer>) -> Self {
-        BusHandle { me, seq: Arc::new(AtomicU64::new(0)), router, signer }
+        BusHandle { me, seq: Arc::new(AtomicU64::new(0)), router, signer, may_attest: false }
+    }
+
+    /// Like [`new`](BusHandle::new), but **may attest cross-node origin** via
+    /// [`emit_attested`](Bus::emit_attested). Reserved for the transport, loaded through the kernel's
+    /// dedicated transport-load path. Granting this to any other creature would let it forge a
+    /// `Verified` origin, so it is deliberately not reachable from a manifest.
+    pub fn new_attesting(me: CreatureId, router: Arc<Router>, signer: Arc<dyn Signer>) -> Self {
+        BusHandle { me, seq: Arc::new(AtomicU64::new(0)), router, signer, may_attest: true }
     }
 
     pub fn id(&self) -> CreatureId {
         self.me
     }
 
+    /// Whether this handle may seal a cross-node [`Origin`] (the boot-only transport grant).
+    pub fn may_attest(&self) -> bool {
+        self.may_attest
+    }
+
     /// Seal a dispatch into an envelope (set `from` / `seq` / `sig`) and route it. `stamp` is set by
     /// the router. Returns the router's result (`NoProvider`, `NoSuchModule`, `Backpressure`, …).
     pub fn send(&self, d: Dispatch) -> Result<(), RouteError> {
+        self.send_sealed(d, None)
+    }
+
+    /// The single sealing seam. `origin` is the cross-node attestation: `None` for ordinary local
+    /// sends, `Some` only on the transport's [`emit_attested`](Bus::emit_attested) path. It is sealed
+    /// into the header *before* the signature, so it rides inside the signed bytes and cannot be
+    /// altered in-fabric without breaking verification.
+    fn send_sealed(&self, d: Dispatch, origin: Option<Origin>) -> Result<(), RouteError> {
         let header = Header {
             from: Address::Creature(self.me),
             to: d.to,
@@ -113,6 +142,7 @@ impl BusHandle {
             corr: d.corr,
             commitment: d.commitment,
             schema: d.schema,
+            origin,
         };
         // Depth first: it is a cheap iterative walk, while the size gate serializes the header —
         // a pathologically deep address must never reach the recursive serializer.
@@ -137,6 +167,20 @@ pub trait Bus: Send + Sync {
     fn emit(&self, d: Dispatch) -> Result<(), BusError>;
     /// This creature's own routing handle.
     fn whoami(&self) -> CreatureId;
+    /// Seal a dispatch with an authenticated cross-node [`Origin`] and route it — the transport's
+    /// one privileged verb. The default **refuses** (`Denied`): no ordinary `Bus` may attest origin.
+    /// Only a [`BusHandle::new_attesting`] handle (the kernel's transport-load grant) overrides this
+    /// to actually seal the origin; every other implementation — the FFI shim, test doubles —
+    /// inherits the honest refusal.
+    fn emit_attested(&self, _d: Dispatch, _origin: Origin) -> Result<(), BusError> {
+        Err(BusError::Denied)
+    }
+    /// Whether this handle may attest cross-node origin (see [`emit_attested`](Bus::emit_attested)).
+    /// The transport checks this to take its attribution path only when it holds the boot grant,
+    /// avoiding a wasted attempt (and payload clone) on an ordinary bus. Defaults to `false`.
+    fn may_attest(&self) -> bool {
+        false
+    }
 }
 
 /// A failure putting a dispatch on the bus. The in-process bus preserves the full router detail via
@@ -196,5 +240,16 @@ impl Bus for BusHandle {
     }
     fn whoami(&self) -> CreatureId {
         self.id()
+    }
+    fn emit_attested(&self, d: Dispatch, origin: Origin) -> Result<(), BusError> {
+        if !self.may_attest {
+            // Not the transport — refuse rather than silently dropping the origin, so a misuse is
+            // loud. An ordinary creature can never reach this with a real grant anyway.
+            return Err(BusError::Denied);
+        }
+        self.send_sealed(d, Some(origin)).map_err(BusError::Route)
+    }
+    fn may_attest(&self) -> bool {
+        self.may_attest
     }
 }

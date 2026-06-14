@@ -269,6 +269,7 @@ version = "0.4.1"
 dependencies = [
  "aether",
  "bestiary",
+ "gawdxfer",
  "mind",
  "serde",
  "serde_json",
@@ -651,6 +652,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "distribute"
+version = "0.4.1"
+dependencies = [
+ "aether",
+ "anima",
+ "omni",
+ "policy-dev",
+ "registry-mem",
+ "sanctum",
+ "serde_json",
+ "sigil",
+ "transport-tcp",
+]
+
+[[package]]
 name = "distributor-requirements"
 version = "0.4.1"
 dependencies = [
@@ -831,6 +847,15 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "gawdxfer"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1339,6 +1364,7 @@ dependencies = [
  "seer",
  "serde",
  "serde_json",
+ "sha2",
  "sigil",
 ]
 
@@ -1364,6 +1390,7 @@ dependencies = [
  "bestiary-daemon",
  "build-cargo",
  "build-critter",
+ "gawdxfer",
  "mind",
  "monitor",
  "policy-dev",
@@ -1430,6 +1457,15 @@ version = "0.4.1"
 dependencies = [
  "sanctum",
  "sigil",
+]
+
+[[package]]
+name = "policy-origin"
+version = "0.4.1"
+dependencies = [
+ "aether",
+ "serde_json",
+ "transport-tcp",
 ]
 
 [[package]]
@@ -1626,6 +1662,7 @@ version = "0.4.1"
 dependencies = [
  "aether",
  "bestiary",
+ "gawdxfer",
  "serde",
  "serde_json",
  "sha2",
@@ -1784,6 +1821,7 @@ dependencies = [
  "echo-daemon-v2",
  "embodiment-advertiser",
  "fitness-selector",
+ "gawdxfer",
  "immune-response",
  "loopback-gateway",
  "merge-lww-map",
@@ -1794,6 +1832,7 @@ dependencies = [
  "policy-abode-allowlist",
  "policy-budget",
  "policy-dev",
+ "policy-origin",
  "policy-prefer-promoted",
  "policy-quarantine-aware",
  "policy-quarantine-trust-all",
@@ -2240,6 +2279,7 @@ name = "transport-tcp"
 version = "0.4.1"
 dependencies = [
  "aether",
+ "gawdxfer",
  "ring",
  "serde",
  "serde_json",

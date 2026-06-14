@@ -222,7 +222,9 @@ Selector control messages are capped before JSON decode. The watch map and obser
 bounded by default (`DEFAULT_MAX_WATCHED_MODULES`, `DEFAULT_MAX_OBSERVED_MODULES`). At capacity, a new
 watch is refused and a new creature id's observation is dropped while already-tracked ids keep
 updating; `with_max_watched_modules(0)` / `with_max_obs(0)` are the explicit opt-outs for unbounded
-replay or lab workloads.
+replay or lab workloads. Registry fillings also shape-check reputation signal metadata before
+retention: artifact hashes, Realm labels, provenance labels, and promotion signature fields are
+bounded and NUL-free, and half-signed promotion markers are refused.
 
 That signature **is heredity made checkable** — the Baldwin effect made concrete. A bare score is an
 *assertion* anyone who can write the registry could fabricate; a *signed* promotion is a verifiable

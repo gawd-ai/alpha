@@ -844,9 +844,10 @@ pub mod topics {
 
     /// Budget topic — reserved/draft (`BudgetRequest` / `ExtendBudget` consult).
     ///
-    /// **Draft shape — may be revised before any consumer ships.** Notably the `AnswerBody`
-    /// currently lacks an explicit denied-vs-granted-zero distinction; a real consumer will likely
-    /// promote this to an enum or add a `granted: bool` flag.
+    /// **Draft shape — may be revised before any consumer ships**, but the denied-vs-granted-zero
+    /// ambiguity is resolved up front: the `AnswerBody` carries an explicit `granted` flag, so
+    /// `granted: false` is a denial and `granted: true, granted_units: 0` is a deliberate
+    /// grant-nothing.
     pub mod budget {
         use super::*;
 
@@ -858,25 +859,29 @@ pub mod topics {
             pub request_units: u64,
             pub justification: String,
         }
-        /// **Reserved/draft.** Granted units. A `granted_units: 0` is currently ambiguous between
-        /// "explicit denial" and "granted nothing"; a real consumer should disambiguate.
+        /// **Reserved/draft.** The grace verdict. `granted` is the explicit admit/deny bit;
+        /// `granted_units` is how much was extended (meaningful only when `granted` is true — a
+        /// `granted_units: 0` with `granted: true` is a deliberate grant-nothing, distinct from a
+        /// `granted: false` denial).
         #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
         pub struct AnswerBody {
+            pub granted: bool,
             pub granted_units: u64,
         }
     }
 
     /// Fitness topic — reserved/draft (Loop 2's selection signal).
     ///
-    /// **Draft shape — may be revised before any consumer ships.** The `candidate: String` is
-    /// likely to become `candidate_hash` (content-addressed) once a real selector lands.
+    /// **Draft shape — may be revised before any consumer ships**, but the candidate is identified
+    /// by its content-addressed `candidate_hash` (the registry artifact hash), not a free-form name,
+    /// so a selector and a rater always agree on which artifact a score is about.
     pub mod fitness {
         use super::*;
 
         /// **Reserved/draft.** A selector asks "how well does this candidate perform?"
         #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
         pub struct QueryBody {
-            pub candidate: String,
+            pub candidate_hash: String,
             pub criterion: String,
         }
         /// **Reserved/draft.** A fitness score in [0.0, 1.0] with an injected criterion. `f32`

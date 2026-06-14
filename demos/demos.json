@@ -12,6 +12,11 @@
       "package": "federation"
     },
     {
+      "name": "distribute",
+      "summary": "Two Sanctums over ed25519 TCP (loopback): A publishes a creature, B fetch-loads it in bounded GX chunks with one `registry fetch-load` command, then runs it.",
+      "package": "distribute"
+    },
+    {
       "name": "bestiary-live",
       "summary": "A REAL model authors a creature into a durable, replicated, AI-curated Bestiary (opt-in: needs ALPHA_LLM_MODEL + --features openai).",
       "package": "bestiary-live"

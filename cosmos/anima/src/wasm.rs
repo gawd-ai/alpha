@@ -184,7 +184,10 @@ struct StoreData {
 /// emits a generic `anyhow!("forcing trap when growing memory…")` string we'd have to brittle-
 /// match. A typed sentinel error is the durable seam.
 struct BudgetLimits {
-    mem_bytes: u64,
+    /// **Live** memory ceiling (bytes; `0` = unlimited). Shared with the kernel's [`BudgetControl`]
+    /// so an `ExtendBudget` mem lift is observed by the very next `memory_growing` — no reach into
+    /// the store on its drain thread.
+    mem_bytes: Arc<AtomicU64>,
 }
 
 impl ResourceLimiter for BudgetLimits {
@@ -194,10 +197,11 @@ impl ResourceLimiter for BudgetLimits {
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        if self.mem_bytes == 0 {
+        let mem_bytes = self.mem_bytes.load(Ordering::Relaxed);
+        if mem_bytes == 0 {
             return Ok(true); // unlimited (the default)
         }
-        if (desired as u64) > self.mem_bytes {
+        if (desired as u64) > mem_bytes {
             // Refuse-as-trap: returning Err short-circuits the grow into a trap whose error chain
             // contains our typed sentinel, which `diagnose_trap` keys off to classify as a Memory
             // budget breach. (Returning `Ok(false)` would silently report -1 to the wasm program,
@@ -251,18 +255,29 @@ impl Engine for WasmEngine {
         let module = Module::new(&self.engine, &bytes)
             .map_err(|e| EngineError::Load(format!("wasm compile: {e}")))?;
 
-        // Per-store budget limiter. `mem_bytes == 0` = unlimited; otherwise a grow past the cap
-        // returns our typed sentinel error → wasmtime trap → `diagnose_trap` classifies it as
-        // `BudgetBreach::Memory`. The wasm program can't quietly swallow this (vs. spec's silent
-        // -1 on memory.grow failure) — that's exactly the shape the budget-kill needs.
-        let limits = BudgetLimits { mem_bytes: manifest.capabilities.mem_bytes };
-
-        let mut store = Store::new(&self.engine, StoreData { limits });
-        store.limiter(|d: &mut StoreData| &mut d.limits as &mut dyn ResourceLimiter);
-
         // cpu_ms → fuel. Always set (the engine is built with consume_fuel=true). `cpu_ms == 0`
         // means "no budget" → effectively unlimited fuel.
         let fuel = budget_to_fuel(manifest.capabilities.cpu_ms, self.fuel_per_ms);
+        // The live budget control owns the per-handle fuel/mem/wall ceilings the instance reads each
+        // handle and the kernel lifts on an `ExtendBudget` grant. Beast enforces fuel + mem live; wall
+        // is enforceable iff the engine's epoch ticker is running (a beast that *declares* a wall cap
+        // with no ticker was already refused above, so this only governs a grant onto a no-wall beast).
+        let budget = BudgetControl::new(
+            fuel,
+            manifest.capabilities.mem_bytes,
+            manifest.capabilities.wall_ms.unwrap_or(0),
+        )
+        .enforcing(true, true, self.ticker.is_some());
+
+        // Per-store budget limiter, reading the **live** mem cell so an `ExtendBudget` mem lift takes
+        // effect on the next grow. `mem_bytes == 0` = unlimited; otherwise a grow past the cap
+        // returns our typed sentinel error → wasmtime trap → `diagnose_trap` classifies it as
+        // `BudgetBreach::Memory`. The wasm program can't quietly swallow this (vs. spec's silent
+        // -1 on memory.grow failure) — that's exactly the shape the budget-kill needs.
+        let limits = BudgetLimits { mem_bytes: budget.mem_cell() };
+
+        let mut store = Store::new(&self.engine, StoreData { limits });
+        store.limiter(|d: &mut StoreData| &mut d.limits as &mut dyn ResourceLimiter);
         store.set_fuel(fuel).map_err(|e| EngineError::Load(format!("wasm set_fuel: {e}")))?;
 
         // Epoch interruption is enabled engine-wide, so the store needs a non-tripping deadline for
@@ -283,16 +298,10 @@ impl Engine for WasmEngine {
             .map_err(|e| EngineError::Load(format!("wasm export `handle`: {e}")))?;
         let cpu_ms = manifest.capabilities.cpu_ms;
         let mem_bytes_cap = manifest.capabilities.mem_bytes;
-        // Per-envelope wall-clock cap (ms), enforced via the engine-global epoch in `handle`.
-        let wall_ms = manifest.capabilities.wall_ms;
         // Clamp the operator-declared warn threshold to [0, 100]; values >100 (a malformed
         // manifest) collapse to "always warn" rather than refusing the load. Admission could
         // also reject them, but engine-side clamp is the floor — never trust the input.
         let budget_warn_at = manifest.capabilities.budget_warn_at.map(|p| p.min(100));
-        // The per-handle fuel ceiling is *live*: a shared atomic the instance reads
-        // each handle and the kernel can lift on a grant (`ExtendBudget`). Seeded with the declared
-        // budget (`fuel` above), so behaviour is identical until a grant raises it.
-        let budget = BudgetControl::new(fuel);
         let inst = WasmInstance {
             store,
             memory,
@@ -303,7 +312,9 @@ impl Engine for WasmEngine {
             envelopes_handled: 0,
             budget_warn_at,
             live_fuel_cap: budget.cell(),
-            wall_ms,
+            // The per-handle wall ceiling is *live* too (ms; `0` = unlimited): read fresh each handle
+            // from the shared cell, so an `ExtendBudget` wall lift takes effect on the next handle.
+            live_wall_ms_cap: budget.wall_cell(),
             epoch_tick_ms: self.epoch_tick_ms,
         };
         Ok(LoadedModule::new(Box::new(inst), Box::new(())).with_budget(budget))
@@ -388,11 +399,12 @@ struct WasmInstance {
     /// creature's *next* handle without touching the instance on its drain thread. Seeded at load to
     /// the declared budget, so an ungranted creature behaves exactly as before.
     live_fuel_cap: Arc<AtomicU64>,
-    /// **Per-envelope wall-clock cap (ms).** `Some(n)` arms an epoch deadline of `ceil(n / tick)`
-    /// ticks before each `handle`, so a beast that exceeds `n` ms of wall time traps with
-    /// `Trap::Interrupt` → a `Hard` `Wall` budget signal. `None` (the default) → an
+    /// **The live per-envelope wall-clock cap (ms).** Read fresh on every `handle` from the shared
+    /// cell the kernel lifts on an `ExtendBudget` wall grant. `n > 0` arms an epoch deadline of
+    /// `ceil(n / tick)` ticks before each `handle`, so a beast that exceeds `n` ms of wall time traps
+    /// with `Trap::Interrupt` → a `Hard` `Wall` budget signal. `0` (the default) → an
     /// effectively-unlimited deadline (never trips), mirroring the `cpu_ms == 0` fuel convention.
-    wall_ms: Option<u64>,
+    live_wall_ms_cap: Arc<AtomicU64>,
     /// The engine-global ticker cadence (ms), cached to convert `wall_ms` to a number of epoch ticks.
     epoch_tick_ms: u64,
 }
@@ -420,8 +432,8 @@ impl Creature for WasmInstance {
         // declared `wall_ms` cap to a number of ticks; `None`/`0` → an effectively-unlimited deadline
         // that never trips (mirrors the fuel `cpu_ms == 0` convention). Set fresh each handle so the
         // budget is genuinely per-envelope.
-        let deadline_ticks = match self.wall_ms {
-            Some(ms) if ms > 0 => ms.div_ceil(self.epoch_tick_ms).max(1),
+        let deadline_ticks = match self.live_wall_ms_cap.load(Ordering::Relaxed) {
+            ms if ms > 0 => ms.div_ceil(self.epoch_tick_ms).max(1),
             _ => UNLIMITED_EPOCH_DEADLINE,
         };
         self.store.set_epoch_deadline(deadline_ticks);
@@ -544,7 +556,7 @@ impl WasmInstance {
             }
             // Wall: consumed is the ms elapsed; limit is the declared per-envelope `wall_ms` cap
             // (0 if somehow unset — a Wall trap shouldn't arise without a cap).
-            LimitKind::Wall => (wall_ms_elapsed, self.wall_ms.unwrap_or(0)),
+            LimitKind::Wall => (wall_ms_elapsed, self.live_wall_ms_cap.load(Ordering::Relaxed)),
         };
         BudgetVector {
             consumed,

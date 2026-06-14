@@ -338,6 +338,7 @@ mod tests {
                     corr: None,
                     commitment: None,
                     schema: String::new(),
+                    origin: None,
                 },
                 payload: b"not json".to_vec(),
             }
@@ -366,6 +367,7 @@ mod tests {
                     corr: None,
                     commitment: None,
                     schema: String::new(),
+                    origin: None,
                 },
                 payload: vec![b'{'; MAX_BUILD_CRITTER_OP_BYTES + 1],
             }

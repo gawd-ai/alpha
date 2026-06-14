@@ -186,19 +186,19 @@ fn durable_publish_fetch_prove_and_survive_restart() {
             &rx,
             probe,
             Address::Creature(id),
-            RegistryOp::PublishInRealm {
+            RegistryOp::Publish {
                 manifest: Manifest::new("c", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
                 artifact: bytes.clone(),
-                realm: realm.clone(),
+                realm: Some(realm.clone()),
             },
             1,
         );
         hash = match reply {
-            RegistryReply::PublishedInRealm { artifact_hash, realm: echoed } => {
+            RegistryReply::Published { artifact_hash, realm: echoed } => {
                 assert_eq!(echoed, realm);
                 artifact_hash
             }
-            other => panic!("expected PublishedInRealm, got {other:?}"),
+            other => panic!("expected Published, got {other:?}"),
         };
 
         // Fetch it back.
@@ -207,12 +207,12 @@ fn durable_publish_fetch_prove_and_survive_restart() {
             &rx,
             probe,
             Address::Creature(id),
-            RegistryOp::FetchInRealm { artifact_hash: hash.clone(), realm: realm.clone() },
+            RegistryOp::Fetch { artifact_hash: hash.clone(), realm: Some(realm.clone()) },
             2,
         );
         match reply {
-            RegistryReply::FetchedInRealm { artifact, .. } => assert_eq!(artifact, bytes),
-            other => panic!("expected FetchedInRealm, got {other:?}"),
+            RegistryReply::Fetched { artifact, .. } => assert_eq!(artifact, bytes),
+            other => panic!("expected Fetched, got {other:?}"),
         }
 
         // Metadata fetch reports length without returning artifact bytes.
@@ -221,7 +221,7 @@ fn durable_publish_fetch_prove_and_survive_restart() {
             &rx,
             probe,
             Address::Creature(id),
-            RegistryOp::FetchMetadataInRealm { artifact_hash: hash.clone(), realm: realm.clone() },
+            RegistryOp::FetchMetadata { artifact_hash: hash.clone(), realm: Some(realm.clone()) },
             21,
         );
         match reply {
@@ -306,11 +306,11 @@ fn durable_publish_fetch_prove_and_survive_restart() {
         &rx,
         probe,
         Address::Creature(id2),
-        RegistryOp::FetchInRealm { artifact_hash: hash, realm },
+        RegistryOp::Fetch { artifact_hash: hash, realm: Some(realm) },
         10,
     );
     match reply {
-        RegistryReply::FetchedInRealm { artifact, manifest, .. } => {
+        RegistryReply::Fetched { artifact, manifest, .. } => {
             assert_eq!(artifact, bytes, "artifact survives restart");
             assert_eq!(manifest.name, "c");
         }
@@ -340,7 +340,7 @@ fn daemon_answers_registry_ops_byte_identically_to_registry_mem() {
         &rx,
         probe,
         Address::Creature(id),
-        RegistryOp::Publish { manifest: manifest.clone(), artifact: bytes.clone() },
+        RegistryOp::Publish { manifest: manifest.clone(), artifact: bytes.clone(), realm: None },
         1,
     );
     let stub_hash = {
@@ -357,29 +357,36 @@ fn daemon_answers_registry_ops_byte_identically_to_registry_mem() {
                 corr: Some(1),
                 commitment: None,
                 schema: "registry.op".into(),
+                origin: None,
             },
-            payload: serde_json::to_vec(&RegistryOp::Publish { manifest, artifact: bytes.clone() })
-                .unwrap(),
+            payload: serde_json::to_vec(&RegistryOp::Publish {
+                manifest,
+                artifact: bytes.clone(),
+                realm: None,
+            })
+            .unwrap(),
         };
         let out = stub.handle(env);
         match serde_json::from_slice::<RegistryReply>(&out.dispatches[0].payload).unwrap() {
-            RegistryReply::Published { artifact_hash } => artifact_hash,
+            RegistryReply::Published { artifact_hash, .. } => artifact_hash,
             other => panic!("stub: {other:?}"),
         }
     };
     let hash = match daemon_reply {
-        RegistryReply::Published { artifact_hash } => artifact_hash,
+        RegistryReply::Published { artifact_hash, .. } => artifact_hash,
         other => panic!("daemon Publish reply: {other:?}"),
     };
     assert_eq!(hash, stub_hash, "daemon + stub index under the identical artifact_hash");
 
-    // Fetch a missing key: both reply NotFound.
+    // Fetch a missing key: both reply NotFound. The hash is validly-shaped (64 lowercase hex) but
+    // absent — a malformed hash is a different, Error-shaped path (the shape guard fires first).
+    let absent_hash = sha256_hex(b"definitely-not-published");
     let reply = registry_op(
         &bus,
         &rx,
         probe,
         Address::Creature(id),
-        RegistryOp::Fetch { artifact_hash: "not-present".into() },
+        RegistryOp::Fetch { artifact_hash: absent_hash, realm: None },
         2,
     );
     assert!(matches!(reply, RegistryReply::NotFound), "missing fetch is NotFound (parity)");
@@ -390,7 +397,7 @@ fn daemon_answers_registry_ops_byte_identically_to_registry_mem() {
         &rx,
         probe,
         Address::Creature(id),
-        RegistryOp::Fetch { artifact_hash: hash },
+        RegistryOp::Fetch { artifact_hash: hash, realm: None },
         3,
     );
     match reply {
@@ -466,10 +473,10 @@ fn daemon_rejects_oversized_registry_publish_artifact() {
         &rx,
         probe,
         Address::Creature(id),
-        RegistryOp::PublishInRealm {
+        RegistryOp::Publish {
             manifest: Manifest::new("too-big", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
             artifact: bytes,
-            realm: realm.clone(),
+            realm: Some(realm.clone()),
         },
         1,
     );
@@ -485,7 +492,7 @@ fn daemon_rejects_oversized_registry_publish_artifact() {
         &rx,
         probe,
         Address::Creature(id),
-        RegistryOp::FetchInRealm { artifact_hash: hash, realm },
+        RegistryOp::Fetch { artifact_hash: hash, realm: Some(realm) },
         2,
     );
     assert!(matches!(reply, RegistryReply::NotFound), "oversized artifact was not stored");
@@ -508,27 +515,27 @@ fn daemon_bounds_full_artifact_list_entries_snapshots() {
         &rx,
         probe,
         Address::Creature(id),
-        RegistryOp::PublishInRealm {
+        RegistryOp::Publish {
             manifest: Manifest::new("a", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
             artifact: b"aaa".to_vec(),
-            realm: RealmId::new("crew"),
+            realm: Some(RealmId::new("crew")),
         },
         1,
     );
-    assert!(matches!(publish_a, RegistryReply::PublishedInRealm { .. }));
+    assert!(matches!(publish_a, RegistryReply::Published { .. }));
     let publish_b = registry_op(
         &bus,
         &rx,
         probe,
         Address::Creature(id),
-        RegistryOp::PublishInRealm {
+        RegistryOp::Publish {
             manifest: Manifest::new("b", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
             artifact: b"bbb".to_vec(),
-            realm: RealmId::new("guests"),
+            realm: Some(RealmId::new("guests")),
         },
         2,
     );
-    assert!(matches!(publish_b, RegistryReply::PublishedInRealm { .. }));
+    assert!(matches!(publish_b, RegistryReply::Published { .. }));
 
     let over_cap = registry_op(
         &bus,
@@ -702,7 +709,7 @@ fn daemon_rejects_oversized_push_entry_batches_before_store_merge() {
             &rx,
             probe,
             Address::Creature(id),
-            RegistryOp::FetchInRealm { artifact_hash: hash, realm: realm.clone() },
+            RegistryOp::Fetch { artifact_hash: hash, realm: Some(realm.clone()) },
             corr,
         );
         assert!(matches!(reply, RegistryReply::NotFound), "over-cap batch must not merge entries");

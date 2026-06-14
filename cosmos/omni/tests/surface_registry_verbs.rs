@@ -135,12 +135,10 @@ fn publish_then_fetch_and_list_round_trip_through_the_registry() {
         .collect();
     assert!(hashes.contains(&hash.as_str()), "list includes the published hash: {hashes:?}");
 
-    // (4) Fetch an unknown hash → a clean not-found error, node survives (a later read still works).
-    let res = control(
-        &kernel,
-        4,
-        &Verb::RegistryFetch { artifact_hash: "deadbeef-not-a-hash".into(), realm: None },
-    );
+    // (4) Fetch an unknown (validly-shaped, 64-hex, but absent) hash → a clean not-found error, node
+    // survives (a later read still works). A malformed hash is a different, Error-shaped path.
+    let res =
+        control(&kernel, 4, &Verb::RegistryFetch { artifact_hash: "f".repeat(64), realm: None });
     assert!(!res.ok, "unknown fetch is an error");
     assert!(!res.is_gate_block(), "not-found is not a gate refusal");
     assert_eq!(res.json.get("not_found").and_then(|v| v.as_bool()), Some(true));

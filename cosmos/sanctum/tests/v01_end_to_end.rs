@@ -377,8 +377,11 @@ fn v01_end_to_end_loop_proves_m3_m2_m1_m4_compose() {
     );
 
     // -- step 3: publish on A --
-    let publish_op =
-        RegistryOp::Publish { manifest: built_manifest.clone(), artifact: built_artifact.clone() };
+    let publish_op = RegistryOp::Publish {
+        manifest: built_manifest.clone(),
+        artifact: built_artifact.clone(),
+        realm: None,
+    };
     let publish_payload = serde_json::to_vec(&publish_op).unwrap();
     a.probe_bus
         .emit(
@@ -391,7 +394,7 @@ fn v01_end_to_end_loop_proves_m3_m2_m1_m4_compose() {
         recv_with_corr(&a.probe_rx, 3, scaled(Duration::from_secs(5))).expect("publish reply");
     let pub_reply: RegistryReply = serde_json::from_slice(&pub_env.payload).unwrap();
     let artifact_hash = match pub_reply {
-        RegistryReply::Published { artifact_hash } => artifact_hash,
+        RegistryReply::Published { artifact_hash, .. } => artifact_hash,
         other => panic!("expected Published, got {other:?}"),
     };
     assert_eq!(artifact_hash, expected_artifact_hash);
@@ -400,7 +403,7 @@ fn v01_end_to_end_loop_proves_m3_m2_m1_m4_compose() {
     // Address::Node(NODE_A, registry_a) is the *capability-shape* address: an envelope addressed
     // off-node by NodeId, delivered to a specific creature there. The transport rewrites reply_to
     // on the way out so the reply comes back to *this* node, *this* probe.
-    let fetch_op = RegistryOp::Fetch { artifact_hash: artifact_hash.clone() };
+    let fetch_op = RegistryOp::Fetch { artifact_hash: artifact_hash.clone(), realm: None };
     let fetch_payload = serde_json::to_vec(&fetch_op).unwrap();
     let fetch_env = retry_until_reply(
         &b.probe_bus,
@@ -417,7 +420,7 @@ fn v01_end_to_end_loop_proves_m3_m2_m1_m4_compose() {
     assert_eq!(fetch_env.header.corr, Some(4), "corr preserved across the wire");
     let fetch_reply: RegistryReply = serde_json::from_slice(&fetch_env.payload).unwrap();
     let (m_fetched, art_fetched) = match fetch_reply {
-        RegistryReply::Fetched { manifest, artifact } => (manifest, artifact),
+        RegistryReply::Fetched { manifest, artifact, .. } => (manifest, artifact),
         other => panic!("expected Fetched, got {other:?}"),
     };
     assert_eq!(m_fetched, built_manifest, "fetched manifest matches what A published");

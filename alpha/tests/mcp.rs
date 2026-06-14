@@ -95,7 +95,7 @@ fn handshake_tools_list_and_unknown_method() {
     mcp.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let list = mcp.recv();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 18, "the tool catalog has 18 entries");
+    assert_eq!(tools.len(), 19, "the tool catalog has 19 entries");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     for expected in [
         "alpha_status",
@@ -108,6 +108,7 @@ fn handshake_tools_list_and_unknown_method() {
         "alpha_registry_publish",
         "alpha_registry_fetch",
         "alpha_registry_list",
+        "alpha_registry_fetch_load",
         "alpha_bestiary_prove",
     ] {
         assert!(names.contains(&expected), "tool `{expected}` is in the catalog: {names:?}");
@@ -126,6 +127,14 @@ fn handshake_tools_list_and_unknown_method() {
         publish_tool["annotations"]["readOnlyHint"],
         json!(true),
         "registry publish is a mutation, not read-only"
+    );
+    // fetch-load loads code into the node → a mutation, gated, not read-only.
+    let fetch_load_tool =
+        tools.iter().find(|t| t["name"] == json!("alpha_registry_fetch_load")).unwrap();
+    assert_ne!(
+        fetch_load_tool["annotations"]["readOnlyHint"],
+        json!(true),
+        "registry fetch-load loads code, so it is a mutation, not read-only"
     );
 
     mcp.send(json!({ "jsonrpc": "2.0", "id": 3, "method": "frobnicate" }));

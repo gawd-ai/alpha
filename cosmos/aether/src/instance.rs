@@ -168,8 +168,8 @@ impl BudgetSignal {
 /// **push order** (it iterates the `Vec` front-to-back, calling `BusHandle::send` on each), and a
 /// local creature's inbox is a **single-consumer FIFO** channel. So two dispatches in the *same*
 /// `Outcome` addressed to the *same* local creature arrive at that creature in the order they were
-/// pushed. A creature may rely on this for a local same-target sequence — e.g. a `PublishInRealm`
-/// pushed before its `AttestFitness` lands first (`omega-federator`'s anti-entropy merge). The
+/// pushed. A creature may rely on this for a local same-target sequence — e.g. a realm-scoped
+/// `Publish` pushed before its `AttestFitness` lands first (`omega-federator`'s anti-entropy merge). The
 /// guarantee is **local only**: `transport-tcp` offers no cross-node / cross-creature ordering, so
 /// a sequence whose target may be off-node must confirm step *n* before emitting step *n+1* rather
 /// than rely on push order.

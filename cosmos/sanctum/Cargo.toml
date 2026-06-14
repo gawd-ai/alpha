@@ -39,6 +39,7 @@ policy-dev = { path = "../creatures/prototypes/policies/policy-dev" }
 policy-signed = { path = "../creatures/prototypes/policies/policy-signed" }
 transport-tcp = { path = "../creatures/transport-tcp" }
 registry-mem = { path = "../creatures/registry-mem" }
+gawdxfer = { path = "../gawdxfer" }
 # The durable Bestiary: the contract/store crate + the daemon creature that fills Role::REGISTRY
 # with persistence + replication, exercised by bestiary_durable_local + bestiary_replication_cross_node.
 bestiary = { path = "../bestiary" }
@@ -96,6 +97,10 @@ policy-prefer-promoted = { path = "../creatures/prototypes/policies/policy-prefe
 immune-response = { path = "../creatures/immune-response" }
 policy-quarantine-trust-all = { path = "../creatures/prototypes/policies/policy-quarantine-trust-all" }
 policy-quarantine-aware = { path = "../creatures/prototypes/policies/policy-quarantine-aware" }
+# Cross-node sender authentication (B4): the reference defense policy that forgets a peer on repeated
+# forged-origin verdicts. Drives cross_node_origin.rs (Verified attribution + BadSig detection over a
+# real two-node channel + the verdict→Forget enforcement loop).
+policy-origin = { path = "../creatures/prototypes/policies/policy-origin" }
 # The consumer of the envelope `commitment` slot (verifiable randomness). Drives verifiable_die_local
 # — commit (commitment rides the slot across the bus) → reveal → any peer verifies the pick.
 verifiable-die = { path = "../creatures/verifiable-die" }

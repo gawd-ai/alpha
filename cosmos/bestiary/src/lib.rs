@@ -27,7 +27,7 @@
 //! ## On security: a wire-sourced Realm is **only ever hashed, never path-joined**
 //!
 //! [`RealmId`](sigil::RealmId) is `pub struct RealmId(pub String)` and its `is_valid()` permits `/`
-//! and `..`. A Realm name reaches the store from untrusted sources (`PublishInRealm`, a pulled
+//! and `..`. A Realm name reaches the store from untrusted sources (a realm-scoped `Publish`, a pulled
 //! `SyncEntry`, a pushed entry), so path-joining it would be a remote arbitrary-file-write primitive.
 //! [`FsBestiaryStore`] hashes every Realm to a `sha256` hex stem and keeps the human name only inside a
 //! signed sidecar index — see the [`store`] module.
@@ -38,9 +38,10 @@ pub mod store;
 mod wire;
 
 pub use wire::{
-    CatalogEntry, Entry, QuarantineNotice, RegistryOp, RegistryReply, ReputationScore, SyncEntry,
-    MAX_QUARANTINE_ATTESTING_PEERS, MAX_QUARANTINE_ATTESTING_PEER_BYTES,
-    MAX_QUARANTINE_REASON_BYTES, MAX_REGISTRY_SIGNAL_FIELD_BYTES,
+    artifact_hash_shape_error, CatalogEntry, Entry, QuarantineNotice, RegistryOp, RegistryReply,
+    ReputationScore, SyncEntry, ARTIFACT_HASH_HEX_BYTES, MAX_QUARANTINE_ATTESTING_PEERS,
+    MAX_QUARANTINE_ATTESTING_PEER_BYTES, MAX_QUARANTINE_REASON_BYTES,
+    MAX_REGISTRY_SIGNAL_FIELD_BYTES,
 };
 
 pub use curator::{AICurator, CurationContext, CurationDecision, Curator, DeterministicCurator};

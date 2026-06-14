@@ -326,6 +326,7 @@ mod tests {
                 corr: Some(5),
                 commitment: None,
                 schema: "test".into(),
+                origin: None,
             },
             payload: b"hello".to_vec(),
         };

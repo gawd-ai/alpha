@@ -50,7 +50,7 @@ envelope to a peer's creature over the gossip mesh:
 ```text
 # Terminal 1 — Sanctum A: author a creature live (note the id it prints / `list` shows)
 $ alpha node --node-id A --cluster-listen 127.0.0.1:9001
-alpha> author write a daemon that reverses a string
+alpha> author write a daemon that reverses a string   # default build keys on "reverse"; --features openai for free-form English
        creature 7  ·  authored → compiled → ed25519-signed → admitted → hot-loaded
 
 # Terminal 2 — Sanctum B: join A's mesh from one seed, then run A's creature over it
