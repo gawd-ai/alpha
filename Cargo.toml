@@ -1,11 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    # ---- the α front door: the single outermost entry point AND the home of every operator surface's
-    #      composition root; dispatches in-process to `alpha node` / `alpha mcp` / `alpha http`.
-    #      `alpha demo <name>` is different: it spawns external demos from `demos/demos.json`.
-    #      It is the ONLY crate at the repository root — the door in the membrane wall ----
+    # ---- the α pole: the front door + local operator (client). The single outermost entry point AND
+    #      the home of every operator surface's composition root; dispatches in-process to
+    #      `alpha node` / `alpha mcp` / `alpha http`. `alpha demo <name>` spawns external demos from
+    #      `demos/demos.json`. α and Ω are the two root poles that hold the system; cosmos/ is their
+    #      common library, foundation/ the shared floor beneath both ----
     "alpha",
+
+    # ---- the Ω pole: the federation apex / mesh side, dual to the α door. Where alpha is the local
+    #      operator (client), omega is the network graph of Realms (the server/mesh) — today the Ω
+    #      contract crate (an embryo), eventually its own binary. A root crate like alpha, not a cosmos
+    #      vocabulary noun; it consumes the cosmology (realm + aether) the same way alpha does ----
+    "omega",
 
     # ---- narrated, runnable demos (stay at the root, alongside the door they exercise) ----
     "demos/walkthrough",
@@ -19,7 +26,7 @@ members = [
     #      (a name "stable across GAWD systems"). gawdxfer is the GX bulk-transfer contract sctl shares. ----
     "foundation/gawdxfer",
 
-    # ---- everything between α and Ω lives under cosmos/ ----
+    # ---- the cosmology between the α and Ω poles — their common library — lives under cosmos/ ----
 
     # ---- substrate spine + tooling ----
     "cosmos/sigil",
@@ -29,13 +36,13 @@ members = [
     "cosmos/forge",
 
     # ---- first-class concept crates: promoted out of aether so future authority lands in a home that
-    #      already exists. abode/seer/bestiary carry live contracts; realm/omega (= Ω) are embryos that
-    #      imprint the cosmology now. Layering: aether → {seer, abode, realm, bestiary} → omega ----
+    #      already exists. abode/seer/bestiary carry live contracts; realm (= the trust domain) is an
+    #      embryo that imprints the cosmology now. Layering: aether → {seer, abode, realm, bestiary}
+    #      (the Ω pole `omega`, now at the root, consumes realm + aether from there) ----
     "cosmos/abode",
     "cosmos/seer",
     "cosmos/realm",
     "cosmos/bestiary",
-    "cosmos/omega",
 
     # ---- the injected model seam: a leaf crate (depends on no creature) carrying the `Model`
     #      contract so BOTH the model-backed author (agent-mind) and the Bestiary curator can consume

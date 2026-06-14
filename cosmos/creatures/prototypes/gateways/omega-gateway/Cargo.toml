@@ -13,5 +13,5 @@ aether = { path = "../../../../aether" }
 sigil = { path = "../../../../sigil" }
 # The `omega` concept crate owns the gateway seam — the bound Role, the structured
 # `omega.deferred` wire contract, and the `OmegaRouting` trait this stub implements.
-omega = { path = "../../../../omega" }
+omega = { path = "../../../../../omega" }
 serde_json = { workspace = true }

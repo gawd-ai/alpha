@@ -9,8 +9,8 @@ publish.workspace = true
 description = "The Ω of GAWD (embryo): the highest set-of-sets, the final membrane — the set-of-Realms that provides common services to the Realms beneath it (cross-realm graph optimization, gating, sanctum persistence/backup, self-containment). It names Ω and reserves the OmegaServices seam so that future authority arrives as an implementation of an existing concept, never as a new top-level membrane bolted on later."
 
 [dependencies]
-realm = { path = "../realm" }
-aether = { path = "../aether" }
+realm = { path = "../cosmos/realm" }
+aether = { path = "../cosmos/aether" }
 serde = { workspace = true }
 
 [dev-dependencies]

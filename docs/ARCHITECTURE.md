@@ -31,7 +31,8 @@ makes "fabric, not model" structurally enforced, not promised.
 
 ```
 .                          # repo root: the α door + support dirs only — "nothing mixed"
-alpha/                      # the α front door: node/mcp/http compose in-process; demo spawns external demos — the cosmology's only root crate
+alpha/                      # the α pole — front door + local operator (client): node/mcp/http compose in-process; demo spawns external demos
+omega/                      # the Ω pole — federation apex / mesh (server), dual to alpha: the Ω contract crate today, its own binary later
 demos/                     # narrated, runnable demos (walkthrough, federation, distribute, bestiary-live; cluster/ is a runbook)
 docs/                      # CONCEPTS / ARCHITECTURE / ROADMAP / TOPICS + design notes …
 foundation/                # shared GAWD foundations Alpha CONSUMES but does not own (cross-system, gawd-prefixed, externalize later):
@@ -43,7 +44,7 @@ cosmos/                    # everything between α and Ω — the interior the f
   sanctum/                 #   the kernel library (lifecycle + routing + admission); memcheck harnesses in tests/memcheck/ (ASan/Miri/Valgrind)
   forge/                   #   the creature-authoring surface (declare_creature! + NativeBus + managed::spawn)
   abode/  seer/            #   first-class concept crates: snapshot contract + Query/Answer primitive
-  realm/  omega/        #   the federation pair: trust domain + Ω (own their gateway seam)
+  realm/                #   the trust domain (owns its realm-gateway seam + realm::serve); Ω (omega) is a root pole, above
   omni/                    #   the spine-only control core every surface drives over the bus
   creatures/               #   production-capable reference organs (mostly native; critter source ships as bytes):
                            #     transport-tcp                     (ed25519 + framed TCP)
