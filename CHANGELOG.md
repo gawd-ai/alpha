@@ -8,7 +8,7 @@ Semantic-versioning guarantees begin at 1.0.
 For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the design notes under [`docs/design/`](docs/design/).
 
-## 0.4.1 - unreleased
+## 0.4.1 - 2026-06-14
 
 Turns two seam-proven claims into shipped reality — a *real model* authors creatures, and the Bestiary
 is a *durable, federated* registry — and hardens migration and budgets. Every contract change is
