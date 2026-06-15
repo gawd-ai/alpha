@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "2"
+  # CI does clean builds, so incremental compilation only bloats the runner disk (it grows
+  # `target/` with rebuild scaffolding that is never reused across a fresh job). Off.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   ci:
@@ -21,13 +24,17 @@ jobs:
       - name: Set up Rust (from rust-toolchain.toml)
         run: rustup show
 
-      - name: Cache cargo registry + target
+      # Cache only the cargo download caches — NOT `target/`. This workspace statically links
+      # wasmtime into nearly every binary (~220 MB each with debuginfo), so a cached `target/` grows
+      # without bound across commits (cargo never GCs stale hashed artifacts) and, decompressed, was
+      # overflowing the hosted runner's ~14 GB disk. The registry/git caches give the real speedup
+      # (no re-download / re-index); `target/` rebuilds from them fast enough.
+      - name: Cache cargo registry + git
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
