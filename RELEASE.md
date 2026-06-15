@@ -49,7 +49,7 @@ network dependency tree (the allow-list is maintained unconditionally — `cargo
 CARGO_BUILD_JOBS=2 cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
 CARGO_BUILD_JOBS=2 cargo clippy --locked -p alpha --features openai -- -D warnings
 CARGO_BUILD_JOBS=2 cargo test --locked -p agent-mind --features openai
-cargo deny check --all-features
+cargo deny --all-features check
 ```
 
 ## Tagging

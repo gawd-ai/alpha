@@ -140,12 +140,13 @@ curl -s -H "Authorization: Bearer $KEY" localhost:7777/api/status  # auth'd; sho
 A remote AI's *mutating* tools are blocked by the **allow-AI gate** (off by default) until a human flips
 `allow-ai on` at the REPL — and the AI's activity shows on your sense-tape so you can `allow-ai off` to
 revoke mid-flight. Full MCP setup (the `.mcp.json`, the gate, the security posture) is in the
-README's [*Drive a node remotely*](../../README.md) section.
+README's [*Drive it over MCP*](../../README.md#4-drive-it-over-mcp) rung.
 
-## 7. Cluster real nodes into a mesh
+## 7. Cluster real nodes into a mesh (a Realm of alphas)
 
 A single `alpha node` is one node. Give it a cluster transport and it joins a **many-to-many mesh** with
-other deployed nodes — gossip-based membership over the authenticated peer transport:
+other deployed nodes — gossip-based membership over the authenticated peer transport. `alpha` is the
+**control surface**, so a mesh of alpha nodes is a **Realm** you author and drive from any member:
 
 ```sh
 # node A (the seed) — boot prints its node-id, pubkey, and the `cluster join` line others use:
@@ -173,6 +174,14 @@ cross-executes, and attaches an AI to each is [`demos/cluster/`](../../demos/clu
 ```sh
 cd demos/cluster && ./00-build.sh && ./01-boot.sh && ./02-join.sh && ./03-graph.sh poll && ./04-cross-run.sh
 ```
+
+**Realms meet at Omega.** The mesh above is one Realm of alpha control surfaces. To federate *across*
+Realms you run the other pole — **`omega serve`**, a headless gateway per Realm that declares its own
+Realm (`--realm`) and maps the others to their gateways (`--peer-realm <realm>=<node-id>`). The gateways
+exchange catalogues by pull anti-entropy, federate signed reputation and quarantine, and route
+Omega-addressed traffic between Realms — while authoring stays here on the alpha seat. See the
+[cross-Realm quickstart rung in the README](../../README.md#3-mesh-more-omegas-across-realms)
+and run the whole cross-Realm story in-process with `cargo run -p federation`.
 
 ## 8. Narrated demos (in one process)
 

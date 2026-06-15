@@ -12,64 +12,167 @@
   <img alt="status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-orange.svg">
 </p>
 
-**Alpha is an open-source substrate for autonomous, self-improving AI** — a decentralized fabric where
-*many* AIs write their own capabilities, cryptographically sign them, and hot-load them into live
-nodes; then distribute and relocate that running work across machines, re-author the substrate they
-run on, and govern it among themselves. There is no central controller: the AIs operate the system,
-and humans supervise.
+**Alpha is an AI-first operating system for building a distributed computing fabric for ASI.** AIs write
+their own capabilities, cryptographically sign them, and hot-load them into live nodes — then distribute
+that running work across machines, federate it between networks, and govern it among themselves. There
+is no central controller: the AIs operate the system; humans supervise.
 
-It is the first public release toward **GAWD — General Autonomous World Demiurge**: AI-authored
-capability that can make, move, govern, and retire its own work across a network of machines.
+It runs as two binaries, two poles:
+
+- **`alpha`** — the **control surface**. The shell an AI (or you) uses to author, sign, hot-load, and
+  drive *creatures*. One bus contract (`Role::CONTROL`) behind three faces: a REPL, HTTP/WS, and MCP.
+- **`omega`** — the **fabric**. A headless server that meshes nodes into **Realms** and federates
+  across them. Every peer link is mutually-authenticated ed25519 over TCP.
+
+This is the first public release toward **GAWD — General Autonomous World Demiurge**.
+
+## Quickstart
+
+Five rungs, each building on the last. Every command is real — the same admission → engine → router
+path the test suite drives, no mocks.
+
+### 1. Get it and build
 
 ```sh
-cargo run -p walkthrough      # the whole loop, narrated — the fastest way to "get" Alpha
+git clone https://github.com/gawd-ai/alpha && cd alpha
+cargo build --release -p alpha -p omega        # → target/release/{alpha,omega}
 ```
 
-That demo has an AI author a string-reversing creature from an English request, compile and
-ed25519-sign it, admit it through the kernel's gate, hot-load and run it — then migrate a *running
-self* between two Sanctums with its state cryptographically intact. It drives the **same** admission →
-engine → router path the test suite uses, no mocks. (The first run shells out to a real `cargo build`,
-so a cold cache takes a minute or two; later runs are seconds.)
+In a hurry? `cargo run -p walkthrough` narrates the whole loop in one process: an AI authors a creature
+from an English request, compiles and ed25519-signs it, hot-loads and runs it, then migrates a *running
+self* between two Sanctums with its state intact. (The authoring step shells out to a real `cargo
+build`, so a cold cache takes a minute; later runs are seconds.)
 
-## See the fabric — many Sanctums, many Realms
+### 2. Run a node, author a creature
 
-One node is the appetizer; Alpha is built to be *distributed*. Watch several Sanctums across two or
-three Realms federate over real ed25519-authenticated TCP (loopback):
+Boot a node and you land in its REPL. A fresh `alpha node` self-hosts its own organs — an authoring
+agent, the build creatures, an in-memory registry, a sense monitor — so it can write and run code
+immediately:
+
+```text
+$ alpha node
+alpha> author --critter reverse a string        # script tier: a sandboxed Rhai creature, no compiler
+       ✓ authored → signed → admitted → hot-loaded critter as id=7
+alpha> send 7 hello
+       reply: olleh
+```
+
+That is one node authoring and running its own capability. Now make it a **fabric**: stand up an
+`omega` node and connect this alpha to it. The first link is mutual — there is **no TOFU**, so each end
+must already hold the other's pubkey (every node prints its own `node pubkey = …` at boot).
 
 ```sh
+# Terminal 1 — your alpha control surface, given a peer port (note the pubkey it prints):
+alpha node --node-id op --cluster-listen 127.0.0.1:9302
+
+# Terminal 2 — an omega fabric node, seeded to your alpha so it can authenticate the first hop:
+omega serve --node-id fab --realm crew --cluster-listen 127.0.0.1:9301 \
+    --seed op@127.0.0.1:9302#<op-pub>
+```
+
+```text
+# back at the alpha REPL — admit the fabric node (now A holds B's key too), then check the graph:
+alpha> cluster join fab@127.0.0.1:9301#<fab-pub>
+alpha> cluster
+       op ── fab   (connected)
+```
+
+A lone `alpha node` already authors and runs creatures by itself; `omega` is what turns separate nodes
+into one fabric. With a single Realm the gateway is just a mesh anchor — it earns its keep in rung 3.
+
+### 3. Mesh more omegas across Realms
+
+A **Realm** is one mesh of nodes. To federate *across* Realms — across servers, sites, organizations —
+run one `omega` gateway per Realm. Each declares its own Realm (`--realm`) and maps the others to their
+gateways (`--peer-realm <realm>=<node>`); seed the gateways with each other and they form the
+inter-Realm mesh:
+
+```sh
+# Realm "crew" gateway (one host):
+omega serve --node-id crew-gw --realm crew --cluster-listen 0.0.0.0:9101 \
+    --peer-realm ops=ops-gw  --seed ops-gw@<ops-host>:9102#<ops-pub>
+
+# Realm "ops" gateway (another host):
+omega serve --node-id ops-gw  --realm ops  --cluster-listen 0.0.0.0:9102 \
+    --peer-realm crew=crew-gw --seed crew-gw@<crew-host>:9101#<crew-pub>
+```
+
+The gateways exchange catalogues by pull anti-entropy, federate signed reputation and quarantine, and
+route Omega-addressed traffic between Realms. Authoring stays on the **alpha** seat: operators join a
+Realm's gateway, author there, and the federation carries it across. Pin a stable identity for scripted
+seeds with `--cluster-key <64-hex>`.
+
+See the whole cross-Realm story two ways — in one process, and as real separate processes:
+
+```sh
+cargo run -p federation                          # 2 Realms × 2 Sanctums, real TCP on loopback
 cargo run -p federation -- --realms 3 --sanctums 2
 ```
 
-You'll see a within-Realm cross-node fetch, cross-Realm pull anti-entropy, **signed reputation**,
-**quarantine** propagation, and **Omega-addressed routing**. The demo runs every Sanctum in one
-process; each Realm gateway there is the in-process equivalent of an **`omega serve`** server (it binds
-its `omega-federator` through the very same recipe, `omega::serve::boot_federator`), so what the demo
-narrates is what a deployed Ω server does.
+The [`demos/cluster/`](demos/cluster/) runbook stands up the same shape as separate processes — an
+`omega serve` anchor plus `alpha node` operators — forms the mesh, and cross-executes between nodes.
 
-Or drive it yourself. Boot one Sanctum, author a creature live, then have a second Sanctum join the
-mesh from a single seed and run that creature *across the cluster* — `send <node>:<id>` routes an
-envelope to a peer's creature over the gossip mesh:
+### 4. Drive it over MCP
 
-```text
-# Terminal 1 — Sanctum A: author a creature live (note the id it prints / `list` shows)
-$ alpha node --node-id A --cluster-listen 127.0.0.1:9001
-alpha> author write a daemon that reverses a string   # default build keys on "reverse"; --features openai for free-form English
-       creature 7  ·  authored → compiled → ed25519-signed → admitted → hot-loaded
+An AI drives a node over **MCP**. `alpha mcp` is itself a headless Alpha Sanctum on the bus — not a
+REST proxy: each tool call becomes a `Verb` envelope on `Role::CONTROL`. Register it with any MCP host:
 
-# Terminal 2 — Sanctum B: join A's mesh from one seed, then run A's creature over it
-$ alpha node --node-id B --cluster-listen 127.0.0.1:9002 --seed A@127.0.0.1:9001#<A-pubkey>
-alpha> cluster              # the mesh self-completed from a single seed → A, B
-alpha> send A:7 hello       # route to creature 7 on peer A, over the mesh → "olleh"
+```json
+{ "mcpServers": { "alpha": {
+    "command": "/abs/path/to/target/release/alpha",
+    "args": ["mcp"] } } }
 ```
 
-*(`alpha` is the built binary — `cargo build -p alpha`, or prefix the commands with `cargo run -p
-alpha --`. `alpha node` boots the three engines, wires its own organs, and drops into the REPL; add
-`--minimal` for a bare kernel.)* The exact seed string and a three-node runbook live in
-[`demos/cluster/`](demos/cluster/) — which stands up both poles on one mesh (node A an `omega serve`
-server, B/C `alpha node` operators); the [operator quickstart](docs/quickstart/operator.md) walks
-boot → author live → watch the sense-tape → scale up, step by step.
+That spawns a self-contained hub. To instead drive a node already running on a mesh, point the hub at a
+peer's control creature and seed it onto the mesh:
 
-## The five governing loops
+```sh
+alpha mcp --node-id hub --target op@<control-id> --seed op@127.0.0.1:9302#<op-pub>
+```
+
+Tools: `alpha_author`, `alpha_author_critter`, `alpha_send`, `alpha_cluster`, `alpha_status`,
+`alpha_list`, `alpha_registry_*`, and the rest of the REPL surface. An AI's *mutating* tools stay
+blocked until a human opens the allow-AI gate (rung 5).
+
+### 5. Drive it over HTTP
+
+Any node can expose an authenticated HTTP-REST + WebSocket control plane — the same `Role::CONTROL`
+surface, for web clients and scripts. (`omega serve` takes the same `--listen` / `--api-key`.)
+
+```sh
+alpha node --listen 127.0.0.1:7777 --api-key secret    # add --headless for API-only, no REPL
+
+curl -s localhost:7777/api/health                                          # public liveness
+curl -s -H "Authorization: Bearer secret" localhost:7777/api/cluster       # the mesh graph
+curl -s -H "Authorization: Bearer secret" -X POST localhost:7777/api/author/critter \
+     -H 'Content-Type: application/json' -d '{"request":"reverse a string"}'   # → {"creature_id":N,…}
+curl -s -H "Authorization: Bearer secret" -X POST localhost:7777/api/send \
+     -H 'Content-Type: application/json' -d '{"id":N,"text":"hello"}'          # → {"reply":"olleh"}
+```
+
+`GET /api/health` is public; everything else needs the Bearer key. A remote caller's **mutating** verbs
+(author, send, cluster connect) stay blocked by the **allow-AI gate** — off by default — until a human
+flips `allow-ai on` at the REPL; the AI's activity shows on the sense-tape, so you can `allow-ai off` to
+revoke mid-flight. The REPL is the local human seat and is never gated.
+
+## Creatures — the unit of work
+
+A **creature** is a hot-loadable unit of capability. All three tiers load through the *same*
+`Kernel::load` path, differing only by `abi.backend`:
+
+| Tier | What it is | Author it with |
+|---|---|---|
+| **`critter`** | A metered **Rhai script** — cheap, portable, authored with no compiler. | `author --critter <request>` ([quickstart](docs/quickstart/critter.md)) |
+| **`daemon`** | A **native** in-process creature (`dlopen` + safe hot-unload), trusted by admission. | `author <request>` → real `cargo build` ([quickstart](docs/quickstart/daemon.md)) |
+| **`beast`** | A sandboxed **WASM** creature — where untrusted or mobile code runs. | the [beast quickstart](docs/quickstart/beast.md) (authored via the SDK) |
+
+The bundled reference author is a deterministic template matcher (it keys on `reverse` / `uppercase`),
+which proves the author → compile → sign → admit → load *seam* with no network. A real model-backed
+author (`agent-mind`) binds the same `AUTHORING` socket — build with `--features openai`, select a model
+at the surface, and a live LLM writes the source. The model is *injected*; the fabric ships only the
+socket. To author your own on any tier, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## How work distributes — the five governing loops
 
 Alpha's behavior is five anti-entropy loops — all ordinary bus traffic, each realized by an *injected*
 creature (the substrate ships the socket and the sense stream; the *model* is a creature you can
@@ -93,9 +196,7 @@ mid-traffic without tearing down the bus.
 
 Four terms carry the rest; the full glossary is [`docs/CONCEPTS.md`](docs/CONCEPTS.md).
 
-- **Creature** — a hot-loadable unit of capability, in one of three tiers: a native `daemon`
-  (in-process, trusted-by-admission), a sandboxed WASM `beast` (where untrusted / mobile code runs),
-  or a metered script `critter` (a Rhai interpreter — cheap, portable, authored with no compiler).
+- **Creature** — a hot-loadable unit of capability, in one of three tiers (above).
 - **Sanctum** — a node: any compute host (server, robot, satellite, edge box) that loads and
   supervises creatures.
 - **Abode** — a portable per-identity *self*: state that migrates / forks / merges between Sanctums.
@@ -126,9 +227,7 @@ We'd rather you knew exactly where the seams are:
 - The **default** reference author is a deterministic **template matcher** (`agent-templated`) —
   hermetic, no network — which proves the author → compile → sign → admit → load *seam*. A real
   **model-backed author** (`agent-mind`) now binds the same `AUTHORING` socket: build with `--features
-  openai`, select a model at the operator surface, and a live LLM writes the source. The model is
-  *injected* through a trait, so the fabric still ships only the socket — "ASI is the fabric, not the
-  model" made literal.
+  openai`, select a model at the operator surface, and a live LLM writes the source.
 - Native `daemon` creatures are **trusted-by-admission** (they run in-process). Run untrusted or
   mobile code in the sandboxed WASM `beast` tier or the metered script `critter` tier.
 - Alpha is **pre-1.0 with no external security audit**. "An AI ships native code to a peer node" is,
@@ -158,43 +257,15 @@ The root holds the two poles — the **α** door (`alpha/`) and the **Ω** serve
 All three tiers are real: integration tests compile and run WebAssembly inline via `WasmEngine` and
 load signed Rhai through `ScriptEngine`, both through the same `Kernel::load` path as native.
 
-## Drive a node remotely — HTTP + MCP
+## Build, test, and platform
 
-The REPL is the local seat. A node can also expose an authenticated **HTTP + WebSocket** control
-plane, and an AI can drive it over **MCP** — both are loadable surface creatures speaking
-`Role::CONTROL` on the bus (see [the bus & control note](docs/design/bus-and-control.md)).
-
-```sh
-cargo run -p alpha -- node --listen 127.0.0.1:7777     # REPL + HTTP/WS  (--headless for API-only)
-curl -s localhost:7777/api/health                      # public liveness
-```
-
-`alpha mcp` **is itself a headless Alpha Sanctum** on the fabric — not a REST proxy: each tool call
-becomes a `Verb` envelope on its own bus. Register it with any MCP host:
-
-```json
-{ "mcpServers": { "alpha": {
-    "command": "/abs/path/to/target/release/alpha",
-    "args": ["mcp"] } } }
-```
-
-**Human and AI co-drive the *same* node, safely:** the allow-AI gate is **off by default**, so a
-remote AI's mutating tools return `ai-not-allowed` until a human grants it at the REPL with `allow-ai
-on` — and can `allow-ai off` to revoke mid-flight while watching the AI's activity on the sense-tape.
-Clustering many real nodes (gossip mesh, cross-execution, attaching an AI to each) is the
-[`demos/cluster/`](demos/cluster/) runbook, with the mechanics in the
-[clustering design note](docs/design/identity-transport-clustering.md).
-
-## Build & install
-
-This first public release is **source-first**: clone the repo and build the `alpha` front door from
-the workspace — that's the whole install. The crates aren't published to a package registry; on Alpha
-the unit you distribute is the **creature** (a signed `gawd_creature_v1` artifact), published and
-fetched by **content address between nodes over the bus**, not through a package manager. (The registry
-that catalogues them — the *Bestiary* — ships in two forms: an in-memory seed (`registry-mem`, the stub
-reference) and a **durable, federated, AI-curated** one (`bestiary-daemon`) — a realm-hashed
-signed-log store with verifiable entry proofs and monotonic-lattice replication. Both fill
-`Role::REGISTRY`; pick either.)
+This first public release is **source-first**: clone the repo and build from the workspace — that's the
+whole install. The crates aren't published to a package registry; on Alpha the unit you distribute is
+the **creature** (a signed `gawd_creature_v1` artifact), published and fetched by **content address
+between nodes over the bus**, not through a package manager. (The registry that catalogues them — the
+*Bestiary* — ships in two forms: an in-memory seed (`registry-mem`) and a **durable, federated,
+AI-curated** one (`bestiary-daemon`) — a realm-hashed signed-log store with verifiable entry proofs and
+monotonic-lattice replication. Both fill `Role::REGISTRY`; pick either.)
 
 ```sh
 cargo build --locked --workspace                                       # build everything

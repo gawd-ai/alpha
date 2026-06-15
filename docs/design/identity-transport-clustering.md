@@ -266,7 +266,8 @@ On every successful connection a node pushes its **full member view** to the new
 frame. On receiving gossip a node admits and dials any member it does not already know (skipping
 itself and peers it is already connected to or dialing); if it learned anything new it re-broadcasts,
 so a fresh member floods to the rest of the mesh. The mesh **self-completes from a single
-introduction** — one seed is enough for the graph to close.
+introduction** — admitting a newcomer at any one existing member is enough for gossip to close the rest
+of the graph (the first hop still needs that mutual admission; see *Joining a mesh* above).
 
 Gossip is event-driven: pushed on connect, re-flooded only when membership changes. It is
 best-effort — there is no periodic re-gossip, and a gossip frame is shed if a peer's send queue is

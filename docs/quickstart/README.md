@@ -11,8 +11,9 @@ Short, task-oriented guides. Two kinds: **run the system** (drive a live node as
 
 The runnable, narrated demos it builds toward live in [`demos/`](../../demos/):
 `cargo run -p walkthrough` (one node's whole loop) and `cargo run -p federation`
-(many Sanctums across 2–3 Realms over real TCP). Driving a node *remotely* over the HTTP API or MCP is
-in the README's [*Drive a node remotely*](../../README.md) section.
+(many Sanctums across 2–3 Realms over real TCP). Driving a node *remotely* is in the README quickstart —
+[*Drive it over MCP*](../../README.md#4-drive-it-over-mcp) and
+[*Drive it over HTTP*](../../README.md#5-drive-it-over-http).
 
 ## Write a creature
 
