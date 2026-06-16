@@ -1,0 +1,13 @@
+[package]
+name = "federation-scheduler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The omega-federator's cadence companion. A daemon creature that, on its own injected interval, emits FederatorMsg::PullFrom to the federator for each configured peer-Realm target — turning operator-poked anti-entropy into a self-driving Ω. Honors the federator's pending-pull backpressure via an in-flight counter it decrements on each Accepted/Rejected ack."
+
+[dependencies]
+aether = { path = "../../aether" }
+omega-federator = { path = "../omega-federator" }

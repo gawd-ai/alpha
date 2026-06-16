@@ -16,10 +16,14 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use aether::{
-    CreatureId, Deadline, Ed25519Signer, Ed25519Verifier, NodeId, RealmId, Role, Signer, Verifier,
+    Address, CreatureId, Deadline, Ed25519Signer, Ed25519Verifier, NodeId, RealmId, Role, Signer,
+    Verifier,
 };
 use anima::{NativeEngine, ScriptEngine, WasmEngine};
+use federation_scheduler::{FederationScheduler, PullTarget};
 use omega_federator::{FederatorConfig, OmegaFederator};
 use omni::{boot_control, boot_manifest, AiControl};
 use policy_dev::DevPolicy;
@@ -40,6 +44,9 @@ struct Opts {
     seeds: Vec<String>,
     /// Realm→peer routes for Omega routing: `<realm>=<node-id>` (repeatable).
     peer_realms: Vec<(String, String)>,
+    /// Self-driving anti-entropy: pull every peer Realm once per this many seconds. `None` keeps the
+    /// poke-driven default (no clock); `Some(n)` boots the `federation-scheduler` companion.
+    pull_interval_secs: Option<u64>,
     /// Reuse a node identity from a 32-byte hex seed (else one is minted at boot).
     cluster_key: Option<String>,
     /// Optional HTTP/WS control-plane listen address.
@@ -57,6 +64,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         realm: "global".to_string(),
         seeds: Vec::new(),
         peer_realms: Vec::new(),
+        pull_interval_secs: None,
         cluster_key: None,
         listen: None,
         api_key: None,
@@ -82,6 +90,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                     return Err("--peer-realm wants <realm>=<node-id> (both non-empty)".to_string());
                 }
                 o.peer_realms.push((realm.to_string(), node.to_string()));
+            }
+            "--pull-interval" => {
+                let v = args.next().ok_or("--pull-interval needs <seconds>")?;
+                let secs: u64 = v.parse().map_err(|_| "--pull-interval wants whole seconds")?;
+                if secs == 0 {
+                    return Err("--pull-interval must be >= 1 second".to_string());
+                }
+                o.pull_interval_secs = Some(secs);
             }
             "--cluster-key" => {
                 o.cluster_key = Some(args.next().ok_or("--cluster-key needs <64-hex-char seed>")?)
@@ -203,6 +219,26 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         "gateway: transport(id={}) → TRANSPORT, registry-mem(id={}) → REGISTRY, omega-federator(id={}) → OMEGA_GATEWAY",
         ids.transport.0, ids.registry.0, ids.federator.0
     );
+
+    // Optional self-driving anti-entropy: the `federation-scheduler` companion. With `--pull-interval`,
+    // the gateway pokes its own federator on a clock instead of waiting for an operator — Ω reconciles
+    // itself. Without the flag the gateway stays poke-driven (the substrate ships no clock).
+    if let Some(secs) = opts.pull_interval_secs {
+        match boot_scheduler(&kernel, &ids, &opts.peer_realms, secs) {
+            Ok(Some(sched_id)) => println!(
+                "gateway: federation-scheduler (id={}) pulling {} peer-realm(s) every {secs}s → self-driving anti-entropy.",
+                sched_id.0,
+                opts.peer_realms.len()
+            ),
+            Ok(None) => eprintln!(
+                "omega serve: --pull-interval set but no --peer-realm routes — nothing to pull; staying poke-driven."
+            ),
+            Err(e) => {
+                eprintln!("omega serve: federation-scheduler boot failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Optional HTTP/WS control plane — the same two creatures `alpha node --listen` boots: the
     // `ControlCore` translator on `Role::CONTROL` and the loadable `surface-http` creature.
@@ -352,6 +388,42 @@ pub fn boot_federator(
         .map_err(|e| format!("omega-federator admits: {e}"))?;
     kernel.bind_role(Role::new(Role::OMEGA_GATEWAY), federator);
     Ok(federator)
+}
+
+/// Boot the optional `federation-scheduler` companion: it pokes `ids.federator`'s anti-entropy on a
+/// fixed cadence, one `PullFrom` per `peer_realms` route, making the gateway self-reconciling.
+///
+/// The peer's registry id is taken to be the gateway's own `ids.registry`: every `omega serve`
+/// gateway boots the identical recipe (transport → registry → federator), so the registry lands at
+/// the same `CreatureId` on each — the id a peer answers `ListEntries` from. (Resolving a
+/// heterogeneous peer's ids is what peer discovery buys in v0.5; this homogeneous-mesh assumption is
+/// the same one the operator-driven cross-node path already relies on, here automated.)
+///
+/// Returns `Ok(None)` when there are no peer-realm routes (nothing to pull).
+pub fn boot_scheduler(
+    kernel: &Kernel,
+    ids: &GatewayIds,
+    peer_realms: &[(String, String)],
+    interval_secs: u64,
+) -> Result<Option<CreatureId>, String> {
+    let targets: Vec<PullTarget> = peer_realms
+        .iter()
+        .map(|(realm, node)| {
+            PullTarget::new(RealmId::new(realm), NodeId(node.clone()), ids.registry)
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let scheduler = FederationScheduler::new(
+        Address::Creature(ids.federator),
+        targets,
+        Duration::from_secs(interval_secs),
+    );
+    let id = kernel
+        .load_instance(boot_manifest("federation-scheduler"), Box::new(scheduler))
+        .map_err(|e| format!("federation-scheduler admits: {e}"))?;
+    Ok(Some(id))
 }
 
 /// This node's derived ed25519 identity — the one key it signs bus envelopes with and authenticates

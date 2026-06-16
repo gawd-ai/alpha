@@ -115,6 +115,10 @@ responder-policy = { path = "../creatures/prototypes/responders/responder-policy
 responder-budget = { path = "../creatures/prototypes/responders/responder-budget" }
 responder-fitness = { path = "../creatures/prototypes/responders/responder-fitness" }
 responder-curation = { path = "../creatures/prototypes/responders/responder-curation" }
+# The federator's cadence companion — drives federation_scheduler.rs: a real kernel runs a stub
+# federator + the scheduler, proving the scheduler self-drives PullFrom on its interval and backs off
+# under the in-flight cap when acks stop.
+federation-scheduler = { path = "../creatures/federation-scheduler" }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 wat = "1"

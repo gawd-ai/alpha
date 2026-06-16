@@ -761,6 +761,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "federation-scheduler"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "omega-federator",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,6 +1358,7 @@ dependencies = [
  "aether",
  "anima",
  "ctrlc",
+ "federation-scheduler",
  "omega-contract",
  "omega-federator",
  "omni",
@@ -1880,6 +1889,7 @@ dependencies = [
  "echo-daemon",
  "echo-daemon-v2",
  "embodiment-advertiser",
+ "federation-scheduler",
  "fitness-selector",
  "gawdxfer",
  "immune-response",

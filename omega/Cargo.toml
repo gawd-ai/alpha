@@ -38,6 +38,9 @@ transport-tcp = { path = "../cosmos/creatures/transport-tcp" }
 registry-mem = { path = "../cosmos/creatures/registry-mem" }
 omega-federator = { path = "../cosmos/creatures/omega-federator" }
 reputation-roundrobin = { path = "../cosmos/creatures/prototypes/reputation/reputation-roundrobin" }
+# The cadence companion that makes the gateway self-reconciling: on `--pull-interval`, it pokes the
+# federator's anti-entropy on its own clock instead of waiting for an operator.
+federation-scheduler = { path = "../cosmos/creatures/federation-scheduler" }
 # Clean shutdown on SIGINT/SIGTERM (the gateway daemon).
 ctrlc = { workspace = true }
 

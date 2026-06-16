@@ -73,6 +73,7 @@ members = [
     "cosmos/creatures/distributor-requirements",
     "cosmos/creatures/embodiment-advertiser",
     "cosmos/creatures/omega-federator",
+    "cosmos/creatures/federation-scheduler",
     "cosmos/creatures/fitness-selector",
     "cosmos/creatures/immune-response",
     "cosmos/creatures/abode-migrator",
