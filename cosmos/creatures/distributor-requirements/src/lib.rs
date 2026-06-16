@@ -60,6 +60,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aether::{
     Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Intent, NodeId, Outcome,
+    RealmId,
 };
 use seer::{topics::placement, SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA};
 use serde::{Deserialize, Serialize};
@@ -223,6 +224,17 @@ pub struct Distributor {
     /// Peer advertisers, addressed as `(peer NodeId, advertiser CreatureId on that peer)`. Static;
     /// the realm-gateway makes this dynamic.
     peer_advertisers: Vec<(NodeId, CreatureId)>,
+    /// This distributor's own Realm. Offers whose `realm` is `None` or equals this are *within-Realm*
+    /// (routed by plain `Creature`/`Node`); an offer in a *different* Realm is routed through the
+    /// Omega gateway. Defaults to [`RealmId::local`] — the within-Realm posture every pre-cross-Realm
+    /// distributor already had. Set via [`with_realm`](Self::with_realm).
+    self_realm: RealmId,
+    /// Cross-Realm advertisers, addressed as `(peer RealmId, advertiser CreatureId in that Realm's
+    /// gateway Sanctum)`. The distributor fans a placement Query to each via
+    /// `Address::Omega{realm, Creature(adv)}` — the Omega gateway carries it into the peer Realm and
+    /// the answer rides `reply_to` back. Empty by default (no cross-Realm fan-out). Set via
+    /// [`with_peer_realm_advertisers`](Self::with_peer_realm_advertisers).
+    peer_realm_advertisers: Vec<(RealmId, CreatureId)>,
     /// The operator's reconciliation model.
     model: PickModel,
     /// Pending consults, keyed by consult corr.
@@ -262,6 +274,8 @@ impl Distributor {
             self_node,
             local_advertisers,
             peer_advertisers,
+            self_realm: RealmId::local(),
+            peer_realm_advertisers: Vec::new(),
             model,
             pending: HashMap::new(),
             max_pending: DEFAULT_MAX_PENDING_CONSULTS,
@@ -274,6 +288,24 @@ impl Distributor {
     /// Override the pending-consult cap. `0` means explicitly unbounded.
     pub fn with_max_pending(mut self, max_pending: usize) -> Self {
         self.max_pending = max_pending;
+        self
+    }
+
+    /// Declare this distributor's own Realm — what makes an offer "cross-Realm" vs local. Defaults to
+    /// [`RealmId::local`]. Additive builder; existing call sites keep the within-Realm default.
+    pub fn with_realm(mut self, self_realm: RealmId) -> Self {
+        self.self_realm = self_realm;
+        self
+    }
+
+    /// Add the cross-Realm advertisers to consult — `(peer RealmId, advertiser CreatureId in that
+    /// Realm's gateway Sanctum)`. The distributor fans a placement Query to each through the Omega
+    /// gateway alongside its local/peer fan-out. Additive builder; empty by default.
+    pub fn with_peer_realm_advertisers(
+        mut self,
+        peer_realm_advertisers: Vec<(RealmId, CreatureId)>,
+    ) -> Self {
+        self.peer_realm_advertisers = peer_realm_advertisers;
         self
     }
 
@@ -384,6 +416,9 @@ impl Distributor {
         let query_body = placement::QueryBody {
             requirements: requirements.clone(),
             outcome: Some(outcome.clone()),
+            // Local + same-Realm peer fan-out is unconstrained; the cross-Realm loop below scopes its
+            // own queries to the target Realm.
+            target_realm: None,
         };
 
         // Outbound Queries' reply_to points at this distributor's own CreatureId (stashed at `bind`,
@@ -407,7 +442,7 @@ impl Distributor {
             );
             expected += 1;
         }
-        // Peer advertisers
+        // Peer advertisers (same Realm, addressed by Node)
         for (peer, adv) in &self.peer_advertisers {
             let query_id = u64::from(expected) + 1;
             let q = SeerEnvelope::query(SeerTopic::Placement, consult_corr, query_id, &query_body);
@@ -416,6 +451,33 @@ impl Distributor {
                     .with_schema(SCHEMA_SEER)
                     .with_corr(consult_corr)
                     .with_reply_to(reply_to_addr.clone()),
+            );
+            expected += 1;
+        }
+
+        // Cross-Realm advertisers (addressed through the Omega gateway). Each query is scoped to its
+        // target Realm so a multi-Realm advertiser answers only for the Realm asked. The answer rides
+        // `reply_to` (rewritten by transport on the way back) to this distributor, exactly like a peer
+        // answer — the consult code path doesn't change, only the address grain of the Query.
+        for (realm, adv) in &self.peer_realm_advertisers {
+            let query_id = u64::from(expected) + 1;
+            let body = placement::QueryBody {
+                requirements: requirements.clone(),
+                outcome: Some(outcome.clone()),
+                target_realm: Some(realm.clone()),
+            };
+            let q = SeerEnvelope::query(SeerTopic::Placement, consult_corr, query_id, &body);
+            dispatches.push(
+                Dispatch::to(
+                    Address::Omega {
+                        realm: realm.clone(),
+                        target: Box::new(Address::Creature(*adv)),
+                    },
+                    q.to_bytes(),
+                )
+                .with_schema(SCHEMA_SEER)
+                .with_corr(consult_corr)
+                .with_reply_to(reply_to_addr.clone()),
             );
             expected += 1;
         }
@@ -559,11 +621,24 @@ impl Distributor {
         };
         let chosen = &p.offers[pick_index];
 
-        // Collapse node==self_node to local addressing; otherwise build a peer Node address.
-        let target_addr = if chosen.node == self.self_node.0 {
-            Address::Creature(CreatureId(chosen.creature_id))
-        } else {
-            Address::Node(NodeId(chosen.node.clone()), CreatureId(chosen.creature_id))
+        // Route the placed Intent to the chosen target. Three cases, by Realm:
+        //  - cross-Realm (offer tagged a Realm other than ours) → wrap in `Address::Omega{realm,
+        //    Node(gateway, target)}` so the Omega gateway carries it into the peer Realm. The offer's
+        //    `node` is the answering (gateway) Sanctum, the form the federator forwards.
+        //  - same Sanctum (node == self_node) → collapse to a local `Address::Creature`.
+        //  - same-Realm peer → a plain `Address::Node`.
+        let target_addr = match &chosen.realm {
+            Some(realm) if *realm != self.self_realm => Address::Omega {
+                realm: realm.clone(),
+                target: Box::new(Address::Node(
+                    NodeId(chosen.node.clone()),
+                    CreatureId(chosen.creature_id),
+                )),
+            },
+            _ if chosen.node == self.self_node.0 => {
+                Address::Creature(CreatureId(chosen.creature_id))
+            }
+            _ => Address::Node(NodeId(chosen.node.clone()), CreatureId(chosen.creature_id)),
         };
 
         // Preserve the Intent's original reply_to (so the chosen target replies to the *original*
@@ -681,6 +756,11 @@ fn placement_offer_shape_is_valid(offer: &placement::EmbodimentOffer) -> bool {
         && bounded_labels(&offer.embodiment.sensors)
         && optional_label_is_bounded(offer.embodiment.jurisdiction.as_deref())
         && optional_label_is_bounded(offer.embodiment.connectivity.as_deref())
+        // A hostile peer's Realm tag is a string too — bound its length and reject NULs before it
+        // becomes an `Address::Omega{realm,…}` we route on.
+        && offer.realm.as_ref().is_none_or(|r| {
+            !r.0.is_empty() && r.0.len() <= MAX_PLACEMENT_OFFER_NODE_ID_BYTES && !has_nul(&r.0)
+        })
 }
 
 fn node_id_shape_is_valid(node: &str) -> bool {
@@ -783,6 +863,19 @@ mod tests {
             node: node.to_string(),
             creature_id,
             embodiment: placement::Embodiment { cpu, ..Default::default() },
+            realm: None,
+        }
+    }
+
+    fn realm_offer(
+        node: &str,
+        creature_id: u64,
+        cpu: u32,
+        realm: &str,
+    ) -> placement::EmbodimentOffer {
+        placement::EmbodimentOffer {
+            realm: Some(RealmId::new(realm)),
+            ..offer(node, creature_id, cpu)
         }
     }
 
@@ -951,6 +1044,91 @@ mod tests {
             &routed.to,
             Address::Node(node, CreatureId(42)) if node.0 == "node-B"
         ));
+    }
+
+    #[test]
+    fn cross_realm_advertiser_query_is_omega_addressed_and_scoped() {
+        let mut d = Distributor::new(
+            NodeId("node-A".into()),
+            vec![CreatureId(50)], // one local advertiser
+            vec![],
+            PickModel::FirstFit,
+            10_000,
+        )
+        .with_realm(RealmId::new("crew"))
+        .with_peer_realm_advertisers(vec![(RealmId::new("guests"), CreatureId(80))]);
+        d.set_me_for_tests(CreatureId(7));
+
+        let out = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"hi"));
+        assert_eq!(out.dispatches.len(), 2, "one local + one cross-Realm query");
+
+        // The cross-Realm query is Omega-addressed to the peer Realm's advertiser, scoped to that
+        // Realm via target_realm, with reply_to pointing back at the distributor.
+        let omega = &out.dispatches[1];
+        assert!(matches!(
+            &omega.to,
+            Address::Omega { realm, target }
+                if realm.0 == "guests" && **target == Address::Creature(CreatureId(80))
+        ));
+        assert_eq!(omega.reply_to, Some(Address::Creature(CreatureId(7))));
+        let seer = SeerEnvelope::parse(&omega.payload).expect("placement query parses");
+        match seer.kind {
+            SeerKind::Query { body, .. } => {
+                let qb: placement::QueryBody = serde_json::from_value(body).unwrap();
+                assert_eq!(qb.target_realm, Some(RealmId::new("guests")));
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_realm_offer_routes_through_omega_gateway() {
+        // A distributor in Realm `crew` picks an offer tagged Realm `guests`: it routes the placed
+        // Intent via the Omega gateway, naming the answering Sanctum so the federator forwards it.
+        let mut d = Distributor::new(
+            NodeId("node-A".into()),
+            vec![CreatureId(50)],
+            vec![],
+            PickModel::FirstFit,
+            10_000,
+        )
+        .with_realm(RealmId::new("crew"))
+        .with_peer_realm_advertisers(vec![(RealmId::new("guests"), CreatureId(80))]);
+        d.set_me_for_tests(CreatureId(7));
+
+        let _ = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"abc"));
+        // Local advertiser is query_id 1, the cross-Realm one query_id 2. FirstFit fires on the first
+        // offer received — answer on query_id 2 with a guests-tagged offer.
+        let out = d.handle(answer_env(10_000, 2, vec![realm_offer("node-B", 42, 8, "guests")]));
+        assert_eq!(out.dispatches.len(), 1);
+        let routed = &out.dispatches[0];
+        assert!(
+            matches!(
+                &routed.to,
+                Address::Omega { realm, target }
+                    if realm.0 == "guests"
+                        && matches!(&**target, Address::Node(n, CreatureId(42)) if n.0 == "node-B")
+            ),
+            "cross-Realm pick routes via Omega(guests, Node(node-B, 42)); got {:?}",
+            routed.to
+        );
+        // Intent payload + corr + the original requester's reply_to preserved across the gateway wrap.
+        assert_eq!(routed.payload, b"abc");
+        assert_eq!(routed.corr, Some(1));
+        assert_eq!(routed.reply_to, Some(Address::Creature(CreatureId(100))));
+    }
+
+    #[test]
+    fn offer_tagged_with_our_own_realm_routes_locally_not_via_omega() {
+        // An offer tagged with the distributor's OWN Realm is within-Realm: routed by plain
+        // Node/Creature, never wrapped in Omega (which would bounce off our own gateway).
+        let mut d = make_dist(PickModel::FirstFit).with_realm(RealmId::new("crew"));
+        let _ = d.handle(intent_env(1, "reverse", vec!["cpu >= 4"], b"abc"));
+        let out = d.handle(answer_env(10_000, 1, vec![realm_offer("node-B", 42, 8, "crew")]));
+        assert!(
+            matches!(&out.dispatches[0].to, Address::Node(n, CreatureId(42)) if n.0 == "node-B"),
+            "same-Realm offer routes by Node, not Omega"
+        );
     }
 
     #[test]

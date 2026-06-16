@@ -35,8 +35,8 @@
 //! other topic. The substrate doesn't adjudicate cross-topic disputes; that's the consumer's call.
 //! Mirrors the pattern in `agent-curious` (the authoring-topic consumer).
 
-use aether::{Creature, CreatureCtx, CreatureId, Dispatch, Envelope, NodeId, Outcome};
-use seer::{topics::placement, SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA};
+use aether::{Creature, CreatureCtx, CreatureId, Envelope, NodeId, Outcome, RealmId};
+use seer::{responder::respond_query, topics::placement, SeerTopic, SCHEMA as SEER_SCHEMA};
 
 /// Schema string the advertiser reads and writes — every conversation envelope is SEER, the topic
 /// discriminates. Mirrors the convention in `agent-curious::schema::SEER`.
@@ -69,6 +69,12 @@ pub struct OfferEntry {
 /// correctness.
 pub struct EmbodimentAdvertiser {
     self_node: NodeId,
+    /// The Realm this Sanctum belongs to. `None` (the default) means the advertiser tags no Realm
+    /// on its offers and ignores a query's `target_realm` — exactly the pre-cross-Realm behavior.
+    /// `Some(realm)` (set via [`EmbodimentAdvertiser::in_realm`]) makes the advertiser a **cross-Realm
+    /// citizen**: it tags every offer with its Realm so a remote distributor routes the placed Intent
+    /// through the Omega gateway, and it declines a query whose `target_realm` names a different Realm.
+    realm: Option<RealmId>,
     offers: Vec<OfferEntry>,
 }
 
@@ -97,7 +103,17 @@ impl EmbodimentAdvertiser {
     /// memory forever.
     pub fn with_max_offers(self_node: NodeId, offers: Vec<OfferEntry>, max_offers: usize) -> Self {
         let offers = retain_configured_offers(&self_node, offers, max_offers);
-        EmbodimentAdvertiser { self_node, offers }
+        EmbodimentAdvertiser { self_node, realm: None, offers }
+    }
+
+    /// Declare which Realm this Sanctum belongs to — opting the advertiser into cross-Realm placement.
+    /// With a Realm set, every answered offer is tagged with it (so a remote distributor routes the
+    /// placement through the Omega gateway), and a query whose `target_realm` names a *different*
+    /// Realm is declined with an empty answer. Without it (the default), the advertiser is Realm-blind
+    /// and behaves exactly as before. Additive builder — existing call sites are unaffected.
+    pub fn in_realm(mut self, realm: RealmId) -> Self {
+        self.realm = Some(realm);
+        self
     }
 
     /// The advertiser's configured offer count. Useful for tests + observability.
@@ -110,56 +126,41 @@ impl Creature for EmbodimentAdvertiser {
     fn bind(&mut self, _ctx: CreatureCtx) {}
 
     fn handle(&mut self, env: Envelope) -> Outcome {
-        // Advertiser only speaks SEER. Anything else (a probe poking the wrong address, a stray
-        // proprio fan-out) is silently ignored — no Failed reply, no panic, no drop count.
-        if env.header.schema != SCHEMA_SEER {
-            return Outcome::none();
-        }
-        let seer = match SeerEnvelope::parse_bounded(&env.payload) {
-            Ok(s) => s,
-            // A malformed SeerEnvelope on the advertiser's inbox is hostile or buggy input. Drop
-            // silently — answering "I couldn't parse you" would imply the substrate adjudicates
-            // wire mismatches via this consumer, which it doesn't.
-            Err(_) => return Outcome::none(),
-        };
-        // Topic isolation by creature discrimination. Same pattern as agent-curious.
-        if seer.topic != SeerTopic::Placement {
-            return Outcome::none();
-        }
-        match seer.kind {
-            SeerKind::Query { query_id, body } => self.on_query(env, seer.corr, query_id, body),
-            // The advertiser is on the *answering* side. Answer/Steer/Progress/Thought arriving
-            // here would mean someone confused the advertiser for a distributor or orchestrator —
-            // silently drop, conservative move.
-            _ => Outcome::none(),
-        }
+        // The advertiser is a standing placement responder. The shared `seer::responder` skeleton
+        // does the schema / bounded-parse / topic-isolation / Query-only gate and builds the reply
+        // (to the Query's `reply_to`, falling back to its sender, with `corr` preserved — transport
+        // rewrites `reply_to` on the cross-node path so the answer ships back either way). The
+        // advertiser supplies only the two things that are its own: the shape check and the match
+        // decision. Wrong schema/topic, a malformed payload, or a non-Query kind all drop silently.
+        respond_query::<placement::QueryBody, placement::AnswerBody>(
+            &env,
+            SeerTopic::Placement,
+            query_shape_is_valid,
+            |q| self.match_offers(q),
+        )
     }
 }
 
 impl EmbodimentAdvertiser {
-    fn on_query(
-        &self,
-        env: Envelope,
-        corr: u64,
-        query_id: u64,
-        body: serde_json::Value,
-    ) -> Outcome {
-        let q: placement::QueryBody = match serde_json::from_value(body) {
-            Ok(q) => q,
-            // A malformed placement body is dropped silently for the same reason a malformed outer
-            // SeerEnvelope is: the substrate doesn't have a "report-back-decoder-error" channel.
-            Err(_) => return Outcome::none(),
-        };
-        if !query_shape_is_valid(&q) {
-            return Outcome::none();
+    /// The decision: gather every configured offer that satisfies all parseable predicates, up to the
+    /// shared answer cap, each tagged with this advertiser's `self_node`.
+    ///
+    /// **Robustness over strict-acceptance**: a single garbage predicate doesn't fail the whole
+    /// query — it's skipped and matching proceeds against the rest. If *every* predicate fails to
+    /// parse, the predicate set is empty and every offer matches (an unconstrained request — the same
+    /// shape as an Intent with no requirements, which by convention means "anyone fits"). An
+    /// advertiser that wants strict acceptance binds its own model in front.
+    fn match_offers(&self, q: placement::QueryBody) -> placement::AnswerBody {
+        // Cross-Realm scoping: if the query targets a specific Realm and this advertiser knows it's
+        // in a *different* one, decline with an empty answer (a positive "not my Realm", same shape as
+        // "nothing fits"). A Realm-blind advertiser (`realm == None`) can't tell, so it never declines
+        // on this basis — preserving the pre-cross-Realm behavior.
+        if let (Some(want), Some(mine)) = (&q.target_realm, &self.realm) {
+            if want != mine {
+                return placement::AnswerBody::default();
+            }
         }
 
-        // Parse predicates. **Robustness over strict-acceptance**: a single garbage predicate
-        // doesn't fail the whole query — we skip it and match against the rest. If *every*
-        // predicate fails to parse, the only well-typed predicate set is the empty one, and every
-        // offer matches (the request is unconstrained). That's the same shape as an Intent with no
-        // requirements, which by convention means "anyone fits." An advertiser that wants strict
-        // acceptance subscribes its own model in front.
         let predicates: Vec<placement::Predicate> =
             q.requirements.iter().filter_map(|s| placement::Predicate::parse(s).ok()).collect();
 
@@ -173,20 +174,13 @@ impl EmbodimentAdvertiser {
                 node: self.self_node.0.clone(),
                 creature_id: o.creature_id.0,
                 embodiment: o.embodiment.clone(),
+                // Tag the answering Realm so a remote distributor knows to route the placed Intent
+                // through the Omega gateway. `None` for a Realm-blind advertiser = within-Realm.
+                realm: self.realm.clone(),
             })
             .collect();
 
-        let answer_body = placement::AnswerBody { matches };
-        let answer = SeerEnvelope::answer(SeerTopic::Placement, corr, query_id, &answer_body);
-
-        // Reply to the Query's reply_to (the original distributor), falling back to the
-        // immediate sender. This is the same pattern every consult-respond creature uses
-        // (transport rewrites reply_to on cross-node so the answer ships back; this creature
-        // never has to know whether the requester was local or peer).
-        let dispatch = Dispatch::reply_to_env(&env, answer.to_bytes())
-            .with_schema(SCHEMA_SEER)
-            .with_corr(corr);
-        Outcome::send(dispatch)
+        placement::AnswerBody { matches }
     }
 }
 
@@ -247,7 +241,8 @@ fn retain_configured_offers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether::{Address, CreatureId, Header};
+    use aether::{Address, CreatureId, Dispatch, Header};
+    use seer::{SeerEnvelope, SeerKind};
 
     fn nv_offer(id: u64, cpu: u32) -> OfferEntry {
         OfferEntry {
@@ -306,7 +301,17 @@ mod tests {
         requirements: Vec<String>,
         outcome: Option<String>,
     ) -> Envelope {
-        let body = placement::QueryBody { requirements, outcome };
+        let body = placement::QueryBody { requirements, outcome, target_realm: None };
+        let q = SeerEnvelope::query(SeerTopic::Placement, corr, query_id, &body);
+        seer_env(corr, q.to_bytes())
+    }
+
+    fn realm_query_env(corr: u64, query_id: u64, target_realm: Option<&str>) -> Envelope {
+        let body = placement::QueryBody {
+            requirements: vec![],
+            outcome: None,
+            target_realm: target_realm.map(RealmId::new),
+        };
         let q = SeerEnvelope::query(SeerTopic::Placement, corr, query_id, &body);
         seer_env(corr, q.to_bytes())
     }
@@ -559,5 +564,49 @@ mod tests {
         let (_, body) = decode_answer(&out.dispatches[0]);
         assert_eq!(body.matches[0].node, "node-B", "advertiser tags its self_node");
         assert_eq!(body.matches[0].creature_id, 42);
+    }
+
+    #[test]
+    fn realm_blind_advertiser_leaves_offer_realm_unset() {
+        // The default (no `in_realm`) advertiser tags no Realm — the within-Realm behavior a
+        // distributor reads as "route via plain Node/Creature, not Omega".
+        let mut a = EmbodimentAdvertiser::new(NodeId("node-A".into()), vec![nv_offer(10, 8)]);
+        let out = a.handle(query_env(1, 1, vec!["cpu >= 4"]));
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert_eq!(body.matches[0].realm, None, "Realm-blind advertiser tags no Realm");
+    }
+
+    #[test]
+    fn in_realm_advertiser_tags_every_offer_with_its_realm() {
+        let mut a = EmbodimentAdvertiser::new(NodeId("node-B".into()), vec![nv_offer(42, 4)])
+            .in_realm(RealmId::new("guests"));
+        let out = a.handle(query_env(1, 1, vec!["cpu >= 4"]));
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert_eq!(
+            body.matches[0].realm,
+            Some(RealmId::new("guests")),
+            "an in-realm advertiser tags each offer with its Realm so the distributor routes via Omega"
+        );
+    }
+
+    #[test]
+    fn in_realm_advertiser_declines_a_query_targeting_a_different_realm() {
+        let mut a = EmbodimentAdvertiser::new(NodeId("node-B".into()), vec![nv_offer(42, 4)])
+            .in_realm(RealmId::new("guests"));
+
+        // target_realm names a DIFFERENT realm → empty answer (a positive "not my Realm").
+        let out = a.handle(realm_query_env(1, 1, Some("crew")));
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert!(body.matches.is_empty(), "advertiser declines a query scoped to another Realm");
+
+        // target_realm names THIS realm → answered normally.
+        let out = a.handle(realm_query_env(2, 1, Some("guests")));
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert_eq!(body.matches.len(), 1, "a query scoped to this advertiser's Realm is answered");
+
+        // No target_realm → unconstrained, answered.
+        let out = a.handle(realm_query_env(3, 1, None));
+        let (_, body) = decode_answer(&out.dispatches[0]);
+        assert_eq!(body.matches.len(), 1, "an unscoped query is answered regardless of Realm");
     }
 }

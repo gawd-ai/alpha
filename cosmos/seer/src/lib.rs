@@ -56,6 +56,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod responder;
+
 /// Schema string carried in [`aether::Envelope::header.schema`](aether::Header) for every SEER
 /// envelope. Single value across every topic — the topic discrimination lives in the payload's
 /// [`SeerEnvelope::topic`], not in the wire schema (S1: one bus contract, never N per role).
@@ -121,6 +123,15 @@ pub enum SeerTopic {
     /// topic is the seam for an *external* curator creature, consulted off the synchronous decide
     /// path so the model call never blocks the catalog).
     Curation,
+    /// Agent-to-agent dialogue — one creature takes a *turn* by sending a `Query` to a *named peer*
+    /// (not its own requester, the way every other topic answers upward), the peer answers, and the
+    /// `(corr, query_id)` thread carries an arbitrarily long back-and-forth. The reference pair is
+    /// `creatures/prototypes/dialogue/{dialogue-initiator,dialogue-responder}`; richer agents — two
+    /// LLM-backed creatures collaborating across the mesh — are the same shape on this topic, and
+    /// because the peer is a plain [`aether::Address`] the conversation composes with cross-node and
+    /// cross-Realm (`Omega`) routing unchanged. The reduction theorem holds: a single Query→Answer is
+    /// wire-equivalent to a one-shot consult.
+    Dialogue,
 }
 
 impl SeerTopic {
@@ -134,6 +145,7 @@ impl SeerTopic {
             SeerTopic::Fitness => "fitness",
             SeerTopic::Consensus => "consensus",
             SeerTopic::Curation => "curation",
+            SeerTopic::Dialogue => "dialogue",
         }
     }
 }
@@ -340,6 +352,7 @@ pub mod topics {
     /// shape early means richer or cross-node placement does not retrofit a synchronous local code
     /// path into the SEER pattern later.
     pub mod placement {
+        use aether::RealmId;
         use serde::{Deserialize, Serialize};
 
         /// Placement outcome text retained in consult state and echoed in no-provider replies.
@@ -577,6 +590,14 @@ pub mod topics {
             pub creature_id: u64,
             /// Metadata for tie-breaking; same fields the predicates read.
             pub embodiment: Embodiment,
+            /// The Realm this offer lives in. `None` (omitted on the wire) means "the same Realm as
+            /// the requesting distributor" — the within-Realm default that preserves every
+            /// pre-cross-Realm offer byte-for-byte. `Some(realm)` marks a **cross-Realm** offer: on
+            /// receipt the distributor routes the placed Intent via `aether::Address::Omega{realm,…}`
+            /// (through the Omega gateway) instead of a bare `Node`/`Creature`. Additive: an advertiser
+            /// that never sets it, and a distributor that never reads it, behave exactly as before.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub realm: Option<RealmId>,
         }
 
         /// The Query body: a Distributor asks "who can place this work?" — the body carries the
@@ -597,6 +618,14 @@ pub mod topics {
             /// when `None` (advertisers ignoring outcome see no field).
             #[serde(default, skip_serializing_if = "Option::is_none")]
             pub outcome: Option<String>,
+            /// Constrain the consult to a single Realm. `None` (omitted on the wire) is the
+            /// unconstrained default — an advertiser answers regardless of Realm, exactly as before.
+            /// `Some(realm)` is the **cross-Realm fan-out** form: the distributor asks a specific peer
+            /// Realm's advertiser, and an advertiser that knows its own Realm and isn't in `realm`
+            /// answers empty. Additive: a distributor that never sets it, and an advertiser that never
+            /// reads it, behave exactly as before.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub target_realm: Option<RealmId>,
         }
 
         /// The Answer body: zero or more matching offers from this advertiser.
@@ -775,13 +804,19 @@ pub mod topics {
                 let full = QueryBody {
                     requirements: vec!["cpu >= 2".into(), "connectivity = wired".into()],
                     outcome: Some("reverse-string".into()),
+                    target_realm: Some(RealmId::new("guests")),
                 };
                 let bytes = serde_json::to_vec(&full).unwrap();
                 let back: QueryBody = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(back, full);
-                let minimal = QueryBody { requirements: vec!["cpu >= 1".into()], outcome: None };
+                let minimal = QueryBody {
+                    requirements: vec!["cpu >= 1".into()],
+                    outcome: None,
+                    target_realm: None,
+                };
                 let json = String::from_utf8(serde_json::to_vec(&minimal).unwrap()).unwrap();
                 assert!(!json.contains("outcome"), "absent outcome elides: {json}");
+                assert!(!json.contains("target_realm"), "absent target_realm elides: {json}");
             }
 
             #[test]
@@ -795,6 +830,7 @@ pub mod topics {
                         node: "node-A".into(),
                         creature_id: 7,
                         embodiment: Embodiment { cpu: 4, ..Default::default() },
+                        realm: None,
                     }],
                 };
                 let bytes = serde_json::to_vec(&one).unwrap();
@@ -941,6 +977,34 @@ pub mod topics {
             pub reason: String,
         }
     }
+
+    /// Dialogue topic — agent-to-agent conversation. One creature takes a *turn* by sending a
+    /// `QueryBody` to a *named peer*; the peer answers with an `AnswerBody`; the `(corr, query_id)`
+    /// thread carries a back-and-forth of any length. Unlike every other topic, the initiator
+    /// addresses a *peer* it names (a plain [`aether::Address`] — local, cross-node, or cross-Realm
+    /// `Omega`), not its own requester. The reference pair is
+    /// `creatures/prototypes/dialogue/{dialogue-initiator,dialogue-responder}`.
+    pub mod dialogue {
+        use super::*;
+
+        /// Maximum bytes in a dialogue turn's `prompt` / `reply` text. A consumer rejects an
+        /// over-cap turn rather than allocate it — the same per-field discipline the other topics use.
+        pub const MAX_TURN_BYTES: usize = 64 * 1024;
+
+        /// One turn an initiator sends to its peer: the prompt text for this step of the conversation.
+        #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+        pub struct QueryBody {
+            /// The conversation turn's content. Free-form; the peer interprets it.
+            pub prompt: String,
+        }
+
+        /// The peer's reply to one turn.
+        #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+        pub struct AnswerBody {
+            /// The reply text for this turn.
+            pub reply: String,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -954,7 +1018,7 @@ mod tests {
     // a type definition.
     // -----------------------------------------------------------------------------------------
 
-    fn all_topics() -> [SeerTopic; 7] {
+    fn all_topics() -> [SeerTopic; 8] {
         [
             SeerTopic::Authoring,
             SeerTopic::Placement,
@@ -963,6 +1027,7 @@ mod tests {
             SeerTopic::Fitness,
             SeerTopic::Consensus,
             SeerTopic::Curation,
+            SeerTopic::Dialogue,
         ]
     }
 

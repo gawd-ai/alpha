@@ -70,6 +70,7 @@ use agent_templated::{
     AuthoringRequest, AuthoringResponse,
 };
 use build_cargo::ManifestStub;
+use seer::responder::{classify, Inbound};
 use seer::{topics, SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA};
 use sigil::{Capabilities, Entrypoint, NetCapability};
 
@@ -227,13 +228,33 @@ impl Creature for AgentCurious {
     fn bind(&mut self, _ctx: CreatureCtx) {}
 
     fn handle(&mut self, env: Envelope) -> Outcome {
-        if env.header.schema == schema::SEER {
-            return self.on_seer(env);
+        // Every inbound envelope starts at the shared SEER gate ([`seer::responder::classify`]).
+        // This creature is the conversation *initiator*, so its four branches differ from a plain
+        // responder's "drop everything but Ours":
+        // - `NotSeer` (empty/REQUEST schema) → the conversation *entry*: an `AuthoringRequest`.
+        // - `Malformed` → a structured Failed reply (we can't tell Answer from Steer, but the
+        //   orchestrator deserves to know its message didn't land).
+        // - `OtherTopic` → drop (topic isolation; the substrate doesn't adjudicate cross-topic).
+        // - `Ours` → kind-dispatch: act on the orchestrator's `Answer`/`Steer`, ignore
+        //   `Query`/`Progress`/`Thought` (it asks; it doesn't answer asks, and Progress/Thought are
+        //   the orchestrator's own observability).
+        match classify(&env, SeerTopic::Authoring) {
+            Inbound::NotSeer => self.on_request(env),
+            Inbound::Malformed(e) => reply_failed(
+                &env,
+                AuthoringError::Invalid { message: format!("malformed seer envelope: {e}") },
+            ),
+            Inbound::OtherTopic => Outcome::none(),
+            Inbound::Ours(seer) => match seer.kind {
+                SeerKind::Answer { query_id, body } => {
+                    self.on_answer(env, seer.corr, query_id, body)
+                }
+                SeerKind::Steer { kind, .. } => self.on_steer(seer.corr, &kind),
+                SeerKind::Query { .. } | SeerKind::Progress { .. } | SeerKind::Thought { .. } => {
+                    Outcome::none()
+                }
+            },
         }
-        // Empty schema or REQUEST → treat as an AuthoringRequest. Matches the orchestrator
-        // pattern, where the test sends without setting an explicit schema. An orchestrator
-        // that does set REQUEST is also supported — this keeps the wire compatible with both.
-        self.on_request(env)
     }
 }
 
@@ -329,37 +350,6 @@ impl AgentCurious {
         out.push(seer_dispatch(&reply_to, progress, corr));
         out.push(seer_dispatch(&reply_to, query, corr));
         out
-    }
-
-    /// One inbound SEER envelope. Topic-discriminates first (the agent is on topic `authoring`;
-    /// other topics are silently dropped — the substrate doesn't adjudicate cross-topic), then
-    /// kind-discriminates.
-    fn on_seer(&mut self, env: Envelope) -> Outcome {
-        let seer = match SeerEnvelope::parse_bounded(&env.payload) {
-            Ok(o) => o,
-            Err(e) => {
-                return reply_failed(
-                    &env,
-                    AuthoringError::Invalid { message: format!("malformed seer envelope: {e}") },
-                );
-            }
-        };
-        if seer.topic != SeerTopic::Authoring {
-            // Topic isolation by creature discrimination — the substrate routes by address; the
-            // creature filters by topic. No Failed reply on the wrong topic (that would be the
-            // substrate adjudicating a model dispute via this creature).
-            return Outcome::none();
-        }
-        match seer.kind {
-            SeerKind::Answer { query_id, body } => self.on_answer(env, seer.corr, query_id, body),
-            SeerKind::Steer { kind, .. } => self.on_steer(seer.corr, &kind),
-            // The agent is on the *answering* side for Query (it asks; it doesn't answer asks),
-            // and Progress/Thought are observability the orchestrator emits to itself, not to a
-            // bound creature. Ignoring is the contract-compliant move (reduction theorem holds).
-            SeerKind::Query { .. } | SeerKind::Progress { .. } | SeerKind::Thought { .. } => {
-                Outcome::none()
-            }
-        }
     }
 
     fn on_answer(
