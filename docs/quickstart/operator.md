@@ -23,7 +23,7 @@ builder), an in-memory registry (`REGISTRY`), and a `monitor` watching the sense
 probe id, the command list, and drops you at a prompt:
 
 ```
-alpha node — Alpha Sanctum daemon (v0.4.1)
+alpha node — Alpha Sanctum daemon (v0.4.2)
 posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.
 boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.
 probe endpoint id = 1
@@ -179,14 +179,17 @@ cd demos/cluster && ./00-build.sh && ./01-boot.sh && ./02-join.sh && ./03-graph.
 Realms you run the other pole — **`omega serve`**, a headless gateway per Realm that declares its own
 Realm (`--realm`) and maps the others to their gateways (`--peer-realm <realm>=<node-id>`). The gateways
 exchange catalogues by pull anti-entropy, federate signed reputation and quarantine, and route
-Omega-addressed traffic between Realms — while authoring stays here on the alpha seat. See the
+Omega-addressed traffic between Realms — while authoring stays here on the alpha seat. Add
+`--pull-interval <seconds>` and the gateway **reconciles itself**: a `federation-scheduler` companion
+pokes the federator's anti-entropy on that cadence, so cross-Realm pulls no longer wait for an operator
+(without the flag the gateway stays poke-driven — the substrate ships no clock). See the
 [cross-Realm quickstart rung in the README](../../README.md#3-mesh-more-omegas-across-realms)
 and run the whole cross-Realm story in-process with `cargo run -p federation`.
 
 ## 8. Narrated demos (in one process)
 
-The cluster above is real, separate processes. Two *narrated* demos run the deeper substrate paths in a
-single process, each riding code the tests prove:
+The cluster above is real, separate processes. Several *narrated* demos run the deeper substrate paths
+in a single process, each riding code the tests prove:
 
 ```sh
 # One node's whole loop: an AI authors → compiles → signs → runs a creature, then a running self
@@ -198,11 +201,16 @@ cargo run -p walkthrough
 # quarantine propagation, and Omega-addressed routing (Loop 5, Acculturate).
 cargo run -p federation                          # 2 Realms × 2 Sanctums (default)
 cargo run -p federation -- --realms 3 --sanctums 2
+
+# Two agents conversing ACROSS a Realm boundary: an initiator on one Realm holds a multi-turn dialogue
+# with a stateful agent on another, through the Omega gateway. The v0.5.0 cross-mesh interaction story.
+cargo run -p dialogue
 ```
 
 `federation` boots each Sanctum as its own kernel and forms the mesh in front of you — the closest
-thing to "stand up a small distributed Alpha deployment and poke it" without leaving one process. See
-[`demos/`](../../demos/) for what each demo shows and the tests it rides on.
+thing to "stand up a small distributed Alpha deployment and poke it" without leaving one process;
+`dialogue` is the same wire carrying a live agent-to-agent conversation rather than catalogue state.
+See [`demos/`](../../demos/) for what each demo shows and the tests it rides on.
 
 ## 9. Shut down
 

@@ -23,6 +23,8 @@ Organized by the seam each fills — `ls` this directory and you are reading GAW
 | [`reputation/`](reputation) | `ReputationWeigher` for `omega-federator` | `reputation-roundrobin` |
 | [`merge/`](merge) | CRDT `MergeModel` for `abode-reconciler` | `merge-lww-map` |
 | [`gateways/`](gateways) | federation gateways for the `Realm` / `Omega` grain | `realm-gateway`, `omega-gateway` |
+| [`responders/`](responders) | **standing SEER consumers** for the reserved topics (the decision is the injected model) | `responder-policy / -budget / -fitness / -curation` |
+| [`dialogue/`](dialogue) | the **agent-to-agent dialogue** pair on the SEER `dialogue` topic — an initiator that names a peer (local / cross-node / cross-Realm `Omega`) + a responder over an injected model | `dialogue-initiator`, `dialogue-responder` |
 | [`monitor/`](monitor) | a sense-stream reader (PROPRIOCEPTION + FITNESS) | `monitor` |
 
 Each folder carries a short README naming its socket and its reference(s). Several seams ship one

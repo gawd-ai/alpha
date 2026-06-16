@@ -26,21 +26,37 @@ kernel and control core; they differ in posture, not mechanism.
 
 - **Transport** — a UDP transport beside the authenticated TCP one, for lossy and intermittent links,
   with richer partition tolerance.
-- **Placement** — cross-Realm placement: a creature's requirements matched against embodiment beyond
-  the local Realm, not only within it.
+- **Interaction across the mesh (the v0.5.0 headline)** — AIs genuinely interacting across Realms and
+  Sanctums: two (or more) model-backed agents collaborating or conversing. v0.4.2 laid every rail —
+  application traffic crosses a Realm boundary (the `omega-federator` forwards arbitrary envelopes, not
+  just registry state), agents are *placed* across Realms (below), and a reserved SEER `Dialogue` topic
+  plus the reference `dialogue-initiator` / `dialogue-responder` pair carry a multi-turn agent-to-agent
+  conversation (`alpha demo dialogue` runs two agents talking across a Realm boundary). v0.5.0 swaps the
+  reference agents for LLM-backed ones — the same wire, no refactor.
+- **Placement** — cross-Realm placement now lands: a distributor fans placement Queries to peer-Realm
+  advertisers through the Omega gateway and routes a chosen offer via `Address::Omega` (offers carry an
+  optional `realm`, queries an optional `target_realm`; both elide from the wire when absent). What
+  remains is *dynamic* discovery — the peer-Realm advertisers are still configured, like the scheduler's
+  targets — and richer cross-Realm matching.
 - **Federation** — Omega discovery and production realm/omega gateway creatures. (The Ω pole now has a
-  body — `omega serve` runs a federation/gateway Sanctum — and a durable, federated Bestiary beyond the
-  in-memory seed ships as `bestiary-daemon`; what remains is peer discovery, autonomous cross-Realm
-  anti-entropy scheduling, and quorum.)
-- **Trust** — more of the proof-of-trust surface made live: weighted and consensus picks, additional
-  verifiable-randomness schemes, and standing SEER consumers for the policy, budget, fitness,
-  consensus, and curation topics.
+  body — `omega serve` runs a federation/gateway Sanctum — that **reconciles itself**: the
+  `federation-scheduler` companion pokes the federator's anti-entropy on an injected cadence
+  (`omega serve --pull-interval`), so cross-Realm pulls no longer wait for an operator. A durable,
+  federated Bestiary beyond the in-memory seed ships as `bestiary-daemon`. What remains is peer
+  discovery — the scheduler's targets are still configured, not discovered — and quorum: a pull is
+  still one peer at a time, not a quorum'd read.)
+- **Trust** — more of the proof-of-trust surface made live: weighted and consensus picks, and
+  additional verifiable-randomness schemes. (Reference standing SEER consumers for the policy, budget,
+  fitness, and curation topics now ship under `creatures/prototypes/responders/`; consensus already had
+  the federator.)
 - **Budgets** — extend live budget enforcement to the trusted-by-admission **native** tier (CPU,
   memory, and wall-clock are OS-level there, so every dimension reports `Unenforceable` today) and lift
-  the **critter** tier's memory cap live (its structural caps are fixed at load); plus a live store
-  limiter for the native tier's deployment seam. (The **beast** tier already lifts fuel, memory, and
-  wall-clock live via `ExtendBudget` and traps a `wall_ms` *cap* via wasmtime epoch interruption; the
-  **critter** tier enforces and lifts fuel + wall-clock.)
+  the **critter** tier's memory cap live (its structural caps are fixed at load). (The **beast** tier
+  already lifts fuel, memory, and wall-clock live via `ExtendBudget` and traps a `wall_ms` *cap* via
+  wasmtime epoch interruption; the **critter** tier enforces and lifts fuel + wall-clock, and now also
+  carries a bounded **persistent memory** across `handle()` calls. The registry's store limiter gained
+  an injected **eviction policy** — a bounded catalog that keeps accepting fresh artifacts under a fixed
+  cap instead of refusing at it.)
 - **Scenarios** — declarative runbooks the control plane replays as verbs over the bus, so a demo or
   an operator can drive a live remote node instead of building its own topology in code.
 

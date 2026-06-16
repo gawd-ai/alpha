@@ -8,6 +8,72 @@ Semantic-versioning guarantees begin at 1.0.
 For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the design notes under [`docs/design/`](docs/design/).
 
+## 0.4.2 - 2026-06-16
+
+Makes the Ω pole earn its name *and* lays the rails for the v0.5.0 headline — **AIs interacting across
+the mesh, across Realms and Sanctums**. The federation gateway reconciles itself on a clock, the
+reserved SEER topics gain reference creatures, and — the larger arc — application traffic, agent
+placement, and a live agent-to-agent conversation now cross a Realm boundary. Every change is additive:
+no existing wire shape changes, so the v0.5.0 agents land as consumers, not a refactor.
+
+### Federation — a self-driving Ω
+- `federation-scheduler`, a daemon creature: the omega-federator's cadence companion. On its own
+  injected interval it emits one `FederatorMsg::PullFrom` per configured peer-Realm target, turning
+  operator-poked anti-entropy into a self-reconciling gateway. The substrate still ships no clock —
+  time enters as this creature, hot-swappable like every other choice; stop it and the schedule stops.
+  It honors the federator's pending-pull backpressure with an in-flight counter decremented on each
+  `Accepted`/`Rejected` ack: a federator that stops answering drives the counter to the cap and the
+  scheduler quietly backs off rather than flooding it.
+- `omega serve --pull-interval <seconds>` boots the companion: the gateway pulls every `--peer-realm`
+  route on that cadence. Without the flag the gateway stays poke-driven (the no-clock default). Peer
+  discovery and quorum remain the v0.5 follow-ons; the cadence is the v0.4.2 down-payment.
+
+### SEER — reference standing consumers for the reserved topics
+- `seer::responder::respond_query`, the standing-consumer skeleton factored into the `seer` crate
+  (schema check → bounded parse → topic isolation → Query-only → typed decode → shape check → decide →
+  reply). A new responder is now just a topic + a typed body + a decision.
+- Four reference responders under `creatures/prototypes/responders/` for the reserved topics that
+  shipped a typed body but no creature standing on them: `responder-policy` (allowlist admission),
+  `responder-budget` (grant up to a ceiling from a depleting pool), `responder-fitness` (an injected
+  `Rater`, clamped `[0,1]`, non-finite folds to `0` fail-closed), and `responder-curation`
+  (keep/gc/quarantine from configured lists). Each is a starting point operators fork — the decision is
+  the model, the skeleton is shared. `placement`, `authoring`, and `consensus` already had live consumers.
+
+### Cross-mesh interaction — the rails for v0.5.0
+- **Cross-Realm application routing.** The `omega-federator` now forwards arbitrary *application*
+  envelopes (any schema) to a creature on a peer Realm — not just system registry traffic — and also
+  accepts the `Omega(realm, Node(gateway, creature))` target form (the shape a cross-Realm placement
+  offer carries). `Omega(realm, Creature(m))` already worked; this proves and widens it. Reply routing
+  (`reply_to` rewritten by transport on the way back) carries the answer to the original requester
+  across the boundary. Proven end-to-end in `omega_app_routing_cross_node`.
+- **Cross-Realm placement (Beat B).** Placement gains a Realm grain, additively: `placement::EmbodimentOffer`
+  carries an optional `realm`, `placement::QueryBody` an optional `target_realm` (both elide from the
+  wire when absent — pre-cross-Realm offers are byte-identical). A distributor learns its own Realm
+  (`Distributor::with_realm`) and a set of cross-Realm advertisers (`with_peer_realm_advertisers`),
+  fans placement Queries to them through the Omega gateway, and routes a chosen cross-Realm offer via
+  `Address::Omega`. An advertiser declares its Realm (`EmbodimentAdvertiser::in_realm`) and tags its
+  offers. Placement stays ask-and-wait over the Omega grain, never federator anti-entropy. Proven in
+  `distributor_cross_realm`.
+- **Agent-to-agent dialogue (the conversation seam).** A new reserved SEER topic, `Dialogue`, and a
+  reference pair under `creatures/prototypes/dialogue/`: `dialogue-initiator` opens a conversation by
+  sending a turn to a **named peer** (a plain `Address` — local, cross-node, or cross-Realm `Omega`),
+  parks the requester by `corr`, and relays the peer's reply back; `dialogue-responder` answers a turn
+  with an injected model (the reference echoes). The `(corr, query_id)` thread carries a back-and-forth
+  of any length; the reduction theorem holds. Proven in `dialogue_seam`. Two LLM agents conversing
+  across the mesh are the same shape on this topic — no new wire.
+- **Persistent critter memory (Tier-1 #2).** The script (critter) tier — until now the only tier with
+  no state carried across `handle()` calls — gains a bounded key→value store reached through three host
+  functions (`mem_get` / `mem_set` / `mem_del`). It survives across calls for the instance's lifetime
+  and is dropped on unload; at most `MAX_PERSIST_ENTRIES` keys (refuse-new at capacity).
+- **Registry eviction (Tier-1 #3).** `registry-mem` gains an injected `EvictionPolicy` seam and the
+  reference `LowValueEviction` (evict quarantined first, then lowest reputation, deterministic
+  tiebreak), so a bounded catalog under a fixed `max_entries` keeps accepting fresh artifacts instead
+  of refusing at the cap. Bound it with `RegistryMem::with_eviction`; unbound, the at-capacity posture
+  stays refuse-new.
+- **`dialogue` demo.** A narrated, runnable demo (`cargo run -p dialogue`, or `alpha demo dialogue`):
+  two Realms over real ed25519 TCP, an initiator on one and a stateful agent on the other holding a
+  multi-turn conversation through the Omega gateway — the v0.5.0 cross-mesh story, out of `#[test]`.
+
 ## 0.4.1 - 2026-06-14
 
 Turns two seam-proven claims into shipped reality — a *real model* authors creatures, and the Bestiary

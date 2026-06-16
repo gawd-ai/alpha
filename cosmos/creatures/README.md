@@ -25,6 +25,7 @@ These are distinct organs (not a family of interchangeable models), so the direc
 | `abode-migrator` | ABODE_MIGRATOR | single-active-fork migration of a running self with cryptographic continuity |
 | `abode-reconciler` | (distributed self) | fork **+ merge**: reconciles two divergent snapshots via an injected CRDT |
 | `omega-federator` | OMEGA_GATEWAY (Loop 5) | cross-Realm routing, pull anti-entropy, signed reputation, quarantine path |
+| `federation-scheduler` | (Loop 5 cadence) | the federator's clock: pokes its anti-entropy per injected interval (`omega serve --pull-interval`) so Ω self-reconciles |
 | `fitness-selector` | (Loop 2) | author→select→promote — signs a verifiable promotion onto the registry reputation slot |
 | `immune-response` | (Loop 4) | senses faults, reversibly quarantines the offending artifact |
 | `verifiable-die` | — | first consumer of the envelope `commitment` slot — a commit-reveal fair pick anyone can audit |

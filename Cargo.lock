@@ -619,6 +619,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "dialogue"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "anima",
+ "dialogue-initiator",
+ "dialogue-responder",
+ "omega-federator",
+ "policy-signed",
+ "registry-mem",
+ "reputation-roundrobin",
+ "sanctum",
+ "serde_json",
+ "sigil",
+ "transport-tcp",
+]
+
+[[package]]
 name = "dialogue-initiator"
 version = "0.4.2"
 dependencies = [

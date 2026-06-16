@@ -20,6 +20,11 @@
       "name": "bestiary-live",
       "summary": "A REAL model authors a creature into a durable, replicated, AI-curated Bestiary (opt-in: needs ALPHA_LLM_MODEL + --features openai).",
       "package": "bestiary-live"
+    },
+    {
+      "name": "dialogue",
+      "summary": "Two agents hold a multi-turn conversation ACROSS a Realm boundary over ed25519 TCP (loopback): an initiator on one Realm speaks to a stateful agent on another through the Omega gateway. The v0.5.0 cross-mesh interaction story.",
+      "package": "dialogue"
     }
   ]
 }

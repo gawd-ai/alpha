@@ -1,0 +1,33 @@
+[package]
+name = "dialogue"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Narrated, runnable demo of two AI agents holding a multi-turn conversation ACROSS a Realm boundary — over real ed25519-authenticated TCP on loopback. The initiator on one Realm and a stateful agent on another exchange turns through the Omega gateway; the agent remembers the conversation. The v0.5.0 'AIs interacting across the mesh' story, out of #[test] and into your terminal."
+
+# The demo body (`run`) lives in the lib so `alpha demo dialogue` can run it in-process; the binary
+# is a thin wrapper.
+[lib]
+name = "dialogue"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dialogue"
+path = "src/main.rs"
+
+[dependencies]
+aether = { path = "../../cosmos/aether" }
+sigil = { path = "../../cosmos/sigil" }
+anima = { path = "../../cosmos/anima" }
+sanctum = { path = "../../cosmos/sanctum" }
+policy-signed = { path = "../../cosmos/creatures/prototypes/policies/policy-signed" }
+transport-tcp = { path = "../../cosmos/creatures/transport-tcp" }
+registry-mem = { path = "../../cosmos/creatures/registry-mem" }
+reputation-roundrobin = { path = "../../cosmos/creatures/prototypes/reputation/reputation-roundrobin" }
+omega-federator = { path = "../../cosmos/creatures/omega-federator" }
+dialogue-initiator = { path = "../../cosmos/creatures/prototypes/dialogue/dialogue-initiator" }
+dialogue-responder = { path = "../../cosmos/creatures/prototypes/dialogue/dialogue-responder" }
+serde_json = { workspace = true }

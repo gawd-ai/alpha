@@ -22,6 +22,7 @@ members = [
     "demos/federation",
     "demos/distribute",
     "demos/bestiary-live",
+    "demos/dialogue",
 
     # ---- shared GAWD foundations: cross-system contracts/tools Alpha CONSUMES but does not own,
     #      destined to externalize into their own repos. They sit BESIDE the cosmology (alpha + cosmos),

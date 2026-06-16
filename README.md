@@ -90,17 +90,19 @@ inter-Realm mesh:
 ```sh
 # Realm "crew" gateway (one host):
 omega serve --node-id crew-gw --realm crew --cluster-listen 0.0.0.0:9101 \
-    --peer-realm ops=ops-gw  --seed ops-gw@<ops-host>:9102#<ops-pub>
+    --peer-realm ops=ops-gw  --seed ops-gw@<ops-host>:9102#<ops-pub> --pull-interval 30
 
 # Realm "ops" gateway (another host):
 omega serve --node-id ops-gw  --realm ops  --cluster-listen 0.0.0.0:9102 \
-    --peer-realm crew=crew-gw --seed crew-gw@<crew-host>:9101#<crew-pub>
+    --peer-realm crew=crew-gw --seed crew-gw@<crew-host>:9101#<crew-pub> --pull-interval 30
 ```
 
 The gateways exchange catalogues by pull anti-entropy, federate signed reputation and quarantine, and
-route Omega-addressed traffic between Realms. Authoring stays on the **alpha** seat: operators join a
-Realm's gateway, author there, and the federation carries it across. Pin a stable identity for scripted
-seeds with `--cluster-key <64-hex>`.
+route Omega-addressed traffic between Realms. `--pull-interval <seconds>` makes a gateway
+**self-reconciling** — it pokes its own anti-entropy on that cadence instead of waiting for an operator
+(omit it and the gateway stays poke-driven; the substrate ships no clock). Authoring stays on the
+**alpha** seat: operators join a Realm's gateway, author there, and the federation carries it across.
+Pin a stable identity for scripted seeds with `--cluster-key <64-hex>`.
 
 See the whole cross-Realm story two ways — in one process, and as real separate processes:
 
