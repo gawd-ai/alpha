@@ -219,8 +219,10 @@ impl ReputationWeigher for UnitWeigher {
 pub enum NoOmegaRouteReason {
     /// No peer mapped for the named Realm in the federator's view.
     UnmappedRealm,
-    /// Only `target = Creature(m)` is forwarded (matches the realm-gateway limit); nested
-    /// grain (Role/Topic/Intent/Realm/Omega) is a later enhancement.
+    /// The inner `target` names something this single-hop gateway can't reach: a nested federation
+    /// grain (Role/Topic/Intent/Realm/Omega), or a `Node` that isn't the Realm's gateway Sanctum
+    /// (reaching a non-gateway Sanctum inside the peer Realm needs an intra-Realm relay — a later
+    /// enhancement). `Creature(m)` and `Node(gateway, m)` are the forwarded forms.
     UnsupportedTarget,
 }
 
@@ -493,15 +495,23 @@ impl OmegaFederator {
                 ));
             }
         };
+        // Resolve the inner target to a creature on the Realm's gateway Sanctum. `Creature(m)` names
+        // it directly; `Node(gateway, m)` names the same creature with the gateway Sanctum spelled
+        // out — the form a cross-Realm placement offer carries, since an offer tags the answering
+        // Sanctum's node. A `Node` naming a *non-gateway* Sanctum inside the peer Realm would need the
+        // gateway to relay intra-Realm — a later enhancement, not this single-hop path — so it's an
+        // honest no-route rather than a silent misdelivery.
         let target_module = match target {
             Address::Creature(m) => m,
+            Address::Node(ref n, m) if *n == peer => m,
             other => {
                 return Outcome::send(self.no_route(
                     env,
                     realm,
                     NoOmegaRouteReason::UnsupportedTarget,
                     Some(format!(
-                        "v0.3 omega-federator forwards only `Omega(R, Creature(m))`; got {other:?}"
+                        "omega-federator forwards `Omega(R, Creature(m))` or \
+                         `Omega(R, Node(gateway, m))`; got {other:?}"
                     )),
                 ));
             }
@@ -1430,6 +1440,60 @@ mod tests {
                     target: Box::new(Address::Role(aether::Role::new("policy"))),
                 },
                 "seer",
+                Some(1),
+            ),
+            payload: b"x".to_vec(),
+        };
+        let d = &f.handle(env).dispatches[0];
+        let reply: NoOmegaRouteReply = serde_json::from_slice(&d.payload).unwrap();
+        assert_eq!(reply.reason, NoOmegaRouteReason::UnsupportedTarget);
+    }
+
+    #[test]
+    fn omega_node_gateway_target_forwards_like_creature() {
+        // `Omega(guests, Node(node-B, 77))` names creature 77 on the Realm's gateway Sanctum — the
+        // form a cross-Realm placement offer carries (it tags the answering Sanctum's node). It
+        // forwards exactly like `Omega(guests, Creature(77))`, preserving the *application* schema +
+        // payload + corr + reply_to byte-for-byte, so any creature (not just a system registry) on a
+        // peer Realm is reachable and answers the original requester.
+        let mut f = fed(0xB4);
+        let env = Envelope {
+            header: header(
+                Address::Omega {
+                    realm: RealmId::new("guests"),
+                    target: Box::new(Address::Node(NodeId(PEER_NODE.into()), CreatureId(77))),
+                },
+                "app.ping",
+                Some(1),
+            ),
+            payload: b"hello".to_vec(),
+        };
+        let out = f.handle(env);
+        assert_eq!(out.dispatches.len(), 1, "exactly one forwarded dispatch");
+        let d = &out.dispatches[0];
+        assert_eq!(d.to, Address::Node(NodeId(PEER_NODE.into()), CreatureId(77)));
+        assert_eq!(d.schema, "app.ping", "application schema preserved across the gateway");
+        assert_eq!(d.payload, b"hello", "payload forwarded byte-for-byte");
+        assert_eq!(d.corr, Some(1), "corr preserved so the reply correlates");
+        assert_eq!(
+            d.reply_to,
+            Some(Address::Creature(CreatureId(100))),
+            "reply_to preserved so the responder answers the original requester"
+        );
+    }
+
+    #[test]
+    fn omega_node_non_gateway_target_yields_unsupported_target() {
+        // A `Node` inside the peer Realm that isn't its gateway Sanctum needs an intra-Realm relay
+        // this single-hop gateway doesn't do — an honest no-route, never a silent misdelivery.
+        let mut f = fed(0xB5);
+        let env = Envelope {
+            header: header(
+                Address::Omega {
+                    realm: RealmId::new("guests"),
+                    target: Box::new(Address::Node(NodeId("node-Z".into()), CreatureId(77))),
+                },
+                "app.ping",
                 Some(1),
             ),
             payload: b"x".to_vec(),
