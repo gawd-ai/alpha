@@ -1,0 +1,15 @@
+[package]
+name = "responder-fitness"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference standing consumer for the SEER `fitness` topic. On a fitness Query it scores a content-addressed candidate via an injected Rater and answers a clamped [0,1] score (non-finite scores fold to 0.0, fail-closed). NOT substrate — the Rater is the operator's injected model."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+seer = { path = "../../../../seer" }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1698,6 +1698,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "responder-budget"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "seer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "responder-curation"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "seer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "responder-fitness"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "seer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "responder-policy"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "seer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rhai"
 version = "1.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1861,6 +1901,10 @@ dependencies = [
  "realm-gateway",
  "registry-mem",
  "reputation-roundrobin",
+ "responder-budget",
+ "responder-curation",
+ "responder-fitness",
+ "responder-policy",
  "runaway-thread-daemon",
  "scorer-success-rate",
  "seer",

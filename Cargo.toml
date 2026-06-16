@@ -103,6 +103,14 @@ members = [
     "cosmos/creatures/prototypes/merge/merge-lww-map",
     "cosmos/creatures/prototypes/monitor",
 
+    # ---- responders: reference standing SEER consumers for the reserved topics that had a typed
+    #      body but no creature to stand on them. Each binds one topic and answers Queries via the
+    #      shared seer::responder skeleton; the decision is the operator-replaceable model. ----
+    "cosmos/creatures/prototypes/responders/responder-policy",
+    "cosmos/creatures/prototypes/responders/responder-budget",
+    "cosmos/creatures/prototypes/responders/responder-fitness",
+    "cosmos/creatures/prototypes/responders/responder-curation",
+
     # ---- fixtures: test-only creatures — the most reduced prototype (walking-skeleton + fault
     #      specimens; loaded by sanctum tests). Nested under prototypes/ ----
     "cosmos/creatures/prototypes/fixtures/echo-daemon",

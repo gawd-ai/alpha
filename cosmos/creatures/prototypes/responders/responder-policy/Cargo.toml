@@ -1,0 +1,15 @@
+[package]
+name = "responder-policy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference standing consumer for the SEER `policy` topic. On an admission Query it admits a manifest whose hash is on a configured allowlist (or admits everything in the explicit dev posture) and answers admit/deny + a reason. NOT substrate — a starting point operators fork into their own admission model."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+seer = { path = "../../../../seer" }
+serde = { workspace = true }
+serde_json = { workspace = true }

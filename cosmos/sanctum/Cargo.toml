@@ -108,6 +108,13 @@ verifiable-die = { path = "../creatures/verifiable-die" }
 # abode_reconcile_local — two divergent signed forks of one self merge into a re-signed snapshot.
 abode-reconciler = { path = "../creatures/abode-reconciler" }
 merge-lww-map = { path = "../creatures/prototypes/merge/merge-lww-map" }
+# The reference standing SEER consumers for the reserved topics (policy / budget / fitness /
+# curation). Drives seer_responders.rs — each is loaded on a real kernel and answers a live Query
+# routed through the bus, proving the reserved topics are stand-on-able end to end.
+responder-policy = { path = "../creatures/prototypes/responders/responder-policy" }
+responder-budget = { path = "../creatures/prototypes/responders/responder-budget" }
+responder-fitness = { path = "../creatures/prototypes/responders/responder-fitness" }
+responder-curation = { path = "../creatures/prototypes/responders/responder-curation" }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 wat = "1"
