@@ -1,0 +1,15 @@
+[package]
+name = "dialogue-initiator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference initiator for the SEER `dialogue` topic — opens an agent-to-agent conversation by sending a turn to a NAMED peer (local, cross-node, or cross-Realm via Omega), then relays the peer's reply to the original requester. The opening half of the dialogue seam; NOT substrate."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+seer = { path = "../../../../seer" }
+serde = { workspace = true }
+serde_json = { workspace = true }

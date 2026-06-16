@@ -119,6 +119,11 @@ responder-curation = { path = "../creatures/prototypes/responders/responder-cura
 # federator + the scheduler, proving the scheduler self-drives PullFrom on its interval and backs off
 # under the in-flight cap when acks stop.
 federation-scheduler = { path = "../creatures/federation-scheduler" }
+# The reference agent-to-agent dialogue pair — drives dialogue_seam.rs: an initiator opens a
+# conversation with a named peer and relays the responder's reply, proving the SEER `dialogue` topic
+# carries a full turn → reply round-trip end to end through a real kernel.
+dialogue-initiator = { path = "../creatures/prototypes/dialogue/dialogue-initiator" }
+dialogue-responder = { path = "../creatures/prototypes/dialogue/dialogue-responder" }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 wat = "1"

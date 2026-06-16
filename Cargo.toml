@@ -112,6 +112,13 @@ members = [
     "cosmos/creatures/prototypes/responders/responder-fitness",
     "cosmos/creatures/prototypes/responders/responder-curation",
 
+    # ---- dialogue: the reference agent-to-agent pair on the SEER `dialogue` topic. The initiator
+    #      opens a conversation by sending a turn to a NAMED peer (local / cross-node / cross-Realm
+    #      via Omega); the responder answers with an injected model. Two LLM agents conversing across
+    #      the mesh are the same shape on this seam. ----
+    "cosmos/creatures/prototypes/dialogue/dialogue-initiator",
+    "cosmos/creatures/prototypes/dialogue/dialogue-responder",
+
     # ---- fixtures: test-only creatures — the most reduced prototype (walking-skeleton + fault
     #      specimens; loaded by sanctum tests). Nested under prototypes/ ----
     "cosmos/creatures/prototypes/fixtures/echo-daemon",

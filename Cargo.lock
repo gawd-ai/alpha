@@ -619,6 +619,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "dialogue-initiator"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "seer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dialogue-responder"
+version = "0.4.2"
+dependencies = [
+ "aether",
+ "seer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1884,6 +1904,8 @@ dependencies = [
  "bestiary-daemon",
  "build-cargo",
  "build-critter",
+ "dialogue-initiator",
+ "dialogue-responder",
  "distributor-requirements",
  "distributor-roundrobin",
  "echo-daemon",

@@ -1,0 +1,15 @@
+[package]
+name = "dialogue-responder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference standing consumer for the SEER `dialogue` topic — the peer half of the agent-to-agent dialogue seam. Answers a conversation turn with an injected Responder model (the reference echoes the prompt). NOT substrate: a fork point for an LLM-backed conversational agent."
+
+[dependencies]
+aether = { path = "../../../../aether" }
+seer = { path = "../../../../seer" }
+serde = { workspace = true }
+serde_json = { workspace = true }
