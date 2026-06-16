@@ -137,11 +137,67 @@ struct GxChunkPull {
 }
 
 /// The registry creature.
+/// A read-only view of one catalog entry, handed to an [`EvictionPolicy`] when the catalog is at
+/// capacity and a *new* artifact wants in. Identity plus the value signals the substrate already
+/// tracks — no bytes — so a policy decides "what is least worth keeping" without a fetch.
+pub struct EvictionCandidate<'a> {
+    pub realm: &'a RealmId,
+    pub artifact_hash: &'a str,
+    /// The entry's reputation score, if any has been attested (`None` = unproven).
+    pub reputation: Option<f32>,
+    /// Whether the entry currently carries a (reversible) quarantine marker.
+    pub quarantined: bool,
+}
+
+/// The injected eviction model. When the catalog is at `max_entries` and a *new* `(realm,
+/// artifact_hash)` wants in, the registry asks the bound policy which existing entry to drop (an
+/// index into `candidates`). `None` declines — the publish is then refused, the same resilience
+/// posture as a registry with no eviction policy bound at all.
+///
+/// The substrate ships the seam + the reference [`LowValueEviction`]; an operator binds whatever
+/// model fits (reputation-weighted, quarantine-first, jurisdiction-aware, or — tracking its own
+/// state — age / LRU). The registry ships the socket, never the policy.
+pub trait EvictionPolicy: Send + Sync {
+    fn choose_victim(&self, candidates: &[EvictionCandidate<'_>]) -> Option<usize>;
+}
+
+/// Reference [`EvictionPolicy`]: evict the *least valuable* entry — a quarantined entry first
+/// (defense-marked artifacts go before anything else), then the lowest reputation (an unattested
+/// entry counts as the floor, so unproven artifacts make room before proven ones), with a
+/// deterministic `artifact_hash` tiebreak so the choice is reproducible. Stateless, bounded, and the
+/// natural "keep accepting fresh artifacts under a fixed cap instead of going stale" default.
+pub struct LowValueEviction;
+
+impl EvictionPolicy for LowValueEviction {
+    fn choose_victim(&self, candidates: &[EvictionCandidate<'_>]) -> Option<usize> {
+        candidates
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                // Lower sorts first = more evictable. `!quarantined` puts quarantined (false) before
+                // not (true); then lower reputation (unattested → the f32::MIN floor); then hash.
+                (!a.quarantined)
+                    .cmp(&!b.quarantined)
+                    .then(
+                        a.reputation
+                            .unwrap_or(f32::MIN)
+                            .partial_cmp(&b.reputation.unwrap_or(f32::MIN))
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                    .then_with(|| a.artifact_hash.cmp(b.artifact_hash))
+            })
+            .map(|(i, _)| i)
+    }
+}
+
 pub struct RegistryMem {
     /// (realm, artifact_hash) → entry. Keying by `(RealmId, String)` is what makes the Realm grain
     /// load-bearing — two creatures with identical bytes in different Realms don't collide. Bare
     /// Mutex: registry RPC is single-creature traffic.
     entries: Mutex<HashMap<(RealmId, String), Entry>>,
+    /// Optional injected eviction model. `None` (the default) keeps the refuse-new-at-capacity
+    /// posture; `Some` lets a publish of a new key at capacity make room by evicting a chosen victim.
+    evictor: Option<Box<dyn EvictionPolicy>>,
     /// Maximum number of distinct catalog entries held at once. A peer that publishes an unbounded
     /// stream of distinct artifacts would otherwise grow the catalog without limit. At capacity a
     /// *new* `(realm, artifact_hash)` is refused (re-publishing an existing key still succeeds — it
@@ -166,6 +222,7 @@ impl RegistryMem {
     pub fn new() -> Self {
         RegistryMem {
             entries: Mutex::new(HashMap::new()),
+            evictor: None,
             max_entries: DEFAULT_MAX_REGISTRY_ENTRIES,
             max_op_bytes: MAX_REGISTRY_OP_BYTES,
             max_artifact_bytes: MAX_REGISTRY_ARTIFACT_BYTES,
@@ -180,6 +237,17 @@ impl RegistryMem {
     /// succeeds. Pass `0` to opt out and make the in-memory catalog unbounded.
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries;
+        self
+    }
+
+    /// Bind an injected [`EvictionPolicy`]. With one bound, a publish of a *new* key at capacity makes
+    /// room by evicting a policy-chosen victim instead of refusing — so a long-running registry keeps
+    /// accepting fresh artifacts under a fixed `max_entries` rather than going stale at the cap. With
+    /// none bound (the default), the at-capacity posture stays refuse-new. Pairs with a non-zero
+    /// `max_entries`: an unbounded catalog (`with_max_entries(0)`) never reaches capacity, so it never
+    /// evicts.
+    pub fn with_eviction(mut self, policy: Box<dyn EvictionPolicy>) -> Self {
+        self.evictor = Some(policy);
         self
     }
 
@@ -260,23 +328,58 @@ impl RegistryMem {
         }
         let key = (realm, hash.clone());
         let mut g = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        // Catalog-pressure guard (resilience): at capacity, refuse a *new* key rather than grow the
-        // catalog without bound. Re-publishing an existing key is always allowed — it resets signals
-        // in place and adds no entry. `0` disables the cap. The returned hash is still the correct
-        // content address of the bytes; a later fetch of a refused key simply misses.
+        // Catalog-pressure guard (resilience): at capacity, a *new* key either evicts a victim (when
+        // an eviction policy is bound) or is refused (the default) — never unbounded growth.
+        // Re-publishing an existing key is always allowed: it resets signals in place and adds no
+        // entry. `0` disables the cap. The returned hash is still the correct content address of the
+        // bytes; a later fetch of a refused key simply misses.
         if self.max_entries != 0 && g.len() >= self.max_entries && !g.contains_key(&key) {
-            let message = format!(
-                "catalog at capacity ({}); refusing new artifact {hash} in realm {}",
-                self.max_entries, key.0 .0
-            );
-            eprintln!("registry-mem: {message}");
-            return PublishResult::Refused { artifact_hash: hash, message };
+            // A bound policy makes room by evicting; without one (or if it declines), refuse-new.
+            if !self.make_room(&mut g) {
+                let message = format!(
+                    "catalog at capacity ({}); refusing new artifact {hash} in realm {}",
+                    self.max_entries, key.0 .0
+                );
+                eprintln!("registry-mem: {message}");
+                return PublishResult::Refused { artifact_hash: hash, message };
+            }
         }
         // A (re)publish resets the reputation/quarantine signals to None. For `quarantine` this is
         // the T5 reversibility rule made concrete: re-publishing a quarantined
         // `(realm, artifact_hash)` clears the marker — the substrate never permanently blacklists.
         g.insert(key, Entry { manifest, artifact, reputation: None, quarantine: None });
         PublishResult::Stored(hash)
+    }
+
+    /// At capacity with a new key: if an eviction policy is bound, ask it for a victim and remove it.
+    /// Returns whether room was actually made (no policy bound, or a policy that declines → `false`,
+    /// and the caller falls back to refuse-new).
+    fn make_room(&self, g: &mut HashMap<(RealmId, String), Entry>) -> bool {
+        let Some(evictor) = self.evictor.as_ref() else {
+            return false;
+        };
+        // A stable key order so the index the policy returns maps back to a concrete key.
+        let keys: Vec<(RealmId, String)> = g.keys().cloned().collect();
+        let candidates: Vec<EvictionCandidate> = keys
+            .iter()
+            .map(|k| {
+                let e = g.get(k).expect("key drawn from this map");
+                EvictionCandidate {
+                    realm: &k.0,
+                    artifact_hash: &k.1,
+                    reputation: e.reputation.as_ref().map(|r| r.score),
+                    quarantined: e.quarantine.is_some(),
+                }
+            })
+            .collect();
+        match evictor.choose_victim(&candidates) {
+            Some(idx) if idx < keys.len() => {
+                let victim = keys[idx].clone();
+                g.remove(&victim);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Attach (or replace) a reputation score on an existing `(realm, artifact_hash)` entry.
@@ -1952,6 +2055,54 @@ mod tests {
         let h1_again = r.publish(manifest("a"), b"artifact-one".to_vec());
         assert_eq!(h1_again, h1);
         assert!(r.fetch(&h1).is_some(), "re-publish of an existing key succeeds at capacity");
+    }
+
+    #[test]
+    fn eviction_evicts_lowest_reputation_to_admit_a_new_artifact() {
+        // With an eviction policy bound, a new artifact at capacity makes room instead of being
+        // refused — the registry keeps accepting fresh work under a fixed cap.
+        let realm = RealmId::new("crew");
+        let r = RegistryMem::new().with_max_entries(2).with_eviction(Box::new(LowValueEviction));
+        let h_high = r.publish_in(realm.clone(), manifest("high"), b"high-value".to_vec());
+        let h_low = r.publish_in(realm.clone(), manifest("low"), b"low-value".to_vec());
+        assert!(r.attest_fitness(&realm, &h_high, ReputationScore::unsigned(0.9, None)));
+        assert!(r.attest_fitness(&realm, &h_low, ReputationScore::unsigned(0.1, None)));
+
+        let h_new = r.publish_in(realm.clone(), manifest("new"), b"fresh".to_vec());
+        assert!(
+            r.fetch_in(&realm, &h_new).is_some(),
+            "fresh artifact admitted by evicting a victim"
+        );
+        assert!(r.fetch_in(&realm, &h_low).is_none(), "the lowest-reputation entry was evicted");
+        assert!(r.fetch_in(&realm, &h_high).is_some(), "the high-reputation entry was kept");
+    }
+
+    #[test]
+    fn eviction_evicts_a_quarantined_entry_before_a_reputable_one() {
+        // Quarantined goes first, even though the other entry has a *lower* reputation score.
+        let realm = RealmId::new("crew");
+        let r = RegistryMem::new().with_max_entries(2).with_eviction(Box::new(LowValueEviction));
+        let h_q = r.publish_in(realm.clone(), manifest("q"), b"quarantined".to_vec());
+        let h_ok = r.publish_in(realm.clone(), manifest("ok"), b"reputable".to_vec());
+        assert!(r.attest_fitness(&realm, &h_ok, ReputationScore::unsigned(0.05, None)));
+        assert!(r.mark_quarantine(
+            &realm,
+            &h_q,
+            QuarantineNotice { reason: "apoptosis".into(), attesting_peers: vec![] }
+        ));
+
+        let h_new = r.publish_in(realm.clone(), manifest("new"), b"fresh".to_vec());
+        assert!(r.fetch_in(&realm, &h_new).is_some());
+        assert!(
+            r.fetch_in(&realm, &h_q).is_none(),
+            "the quarantined entry is evicted first, despite the other's lower reputation"
+        );
+        assert!(r.fetch_in(&realm, &h_ok).is_some());
+    }
+
+    #[test]
+    fn low_value_eviction_declines_on_empty_candidates() {
+        assert_eq!(LowValueEviction.choose_victim(&[]), None);
     }
 
     #[test]

@@ -29,6 +29,7 @@
 //! becomes a reply to the envelope's reply target, and it may `emit(addr, bytes)` additional
 //! dispatches.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -75,6 +76,18 @@ pub const DEFAULT_STRUCTURAL_CAP: u64 = 1024 * 1024;
 /// before the script runs. The effective cap is `min(mem_bytes-or-default, MAX_ENV_TEXT_BYTES)`, so a
 /// tight declared memory budget also tightens the text view.
 pub const MAX_ENV_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Maximum number of keys a critter's persistent memory (`mem_set`) holds at once. At capacity a
+/// *new* key is refused while an *existing* one can still be overwritten — the same refuse-new
+/// posture `registry-mem` takes, so a runaway script cannot grow host memory without bound through
+/// the memory surface. The per-creature analog of a registry's `max_entries`. (Each stored value is
+/// separately bounded by the engine's structural caps — `mem_bytes` / [`DEFAULT_STRUCTURAL_CAP`] —
+/// at the moment the script builds it, so the whole surface is bounded by entries × value-size.)
+pub const MAX_PERSIST_ENTRIES: usize = 256;
+
+/// Maximum byte length of a persistent-memory key. A longer key is refused by `mem_set` rather than
+/// retained, so a script can't grow the keyspace's memory through pathological key strings.
+pub const MAX_PERSIST_KEY_BYTES: usize = 256;
 
 /// Maximum parse-time expression nesting depth (global scope, then function body). Rhai's *default*
 /// caps are **profile-dependent** — halved in debug builds (function-body depth 16 debug vs 32
@@ -215,6 +228,64 @@ impl Engine for ScriptEngine {
                 },
             );
         }
+        // Persistent per-creature memory. Every other critter state is per-call — a fresh `Scope`
+        // each `handle` (see below) — so until now the critter was the one tier with *no* carried
+        // state, where a daemon has struct fields and a beast has linear memory. This is that carried
+        // state: a small key→value store, reached through three host fns (`mem_get`/`mem_set`/`mem_del`,
+        // the same registered-host-fn shape as `emit`, because Rhai script functions can't see the
+        // parent scope). It SURVIVES across `handle` calls for the instance's lifetime and is dropped
+        // on unload — NOT durable across a reload (a reloaded critter starts empty, matching "a critter
+        // is exactly its signed source"). Bounded: at most [`MAX_PERSIST_ENTRIES`] keys (refuse-new at
+        // capacity, like `registry-mem`), keys up to [`MAX_PERSIST_KEY_BYTES`]; each value is already
+        // structurally size-capped by the engine at the moment the script builds it.
+        let persist: Arc<Mutex<HashMap<String, Dynamic>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let store = persist.clone();
+            engine.register_fn("mem_get", move |key: rhai::ImmutableString| -> Dynamic {
+                store
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.get(key.as_str()).cloned())
+                    .unwrap_or(Dynamic::UNIT)
+            });
+        }
+        {
+            let store = persist.clone();
+            engine.register_fn(
+                "mem_set",
+                move |key: rhai::ImmutableString,
+                      value: Dynamic|
+                      -> Result<(), Box<EvalAltResult>> {
+                    if key.len() > MAX_PERSIST_KEY_BYTES {
+                        return Err(
+                            format!("mem_set: key exceeds {MAX_PERSIST_KEY_BYTES} bytes").into()
+                        );
+                    }
+                    let mut g = store
+                        .lock()
+                        .map_err(|_| -> Box<EvalAltResult> { "mem_set: memory poisoned".into() })?;
+                    // Refuse-new at capacity; overwriting an existing key always succeeds.
+                    if !g.contains_key(key.as_str()) && g.len() >= MAX_PERSIST_ENTRIES {
+                        return Err(format!(
+                            "mem_set: memory at capacity ({MAX_PERSIST_ENTRIES} keys); \
+                             delete a key before adding a new one"
+                        )
+                        .into());
+                    }
+                    g.insert(key.to_string(), value);
+                    Ok(())
+                },
+            );
+        }
+        {
+            let store = persist.clone();
+            engine.register_fn("mem_del", move |key: rhai::ImmutableString| {
+                if let Ok(mut g) = store.lock() {
+                    g.remove(key.as_str());
+                }
+            });
+        }
+
         // Seed the static cap; `handle` re-seeds from the live atomic each call so an `ExtendBudget`
         // grant takes effect on the next handle, mirroring the beast at `wasm.rs`.
         engine.set_max_operations(ops_cap);
@@ -575,5 +646,132 @@ mod tests {
         assert!(!crossed(89, 100, 90));
         assert!(crossed(90, 100, 90));
         assert!(crossed(100, 100, 0), "threshold 0 always crosses a capped, used budget");
+    }
+
+    // ---- persistent critter memory (Tier-1 #2) -----------------------------------------------
+
+    /// Load a critter from source with an unbounded op budget (these tests exercise memory, not the
+    /// CPU dial), returning its drivable instance.
+    fn critter(src: &str) -> Box<dyn Creature> {
+        let mut manifest = Manifest::new("mem-critter", "0.1.0", Backend::Critter, CRITTER_ABI_TAG);
+        manifest.capabilities.cpu_ms = 0; // unbounded ops — don't let the budget interrupt a fill loop
+        ScriptEngine
+            .load(&Artifact::Bytes(src.as_bytes().to_vec()), &manifest)
+            .expect("critter loads")
+            .instance
+    }
+
+    fn mem_env(payload: &[u8]) -> Envelope {
+        Envelope {
+            header: aether::Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::Creature(CreatureId(2)),
+                reply_to: Some(Address::Creature(CreatureId(1))),
+                seq: 0,
+                causal: vec![],
+                stamp: 0,
+                sig: String::new(),
+                corr: Some(9),
+                commitment: None,
+                schema: "text".into(),
+                origin: None,
+            },
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn reply_text(out: &Outcome) -> String {
+        let d = out.dispatches.last().expect("a reply dispatch");
+        String::from_utf8(d.payload.clone()).expect("utf8 reply")
+    }
+
+    #[test]
+    fn persistent_memory_survives_across_handle_calls() {
+        // The counter lives only in the persistent store — a fresh Scope each call would lose it.
+        let mut c = critter(
+            r#"
+            fn handle(env) {
+                let n = mem_get("count");
+                if type_of(n) == "()" { n = 0; }
+                n += 1;
+                mem_set("count", n);
+                n.to_string()
+            }
+            "#,
+        );
+        assert_eq!(reply_text(&c.handle(mem_env(b""))), "1");
+        assert_eq!(reply_text(&c.handle(mem_env(b""))), "2");
+        assert_eq!(
+            reply_text(&c.handle(mem_env(b""))),
+            "3",
+            "the counter accumulates across handle calls — state carried, not reset"
+        );
+    }
+
+    #[test]
+    fn persistent_memory_is_capped_refuse_new_at_capacity() {
+        // The script adds distinct keys until `mem_set` refuses, then reports how many it stored —
+        // exactly MAX_PERSIST_ENTRIES. Refuse-new at capacity, never unbounded growth.
+        let mut c = critter(
+            r#"
+            fn handle(env) {
+                let added = 0;
+                for i in 0..100000 {
+                    try {
+                        mem_set("k" + i, i);
+                        added += 1;
+                    } catch (e) {
+                        break;
+                    }
+                }
+                added.to_string()
+            }
+            "#,
+        );
+        assert_eq!(
+            reply_text(&c.handle(mem_env(b""))),
+            MAX_PERSIST_ENTRIES.to_string(),
+            "memory holds at most MAX_PERSIST_ENTRIES keys (refuse-new at capacity)"
+        );
+    }
+
+    #[test]
+    fn overwriting_an_existing_key_at_capacity_is_allowed() {
+        // Refuse-NEW, not refuse-write: at capacity, re-setting an EXISTING key must still succeed.
+        let mut c = critter(
+            r#"
+            fn handle(env) {
+                for i in 0..100000 {
+                    try { mem_set("k" + i, i); } catch (e) { break; }
+                }
+                mem_set("k0", 999);   // overwrite an existing key — must NOT throw
+                mem_get("k0").to_string()
+            }
+            "#,
+        );
+        assert_eq!(
+            reply_text(&c.handle(mem_env(b""))),
+            "999",
+            "an existing key stays overwritable even at capacity"
+        );
+    }
+
+    #[test]
+    fn mem_del_frees_a_slot_and_get_returns_unit_for_absent() {
+        let mut c = critter(
+            r#"
+            fn handle(env) {
+                mem_set("a", 1);
+                mem_del("a");
+                let v = mem_get("a");
+                type_of(v)        // "()" once deleted
+            }
+            "#,
+        );
+        assert_eq!(
+            reply_text(&c.handle(mem_env(b""))),
+            "()",
+            "a deleted (or never-set) key reads back as unit"
+        );
     }
 }
