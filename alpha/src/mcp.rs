@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aether::{
-    CreatureId, Deadline, Ed25519Signer, Ed25519Verifier, NodeId, Role, Signer, StubSigner,
-    StubVerifier, Verifier,
+    CreatureId, Deadline, Ed25519Signer, Ed25519Verifier, Signer, StubSigner, StubVerifier,
+    Verifier,
 };
 use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use sanctum::Kernel;
@@ -127,8 +127,8 @@ pub fn run(args: &[String]) {
     // Remote mode joins a mesh, so the hub needs a real ed25519 identity — and the bus signer must
     // be that same key so the peer can verify the hub's control envelopes under the pubkey it
     // authenticated at the handshake. Local mode never leaves the process; the stub signer suffices.
-    let node_identity: Option<crate::node::NodeKeyBoot> = if opts.target.is_some() {
-        match crate::node::derive_node_key(opts.cluster_key.as_deref()) {
+    let node_identity: Option<omni::NodeKeyBoot> = if opts.target.is_some() {
+        match omni::derive_node_key(opts.cluster_key.as_deref()) {
             Ok(nk) => Some(nk),
             Err(e) => {
                 eprintln!("alpha mcp: {e}");
@@ -227,42 +227,13 @@ pub fn run(args: &[String]) {
 fn join_mesh(
     kernel: &Arc<Kernel>,
     opts: &Opts,
-    nk: &crate::node::NodeKeyBoot,
+    nk: &omni::NodeKeyBoot,
 ) -> Result<CreatureId, String> {
     let node_id = opts.node_id.clone().ok_or("--target (remote mode) requires --node-id <id>")?;
     let listen = opts.listen.clone().ok_or("--target (remote mode) requires --listen <addr>")?;
     if opts.seeds.is_empty() {
         return Err("--target (remote mode) requires at least one --seed to reach the peer".into());
     }
-
-    let mut peers = Vec::new();
-    for s in &opts.seeds {
-        let bad = || format!("bad --seed {s:?} (want node-id@host:port#pubkey-hex)");
-        let (id, rest) = s.split_once('@').ok_or_else(bad)?;
-        let (addr, pk) = rest.split_once('#').ok_or_else(bad)?;
-        if id.is_empty() || addr.is_empty() || pk.is_empty() {
-            return Err(bad());
-        }
-        peers.push(transport_tcp::PeerConfig {
-            node_id: NodeId(id.to_string()),
-            pubkey_hex: pk.to_string(),
-            dial_addr: Some(addr.to_string()),
-        });
-    }
-
-    let cfg = transport_tcp::TransportConfig {
-        self_key: nk.key.clone(),
-        self_node: NodeId(node_id),
-        listen_addr: listen.clone(),
-        peers,
-    };
-    // The boot-only attestation grant: the hub's transport stamps authenticated origins too.
-    let transport = kernel
-        .load_transport_instance(
-            boot_manifest("transport-tcp"),
-            Box::new(transport_tcp::TransportTcp::new(cfg).with_gossip(Some(listen))),
-        )
-        .map_err(|e| format!("transport admits: {e}"))?;
-    kernel.bind_role(Role::new(Role::TRANSPORT), transport);
-    Ok(transport)
+    // Same cluster-transport boot the α/Ω composition roots use (ADR-0044) — single source of truth.
+    omni::boot_cluster(kernel, &node_id, &listen, &opts.seeds, &nk.key)
 }

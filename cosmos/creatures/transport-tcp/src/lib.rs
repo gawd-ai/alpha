@@ -1460,10 +1460,9 @@ fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId, peer_pu
         && Ed25519Verifier.verify(peer_pubkey, &env.signing_payload(), &env.header.sig);
 
     // Rewrite `reply_to`: a `Creature(mid)` from the peer means "mid on the peer node" from our POV.
-    let reply_to = env.header.reply_to.clone().map(|rt| match rt {
-        Address::Creature(mid) => Address::Node(peer.clone(), mid),
-        other => other,
-    });
+    // Recurses through `Realm`/`Omega` wrappers so a cross-Realm `reply_to` is rewritten at any depth
+    // (ADR-0039), not just a bare `Creature`.
+    let reply_to = env.header.reply_to.clone().map(|rt| rewrite_inbound_target(rt, peer));
     let commitment = env.header.commitment.clone();
     let schema = env.header.schema.clone();
 
@@ -1520,8 +1519,36 @@ fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId, peer_pu
     }
 }
 
+/// Rewrite an inbound address's *sender-local* grain to *our* point of view: a peer's `Creature(mid)`
+/// is `Node(peer, mid)` from here. Recurses through `Realm` / `Omega` wrappers so a nested target
+/// (e.g. a cross-Realm `reply_to`) is rewritten at any depth while the federation wrapper is preserved
+/// (ADR-0039). Recursion terminates because depth is bounded by the kernel's address-depth cap (the
+/// frame was already accepted, so it is within that bound). Any other address kind is left unchanged.
+fn rewrite_inbound_target(addr: Address, peer: &NodeId) -> Address {
+    match addr {
+        Address::Creature(mid) => Address::Node(peer.clone(), mid),
+        Address::Realm { realm, target } => {
+            Address::Realm { realm, target: Box::new(rewrite_inbound_target(*target, peer)) }
+        }
+        Address::Omega { realm, target } => {
+            Address::Omega { realm, target: Box::new(rewrite_inbound_target(*target, peer)) }
+        }
+        other => other,
+    }
+}
+
 /// Replay-guard check: returns `true` (drop) when `seq` does not advance the high-water mark for
 /// `(peer, sender)`, else records it and returns `false`. Monotone per sender within a link session.
+///
+/// **Scope (ADR-0040): this guard is session-scoped, not cross-session.** It prevents replay *within*
+/// an authenticated link session; a fresh handshake wipes the marks for that peer
+/// ([`reset_origin_watermarks`]) so a legitimately restarted `seq` stream isn't mistaken for a replay.
+/// The consequence is deliberate and specified: a peer that crashes and reconnects *can* re-present a
+/// frame from a previous session with a `seq` the cleared map no longer remembers. The bus does **not**
+/// promise exactly-once delivery across reconnects — components that need it dedup at the application
+/// layer on `corr` (the SEER/dialogue reduction theorem already keys on `corr`). Adding durable
+/// per-peer watermarks / generation tokens is the future option if a concrete need arises; it is out of
+/// scope here because it trades a memory-only transport for durable state and a stale-mark failure mode.
 fn is_replayed_seq(state: &TransportState, peer: &NodeId, sender: CreatureId, seq: u64) -> bool {
     let mut wm = mlock(&state.origin_seq);
     let key = (peer.clone(), sender);
@@ -1901,6 +1928,46 @@ mod tests {
     fn fresh_nonce_returns_distinct_values() {
         // Probabilistic; two 32-byte RNG draws colliding is ~2^-256.
         assert_ne!(fresh_nonce(), fresh_nonce());
+    }
+
+    #[test]
+    fn rewrite_inbound_target_recurses_through_realm_and_omega() {
+        use aether::RealmId;
+        let peer = NodeId("peer-1".to_string());
+        let mid = CreatureId(7);
+
+        // Bare Creature → Node(peer, mid).
+        assert_eq!(
+            rewrite_inbound_target(Address::Creature(mid), &peer),
+            Address::Node(peer.clone(), mid)
+        );
+
+        // Realm{ r, Creature(mid) } → Realm{ r, Node(peer, mid) } — wrapper preserved, inner rewritten.
+        let realm = RealmId::new("other");
+        let nested =
+            Address::Realm { realm: realm.clone(), target: Box::new(Address::Creature(mid)) };
+        match rewrite_inbound_target(nested, &peer) {
+            Address::Realm { realm: r, target } => {
+                assert_eq!(r, realm);
+                assert_eq!(*target, Address::Node(peer.clone(), mid));
+            }
+            other => panic!("expected Realm wrapper preserved, got {other:?}"),
+        }
+
+        // Omega{ r, Creature(mid) } likewise.
+        let omega =
+            Address::Omega { realm: realm.clone(), target: Box::new(Address::Creature(mid)) };
+        match rewrite_inbound_target(omega, &peer) {
+            Address::Omega { realm: r, target } => {
+                assert_eq!(r, realm);
+                assert_eq!(*target, Address::Node(peer.clone(), mid));
+            }
+            other => panic!("expected Omega wrapper preserved, got {other:?}"),
+        }
+
+        // A non-creature inner (already Node) is left as-is — only sender-local grain is rewritten.
+        let already = Address::Node(NodeId("elsewhere".to_string()), mid);
+        assert_eq!(rewrite_inbound_target(already.clone(), &peer), already);
     }
 
     #[test]
@@ -2694,7 +2761,7 @@ mod tests {
         let (key, _) = Ed25519KeyMaterial::generate().unwrap();
         let peer = NodeId("node-A".into());
 
-        // seq 1 admitted, a replay of seq 1 dropped, seq 2 admitted again.
+        // Intra-session (ADR-0040): seq 1 admitted, a replay of seq 1 dropped, seq 2 admitted again.
         deliver_locally(&state, signed_inbound_env(&key, 1, None), &peer, key.public_hex());
         deliver_locally(&state, signed_inbound_env(&key, 1, None), &peer, key.public_hex());
         deliver_locally(&state, signed_inbound_env(&key, 2, None), &peer, key.public_hex());
@@ -2704,6 +2771,18 @@ mod tests {
         reset_origin_watermarks(&state, &peer);
         deliver_locally(&state, signed_inbound_env(&key, 1, None), &peer, key.public_hex());
         assert_eq!(mlock(&bus.attested).len(), 3, "post-reconnect seq-1 is not a replay");
+
+        // ADR-0040 — the guard is SESSION-scoped, not cross-session. After a reconnect the cleared map
+        // no longer remembers the previous session's frames, so re-presenting an *old-session* frame
+        // (here the previous session's seq-2) is ACCEPTED, not dropped. This is the specified,
+        // accepted contract: exactly-once across reconnects is an application-layer property keyed on
+        // `corr`, never a transport guarantee. This assertion pins the boundary as known, not a bug.
+        deliver_locally(&state, signed_inbound_env(&key, 2, None), &peer, key.public_hex());
+        assert_eq!(
+            mlock(&bus.attested).len(),
+            4,
+            "a frame from a previous session is accepted after reconnect (session-scoped guard)"
+        );
     }
 
     #[test]

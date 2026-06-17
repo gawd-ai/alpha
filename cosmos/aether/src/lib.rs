@@ -591,6 +591,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subscribe_past_max_topics_is_refused_but_existing_still_accept() {
+        // ADR-0037: bound the distinct-topic table (defense-in-depth; subscribe is host-only).
+        let r = Arc::new(Router::new(Arc::new(StubVerifier), 16).with_max_topics(2));
+        let (a, _arx) = r.register(Capabilities::default());
+        let (b, _brx) = r.register(Capabilities::default());
+        r.subscribe(Topic::new("t1"), a);
+        r.subscribe(Topic::new("t2"), a);
+        // Table is at the cap of 2 distinct topics — a third *new* topic is refused.
+        r.subscribe(Topic::new("t3"), a);
+        assert!(r.has_subscribers(&Topic::new("t1")));
+        assert!(r.has_subscribers(&Topic::new("t2")));
+        assert!(!r.has_subscribers(&Topic::new("t3")), "new topic past cap must be refused");
+        // An *existing* topic still accepts a new subscriber even at the cap.
+        r.subscribe(Topic::new("t1"), b);
+        assert!(r.has_subscribers(&Topic::new("t1")));
+    }
+
+    #[test]
+    fn max_topics_zero_is_unbounded_opt_out() {
+        // ADR-0042 escape-hatch convention: 0 disables the cap (lab/demo posture).
+        let r = Arc::new(Router::new(Arc::new(StubVerifier), 16).with_max_topics(0));
+        let (a, _arx) = r.register(Capabilities::default());
+        for i in 0..50 {
+            r.subscribe(Topic::new(format!("t{i}")), a);
+        }
+        assert!(r.has_subscribers(&Topic::new("t49")));
+    }
+
     /// `Ed25519Signer` plugs into the `Signer` slot the same way `StubSigner` does — proving
     /// the stub→real swap is a *configuration* change, not a shape change. The signature sealed
     /// onto the envelope verifies under the matching `Ed25519Verifier`+pubkey, so any consumer that

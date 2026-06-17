@@ -22,6 +22,14 @@ and an AI drives any node it is allowed to. Its dual, the **Ω server** `omega s
 federation/gateway Sanctum (`omega-federator` on `Role::OMEGA_GATEWAY`) — both poles compose the same
 kernel and control core; they differ in posture, not mechanism.
 
+The **v0.4.3 convergence pass** hardened that baseline so it is a stable floor for v0.5.0, not a
+moving target: every load-bearing surface is now bounded, attributable, coherent, and documented —
+cross-node origin is hop-by-hop with **app-signed dialogue provenance** for end-to-end agent identity,
+the topic table and every retained collection are finite-by-default, the control vocabulary is uniform
+across REPL/MCP/HTTP, and both poles share one node-boot recipe. The design corpus is `docs/trd/`
+(five TRDs) + `docs/adr/` (ADRs 0037–0045). Crucially, **v0.5.0 introduces no wire-format churn** — it
+lands as composition on top of this floor.
+
 ## Where it goes next
 
 - **Transport** — a UDP transport beside the authenticated TCP one, for lossy and intermittent links,

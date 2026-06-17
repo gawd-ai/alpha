@@ -234,7 +234,10 @@ impl RegistryMem {
     ///
     /// The default is [`DEFAULT_MAX_REGISTRY_ENTRIES`]. At capacity a publish of a *new* key is
     /// refused rather than growing the catalog without bound; re-publishing an existing key always
-    /// succeeds. Pass `0` to opt out and make the in-memory catalog unbounded.
+    /// succeeds.
+    ///
+    /// `0` selects the explicit unbounded opt-out (lab/demo workloads only); production deployments
+    /// MUST set a finite cap. (The unified escape-hatch convention — see `docs/design/substrate.md`.)
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries;
         self

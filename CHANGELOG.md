@@ -8,6 +8,56 @@ Semantic-versioning guarantees begin at 1.0.
 For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the design notes under [`docs/design/`](docs/design/).
 
+## 0.4.3 - 2026-06-17
+
+The **convergence release**: no new features — make the current surface genuinely *work and make
+sense*, close resource/security/coherence gaps, and remove needless complexity, so that before v0.5.0
+Alpha is already a stable AI-OS / ASI fabric and v0.5.0 lands as *composition*, not a rewrite. Driven by
+a design corpus authored first: five TRDs (`docs/trd/`) and ADRs 0037–0045 (`docs/adr/`). **Every change
+is additive — no existing wire shape changes.**
+
+### Cross-node origin & relay integrity (the v0.5.0 cross-mesh load-bearer)
+- **App-signed dialogue provenance (ADR-0038).** The SEER `dialogue` answer body gains optional,
+  serde-elided `signer_pubkey` + `signature` over `(corr, prompt, reply)` — *end-to-end* "which agent
+  answered" that survives a relay, because the transport `Origin` is hop-by-hop by construction (a
+  creature can never forge a cross-node origin). Realized end to end: `dialogue-responder` signs
+  (`DialogueResponder::signed`), `dialogue-initiator` verifies on relay (`with_verifier` /
+  `with_expected_signer`) and fails a tampered/forged/wrong-signer reply rather than relaying it as
+  authentic. We deliberately did **not** add a creature-settable `Dispatch.origin` — it would be
+  forgeable.
+- **Nested `reply_to` rewrite (ADR-0039).** The transport now rewrites a peer's `Creature(mid)` to
+  `Node(peer, mid)` recursively through `Realm`/`Omega` wrappers, so a cross-Realm `reply_to` routes
+  back to the right creature on the right node.
+- **Replay guard specified (ADR-0040).** The per-`(peer, sender)` `seq` guard is documented as
+  *session-scoped* (reset on reconnect); cross-reconnect exactly-once is an application property keyed
+  on `corr`, not a transport promise. The contract is now pinned by a test.
+- **Origin-verdict posture (ADR-0041).** The router/transport stay non-enforcing (publish an
+  `OriginVerdict`, never drop a `BadSig` frame); a clustered node with no `Role::IMMUNE_RESPONSE` bound
+  now prints a loud boot warning (`omni::warn_if_no_immune_response`), and SECURITY.md documents the
+  baseline. No fail-closed mode in the kernel.
+
+### Resource-safety & hygiene
+- **Bounded topic-subscription table (ADR-0037).** `Router` gains a finite `max_topics` cap (+ existing
+  subscriber dedup); `subscribe` is host-only, so this is defense-in-depth, not a creature-facing DoS.
+- **Unified escape-hatch convention (ADR-0042).** `with_max_*(0) = unbounded` is one documented "lab
+  posture" across the spine (`Router`, registry-mem, embodiment-advertiser, realm-gateway, dialogue
+  initiator, bestiary curator), with finite defaults and one canonical doc phrase. See
+  `docs/design/substrate.md`.
+- **`omni` control-plane DRY (ADR-0044).** Node-identity minting (`NodeKeyBoot`/`derive_node_key`),
+  cluster-transport boot (`boot_cluster`), and the HTTP-surface sense wiring (`boot_http_surface`, via a
+  surface-factory closure) move into `omni` — one source of truth for both the α front door and the Ω
+  gateway (and the MCP-hub mesh join), replacing two drifting copies.
+
+### App-surface coherence
+- **Demo registry is authoritative (ADR-0045).** The multi-process `cluster` demo is now in
+  `demos.json` tagged `(manual runbook)`: `alpha demo list` shows it and `alpha demo run cluster` prints
+  its runbook steps and exits cleanly instead of "unknown demo". `alpha demo list` and `demos/README.md`
+  agree.
+- **MCP / allow-AI discoverability.** `docs/design/bus-and-control.md` now enumerates all **19** `alpha_*`
+  tools (added `alpha_registry_fetch_load`); the MCP `instructions` explain *why* there is no remote
+  allow-AI tool (the gate is local-REPL-only by design); the verb×surface parity matrix is pinned by a
+  test.
+
 ## 0.4.2 - 2026-06-16
 
 Makes the Ω pole earn its name *and* lays the rails for the v0.5.0 headline — **AIs interacting across

@@ -383,14 +383,14 @@ On shutdown it asks the stdio loop to stop, joins it if stdin has reached EOF, a
 otherwise detaches the still-blocked reader rather than hanging node teardown on
 an uninterruptible `read_line`.
 
-The server id is `alpha-mcp` and the tool verbs are `alpha_*` —
+The server id is `alpha-mcp` and the 19 tool verbs are `alpha_*` —
 `alpha_status` / `alpha_list` / `alpha_journal` / `alpha_watch` /
 `alpha_cluster` / `alpha_registry_fetch` / `alpha_registry_list` /
 `alpha_bestiary_prove` read-only (carrying `readOnlyHint`), and `alpha_author` /
-`alpha_author_critter` / `alpha_load` / `alpha_registry_publish` / `alpha_send` /
-`alpha_intent` / `alpha_bind` / `alpha_unload` / `alpha_cluster_connect`
-mutating, plus the `alpha_ai_status` announcement. One binary, two profiles, one
-`ControlTarget`:
+`alpha_author_critter` / `alpha_load` / `alpha_registry_publish` /
+`alpha_registry_fetch_load` / `alpha_send` / `alpha_intent` / `alpha_bind` /
+`alpha_unload` / `alpha_cluster_connect` mutating, plus the `alpha_ai_status`
+announcement. One binary, two profiles, one `ControlTarget`:
 
 - **Local (default)** — the hub boots its own `authoring` / `build` /
   critter-builder organs and a `ControlCore`, and the surface targets

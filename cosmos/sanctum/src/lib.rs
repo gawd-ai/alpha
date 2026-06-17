@@ -605,6 +605,13 @@ impl Kernel {
         self.router.bind_role(role, id);
     }
 
+    /// The creature currently bound to `role`, if any. A composition root uses this to check that a
+    /// recommended baseline (e.g. an `IMMUNE_RESPONSE` reacting to `OriginVerdict::BadSig`) is present
+    /// — see ADR-0041's clustered-boot posture warning.
+    pub fn role_binding(&self, role: &Role) -> Option<CreatureId> {
+        self.router.role_binding(role)
+    }
+
     /// Subscribe a creature to a topic (e.g. a logger to proprioception).
     pub fn subscribe(&self, topic: Topic, id: CreatureId) {
         self.router.subscribe(topic, id);

@@ -165,7 +165,9 @@ impl AICurator {
     /// The default is [`DEFAULT_MAX_AI_CURATOR_CACHE_ENTRIES`]. At capacity, observing a *new*
     /// `(realm, artifact_hash)` key is skipped before the model is called, and [`decide`](Curator::decide)
     /// will keep that entry on its cache miss. Re-observing an already-cached key is still allowed so
-    /// a curator pass can refresh a previous decision. `0` is the explicit unbounded lab/demo opt-out.
+    /// a curator pass can refresh a previous decision. `0` selects the explicit unbounded opt-out
+    /// (lab/demo workloads only); production deployments MUST set a finite cap. (The unified
+    /// escape-hatch convention — see `docs/design/substrate.md`.)
     pub fn with_max_cache_entries(mut self, max_cache_entries: usize) -> Self {
         self.max_cache_entries = max_cache_entries;
         self

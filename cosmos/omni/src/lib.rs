@@ -755,6 +755,9 @@ pub fn run_verb(verb: Verb, ctx: &mut VerbCtx, progress: &mut dyn FnMut(&str)) -
             VerbResult::ok(json!({ "total": total, "entries": entries }), human)
         }
         Verb::Watch => {
+            // Intentional pointer, NOT a stub (TRD-003 R5): control is request/reply, so `Watch`
+            // cannot stream on this channel. It returns where the live stream actually is (`/api/ws`)
+            // and what is already tailing on stdout. A future audit should read this as by-design.
             let human = "the monitor is tailing PROPRIOCEPTION + FITNESS on stdout above; use `journal` for the bus history, or connect a client to /api/ws for the live stream.";
             VerbResult::ok(json!({ "ok": true, "note": human }), human)
         }
@@ -2186,6 +2189,129 @@ pub fn boot_control(
         )
         .map_err(|e| format!("omni: {e}"))?;
     kernel.bind_role(Role::new(Role::CONTROL), id);
+    Ok(id)
+}
+
+/// ADR-0041 clustered-boot posture check. The transport computes an `OriginVerdict` for every inbound
+/// cross-node frame and **publishes** it (non-enforcing, R5) — it never drops a `BadSig` frame itself.
+/// Enforcement is an injected `Role::IMMUNE_RESPONSE` decision. So a clustered node with **no**
+/// immune-response bound admits forged-signature frames to inboxes. The substrate must not silently
+/// enforce (that would move a trust decision into the kernel), so the honest move is to *warn loudly*
+/// at boot. Call this from a clustered composition root after wiring; it prints a one-line warning to
+/// stderr when no immune-response is bound, and is a no-op when one is. Returns `true` if it warned.
+pub fn warn_if_no_immune_response(kernel: &Kernel) -> bool {
+    if kernel.role_binding(&Role::new(Role::IMMUNE_RESPONSE)).is_some() {
+        return false;
+    }
+    eprintln!(
+        "warning: clustering is on but no Role::IMMUNE_RESPONSE is bound. The transport publishes an \
+         OriginVerdict for each peer frame but does not drop BadSig frames itself — so forged-signature \
+         frames are admitted. Bind the reference `immune-response` creature (see SECURITY.md) as the \
+         recommended baseline for any clustered node."
+    );
+    true
+}
+
+// ── Shared node-identity + transport + control-surface boot (ADR-0044) ────────────────────────────
+// Both composition-root poles — the α `alpha node` front door and the Ω `omega serve` gateway — boot
+// the same node skeleton. These helpers are the single source of truth for it, so a change to how a
+// node mints its key, parses seeds, or wires its sense endpoint is made once and inherited by both.
+
+/// This node's derived ed25519 identity — the one key it both signs bus envelopes with and
+/// authenticates transport links with. Minted once at boot, before the kernel is constructed. Shared
+/// by both poles and the MCP-hub boot path, so node-identity minting lives in exactly one place.
+pub struct NodeKeyBoot {
+    pub key: Ed25519KeyMaterial,
+    pub seed: [u8; 32],
+    pub generated: bool,
+}
+
+/// Mint (or load, via `--cluster-key`) the node's ed25519 identity. Done up front so the same key
+/// drives the kernel's bus signer and the transport handshake.
+pub fn derive_node_key(cluster_key: Option<&str>) -> Result<NodeKeyBoot, String> {
+    use sigil::crypto;
+    let (seed, generated): ([u8; 32], bool) = match cluster_key {
+        Some(hex) => {
+            let bytes = crypto::hex_decode(hex)
+                .filter(|b| b.len() == 32)
+                .ok_or("--cluster-key must be 64 hex chars (a 32-byte seed)")?;
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&bytes);
+            (s, false)
+        }
+        None => (crypto::fresh_seed()?, true),
+    };
+    let key = Ed25519KeyMaterial::from_seed(seed).map_err(|e| format!("node key: {e}"))?;
+    Ok(NodeKeyBoot { key, seed, generated })
+}
+
+/// Boot the `transport-tcp` organ in gossip (cluster) mode and bind it to `Role::TRANSPORT`, using the
+/// pre-derived node identity. Loaded via [`Kernel::load_transport_instance`] so the transport holds the
+/// boot-only origin-attestation grant: it stamps an authenticated `Origin{node}` on inbound cross-node
+/// frames. Dials each seed (`node-id@host:port#pubkey-hex`).
+pub fn boot_cluster(
+    kernel: &Kernel,
+    node_id: &str,
+    listen: &str,
+    seeds: &[String],
+    node_key: &Ed25519KeyMaterial,
+) -> Result<CreatureId, String> {
+    let mut peers = Vec::new();
+    for s in seeds {
+        let bad = || format!("bad --seed {s:?} (want node-id@host:port#pubkey-hex)");
+        let (id, rest) = s.split_once('@').ok_or_else(bad)?;
+        let (addr, pk) = rest.split_once('#').ok_or_else(bad)?;
+        if id.is_empty() || addr.is_empty() || pk.is_empty() {
+            return Err(bad());
+        }
+        peers.push(transport_tcp::PeerConfig {
+            node_id: NodeId(id.to_string()),
+            pubkey_hex: pk.to_string(),
+            dial_addr: Some(addr.to_string()),
+        });
+    }
+    let cfg = transport_tcp::TransportConfig {
+        self_key: node_key.clone(),
+        self_node: NodeId(node_id.to_string()),
+        listen_addr: listen.to_string(),
+        peers,
+    };
+    let transport = kernel
+        .load_transport_instance(
+            boot_manifest("transport-tcp"),
+            Box::new(transport_tcp::TransportTcp::new(cfg).with_gossip(Some(listen.to_string()))),
+        )
+        .map_err(|e| format!("transport admits: {e}"))?;
+    kernel.bind_role(Role::new(Role::TRANSPORT), transport);
+    Ok(transport)
+}
+
+/// Bind the HTTP/WS control-surface wiring that is identical across poles: bind the listener (so a
+/// port conflict surfaces synchronously, before the creature loads), open a dedicated **drain-less
+/// sense endpoint** subscribed to the node's nervous system (PROPRIOCEPTION + FITNESS + `seer`) — kept
+/// off the surface's own inbox so a fitness burst can't shed a control reply, and so reading it never
+/// re-publishes fitness — then construct the surface via `make_surface(listener, sense_rx)` and load
+/// it. The surface itself is built by the caller because the `surface-http` crate depends on `omni`
+/// (omni naming `SurfaceHttp` would be a dependency cycle); everything that must stay identical between
+/// poles — the listener bind and the exact sense-topic subscription set — is single-sourced here.
+pub fn boot_http_surface(
+    kernel: &std::sync::Arc<Kernel>,
+    listen: std::net::SocketAddr,
+    make_surface: impl FnOnce(
+        std::net::TcpListener,
+        InboxReceiver,
+    ) -> Result<Box<dyn aether::Creature>, String>,
+) -> Result<CreatureId, String> {
+    let listener =
+        std::net::TcpListener::bind(listen).map_err(|e| format!("bind {listen}: {e}"))?;
+    let (sense_id, _sense_bus, sense_rx) = kernel.open_endpoint(Capabilities::default());
+    kernel.subscribe(Topic::new(Topic::PROPRIOCEPTION), sense_id);
+    kernel.subscribe(Topic::new(Topic::FITNESS), sense_id);
+    kernel.subscribe(Topic::new("seer"), sense_id);
+    let surface = make_surface(listener, sense_rx)?;
+    let id = kernel
+        .load_instance(boot_manifest("surface-http"), surface)
+        .map_err(|e| format!("surface-http admits: {e}"))?;
     Ok(id)
 }
 

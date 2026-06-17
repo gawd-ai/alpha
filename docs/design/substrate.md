@@ -275,3 +275,30 @@ fresh each `handle`, so a granted lift takes effect on the very next envelope wi
 creature on its own drain thread. A native creature exposes no such ceiling, so a grant to it is an
 honest no-op the kernel reports rather than a silent lie. The control enum is tagged so future ops
 land additively; a malformed payload is skipped, never a panic.
+
+## Bounded growth and the `0 = unbounded` escape-hatch convention
+
+Every in-memory table that a peer or a config could otherwise grow without limit is **bounded by a
+finite default** — the kernel's per-creature inboxes, the history journal, the topic-subscription
+table, the reference registry's entry/byte caps, the advertiser's offer table, the realm-gateway's
+mapping table, the dialogue initiator's parked-conversation table. This is the R9 fabric-integrity
+floor in practice: the kernel bounds the *table*, not the *traffic*, and a flood sheds via
+backpressure or drop-oldest rather than OOM.
+
+For the cases where a lab or demo workload genuinely wants no cap, those bounds expose **one uniform
+opt-out**: a `with_max_*` / `*_and_limit` builder where **`0` selects the explicit unbounded opt-out**.
+The convention, applied identically everywhere:
+
+- The default is always a **finite** value; `0` is never the default and must be selected explicitly.
+- `0` means *unbounded* and is documented, on every such knob, with the canonical phrase: *"`0`
+  selects the explicit unbounded opt-out (lab/demo workloads only); production deployments MUST set a
+  finite cap."*
+- The opt-out is kept (the demos and test fixtures rely on it knowingly), not removed — removing it
+  would trade a documented, opt-in escape hatch for friction with no safety gain, since the default is
+  already finite.
+
+A new creature author bounding any retained collection reaches for this same `with_max_*(0) =
+unbounded` shape and the same doc phrasing, so an operator learns the rule once and an unbounded
+opt-out is one phrase to grep for in review. (See `Router::with_max_topics`,
+`RegistryMem::with_max_entries`, `EmbodimentAdvertiser::with_max_offers`,
+`RealmGateway::with_many_and_limit`, `DialogueInitiator::with_max_pending`.)

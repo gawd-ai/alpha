@@ -86,9 +86,10 @@ impl RealmGatewayConfig {
         self
     }
 
-    /// Builder-style bulk add with an explicit retained mapping cap. `max_mappings == 0` disables
-    /// the cap for this config builder; pair with [`RealmGateway::new_with_limit`] if the live
-    /// gateway should also retain more than the default.
+    /// Builder-style bulk add with an explicit retained mapping cap. `0` selects the explicit
+    /// unbounded opt-out (lab/demo workloads only); production deployments MUST set a finite cap.
+    /// (The unified escape-hatch convention — see `docs/design/substrate.md`.) Pair with
+    /// [`RealmGateway::new_with_limit`] if the live gateway should also retain more than the default.
     pub fn with_many_and_limit(
         mut self,
         mappings: impl IntoIterator<Item = (RealmId, NodeId)>,

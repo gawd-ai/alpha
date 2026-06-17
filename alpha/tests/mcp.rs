@@ -97,6 +97,35 @@ fn handshake_tools_list_and_unknown_method() {
     let tools = list["result"]["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 19, "the tool catalog has 19 entries");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    // TRD-003 R1: pin the EXACT catalog so an add/remove/rename is caught (not just the count). This
+    // is the MCP column of the verb×surface parity matrix; `alpha_allow_ai` is deliberately absent
+    // (the allow-AI gate is local-REPL-only — no remote tool to flip it).
+    let mut got = names.clone();
+    got.sort_unstable();
+    let mut want = [
+        "alpha_ai_status",
+        "alpha_author",
+        "alpha_author_critter",
+        "alpha_bestiary_prove",
+        "alpha_bind",
+        "alpha_cluster",
+        "alpha_cluster_connect",
+        "alpha_intent",
+        "alpha_journal",
+        "alpha_list",
+        "alpha_load",
+        "alpha_registry_fetch",
+        "alpha_registry_fetch_load",
+        "alpha_registry_list",
+        "alpha_registry_publish",
+        "alpha_send",
+        "alpha_status",
+        "alpha_unload",
+        "alpha_watch",
+    ];
+    want.sort_unstable();
+    assert_eq!(got, want.to_vec(), "the MCP tool catalog must match the parity matrix exactly");
+    assert!(!names.contains(&"alpha_allow_ai"), "allow-ai is REPL-only; there is no remote tool");
     for expected in [
         "alpha_status",
         "alpha_journal",

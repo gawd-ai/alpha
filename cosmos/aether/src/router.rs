@@ -23,6 +23,14 @@ pub const KERNEL_ID: CreatureId = CreatureId(0);
 /// choke point that bounds the inboxes.)
 const DEFAULT_JOURNAL_CAP: usize = 65_536;
 
+/// Default cap on the number of *distinct* topics the subscription table will hold. `subscribe` is
+/// host-only (the `Bus`/`BusHandle` a creature holds exposes no `subscribe`; see the field doc on
+/// [`Router::topics`]), so this is **defense-in-depth + hygiene** — it stops a buggy composition-root
+/// loop from growing the map without bound — not a creature-facing DoS mitigation. `0` selects the
+/// explicit unbounded opt-out (lab/demo workloads only); production deployments MUST set a finite cap.
+/// (The unified escape-hatch convention — see `docs/design/substrate.md`.)
+const DEFAULT_MAX_TOPICS: usize = 4_096;
+
 // ── Poison-tolerant lock acquisition (R9 fabric-integrity floor) ────────────────────────────────
 // A blind `.lock().unwrap()` turns a single panic *while a holder is mid-section* into a poisoned
 // lock that panics every subsequent acquire — on the bus's single choke point that cascades one
@@ -83,7 +91,15 @@ pub enum RouteError {
 pub struct Router {
     table: RwLock<HashMap<CreatureId, Registration>>,
     roles: RwLock<HashMap<Role, CreatureId>>,
+    /// Topic fan-out table. `subscribe` is **host-only** — the `Bus`/`BusHandle` handed to a creature
+    /// exposes no `subscribe`, only `send`/`id`/`may_attest`/backpressure (`bus.rs`) — so a creature
+    /// cannot grow this map. It is bounded by [`Router::max_topics`] anyway, as defense-in-depth
+    /// against a buggy composition root, and subscribers are deduped per topic (idempotent subscribe).
     topics: RwLock<HashMap<Topic, Vec<CreatureId>>>,
+    /// Cap on the number of *distinct* topics. A `subscribe` to a **new** topic past this is refused
+    /// (no-op); existing topics still accept subscribers. `0` = unbounded opt-out. See
+    /// [`DEFAULT_MAX_TOPICS`] and [`Router::with_max_topics`].
+    max_topics: usize,
     /// History primitive — a **bounded** ring (drop-oldest past `journal_cap`). See
     /// [`DEFAULT_JOURNAL_CAP`].
     journal: Mutex<VecDeque<JournalEntry>>,
@@ -115,12 +131,22 @@ impl Router {
             topics: RwLock::new(HashMap::new()),
             journal: Mutex::new(VecDeque::new()),
             journal_cap: DEFAULT_JOURNAL_CAP,
+            max_topics: DEFAULT_MAX_TOPICS,
             clock: AtomicU64::new(0),
             next_id: AtomicU64::new(KERNEL_ID.0 + 1), // ids start after the reserved kernel id
             verifier,
             local_pubkey: OnceLock::new(),
             inbox_capacity: inbox_capacity.max(1),
         }
+    }
+
+    /// Override the distinct-topic cap (default `DEFAULT_MAX_TOPICS`). Consuming builder, applied
+    /// before the `Router` is wrapped in its `Arc`. `0` selects the explicit unbounded opt-out
+    /// (lab/demo workloads only); production deployments MUST set a finite cap. (The unified
+    /// escape-hatch convention — see `docs/design/substrate.md`.)
+    pub fn with_max_topics(mut self, max_topics: usize) -> Self {
+        self.max_topics = max_topics;
+        self
     }
 
     /// Record this node's bus-signing public key (its ed25519 node identity). Set once at boot via
@@ -189,9 +215,22 @@ impl Router {
         rlock(&self.table).contains_key(&id)
     }
 
-    /// Subscribe a creature to a topic (fan-out target).
+    /// Subscribe a creature to a topic (fan-out target). Host-only (see the `topics` field).
+    /// Idempotent — a repeat `(topic, id)` does not grow the subscriber `Vec`. Bounded by
+    /// `max_topics`: once the table holds that many distinct topics, a `subscribe` to a
+    /// **new** topic is refused (no-op, logged); subscribers to already-known topics still go through.
+    /// `max_topics == 0` is the explicit unbounded opt-out.
     pub fn subscribe(&self, topic: Topic, id: CreatureId) {
         let mut topics = wlock(&self.topics);
+        if !topics.contains_key(&topic) && self.max_topics != 0 && topics.len() >= self.max_topics {
+            // Defense-in-depth: a buggy host loop cannot grow the table without bound. Drop the new
+            // topic rather than block or OOM (R9 discipline), consistent with fan-out's best-effort.
+            eprintln!(
+                "aether: topic-subscription table at cap ({}); refusing new topic {:?}",
+                self.max_topics, topic
+            );
+            return;
+        }
         let subs = topics.entry(topic).or_default();
         if !subs.contains(&id) {
             subs.push(id);

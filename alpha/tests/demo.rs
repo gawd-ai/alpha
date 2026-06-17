@@ -34,6 +34,40 @@ fn no_args_prints_the_registry() {
 }
 
 #[test]
+fn list_shows_the_cluster_manual_runbook_tagged() {
+    // ADR-0045: the cluster demo is a multi-process runbook, not runner-launchable, but it IS in the
+    // registry so `alpha demo list` is authoritative and agrees with demos/README.md.
+    let out = alpha_demo().arg("list").output().expect("run alpha demo list");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("cluster"), "registry should list cluster: {stdout:?}");
+    assert!(
+        stdout.contains("manual runbook"),
+        "cluster should be tagged as a manual runbook: {stdout:?}"
+    );
+}
+
+#[test]
+fn run_cluster_prints_the_runbook_and_exits_zero() {
+    // ADR-0045: a manual demo doesn't fail with "unknown demo" (it's listed) — it points at the
+    // runbook and exits cleanly, the coherent behavior for an operator following the docs.
+    let out = alpha_demo().arg("run").arg("cluster").output().expect("run alpha demo run cluster");
+    assert!(
+        out.status.success(),
+        "`alpha demo run cluster` must exit 0 (runbook pointer), not error; stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("runbook"), "should print the runbook pointer: {stdout:?}");
+    assert!(stdout.contains("00-build.sh"), "should show the first runbook step: {stdout:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown demo"),
+        "a listed demo must never read as unknown: {stderr:?}"
+    );
+}
+
+#[test]
 fn unknown_demo_fails_with_guidance() {
     let out = alpha_demo().arg("definitely-not-a-demo").output().expect("run alpha demo <bad>");
     assert!(!out.status.success(), "an unknown demo must be a non-zero exit");

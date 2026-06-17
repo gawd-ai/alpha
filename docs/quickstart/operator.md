@@ -23,7 +23,7 @@ builder), an in-memory registry (`REGISTRY`), and a `monitor` watching the sense
 probe id, the command list, and drops you at a prompt:
 
 ```
-alpha node — Alpha Sanctum daemon (v0.4.2)
+alpha node — Alpha Sanctum daemon (v0.4.3)
 posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.
 boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.
 probe endpoint id = 1

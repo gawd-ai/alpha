@@ -44,6 +44,33 @@ hot-load and drive). This surface **can author and hot-load native code**, so tr
   and this file all state that the bundled dev policy admits everything and the bus signer is a stub.
   This is a single-node developer surface, not a hardened multi-tenant deployment.
 
+## Cross-node origin & relay integrity (clustered nodes)
+
+A clustered node (`alpha node --cluster-listen`, or any `omega serve` gateway) authenticates every peer
+link with an ed25519 handshake and verifies each inbound frame's signature against the
+connection-authenticated key. Two properties are deliberately specified, not silently assumed:
+
+- **Origin verdicts are published, not enforced (ADR-0041).** For every inbound frame the transport
+  computes an `OriginVerdict` (`Verified` / `BadSig` / `Unresolved`) and **publishes** it on
+  `PROPRIOCEPTION` — it does **not** drop a `BadSig` frame. Enforcement (quarantine the peer, drop the
+  sender) is an injected `Role::IMMUNE_RESPONSE` decision, keeping the kernel model-free (R5/R6).
+  **Consequence:** a clustered node with **no** immune-response bound admits forged-signature frames to
+  inboxes. Bind the reference `immune-response` creature (`cosmos/creatures/immune-response`) reacting
+  to `OriginVerdict::BadSig` as the **recommended baseline for any clustered node**. The clustered boot
+  path prints a one-line warning when clustering is on and no immune-response is bound — heed it.
+- **Origin is hop-by-hop; end-to-end agent identity is application-signed (ADR-0038).** The transport
+  `Origin` attributes the *immediate authenticated peer* and does **not** survive a relay. A component
+  that needs to prove *which agent* produced a multi-hop reply (cross-Realm dialogue) signs the message
+  body itself (the SEER `dialogue` answer carries optional `signer_pubkey` + `signature` over
+  `(corr, prompt, reply)`), and the relay/requester verifies that — authenticity becomes a property of
+  the message, not the transport path.
+- **The replay guard is session-scoped, not cross-session (ADR-0040).** The per-`(peer, sender)` `seq`
+  high-water mark prevents replay *within* an authenticated link session and is reset by a fresh
+  handshake (so a legitimately restarted `seq` stream is not mistaken for a replay). The bus does **not**
+  promise exactly-once delivery across reconnects — a peer that crashes and reconnects can re-present a
+  previous-session frame. Components needing exactly-once dedup at the application layer on `corr` (the
+  SEER/dialogue reduction theorem already keys on `corr`).
+
 ## Supported versions
 
 | Version | Supported          |

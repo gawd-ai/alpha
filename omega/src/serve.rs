@@ -137,7 +137,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     // One identity: a gateway always clusters, so its ed25519 node key signs the bus AND
     // authenticates transport links — a peer that authenticates this node at the handshake can then
     // verify the envelopes it signs (real cross-node `Verified`). Mirrors `alpha node --cluster-listen`.
-    let nk = match derive_node_key(opts.cluster_key.as_deref()) {
+    let nk = match omni::derive_node_key(opts.cluster_key.as_deref()) {
         Ok(nk) => nk,
         Err(e) => {
             eprintln!("omega serve: {e}");
@@ -219,6 +219,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         "gateway: transport(id={}) → TRANSPORT, registry-mem(id={}) → REGISTRY, omega-federator(id={}) → OMEGA_GATEWAY",
         ids.transport.0, ids.registry.0, ids.federator.0
     );
+    // ADR-0041: a gateway is always a mesh node; warn loudly if no immune-response enforces the
+    // published OriginVerdict (BadSig frames are otherwise admitted).
+    omni::warn_if_no_immune_response(&kernel);
 
     // Optional self-driving anti-entropy: the `federation-scheduler` companion. With `--pull-interval`,
     // the gateway pokes its own federator on a clock instead of waiting for an operator — Ω reconciles
@@ -270,7 +273,17 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 std::process::exit(1);
             }
         };
-        match boot_http_surface(&kernel, listen, key.clone()) {
+        let key_for_surface = key.clone();
+        match omni::boot_http_surface(&kernel, listen, move |listener, sense_rx| {
+            surface_http::SurfaceHttp::new(
+                listener,
+                key_for_surface,
+                surface_http::ControlTarget::Local,
+                sense_rx,
+            )
+            .map(|s| Box::new(s) as Box<dyn aether::Creature>)
+            .map_err(|e| format!("surface-http setup: {e}"))
+        }) {
             Ok(surface_id) => {
                 println!("control: ControlCore on Role::CONTROL (id={}), surface-http (id={}) — control rides the bus.", control_id.0, surface_id.0);
                 println!("api: HTTP/WS control plane on http://{listen}  (Bearer key: {key})");
@@ -323,7 +336,8 @@ pub struct GatewayIds {
 /// [`boot_federator`]). No authoring agent — a gateway does not author. Mirrors the per-node boot in
 /// `cosmos/sanctum/tests/omega_federation_cross_node.rs`.
 pub fn boot_gateway(kernel: &Arc<Kernel>, cfg: &GatewayConfig) -> Result<GatewayIds, String> {
-    let transport = boot_cluster(kernel, &cfg.node_id, &cfg.listen, &cfg.seeds, &cfg.node_key)?;
+    let transport =
+        omni::boot_cluster(kernel, &cfg.node_id, &cfg.listen, &cfg.seeds, &cfg.node_key)?;
 
     let registry = kernel
         .load_instance(boot_manifest("registry-mem"), Box::new(RegistryMem::new()))
@@ -426,99 +440,6 @@ pub fn boot_scheduler(
     Ok(Some(id))
 }
 
-/// This node's derived ed25519 identity — the one key it signs bus envelopes with and authenticates
-/// transport links with. Minted once before the kernel is constructed. (Copied from `alpha::node`;
-/// shared promotion into `omni` is a deferred DRY follow-up.)
-struct NodeKeyBoot {
-    key: Ed25519KeyMaterial,
-    seed: [u8; 32],
-    generated: bool,
-}
-
-/// Mint (or load, via `--cluster-key`) the node's ed25519 identity.
-fn derive_node_key(cluster_key: Option<&str>) -> Result<NodeKeyBoot, String> {
-    use sigil::crypto;
-    let (seed, generated): ([u8; 32], bool) = match cluster_key {
-        Some(hex) => {
-            let bytes = crypto::hex_decode(hex)
-                .filter(|b| b.len() == 32)
-                .ok_or("--cluster-key must be 64 hex chars (a 32-byte seed)")?;
-            let mut s = [0u8; 32];
-            s.copy_from_slice(&bytes);
-            (s, false)
-        }
-        None => (crypto::fresh_seed()?, true),
-    };
-    let key = Ed25519KeyMaterial::from_seed(seed).map_err(|e| format!("node key: {e}"))?;
-    Ok(NodeKeyBoot { key, seed, generated })
-}
-
-/// Boot the `transport-tcp` organ in gossip (cluster) mode bound to `Role::TRANSPORT`, dialing each
-/// seed. Loaded via [`Kernel::load_transport_instance`] so the transport holds the boot-only
-/// origin-attestation grant. (Copied from `alpha::node::boot_cluster`.)
-fn boot_cluster(
-    kernel: &Kernel,
-    node_id: &str,
-    listen: &str,
-    seeds: &[String],
-    node_key: &Ed25519KeyMaterial,
-) -> Result<CreatureId, String> {
-    let mut peers = Vec::new();
-    for s in seeds {
-        let bad = || format!("bad --seed {s:?} (want node-id@host:port#pubkey-hex)");
-        let (id, rest) = s.split_once('@').ok_or_else(bad)?;
-        let (addr, pk) = rest.split_once('#').ok_or_else(bad)?;
-        if id.is_empty() || addr.is_empty() || pk.is_empty() {
-            return Err(bad());
-        }
-        peers.push(transport_tcp::PeerConfig {
-            node_id: NodeId(id.to_string()),
-            pubkey_hex: pk.to_string(),
-            dial_addr: Some(addr.to_string()),
-        });
-    }
-
-    let cfg = transport_tcp::TransportConfig {
-        self_key: node_key.clone(),
-        self_node: NodeId(node_id.to_string()),
-        listen_addr: listen.to_string(),
-        peers,
-    };
-    let transport = kernel
-        .load_transport_instance(
-            boot_manifest("transport-tcp"),
-            Box::new(transport_tcp::TransportTcp::new(cfg).with_gossip(Some(listen.to_string()))),
-        )
-        .map_err(|e| format!("transport-tcp admits: {e}"))?;
-    kernel.bind_role(Role::new(Role::TRANSPORT), transport);
-    Ok(transport)
-}
-
-/// Load the HTTP/WS surface creature and subscribe it to the sense topics. The listener is bound
-/// here so a port conflict surfaces synchronously, then handed to the creature. (Copied from
-/// `alpha::node::boot_http_surface`.)
-fn boot_http_surface(
-    kernel: &Arc<Kernel>,
-    listen: std::net::SocketAddr,
-    api_key: String,
-) -> Result<CreatureId, String> {
-    use aether::Topic;
-    use sigil::Capabilities;
-    let listener =
-        std::net::TcpListener::bind(listen).map_err(|e| format!("bind {listen}: {e}"))?;
-    let (sense_id, _sense_bus, sense_rx) = kernel.open_endpoint(Capabilities::default());
-    kernel.subscribe(Topic::new(Topic::PROPRIOCEPTION), sense_id);
-    kernel.subscribe(Topic::new(Topic::FITNESS), sense_id);
-    kernel.subscribe(Topic::new("seer"), sense_id);
-    let surface = surface_http::SurfaceHttp::new(
-        listener,
-        api_key,
-        surface_http::ControlTarget::Local,
-        sense_rx,
-    )
-    .map_err(|e| format!("surface-http setup: {e}"))?;
-    let id = kernel
-        .load_instance(boot_manifest("surface-http"), Box::new(surface))
-        .map_err(|e| format!("surface-http admits: {e}"))?;
-    Ok(id)
-}
+// Node-identity minting (`NodeKeyBoot` / `derive_node_key`), cluster-transport boot (`boot_cluster`),
+// and the HTTP-surface sense-endpoint wiring (`boot_http_surface`) now live in `omni` — one source of
+// truth shared by this Ω gateway, the α `alpha node` front door, and the MCP-hub boot path (ADR-0044).

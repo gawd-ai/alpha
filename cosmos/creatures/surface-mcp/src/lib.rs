@@ -333,7 +333,9 @@ fn initialize_result(params: &Value) -> Value {
              alpha_intent, alpha_bind, alpha_unload, alpha_cluster_connect) are gated by the target \
              node's allow-AI switch, which a \
              human grants with `allow-ai on` at that node's REPL; while it is off they return an \
-             `ai-not-allowed` error. Read-only tools (alpha_status, alpha_list, alpha_journal, alpha_watch, \
+             `ai-not-allowed` error. There is deliberately NO tool to flip that switch — the gate is \
+             local-REPL-only (`allow-ai on/off`) by design, so a remote AI can never grant itself \
+             permission; that is why no `alpha_allow_ai` tool exists. Read-only tools (alpha_status, alpha_list, alpha_journal, alpha_watch, \
              alpha_registry_fetch, alpha_registry_list, alpha_bestiary_prove, alpha_cluster) are not \
              blocked by allow-AI. Call alpha_ai_status before mutating so the human \
              watching the node can see your activity and revoke. Prefer alpha_author_critter (Rhai, \

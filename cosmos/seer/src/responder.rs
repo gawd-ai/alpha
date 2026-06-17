@@ -88,6 +88,23 @@ where
     Q: DeserializeOwned,
     A: Serialize,
 {
+    respond_query_corr(env, topic, query_ok, |_corr, q| decide(q))
+}
+
+/// Like [`respond_query`], but `decide` also receives the conversation `corr`. The `corr` is needed
+/// when the answer body binds itself to the turn it answers — e.g. the `dialogue` topic's app-signed
+/// provenance (ADR-0038) signs over `(corr, prompt, reply)`. [`respond_query`] is the zero-corr
+/// special case, so existing responders that don't bind to `corr` are unaffected.
+pub fn respond_query_corr<Q, A>(
+    env: &Envelope,
+    topic: SeerTopic,
+    query_ok: impl FnOnce(&Q) -> bool,
+    decide: impl FnOnce(u64, Q) -> A,
+) -> Outcome
+where
+    Q: DeserializeOwned,
+    A: Serialize,
+{
     // (1) Shared inbound gate: not-SEER / malformed / wrong-topic all drop silently — a responder
     // has no "I couldn't parse you" reply channel; answering one would imply it adjudicates wire
     // mismatches, which it doesn't.
@@ -108,7 +125,7 @@ where
     if !query_ok(&q) {
         return Outcome::none();
     }
-    let answer_body = decide(q);
+    let answer_body = decide(seer.corr, q);
     let answer = SeerEnvelope::answer(topic, seer.corr, query_id, &answer_body);
     let dispatch =
         Dispatch::reply_to_env(env, answer.to_bytes()).with_schema(SCHEMA).with_corr(seer.corr);

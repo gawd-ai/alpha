@@ -19,8 +19,8 @@
 //! - **It doesn't time out, and never replies to a malformed turn.** A turn it can't decode, on the
 //!   wrong topic, or over the topic's size cap is dropped silently — the shared consult posture.
 
-use aether::{Creature, CreatureCtx, Envelope, Outcome};
-use seer::{responder::respond_query, topics::dialogue, SeerTopic};
+use aether::{Creature, CreatureCtx, Envelope, Outcome, Signer};
+use seer::{responder::respond_query_corr, topics::dialogue, SeerTopic};
 
 /// The injected conversation model: given the peer's turn (`prompt`), produce this responder's reply.
 /// The one part a concrete conversational agent writes; everything else is the shared skeleton.
@@ -41,23 +41,38 @@ impl Responder for EchoResponder {
 
 /// The reference dialogue responder. Stateless across turns: every Query is answered by the same
 /// injected model, so retries and reordering don't change the reply.
+///
+/// An optional [`Signer`] gives this agent an *identity*: when present, every answer carries
+/// app-signed provenance (ADR-0038) — a signature over `(corr, prompt, reply)` proving *which agent*
+/// produced the reply, end-to-end, regardless of how many fabric hops it crosses. Without a signer
+/// (the reference echo path) answers are unsigned, wire-identical to the pre-provenance shape.
 pub struct DialogueResponder {
     model: Box<dyn Responder>,
+    signer: Option<Box<dyn Signer>>,
 }
 
 impl DialogueResponder {
-    /// Build a responder over an injected [`Responder`] model.
+    /// Build a responder over an injected [`Responder`] model (unsigned answers — no agent identity).
     pub fn new(model: Box<dyn Responder>) -> Self {
-        DialogueResponder { model }
+        DialogueResponder { model, signer: None }
     }
 
-    /// Build the reference echo responder.
+    /// Build a responder that signs every answer with `signer` (ADR-0038 app-signed provenance).
+    pub fn signed(model: Box<dyn Responder>, signer: Box<dyn Signer>) -> Self {
+        DialogueResponder { model, signer: Some(signer) }
+    }
+
+    /// Build the reference echo responder (unsigned).
     pub fn echo() -> Self {
         DialogueResponder::new(Box::new(EchoResponder))
     }
 
-    fn decide(&self, q: dialogue::QueryBody) -> dialogue::AnswerBody {
-        dialogue::AnswerBody { reply: self.model.respond(&q.prompt) }
+    fn decide(&self, corr: u64, q: dialogue::QueryBody) -> dialogue::AnswerBody {
+        let reply = self.model.respond(&q.prompt);
+        match &self.signer {
+            Some(s) => dialogue::AnswerBody::signed(corr, &q.prompt, reply, s.as_ref()),
+            None => dialogue::AnswerBody::unsigned(reply),
+        }
     }
 }
 
@@ -67,11 +82,11 @@ impl Creature for DialogueResponder {
     fn handle(&mut self, env: Envelope) -> Outcome {
         // Standing-responder skeleton: schema / bounded-parse / topic-isolation / Query-only / shape
         // check, then our decision. A turn whose prompt is over the topic cap is dropped silently.
-        respond_query::<dialogue::QueryBody, dialogue::AnswerBody>(
+        respond_query_corr::<dialogue::QueryBody, dialogue::AnswerBody>(
             &env,
             SeerTopic::Dialogue,
             |q| q.prompt.len() <= dialogue::MAX_TURN_BYTES,
-            |q| self.decide(q),
+            |corr, q| self.decide(corr, q),
         )
     }
 }
@@ -151,5 +166,39 @@ mod tests {
         let mut r = DialogueResponder::new(Box::new(Shout));
         let out = r.handle(turn(1, 1, "quiet"));
         assert_eq!(decode_reply(&out.dispatches[0]), "QUIET");
+    }
+
+    #[test]
+    fn a_signed_responder_attaches_verifiable_provenance_bound_to_the_turn() {
+        // ADR-0038: with an agent identity, every answer carries a signature over (corr, prompt,
+        // reply) that a requester can verify end-to-end, regardless of relay hops.
+        use aether::{Ed25519Signer, Ed25519Verifier, Signer as _};
+        use seer::topics::dialogue::Provenance;
+
+        let (signer, _seed) = Ed25519Signer::generate().expect("keygen");
+        let pubkey = signer.public_key();
+        let mut r = DialogueResponder::signed(Box::new(EchoResponder), Box::new(signer));
+
+        // corr=7 prompt="hello peer" (matches `turn`).
+        let out = r.handle(turn(7, 1, "hello peer"));
+        let env = SeerEnvelope::parse(&out.dispatches[0].payload).expect("seer envelope");
+        let SeerKind::Answer { body, .. } = env.kind else { panic!("expected Answer") };
+        let answer: dialogue::AnswerBody = serde_json::from_value(body).expect("answer body");
+
+        assert_eq!(answer.signer_pubkey.as_deref(), Some(pubkey.as_str()));
+        match answer.verify_provenance(7, "hello peer", &Ed25519Verifier) {
+            Provenance::Verified(pk) => assert_eq!(pk, pubkey),
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unsigned_responder_leaves_provenance_absent() {
+        let mut r = DialogueResponder::echo();
+        let out = r.handle(turn(7, 1, "hi"));
+        let env = SeerEnvelope::parse(&out.dispatches[0].payload).unwrap();
+        let SeerKind::Answer { body, .. } = env.kind else { panic!("expected Answer") };
+        let answer: dialogue::AnswerBody = serde_json::from_value(body).unwrap();
+        assert!(answer.signer_pubkey.is_none() && answer.signature.is_none());
     }
 }

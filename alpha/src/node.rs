@@ -29,10 +29,7 @@ use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use policy_dev::DevPolicy;
 use sanctum::Kernel;
 
-use omni::{
-    boot_control, boot_manifest, boot_organs_with, parse_verb, run_verb, AiControl, VerbCtx,
-    COMMANDS,
-};
+use omni::{boot_control, boot_organs_with, parse_verb, run_verb, AiControl, VerbCtx, COMMANDS};
 
 /// Parsed command-line options.
 struct Opts {
@@ -132,8 +129,8 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
     // signer is the *same* key the transport authenticates links with. A peer that authenticates this
     // node at the handshake can then verify the envelopes it signs (real cross-node `Verified`). A
     // non-clustered dev node keeps the stub signer/verifier (no real crypto needed).
-    let node_identity: Option<NodeKeyBoot> = if opts.cluster_listen.is_some() {
-        match derive_node_key(opts.cluster_key.as_deref()) {
+    let node_identity: Option<omni::NodeKeyBoot> = if opts.cluster_listen.is_some() {
+        match omni::derive_node_key(opts.cluster_key.as_deref()) {
             Ok(nk) => Some(nk),
             Err(e) => {
                 eprintln!("alpha node: {e}");
@@ -229,7 +226,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             std::process::exit(2);
         };
         let nk = node_identity.as_ref().expect("node identity derived when clustering");
-        match boot_cluster(&kernel, &node_id, listen, &opts.seeds, nk) {
+        match omni::boot_cluster(&kernel, &node_id, listen, &opts.seeds, &nk.key) {
             Ok(transport) => {
                 cluster_transport = Some(transport);
                 note!("cluster: node-id={node_id}  listen={listen}  seeds={}", opts.seeds.len());
@@ -244,6 +241,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     "cluster: peers join this node with  cluster join {node_id}@{listen}#{}",
                     nk.key.public_hex()
                 );
+                // ADR-0041: clustering is on but the dev node binds no immune-response by default —
+                // warn loudly that BadSig frames are admitted absent an injected enforcer.
+                omni::warn_if_no_immune_response(&kernel);
             }
             Err(e) => {
                 eprintln!("alpha node: cluster boot failed: {e}");
@@ -287,9 +287,19 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 std::process::exit(1);
             }
         };
-        // Load the HTTP/WS surface creature. The listener is bound here (synchronously,
-        // so a port conflict is reported before load) and handed to the creature.
-        match boot_http_surface(&kernel, listen, key.clone()) {
+        // Load the HTTP/WS surface creature. omni binds the listener (synchronously, so a port
+        // conflict is reported before load) + wires the sense endpoint; we supply the surface.
+        let key_for_surface = key.clone();
+        match omni::boot_http_surface(&kernel, listen, move |listener, sense_rx| {
+            surface_http::SurfaceHttp::new(
+                listener,
+                key_for_surface,
+                surface_http::ControlTarget::Local,
+                sense_rx,
+            )
+            .map(|s| Box::new(s) as Box<dyn aether::Creature>)
+            .map_err(|e| format!("surface-http setup: {e}"))
+        }) {
             Ok(surface_id) => {
                 note!("control: ControlCore on Role::CONTROL (id={}), surface-http (id={}) — control rides the bus.", control_id.0, surface_id.0);
                 note!("api: HTTP/WS control plane on http://{listen}  (Bearer key: {key})");
@@ -491,108 +501,6 @@ fn prompt(out: &mut std::io::Stdout) -> std::io::Result<()> {
     out.flush()
 }
 
-/// Load the HTTP/WS surface creature and subscribe it to the sense topics so its
-/// WebSocket stream tails the node's nervous system. The listener is bound here so a port conflict
-/// surfaces synchronously (before the creature loads), then handed to the creature, which owns its
-/// Axum/tokio runtime and releases the port on unload. The surface targets the local
-/// `Role::CONTROL`, so its handlers drive this node's `ControlCore` over the bus.
-fn boot_http_surface(
-    kernel: &Arc<Kernel>,
-    listen: std::net::SocketAddr,
-    api_key: String,
-) -> Result<CreatureId, String> {
-    use aether::Topic;
-    use sigil::Capabilities;
-    let listener =
-        std::net::TcpListener::bind(listen).map_err(|e| format!("bind {listen}: {e}"))?;
-    // A dedicated, drain-less sense endpoint for the WS stream — subscribed to the node's nervous
-    // system. Kept off the surface creature's own inbox (which carries control replies) so a fitness
-    // burst can't shed a control reply, and so reading it never re-publishes fitness (no storm).
-    let (sense_id, _sense_bus, sense_rx) = kernel.open_endpoint(Capabilities::default());
-    kernel.subscribe(Topic::new(Topic::PROPRIOCEPTION), sense_id);
-    kernel.subscribe(Topic::new(Topic::FITNESS), sense_id);
-    kernel.subscribe(Topic::new("seer"), sense_id);
-    let surface = surface_http::SurfaceHttp::new(
-        listener,
-        api_key,
-        surface_http::ControlTarget::Local,
-        sense_rx,
-    )
-    .map_err(|e| format!("surface-http setup: {e}"))?;
-    let id = kernel
-        .load_instance(boot_manifest("surface-http"), Box::new(surface))
-        .map_err(|e| format!("surface-http admits: {e}"))?;
-    Ok(id)
-}
-
-/// Result of booting the cluster transport: its creature id + this node's identity (printed at boot).
-/// This node's derived ed25519 identity — the one key it both signs bus envelopes with and
-/// authenticates transport links with. Minted once at boot, before the kernel is constructed.
-/// Shared with the MCP-hub boot path ([`crate::mcp`]).
-pub(crate) struct NodeKeyBoot {
-    pub(crate) key: sigil::Ed25519KeyMaterial,
-    pub(crate) seed: [u8; 32],
-    pub(crate) generated: bool,
-}
-
-/// Mint (or load, via `--cluster-key`) the node's ed25519 identity. Done up front so the same key
-/// drives the kernel's bus signer and the transport handshake — see [`run`].
-pub(crate) fn derive_node_key(cluster_key: Option<&str>) -> Result<NodeKeyBoot, String> {
-    use sigil::{crypto, Ed25519KeyMaterial};
-    let (seed, generated): ([u8; 32], bool) = match cluster_key {
-        Some(hex) => {
-            let bytes = crypto::hex_decode(hex)
-                .filter(|b| b.len() == 32)
-                .ok_or("--cluster-key must be 64 hex chars (a 32-byte seed)")?;
-            let mut s = [0u8; 32];
-            s.copy_from_slice(&bytes);
-            (s, false)
-        }
-        None => (crypto::fresh_seed()?, true),
-    };
-    let key = Ed25519KeyMaterial::from_seed(seed).map_err(|e| format!("node key: {e}"))?;
-    Ok(NodeKeyBoot { key, seed, generated })
-}
-
-/// Boot the `transport-tcp` organ in gossip (cluster) mode and bind it to `Role::TRANSPORT`, using
-/// the pre-derived node identity `nk`. Loaded via [`Kernel::load_transport_instance`] so the
-/// transport holds the boot-only **origin-attestation** grant: it stamps an authenticated
-/// `Origin{node}` on inbound cross-node frames. Dials each `--seed`.
-fn boot_cluster(
-    kernel: &Kernel,
-    node_id: &str,
-    listen: &str,
-    seeds: &[String],
-    nk: &NodeKeyBoot,
-) -> Result<CreatureId, String> {
-    let mut peers = Vec::new();
-    for s in seeds {
-        let bad = || format!("bad --seed {s:?} (want node-id@host:port#pubkey-hex)");
-        let (id, rest) = s.split_once('@').ok_or_else(bad)?;
-        let (addr, pk) = rest.split_once('#').ok_or_else(bad)?;
-        if id.is_empty() || addr.is_empty() || pk.is_empty() {
-            return Err(bad());
-        }
-        peers.push(transport_tcp::PeerConfig {
-            node_id: aether::NodeId(id.to_string()),
-            pubkey_hex: pk.to_string(),
-            dial_addr: Some(addr.to_string()),
-        });
-    }
-
-    let cfg = transport_tcp::TransportConfig {
-        self_key: nk.key.clone(),
-        self_node: aether::NodeId(node_id.to_string()),
-        listen_addr: listen.to_string(),
-        peers,
-    };
-    let transport = kernel
-        .load_transport_instance(
-            omni::boot_manifest("transport-tcp"),
-            Box::new(transport_tcp::TransportTcp::new(cfg).with_gossip(Some(listen.to_string()))),
-        )
-        .map_err(|e| format!("transport admits: {e}"))?;
-    kernel.bind_role(aether::Role::new(aether::Role::TRANSPORT), transport);
-
-    Ok(transport)
-}
+// Node-identity minting (`NodeKeyBoot` / `derive_node_key`), cluster-transport boot (`boot_cluster`),
+// and the HTTP-surface sense-endpoint wiring (`boot_http_surface`) now live in `omni` — one source of
+// truth shared by this α front door, the Ω `omega serve` gateway, and the MCP-hub boot path (ADR-0044).

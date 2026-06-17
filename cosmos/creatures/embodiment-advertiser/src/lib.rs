@@ -98,9 +98,10 @@ impl EmbodimentAdvertiser {
 
     /// Construct an advertiser with an explicit retained-offer cap.
     ///
-    /// `max_offers == 0` is the deliberate unbounded opt-out for lab/demo workloads. Invalid offer
-    /// shapes are always dropped, because they cannot be routed safely and would otherwise remain in
-    /// memory forever.
+    /// `0` selects the explicit unbounded opt-out (lab/demo workloads only); production deployments
+    /// MUST set a finite cap. (The unified escape-hatch convention — see `docs/design/substrate.md`.)
+    /// Invalid offer shapes are always dropped, because they cannot be routed safely and would
+    /// otherwise remain in memory forever.
     pub fn with_max_offers(self_node: NodeId, offers: Vec<OfferEntry>, max_offers: usize) -> Self {
         let offers = retain_configured_offers(&self_node, offers, max_offers);
         EmbodimentAdvertiser { self_node, realm: None, offers }

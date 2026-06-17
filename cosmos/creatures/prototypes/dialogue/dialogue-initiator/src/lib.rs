@@ -19,11 +19,12 @@
 //! consult; the `(corr, query_id)` thread admits an arbitrarily long back-and-forth without new wire.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use aether::{Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome};
+use aether::{Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, Outcome, Verifier};
 use seer::{
     responder::{classify, Inbound},
-    topics::dialogue,
+    topics::dialogue::{self, Provenance},
     SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
@@ -66,10 +67,12 @@ impl DialogueFailed {
     }
 }
 
-/// A conversation awaiting the peer's reply: where to relay it, and on which corr.
+/// A conversation awaiting the peer's reply: where to relay it, on which corr, and the prompt that
+/// opened it (kept so the relay can recompute the app-signed provenance payload, ADR-0038).
 struct Pending {
     reply_to: Address,
     orig_corr: Option<u64>,
+    prompt: String,
 }
 
 impl Pending {
@@ -100,6 +103,15 @@ pub struct DialogueInitiator {
     /// This initiator's own id, stashed at `bind`, so the peer's `Answer` is addressed back here
     /// regardless of how many hops it crosses.
     me: Option<CreatureId>,
+    /// Optional verify **mechanism** for app-signed dialogue provenance (ADR-0038). When set, the
+    /// relay checks the peer's signature over `(corr, prompt, reply)` before relaying — end-to-end
+    /// authenticity that survives the relay even though the transport `Origin` is hop-by-hop. `None`
+    /// is the reference posture (relay unverified, wire-identical to before provenance existed).
+    verifier: Option<Arc<dyn Verifier>>,
+    /// Optional expected peer signer (hex pubkey). When set (and a verifier is configured), the relay
+    /// additionally requires the reply to be signed *by this key* — an unsigned or wrong-key reply
+    /// fails the conversation rather than being relayed as if authentic.
+    expect_signer: Option<String>,
 }
 
 impl DialogueInitiator {
@@ -112,10 +124,30 @@ impl DialogueInitiator {
             next_corr: 900_000,
             max_pending: DEFAULT_MAX_PENDING,
             me: None,
+            verifier: None,
+            expect_signer: None,
         }
     }
 
-    /// Override the parked-conversation cap. `0` means explicitly unbounded.
+    /// Verify app-signed provenance (ADR-0038) on every relayed reply with `verifier`. A reply whose
+    /// signature is *present but invalid* (tampered/forged) fails the conversation on
+    /// [`FAILED_SCHEMA`] instead of being relayed as authentic. An *unsigned* reply still relays
+    /// (lenient) unless an expected signer is also pinned via [`Self::with_expected_signer`].
+    pub fn with_verifier(mut self, verifier: Arc<dyn Verifier>) -> Self {
+        self.verifier = Some(verifier);
+        self
+    }
+
+    /// Pin the peer's expected signer (hex pubkey). Implies verification: a relayed reply must be
+    /// signed by exactly this key, or the conversation fails. No effect without a verifier set.
+    pub fn with_expected_signer(mut self, signer_pubkey: impl Into<String>) -> Self {
+        self.expect_signer = Some(signer_pubkey.into());
+        self
+    }
+
+    /// Override the parked-conversation cap. `0` selects the explicit unbounded opt-out (lab/demo
+    /// workloads only); production deployments MUST set a finite cap. (The unified escape-hatch
+    /// convention — see `docs/design/substrate.md`.)
     pub fn with_max_pending(mut self, max_pending: usize) -> Self {
         self.max_pending = max_pending;
         self
@@ -161,8 +193,14 @@ impl DialogueInitiator {
 
         let corr = self.next_corr;
         self.next_corr = self.next_corr.wrapping_add(1);
-        self.pending
-            .insert(corr, Pending { reply_to: env.reply_target(), orig_corr: env.header.corr });
+        self.pending.insert(
+            corr,
+            Pending {
+                reply_to: env.reply_target(),
+                orig_corr: env.header.corr,
+                prompt: prompt.clone(),
+            },
+        );
 
         // Send the opening turn to the named peer; reply_to points back here so the Answer returns.
         let q = SeerEnvelope::query(SeerTopic::Dialogue, corr, 1, &dialogue::QueryBody { prompt });
@@ -190,6 +228,34 @@ impl DialogueInitiator {
         // breaks the contract fails the conversation rather than having an over-cap turn relayed.
         if answer.reply.len() > dialogue::MAX_TURN_BYTES {
             return Outcome::send(p.failed("peer reply exceeded the dialogue turn cap"));
+        }
+        // App-signed provenance gate (ADR-0038). The transport `Origin` is hop-by-hop and does NOT
+        // survive this relay — so end-to-end "which agent answered" is the *message* signature, not
+        // the transport path. When a verifier is configured we check it before relaying: a tampered
+        // or forged signature (`Invalid`) fails the conversation rather than being passed off as
+        // authentic; an unsigned reply fails only if a signer was pinned (else it relays, lenient).
+        if let Some(verifier) = &self.verifier {
+            match answer.verify_provenance(seer.corr, &p.prompt, verifier.as_ref()) {
+                Provenance::Verified(pk) => {
+                    if let Some(expected) = &self.expect_signer {
+                        if &pk != expected {
+                            return Outcome::send(
+                                p.failed("peer reply signed by an unexpected agent key"),
+                            );
+                        }
+                    }
+                }
+                Provenance::Invalid => {
+                    return Outcome::send(p.failed("peer reply failed provenance verification"));
+                }
+                Provenance::Unsigned => {
+                    if self.expect_signer.is_some() {
+                        return Outcome::send(
+                            p.failed("peer reply was unsigned but a signer was required"),
+                        );
+                    }
+                }
+            }
         }
         // Relay the peer's reply to the original requester, on its own corr.
         let mut d = Dispatch::to(p.reply_to, answer.reply.into_bytes()).with_schema(RESULT_SCHEMA);
@@ -309,7 +375,7 @@ mod tests {
             SeerTopic::Dialogue,
             700_000,
             1,
-            &dialogue::AnswerBody { reply: "echo: hi".into() },
+            &dialogue::AnswerBody::unsigned("echo: hi"),
         );
         let out = i.handle(env(SEER_SCHEMA, ans.to_bytes(), Some(700_000), None));
         assert_eq!(out.dispatches.len(), 1, "the reply is relayed");
@@ -328,7 +394,7 @@ mod tests {
             SeerTopic::Dialogue,
             999,
             1,
-            &dialogue::AnswerBody { reply: "nobody asked".into() },
+            &dialogue::AnswerBody::unsigned("nobody asked"),
         );
         let out = i.handle(env(SEER_SCHEMA, ans.to_bytes(), Some(999), None));
         assert!(out.dispatches.is_empty(), "no parked conversation for corr 999 → dropped");
@@ -406,7 +472,7 @@ mod tests {
             SeerTopic::Dialogue,
             700_000,
             1,
-            &dialogue::AnswerBody { reply: big },
+            &dialogue::AnswerBody::unsigned(big),
         );
         let out = i.handle(env(SEER_SCHEMA, ans.to_bytes(), Some(700_000), None));
         assert_eq!(out.dispatches.len(), 1, "the over-cap reply is not relayed");
@@ -416,5 +482,86 @@ mod tests {
         );
         assert_eq!(out.dispatches[0].corr, Some(1), "on the original requester's corr");
         assert_eq!(i.pending_conversations(), 0, "conversation consumed");
+    }
+
+    // ── ADR-0038: app-signed provenance verified at the relay ────────────────────────────────────
+
+    use aether::{Ed25519Signer, Ed25519Verifier, Signer as _};
+
+    /// Drive a full conversation through a (possibly verifying) initiator and return its relayed
+    /// dispatch. `make_answer` builds the peer's answer body for the conversation's corr.
+    fn run_conversation(
+        mut i: DialogueInitiator,
+        prompt: &str,
+        make_answer: impl FnOnce(u64, &str) -> dialogue::AnswerBody,
+    ) -> Dispatch {
+        i.handle(env(
+            START_SCHEMA,
+            prompt.as_bytes().to_vec(),
+            Some(1),
+            Some(Address::Creature(CreatureId(100))),
+        ));
+        let corr = 700_000; // from `initiator()`'s corr seed
+        let ans = SeerEnvelope::answer(SeerTopic::Dialogue, corr, 1, &make_answer(corr, prompt));
+        let out = i.handle(env(SEER_SCHEMA, ans.to_bytes(), Some(corr), None));
+        assert_eq!(out.dispatches.len(), 1, "exactly one relayed dispatch");
+        out.dispatches.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_verifying_initiator_relays_a_validly_signed_reply() {
+        let (signer, _seed) = Ed25519Signer::generate().unwrap();
+        let pubkey = signer.public_key();
+        let i = initiator().with_verifier(Arc::new(Ed25519Verifier)).with_expected_signer(pubkey);
+        let d = run_conversation(i, "hi", |corr, prompt| {
+            dialogue::AnswerBody::signed(corr, prompt, "echo: hi", &signer)
+        });
+        assert_eq!(d.schema, RESULT_SCHEMA, "a valid signature relays normally");
+        assert_eq!(d.payload, b"echo: hi");
+    }
+
+    #[test]
+    fn a_verifying_initiator_fails_a_tampered_reply() {
+        let (signer, _seed) = Ed25519Signer::generate().unwrap();
+        let i = initiator().with_verifier(Arc::new(Ed25519Verifier));
+        let d = run_conversation(i, "hi", |corr, prompt| {
+            // Sign the honest reply, then tamper the content — the signature no longer matches.
+            let mut a = dialogue::AnswerBody::signed(corr, prompt, "echo: hi", &signer);
+            a.reply = "FORGED".into();
+            a
+        });
+        assert_eq!(d.schema, FAILED_SCHEMA, "a tampered reply must not be relayed as authentic");
+    }
+
+    #[test]
+    fn a_verifying_initiator_fails_a_reply_from_the_wrong_signer() {
+        let (peer, _s1) = Ed25519Signer::generate().unwrap();
+        let (impostor, _s2) = Ed25519Signer::generate().unwrap();
+        let i = initiator()
+            .with_verifier(Arc::new(Ed25519Verifier))
+            .with_expected_signer(peer.public_key());
+        let d = run_conversation(i, "hi", |corr, prompt| {
+            // Validly signed, but by the wrong key.
+            dialogue::AnswerBody::signed(corr, prompt, "echo: hi", &impostor)
+        });
+        assert_eq!(d.schema, FAILED_SCHEMA, "a reply from an unexpected signer fails");
+    }
+
+    #[test]
+    fn a_pinned_initiator_fails_an_unsigned_reply_but_a_lenient_one_relays_it() {
+        // With an expected signer pinned, an unsigned reply fails.
+        let (peer, _s) = Ed25519Signer::generate().unwrap();
+        let pinned = initiator()
+            .with_verifier(Arc::new(Ed25519Verifier))
+            .with_expected_signer(peer.public_key());
+        let d = run_conversation(pinned, "hi", |_c, _p| dialogue::AnswerBody::unsigned("echo: hi"));
+        assert_eq!(d.schema, FAILED_SCHEMA, "unsigned fails when a signer is required");
+
+        // A verifier without a pinned signer is lenient: an unsigned reply still relays.
+        let lenient = initiator().with_verifier(Arc::new(Ed25519Verifier));
+        let d =
+            run_conversation(lenient, "hi", |_c, _p| dialogue::AnswerBody::unsigned("echo: hi"));
+        assert_eq!(d.schema, RESULT_SCHEMA, "unsigned relays when no signer is pinned");
+        assert_eq!(d.payload, b"echo: hi");
     }
 }

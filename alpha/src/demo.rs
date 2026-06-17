@@ -28,6 +28,15 @@ struct DemoEntry {
     /// Prebuilt binary to exec (installed alpha). Wins over `package` if both are set; a relative
     /// path resolves against the manifest's directory.
     bin: Option<String>,
+    /// A **manual runbook** demo (ADR-0045): a multi-process walkthrough the runner can't launch as a
+    /// single child (e.g. `cluster`, which stands up an `omega serve` + two `alpha node`s). It is
+    /// *listed* (tagged `(manual runbook)`) so `alpha demo list` is authoritative, and `alpha demo run
+    /// <name>` prints the runbook pointer and exits cleanly instead of failing with "unknown demo".
+    #[serde(default)]
+    manual: bool,
+    /// Directory holding the runbook scripts (relative to the manifest dir), printed by `run` for a
+    /// `manual` demo. Ignored for runner-launched demos.
+    runbook: Option<String>,
 }
 
 /// Locate `demos.json`: explicit `$ALPHA_DEMOS_MANIFEST` (or legacy `$GAWD_DEMOS_MANIFEST`), then the
@@ -105,7 +114,31 @@ pub fn run(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
+    // A manual runbook demo (e.g. `cluster`) can't be launched as one child — point at the runbook
+    // and exit cleanly, never a bare "unknown demo" for a demo the docs list (ADR-0045).
+    if entry.manual {
+        return print_runbook(entry, &path);
+    }
     spawn(entry, &path, rest)
+}
+
+/// Print the pointer to a manual runbook demo's scripts and exit cleanly (ADR-0045).
+fn print_runbook(entry: &DemoEntry, manifest_path: &Path) -> ExitCode {
+    let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = entry.runbook.as_deref().unwrap_or(entry.name.as_str());
+    println!(
+        "`{}` is a manual, multi-process runbook — the runner can't launch it as one child.",
+        entry.name
+    );
+    if !entry.summary.is_empty() {
+        println!("\n{}", entry.summary);
+    }
+    println!("\nFollow the runbook in {}:", manifest_dir.join(dir).display());
+    println!(
+        "    cd {dir} && ./00-build.sh && ./01-boot.sh   # then 02-join, 03-graph, 04-cross-run, …"
+    );
+    println!("\nSee {}/README.md for the full sequence.", dir);
+    ExitCode::SUCCESS
 }
 
 fn list(path: &Path, manifest: &DemoManifest) -> ExitCode {
@@ -116,9 +149,10 @@ fn list(path: &Path, manifest: &DemoManifest) -> ExitCode {
     }
     let width = manifest.demos.iter().map(|d| d.name.len()).max().unwrap_or(0);
     for d in &manifest.demos {
-        println!("  {:<width$}  {}", d.name, d.summary);
+        let tag = if d.manual { "  (manual runbook)" } else { "" };
+        println!("  {:<width$}  {}{tag}", d.name, d.summary);
     }
-    println!("\nRun one with: alpha demo run <name>");
+    println!("\nRun one with: alpha demo run <name>  (a manual runbook prints its steps).");
     ExitCode::SUCCESS
 }
 

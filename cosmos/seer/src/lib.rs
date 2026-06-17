@@ -986,6 +986,7 @@ pub mod topics {
     /// `creatures/prototypes/dialogue/{dialogue-initiator,dialogue-responder}`.
     pub mod dialogue {
         use super::*;
+        use aether::{Signer, Verifier};
 
         /// Maximum bytes in a dialogue turn's `prompt` / `reply` text. A consumer rejects an
         /// over-cap turn rather than allocate it — the same per-field discipline the other topics use.
@@ -999,10 +1000,97 @@ pub mod topics {
         }
 
         /// The peer's reply to one turn.
+        ///
+        /// **App-signed provenance (ADR-0038).** The optional `signer_pubkey` + `signature` carry
+        /// *end-to-end* agent identity: a signature over `(corr, prompt, reply)` proving *which agent*
+        /// produced this reply, independent of how many fabric hops it crossed. This is the correct
+        /// grain for multi-hop cross-Realm dialogue, because the transport `Origin` is **hop-by-hop**
+        /// (it attributes the immediate authenticated peer and does *not* survive a relay — see
+        /// `aether::bus` `may_attest` and ADR-0038). Both fields are `#[serde(default,
+        /// skip_serializing_if = "Option::is_none")]`, so when absent the wire is byte-identical to the
+        /// pre-provenance shape — additive, zero-retrofit. `None` = an unsigned reference/echo reply.
         #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
         pub struct AnswerBody {
             /// The reply text for this turn.
             pub reply: String,
+            /// The responding agent's public key (hex ed25519), present iff this reply is signed.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub signer_pubkey: Option<String>,
+            /// Detached signature over [`AnswerBody::provenance_payload`] binding `(corr, prompt,
+            /// reply)` to `signer_pubkey`. Verified by the requester or a relay.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub signature: Option<String>,
+        }
+
+        /// Verdict from [`AnswerBody::verify_provenance`] — the end-to-end authenticity of a reply.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum Provenance {
+            /// Valid signature; the contained hex pubkey is the proven responding-agent identity.
+            Verified(String),
+            /// No provenance fields present — an unsigned reference/echo reply.
+            Unsigned,
+            /// Provenance present but the signature does not check: a tampered reply, the wrong key, or
+            /// a reply lifted onto a different `(corr, prompt)` turn. An enforcing initiator drops it.
+            Invalid,
+        }
+
+        impl AnswerBody {
+            /// Canonical bytes an agent signs (and a verifier checks) to bind a reply to its turn.
+            /// Domain-tagged + length-prefixed so (a) a relay that strips the transport `Origin`
+            /// cannot detach identity from content, and (b) a signature can never be replayed onto a
+            /// different `corr`/`prompt`/`reply`. Pure (no crypto), so initiator and responder agree
+            /// byte-for-byte on what was signed.
+            pub fn provenance_payload(corr: u64, prompt: &str, reply: &str) -> Vec<u8> {
+                let mut p = Vec::with_capacity(40 + prompt.len() + reply.len());
+                p.extend_from_slice(b"gawd:dialogue-provenance:v1");
+                p.extend_from_slice(&corr.to_le_bytes());
+                p.extend_from_slice(&(prompt.len() as u64).to_le_bytes());
+                p.extend_from_slice(prompt.as_bytes());
+                p.extend_from_slice(&(reply.len() as u64).to_le_bytes());
+                p.extend_from_slice(reply.as_bytes());
+                p
+            }
+
+            /// An unsigned answer (the reference echo path, or when no agent identity is configured).
+            pub fn unsigned(reply: impl Into<String>) -> Self {
+                AnswerBody { reply: reply.into(), signer_pubkey: None, signature: None }
+            }
+
+            /// Build an answer whose provenance is signed by `signer` over `(corr, prompt, reply)`.
+            pub fn signed(
+                corr: u64,
+                prompt: &str,
+                reply: impl Into<String>,
+                signer: &dyn Signer,
+            ) -> Self {
+                let reply = reply.into();
+                let signature = signer.sign(&Self::provenance_payload(corr, prompt, &reply));
+                AnswerBody {
+                    reply,
+                    signer_pubkey: Some(signer.public_key()),
+                    signature: Some(signature),
+                }
+            }
+
+            /// Verify this reply's app-signed provenance against the turn it answers.
+            pub fn verify_provenance(
+                &self,
+                corr: u64,
+                prompt: &str,
+                verifier: &dyn Verifier,
+            ) -> Provenance {
+                match (&self.signer_pubkey, &self.signature) {
+                    (Some(pk), Some(sig)) => {
+                        let payload = Self::provenance_payload(corr, prompt, &self.reply);
+                        if verifier.verify(pk, &payload, sig) {
+                            Provenance::Verified(pk.clone())
+                        } else {
+                            Provenance::Invalid
+                        }
+                    }
+                    _ => Provenance::Unsigned,
+                }
+            }
         }
     }
 }
@@ -1052,6 +1140,56 @@ mod tests {
                 assert_eq!(back, env, "roundtrip failed for topic={topic:?} kind={kind:?}");
             }
         }
+    }
+
+    #[test]
+    fn dialogue_provenance_signs_verifies_and_catches_tampering() {
+        // ADR-0038: app-signed dialogue provenance — end-to-end authenticity that survives a relay
+        // even though the transport `Origin` is hop-by-hop. The signature binds (corr, prompt, reply).
+        use aether::{Ed25519Signer, Ed25519Verifier, Signer as _};
+        use topics::dialogue::{AnswerBody, Provenance};
+
+        let (signer, _seed) = Ed25519Signer::generate().expect("keygen");
+        let verifier = Ed25519Verifier;
+        let (corr, prompt) = (42u64, "what is your name?");
+
+        let answer = AnswerBody::signed(corr, prompt, "I am agent-7", &signer);
+        assert!(answer.signer_pubkey.is_some() && answer.signature.is_some());
+
+        // A valid signature verifies and yields the signing agent's identity.
+        match answer.verify_provenance(corr, prompt, &verifier) {
+            Provenance::Verified(pk) => assert_eq!(pk, signer.public_key()),
+            other => panic!("expected Verified, got {other:?}"),
+        }
+
+        // A tampered reply fails verification (the signature no longer matches the content).
+        let mut tampered = answer.clone();
+        tampered.reply = "I am someone else".into();
+        assert_eq!(tampered.verify_provenance(corr, prompt, &verifier), Provenance::Invalid);
+
+        // Re-binding a valid signature onto a different turn (corr/prompt) also fails — the payload
+        // is domain-tagged and length-prefixed so a signature can't be replayed across turns.
+        assert_eq!(answer.verify_provenance(corr + 1, prompt, &verifier), Provenance::Invalid);
+        assert_eq!(
+            answer.verify_provenance(corr, "different prompt", &verifier),
+            Provenance::Invalid
+        );
+
+        // An unsigned answer reports Unsigned, not Invalid (the reference echo path).
+        assert_eq!(
+            AnswerBody::unsigned("hi").verify_provenance(corr, prompt, &verifier),
+            Provenance::Unsigned
+        );
+    }
+
+    #[test]
+    fn dialogue_answer_provenance_fields_elide_when_unsigned() {
+        // The optional provenance fields are serde-elided when absent — additive, zero-retrofit:
+        // an unsigned answer is byte-identical to the pre-provenance wire shape.
+        use topics::dialogue::AnswerBody;
+        let json = String::from_utf8(aether::wire::to_bytes(&AnswerBody::unsigned("ok"))).unwrap();
+        assert!(!json.contains("signer_pubkey"), "absent signer_pubkey must not appear: {json}");
+        assert!(!json.contains("signature"), "absent signature must not appear: {json}");
     }
 
     #[test]

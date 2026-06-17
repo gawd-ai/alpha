@@ -5,6 +5,10 @@ substrate's most striking properties, out of `#[test]` and into your terminal. E
 the public APIs an operator would use; there is no demo-only back door into the kernel, and each one
 rides code paths the integration tests prove.
 
+`alpha demo list` is the authoritative registry — every demo below appears there. Single-process
+demos launch with `alpha demo run <name>`; the multi-process **cluster** runbook is listed tagged
+`(manual runbook)` and `alpha demo run cluster` prints its step sequence rather than launching it.
+
 | Demo | Run | What it shows | Proven in |
 |---|---|---|---|
 | [**walkthrough**](walkthrough/) | `cargo run -p walkthrough` | **One node's loop.** An AI authors a creature from an English request → compiles → ed25519-signs → admits → hot-loads → runs it (native *and* critter tiers), then a running self **migrates between two Sanctums** with cryptographic continuity. | `m3_authoring_loop.rs`, `abode_migrate_local.rs` |
