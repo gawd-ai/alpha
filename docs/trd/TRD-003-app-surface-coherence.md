@@ -64,6 +64,12 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
   `alpha_watch`** (`surface-http/src/lib.rs:420`), and (c) every `Verb::is_gated` verb is rejected over a
   gated surface without the allow-AI grant. The existing `alpha/tests/mcp.rs:98` (`tools.len() == 19`)
   locks the MCP count; extend it to lock the cross-surface set, not just MCP.
+  *Met (v0.4.3):* (a) `alpha/tests/mcp.rs` now pins the **exact** 19-name catalog (not just the count)
+  and asserts no phantom `alpha_allow_ai`; (b) `alpha/tests/node_api.rs`
+  `http_route_set_is_the_mcp_verb_set_minus_watch` behaviourally pins the 18 HTTP verb routes (non-404)
+  + `/api/watch` absent (404) against the live router; (c) `node_api.rs`
+  `health_is_public_auth_required_and_gate_blocks_mutation` asserts a mutating verb is refused
+  (`403 ai-not-allowed`) over the gated HTTP surface while a read-only verb succeeds.
 - **R2 — The MCP catalog is exactly 19, and docs that enumerate it match.** `tool_list`
   (`surface-mcp/src/lib.rs:451-472`) MUST list the 19 named in the matrix — no `alpha_allow_ai` (it does
   not exist; the earlier "20" audit miscounted a phantom verb). Any doc that *enumerates* the tools MUST
@@ -125,8 +131,9 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 
 ## Acceptance
 
-- A test pins the parity matrix: MCP tool set ≡ `known_tool`; HTTP `/api/*` verb set == MCP set minus
-  `alpha_watch`; every `is_gated` verb is refused over a gated surface absent the allow-AI grant.
+- ✅ A test pins the parity matrix: MCP tool set pinned exactly (`alpha/tests/mcp.rs`); HTTP `/api/*`
+  verb set == MCP set minus `alpha_watch` (`alpha/tests/node_api.rs`); every `is_gated` verb is refused
+  over a gated surface absent the allow-AI grant (`node_api.rs`).
 - `docs/design/bus-and-control.md` enumerates all **19** tools (adds `alpha_registry_fetch_load`); a
   grep-level check (or the matrix here) confirms no doc enumerates a phantom `alpha_allow_ai`.
 - `allow-ai`'s REPL-only posture is discoverable from a gated surface (MCP `instructions`/HTTP caps note,

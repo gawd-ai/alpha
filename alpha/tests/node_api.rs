@@ -267,3 +267,58 @@ fn co_drive_author_critter_then_send_over_the_api() {
         "the reverse critter replies olleh"
     );
 }
+
+#[test]
+fn http_route_set_is_the_mcp_verb_set_minus_watch() {
+    // TRD-003 R1, HTTP column of the verb×surface parity matrix. The HTTP surface exposes exactly the
+    // MCP `alpha_*` verbs MINUS `alpha_watch` (no `/api/watch` — streaming lives on `/api/ws`), plus
+    // the public health/ws routes. A wired path answers non-404 even unauthenticated (401) or on the
+    // wrong method (405); an unregistered path answers 404. So `non-404 ⟺ the route exists`, which lets
+    // us pin the set behaviourally against the real running router (no axum route introspection).
+    let d = Daemon::spawn(free_port(), true, false); // --minimal: routes exist regardless of organs
+
+    // The 18 verb routes = the 19 MCP tools minus `alpha_watch`. Mirrors `surface-http::router()` and
+    // the TRD-003 matrix; if a verb is added to one surface but not the other, this breaks.
+    let verb_routes = [
+        "/api/status",
+        "/api/creatures",
+        "/api/journal",
+        "/api/author",
+        "/api/author/critter",
+        "/api/load",
+        "/api/registry/publish",
+        "/api/registry/fetch",
+        "/api/registry/list",
+        "/api/registry/fetch-load",
+        "/api/bestiary/prove",
+        "/api/send",
+        "/api/intent",
+        "/api/bind",
+        "/api/unload",
+        "/api/ai/status",
+        "/api/cluster",
+        "/api/cluster/connect",
+    ];
+    assert_eq!(verb_routes.len(), 18, "the 19 MCP tools minus alpha_watch");
+    for path in verb_routes {
+        let (sc, _) = http(d.port, "GET", path, None, None);
+        assert_ne!(sc, 404, "`{path}` must be a wired HTTP route (got 404)");
+    }
+
+    // The deliberate asymmetry: `alpha_watch` has NO HTTP route by design (use `/api/ws`).
+    let (sc, _) = http(d.port, "GET", "/api/watch", None, None);
+    assert_eq!(sc, 404, "alpha_watch has no /api/watch route by design (streaming is /api/ws)");
+
+    // Publics, and a control: an unknown path is 404, proving 404 here means "no route".
+    assert_eq!(http(d.port, "GET", "/api/health", None, None).0, 200, "health is public");
+    assert_ne!(
+        http(d.port, "GET", "/api/ws", None, None).0,
+        404,
+        "/api/ws is a wired public route"
+    );
+    assert_eq!(
+        http(d.port, "GET", "/api/no-such-route", None, None).0,
+        404,
+        "an unregistered path is 404 (control for the non-404 ⟺ exists assumption)"
+    );
+}
