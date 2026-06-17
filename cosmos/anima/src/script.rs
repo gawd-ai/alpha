@@ -757,6 +757,30 @@ mod tests {
     }
 
     #[test]
+    fn mem_set_rejects_an_over_long_key() {
+        // Keys are capped at MAX_PERSIST_KEY_BYTES so a hostile critter can't pile unbounded bytes
+        // into the key namespace. An over-cap key throws (caught here); a normal key still stores.
+        let over = MAX_PERSIST_KEY_BYTES + 1;
+        let mut c = critter(&format!(
+            r#"
+            fn handle(env) {{
+                let long_key = "";
+                for i in 0..{over} {{ long_key += "k"; }}
+                let rejected = false;
+                try {{ mem_set(long_key, 1); }} catch (e) {{ rejected = true; }}
+                mem_set("ok", 2);                       // a normal-length key still works
+                rejected.to_string() + ":" + mem_get("ok").to_string()
+            }}
+            "#,
+        ));
+        assert_eq!(
+            reply_text(&c.handle(mem_env(b""))),
+            "true:2",
+            "an over-cap key is refused while a normal-length key still stores"
+        );
+    }
+
+    #[test]
     fn mem_del_frees_a_slot_and_get_returns_unit_for_absent() {
         let mut c = critter(
             r#"

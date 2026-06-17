@@ -26,6 +26,7 @@ use seer::{
     topics::dialogue,
     SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA,
 };
+use serde::{Deserialize, Serialize};
 
 /// Schema of the trigger that opens a conversation. Its payload is the opening prompt (UTF-8); its
 /// `reply_to` (or `from`) is where the peer's eventual reply is relayed.
@@ -35,15 +36,53 @@ pub const START_SCHEMA: &str = "dialogue.start";
 /// SEER — it's the closing reply to the trigger's originator, not an in-conversation envelope.
 pub const RESULT_SCHEMA: &str = "dialogue.result";
 
-/// Default cap on conversations awaiting a peer reply. A new trigger at capacity is dropped (refuse-
-/// new) rather than growing parked state without bound. `0` (via [`DialogueInitiator::with_max_pending`])
-/// is the explicit lab/demo opt-out.
+/// Schema of a terminal *failure* the initiator relays to a conversation's original requester when it
+/// abandons the conversation (the parked entry was evicted under pending-pressure, or the peer's reply
+/// broke the turn-size contract). Distinct from [`RESULT_SCHEMA`] so a requester never mistakes an
+/// abandonment for a real reply — the same "structured terminal reply, never silent abandonment"
+/// discipline `distributor-requirements` commits to with its no-provider reply.
+pub const FAILED_SCHEMA: &str = "dialogue.failed";
+
+/// Default cap on conversations awaiting a peer reply. At capacity a new trigger evicts the **oldest**
+/// parked conversation (notifying its abandoned originator on [`FAILED_SCHEMA`]) rather than refusing
+/// the new one — so a handful of dead peers can't permanently wedge the initiator into refuse-new.
+/// `0` (via [`DialogueInitiator::with_max_pending`]) is the explicit lab/demo unbounded opt-out.
 pub const DEFAULT_MAX_PENDING: usize = 128;
+
+/// The terminal failure body relayed on [`FAILED_SCHEMA`]. `reason` is free-form audit prose; the
+/// schema is the dispatch key (a requester branches on the schema, then surfaces the reason).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DialogueFailed {
+    /// Human-readable reason the conversation was abandoned.
+    pub reason: String,
+}
+
+impl DialogueFailed {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        aether::wire::to_bytes(self)
+    }
+    pub fn parse(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+}
 
 /// A conversation awaiting the peer's reply: where to relay it, and on which corr.
 struct Pending {
     reply_to: Address,
     orig_corr: Option<u64>,
+}
+
+impl Pending {
+    /// Build the terminal failure dispatch for this conversation's original requester (on its own
+    /// corr, on [`FAILED_SCHEMA`]). Used when the conversation is abandoned rather than answered.
+    fn failed(&self, reason: &str) -> Dispatch {
+        let body = DialogueFailed { reason: reason.to_string() };
+        let mut d = Dispatch::to(self.reply_to.clone(), body.to_bytes()).with_schema(FAILED_SCHEMA);
+        if let Some(c) = self.orig_corr {
+            d = d.with_corr(c);
+        }
+        d
+    }
 }
 
 /// The reference dialogue initiator.
@@ -101,10 +140,24 @@ impl DialogueInitiator {
         if env.payload.len() > dialogue::MAX_TURN_BYTES {
             return Outcome::none();
         }
-        if self.max_pending != 0 && self.pending.len() >= self.max_pending {
-            return Outcome::none(); // refuse-new at capacity.
-        }
         let prompt = String::from_utf8_lossy(&env.payload).into_owned();
+
+        // Pending-pressure guard: at capacity, evict the OLDEST parked conversation (smallest corr —
+        // `next_corr` is monotone, so smallest == oldest) and relay a terminal failure to its
+        // abandoned originator, then open the new conversation. Refusing the *new* one instead would
+        // let a handful of dead peers permanently wedge the initiator into refuse-new — the parked
+        // entry has no other exit than a matching Answer. This mirrors `distributor-requirements`'
+        // PendingEvicted discipline: a bounded table that keeps accepting, never silent abandonment.
+        let mut dispatches: Vec<Dispatch> = Vec::new();
+        if self.max_pending != 0 && self.pending.len() >= self.max_pending {
+            if let Some(&oldest) = self.pending.keys().min() {
+                if let Some(p) = self.pending.remove(&oldest) {
+                    dispatches.push(
+                        p.failed("dialogue initiator at capacity; oldest conversation evicted"),
+                    );
+                }
+            }
+        }
 
         let corr = self.next_corr;
         self.next_corr = self.next_corr.wrapping_add(1);
@@ -113,12 +166,13 @@ impl DialogueInitiator {
 
         // Send the opening turn to the named peer; reply_to points back here so the Answer returns.
         let q = SeerEnvelope::query(SeerTopic::Dialogue, corr, 1, &dialogue::QueryBody { prompt });
-        Outcome::send(
+        dispatches.push(
             Dispatch::to(self.peer.clone(), q.to_bytes())
                 .with_schema(SEER_SCHEMA)
                 .with_corr(corr)
                 .with_reply_to(Address::Creature(me)),
-        )
+        );
+        Outcome { dispatches, budget_signal: None }
     }
 
     fn on_answer(&mut self, seer: SeerEnvelope) -> Outcome {
@@ -132,6 +186,11 @@ impl DialogueInitiator {
             Ok(a) => a,
             Err(_) => return Outcome::none(),
         };
+        // The reply is held to the same turn cap the prompt side already enforces — a peer that
+        // breaks the contract fails the conversation rather than having an over-cap turn relayed.
+        if answer.reply.len() > dialogue::MAX_TURN_BYTES {
+            return Outcome::send(p.failed("peer reply exceeded the dialogue turn cap"));
+        }
         // Relay the peer's reply to the original requester, on its own corr.
         let mut d = Dispatch::to(p.reply_to, answer.reply.into_bytes()).with_schema(RESULT_SCHEMA);
         if let Some(c) = p.orig_corr {
@@ -289,14 +348,73 @@ mod tests {
     }
 
     #[test]
-    fn capacity_refuses_new_conversations() {
+    fn capacity_evicts_oldest_conversation_and_notifies_its_originator() {
         let mut i = DialogueInitiator::new(Address::Creature(CreatureId(42)))
             .with_corr_seed(1)
             .with_max_pending(1);
         i.set_me_for_tests(CreatureId(5));
-        assert_eq!(i.handle(env(START_SCHEMA, b"a".to_vec(), Some(1), None)).dispatches.len(), 1);
-        // Second start at capacity → refused (no dispatch, not parked).
-        assert!(i.handle(env(START_SCHEMA, b"b".to_vec(), Some(2), None)).dispatches.is_empty());
-        assert_eq!(i.pending_conversations(), 1, "the second conversation was refused, not parked");
+        // First conversation parks (originator = creature 100, on corr 1).
+        let out1 = i.handle(env(
+            START_SCHEMA,
+            b"a".to_vec(),
+            Some(1),
+            Some(Address::Creature(CreatureId(100))),
+        ));
+        assert_eq!(out1.dispatches.len(), 1, "one opening turn");
+        assert_eq!(i.pending_conversations(), 1);
+        // Second start at capacity: evict the oldest (originator 100) AND open the new conversation —
+        // never a permanent refuse-new wedge, never silent abandonment of the evicted requester.
+        let out2 = i.handle(env(
+            START_SCHEMA,
+            b"b".to_vec(),
+            Some(2),
+            Some(Address::Creature(CreatureId(200))),
+        ));
+        assert_eq!(
+            out2.dispatches.len(),
+            2,
+            "a failed-notice for the evicted originator + the new turn"
+        );
+        let failed = out2
+            .dispatches
+            .iter()
+            .find(|d| d.schema == FAILED_SCHEMA)
+            .expect("the evicted originator is notified, not silently abandoned");
+        assert_eq!(
+            failed.to,
+            Address::Creature(CreatureId(100)),
+            "notice goes to the evicted originator"
+        );
+        assert_eq!(failed.corr, Some(1), "on its own corr");
+        assert!(DialogueFailed::parse(&failed.payload).is_ok(), "structured failure body");
+        // The new conversation is parked; the evicted one is gone — the table stays bounded at 1.
+        assert_eq!(i.pending_conversations(), 1, "evicted one dropped, new one parked");
+    }
+
+    #[test]
+    fn an_over_cap_peer_reply_fails_the_conversation_instead_of_relaying() {
+        let mut i = initiator();
+        i.handle(env(
+            START_SCHEMA,
+            b"hi".to_vec(),
+            Some(1),
+            Some(Address::Creature(CreatureId(100))),
+        ));
+        // The peer answers on the conversation corr with a reply over the turn cap.
+        let big = "x".repeat(dialogue::MAX_TURN_BYTES + 1);
+        let ans = SeerEnvelope::answer(
+            SeerTopic::Dialogue,
+            700_000,
+            1,
+            &dialogue::AnswerBody { reply: big },
+        );
+        let out = i.handle(env(SEER_SCHEMA, ans.to_bytes(), Some(700_000), None));
+        assert_eq!(out.dispatches.len(), 1, "the over-cap reply is not relayed");
+        assert_eq!(
+            out.dispatches[0].schema, FAILED_SCHEMA,
+            "the requester is told the conversation failed"
+        );
+        assert_eq!(out.dispatches[0].corr, Some(1), "on the original requester's corr");
+        assert_eq!(i.pending_conversations(), 0, "conversation consumed");
     }
 }

@@ -291,28 +291,42 @@ pub fn run(_args: &[String]) {
     banner("3. open the mesh — wait for the cross-Realm handshake");
     let (_probe, bus, rx) = crew.open_endpoint(Capabilities::default());
     crew.router().subscribe(Topic::new(Topic::PROPRIOCEPTION), bus.id());
+    // On any failure past this point, shut both Sanctums down and exit non-zero — the same fail-loud
+    // discipline `demos/walkthrough` and `demos/federation` use, so `alpha demo dialogue` (and CI)
+    // actually catch a cross-mesh regression instead of printing "done" over a broken run.
+    let bail = |code: i32| -> ! {
+        crew.shutdown_all(Deadline::from_millis(1500));
+        guests.shutdown_all(Deadline::from_millis(1500));
+        std::process::exit(code);
+    };
+
     if !wait_for_peer(&rx, NODE_GUESTS, scaled(Duration::from_secs(5))) {
         eprintln!("  ✗ crew↔guests handshake did not complete; aborting demo");
-        crew.shutdown_all(Deadline::from_millis(1000));
-        guests.shutdown_all(Deadline::from_millis(1000));
-        return;
+        bail(1);
     }
     ok("crew ↔ guests authenticated link is up");
 
     banner("4. converse — each turn crosses the Realm boundary, the agent remembers");
     let prompts = ["hello, neighbour", "what's it like over there?", "talk again soon"];
     for (i, prompt) in prompts.iter().enumerate() {
+        let turn = i + 1;
         step(&format!("crew → guests:  \"{prompt}\""));
-        match say(&bus, &rx, initiator_id, (i + 1) as u64, prompt) {
-            Some(reply) => {
-                ok(&format!("guests → crew:  {reply}"));
-                note("the turn rode Omega(guests, …) across the boundary and the reply came back.");
-            }
-            None => {
-                eprintln!("  ✗ no reply within the window on turn {}", i + 1);
-                break;
-            }
+        let Some(reply) = say(&bus, &rx, initiator_id, turn as u64, prompt) else {
+            eprintln!("  ✗ no reply within the window on turn {turn}");
+            bail(1);
+        };
+        ok(&format!("guests → crew:  {reply}"));
+        // The agent stamps each reply with its running turn count — proof it carried state across the
+        // boundary, in order. A stateless agent, or a dropped/duplicated turn, would not show this
+        // exact climbing count, so asserting it makes the demo a real regression anchor (P5).
+        let marker = format!("(turn {turn} ");
+        if !reply.contains(&marker) {
+            eprintln!(
+                "  ✗ turn {turn} reply lacked the expected `{marker}…` state marker: {reply}"
+            );
+            bail(1);
         }
+        note("the turn rode Omega(guests, …) across the boundary; the reply's turn-count climbed.");
     }
 
     banner("done");

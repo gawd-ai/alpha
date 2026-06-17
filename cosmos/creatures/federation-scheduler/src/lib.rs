@@ -24,9 +24,12 @@
 //! The federator caps concurrent in-flight pulls (`with_max_pending_pulls`, default 128) and
 //! *refuses* a new `PullFrom` at capacity. This scheduler mirrors that with its own `max_in_flight`
 //! counter: a round fires only if the **whole** round fits under the cap, and the counter decrements
-//! on each ack. A federator that stops acking (gone, wedged, or saturated) drives the counter up,
-//! the rounds stop firing, and the scheduler quietly backs off until acks resume — no unbounded
-//! emission, no eviction of work already issued.
+//! on each ack. A federator that stops *answering* (gone or wedged) leaves its pulls unacked, drives
+//! the counter to the cap, and the rounds stop firing until acks resume — no unbounded emission, no
+//! eviction of work already issued. (A merely *saturated* federator still acks: it replies `Rejected`
+//! at capacity, which frees the slot — so the scheduler keeps offering rounds rather than backing
+//! off. Backoff is the response to *silence*, not to refusal; retrying a refusing target is the
+//! operator's call.)
 //!
 //! ## What it deliberately doesn't do
 //!
@@ -107,11 +110,16 @@ pub struct FederationScheduler {
 impl FederationScheduler {
     /// Construct a scheduler that pulls every `targets` Realm from the federator at `federator`,
     /// once per `interval`. Uses [`DEFAULT_MAX_IN_FLIGHT`] backpressure.
+    ///
+    /// `interval` is clamped up to at least one `STOP_POLL` tick: a zero or sub-tick interval would
+    /// make the cadence loop's wait return without ever sleeping, busy-spinning the worker at 100% CPU
+    /// (it would observe `stop` only once per spin). `omega serve` already rejects a `0`
+    /// `--pull-interval`; this guards every other library caller too.
     pub fn new(federator: Address, targets: Vec<PullTarget>, interval: Duration) -> Self {
         FederationScheduler {
             federator,
             targets,
-            interval,
+            interval: interval.max(STOP_POLL),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             shared: Arc::new(Shared {
                 stop: AtomicBool::new(false),
@@ -303,6 +311,18 @@ mod tests {
         };
         s.handle(ack_env(&notice));
         assert_eq!(s.in_flight(), 1, "a non-ack message leaves in-flight untouched");
+    }
+
+    #[test]
+    fn a_sub_tick_interval_is_clamped_to_avoid_a_busy_spin() {
+        // A zero interval would make `sleep_with_stop` return without sleeping → the cadence loop
+        // would spin at 100% CPU. The constructor clamps it up to at least one stop-poll tick.
+        let s = FederationScheduler::new(
+            Address::Creature(CreatureId(9)),
+            vec![target("alpha", "node-B", 7)],
+            Duration::ZERO,
+        );
+        assert!(s.interval >= STOP_POLL, "a sub-tick interval is clamped up to a real sleep");
     }
 
     #[test]
