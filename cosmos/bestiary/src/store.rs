@@ -1462,7 +1462,7 @@ impl FsBestiaryStore {
         let mut tip = genesis_prev();
 
         let mut live_keys: Vec<(RealmId, String)> =
-            inner.entries.keys().filter(|(r, _)| *r == realm).cloned().collect();
+            inner.entries.keys().filter(|(r, _)| r == realm).cloned().collect();
         live_keys
             .sort_by(|a, b| (a.0 .0.as_str(), a.1.as_str()).cmp(&(b.0 .0.as_str(), b.1.as_str())));
         for key in live_keys {
@@ -1499,7 +1499,7 @@ impl FsBestiaryStore {
         }
 
         let mut tomb_keys: Vec<(RealmId, String)> =
-            inner.tombstones.iter().filter(|(r, _)| *r == realm).cloned().collect();
+            inner.tombstones.iter().filter(|(r, _)| r == realm).cloned().collect();
         tomb_keys
             .sort_by(|a, b| (a.0 .0.as_str(), a.1.as_str()).cmp(&(b.0 .0.as_str(), b.1.as_str())));
         for key in tomb_keys {
