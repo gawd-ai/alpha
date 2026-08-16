@@ -1,0 +1,10 @@
+[build]
+# A focused `cargo test -p …` must be courteous even when the caller forgets the documented env.
+# This bounds crate-level compilation and prevents incremental graphs from accumulating in target/.
+jobs = 1
+incremental = false
+
+[env]
+# Libtest otherwise defaults to the machine's logical CPU count. Callers may explicitly override
+# this for a dedicated runner, but ordinary workspace tests are serial by construction.
+RUST_TEST_THREADS = { value = "1", force = false }

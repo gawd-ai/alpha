@@ -89,13 +89,20 @@ fn node_a_drives_node_b_control_plane_over_the_mesh() {
     // Retry to ride out the handshake delay (an early send is dropped by the transport with no link).
     let drive = |corr: u64, verb: &Verb| -> Option<VerbResult> {
         let payload = serde_json::to_vec(verb).unwrap();
+        let reply_capability = format!("mesh-control-capability-{corr}");
         for _ in 0..40 {
             let d = Dispatch::to(Address::Node(NodeId(NODE_B.into()), b_control), payload.clone())
                 .with_schema(CONTROL_SCHEMA)
                 .with_reply_to(Address::Creature(probe_id))
-                .with_corr(corr);
+                .with_corr(corr)
+                .with_commitment(reply_capability.clone());
             if probe_bus.send(d).is_ok() {
                 if let Some(env) = recv_corr(&probe_rx, corr, Duration::from_millis(500)) {
+                    assert_eq!(
+                        env.header.commitment.as_deref(),
+                        Some(reply_capability.as_str()),
+                        "reply capability survives both authenticated transport rewrites"
+                    );
                     return Some(serde_json::from_slice::<VerbResult>(&env.payload).unwrap());
                 }
             }

@@ -264,6 +264,20 @@ fn fully_populated() -> Manifest {
         entrypoints: vec![Entrypoint {
             name: "handle".into(),
             signature: "(Envelope) -> Outcome".into(),
+            contract: Some(gawdfn::EntrypointContractV1 {
+                description: "Handle one envelope".into(),
+                input_schema: gawdfn::SchemaRefV1::Inline {
+                    schema: serde_json::json!({ "type": "object" }),
+                },
+                output_schema: gawdfn::SchemaRefV1::Inline {
+                    schema: serde_json::json!({ "type": "object" }),
+                },
+                error_schema: Some(gawdfn::SchemaRefV1::Inline {
+                    schema: serde_json::json!({ "type": "object" }),
+                }),
+                effect: gawdfn::EffectClassV1::Unknown,
+                controls: gawdfn::FunctionControlsV1::default(),
+            }),
         }],
         capabilities: Capabilities {
             fs: vec!["/tmp".into()],
@@ -321,6 +335,8 @@ fn fully_populated_manifest_validates_and_keys_match_schema() {
         ("", None),
         ("/abi", Some("/$defs/Abi")),
         ("/entrypoints/0", Some("/$defs/Entrypoint")),
+        ("/entrypoints/0/contract", Some("/$defs/EntrypointContractV1")),
+        ("/entrypoints/0/contract/controls", Some("/$defs/FunctionControlsV1")),
         ("/capabilities", Some("/$defs/Capabilities")),
         ("/requirements", Some("/$defs/Requirements")),
         ("/provenance", Some("/$defs/Provenance")),

@@ -67,11 +67,12 @@ drive, in `cosmos/sanctum/tests/memcheck/` — not a root `ci/` dir; the real CI
 | `demos/` | Narrated, runnable demos (`walkthrough`, `federation`, `distribute`, `bestiary-live`, `dialogue`; the `cluster/` dir is a multi-process runbook — listed in the registry tagged `(manual runbook)`, run by hand rather than launched by the runner). The registry of what `alpha demo` knows is [`demos/demos.json`](demos/demos.json), and `alpha demo list` is authoritative. The fastest way to *see* Alpha. Stay at the root, alongside the door they exercise. |
 | `foundation/` | **Shared GAWD foundations** — cross-system contracts/tools Alpha *consumes but does not own* (`gawd`-prefixed, destined to externalize into their own repos). Beside the cosmology, not within it. A new crate lands here (not `cosmos/`) when another GAWD system would want the *exact same* crate and it will carry its own version/repo/maybe binary. |
 | `foundation/gawdxfer/` | **The GX bulk-transfer contract** shared by GAWD systems: chunked/resumable init, chunk, ack, progress, resume, status, completion, binary chunk framing, chunk math, and streaming SHA-256 helpers. Transport-neutral; Alpha and `sctl` adapt this instead of inventing local xfer protocols. |
+| `foundation/gawdfn/` | **The typed-Function + durable-Job contract** shared by GAWD systems: immutable function/deployment/job identities, versioned application schemas, proof chains, delivery semantics, custody grants, and pressure caps. It contains wire and verification mechanism, never placement/trust/retry policy or private-key storage. |
 | `cosmos/` | **Everything between α and Ω** — the interior the front door opens onto: the whole spine, the concept crates, the control core, and every creature. |
 | `cosmos/{sigil,aether,anima,sanctum,forge}/` | **The spine**: contract → bus → per-tier loaders → kernel → authoring SDK. |
-| `cosmos/{abode,seer,realm}/` | **First-class concept crates**: the distributed-self snapshot contract (`abode`), the consult-and-reconcile primitive (`seer`), and the trust-domain (`realm`). They live alongside `aether` so federation authority has a home that already exists. `realm` owns the realm-gateway seam *and* its routing mechanism (`realm::serve`). (**Ω** lived here too as `cosmos/omega`; it was promoted to the root as the system's second pole — see `omega/` above. `omega` still owns the gateway socket + `deferred` wire contract + reserved `OmegaServices`.) |
+| `cosmos/{abode,seer,realm,bestiary,mind,omega-contract}/` | **First-class concept/leaf crates**: distributed-self snapshots, consult-and-reconcile, the trust domain, durable registry contracts/store, model injection, and the lean Ω wire contract. They live alongside `aether`; none is hidden inside the bus crate. `realm` owns the realm-gateway seam and routing mechanism (`realm::serve`). |
 | `cosmos/omni/` | **The spine-only control core** every surface drives over the bus (`run_verb` + `ControlCore`). |
-| `cosmos/creatures/` | **Production-capable reference organs** — the real substrate creatures (the daemon boots several), plus the loadable surfaces (`surface-http`, `surface-mcp`). Indexed by [`cosmos/creatures/README.md`](cosmos/creatures/README.md). Reads as a reduction gradient ↓. |
+| `cosmos/creatures/` | **Production-capable reference organs** — the real substrate creatures (the daemon boots several), including the Function/Job home, executor, resolver, locator, blob store, plus the loadable surfaces (`surface-http`, `surface-mcp`). Indexed by [`cosmos/creatures/README.md`](cosmos/creatures/README.md). Reads as a reduction gradient ↓. |
 | `cosmos/creatures/prototypes/<seam>/` | **Operator-replaceable injected models** — the reference strategies that fill the IoC sockets (the "model" in *fabric, not model*), grouped by socket (`policies/`, `scorers/`, `distributors/`, `reputation/`, `merge/`, `gateways/`, `responders/`, `dialogue/`, `critters/`, + `monitor/`). These are reference strategies, not disposable demo material. Legend: [`cosmos/creatures/prototypes/README.md`](cosmos/creatures/prototypes/README.md). |
 | `cosmos/creatures/prototypes/fixtures/` | **Test-only creatures** the kernel test suite dlopens (walking skeleton + fault specimens) — the most reduced prototype, nested deepest. Not shipped. |
 
@@ -81,14 +82,27 @@ The three creature tiers (`abi.backend`): **`daemon`** (native `.so`), **`beast`
 ## Build · run · test
 
 ```sh
-cargo run -p walkthrough          # the whole loop, narrated — start here
-cargo run -p federation           # many Sanctums × Realms over ed25519 TCP (loopback)
-cargo build --locked --workspace
-CARGO_BUILD_JOBS=2 cargo test --locked --workspace -- --test-threads=1   # CI uses this cap
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo run -p walkthrough # narrated loop — start here
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo run -p federation  # many Sanctums × Realms
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo build --locked -p alpha -p omega
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo test --locked -p <crate> -- --test-threads=1
 cargo run -p alpha -- node              # boot a live node + REPL (add --minimal for a bare kernel)
 cargo run -p omega -- serve --node-id Ω --cluster-listen 127.0.0.1:9100   # boot the Ω federation/gateway server (headless)
-cargo doc --workspace --no-deps --open # browse the API — every crate has //! docs
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo doc --locked -p sanctum --no-deps --open
 ```
+
+Run only the smallest affected package/test target locally. The full workspace gate runs once on the
+exact candidate in constrained CI, never as a second local pass. Cargo does not garbage-collect stale
+`target/` variants; if space must be reclaimed, inspect the directory first and use
+`cargo clean -p <exact-package>` rather than deleting a broad workspace or any runtime state.
+Before launching any Cargo command, confirm another agent or shell is not already compiling this
+workspace; concurrent/repeated gates are forbidden. Reuse the existing result or wait for the active
+command instead of creating another target variant.
+The separately generated authoring cache is exactly `target/gawd-build-cache`; while no authoring
+build is active, reclaim only that cache with `cargo clean --target-dir target/gawd-build-cache`.
+After a candidate is frozen and the user authorizes a workspace-wide debug/test reclaim, first run
+`cargo clean --locked --profile dev --dry-run`, then repeat without `--dry-run` only after confirming
+no compiler is active. This preserves `target/release` and every runtime state/journal/key path.
 
 A **Sanctum** is the kernel (`sanctum`) run as a process; both poles realize one — `alpha node` is the
 operator/authoring seat (REPL + authoring organs), `omega serve` the headless federation/gateway server
@@ -99,7 +113,8 @@ the same `omega::serve::boot_federator` recipe `omega serve` uses.
 
 The composed end-to-end loops live in `cosmos/sanctum/tests/`. The `panic-daemon` "failures" in a test run
 are **expected** — it is the fault-isolation specimen proving a panicking creature doesn't crash
-the node. Toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+the node. The exact release toolchain and required components are pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml).
 
 ## Before you author or modify a creature
 

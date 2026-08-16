@@ -430,6 +430,7 @@ fn template_reverse_string(template_label: &str) -> AuthoringResponse {
             entrypoints: vec![Entrypoint {
                 name: "handle".to_string(),
                 signature: "(Envelope) -> Outcome".to_string(),
+                contract: None,
             }],
             capabilities: Capabilities::default(),
             provides: vec![],
@@ -466,6 +467,7 @@ fn template_reverse_critter() -> AuthoringResponse {
             entrypoints: vec![Entrypoint {
                 name: "handle".to_string(),
                 signature: "(env) -> reply".to_string(),
+                contract: None,
             }],
             capabilities: Capabilities::default(),
             provides: vec![],
@@ -508,6 +510,7 @@ fn template_uppercase_critter() -> AuthoringResponse {
             entrypoints: vec![Entrypoint {
                 name: "handle".to_string(),
                 signature: "(env) -> reply".to_string(),
+                contract: None,
             }],
             capabilities: Capabilities::default(),
             provides: vec![],
@@ -613,6 +616,7 @@ fn template_fetch_url_title() -> AuthoringResponse {
             entrypoints: vec![Entrypoint {
                 name: "handle".to_string(),
                 signature: "(Envelope) -> Outcome".to_string(),
+                contract: None,
             }],
             // Outbound net is *declared* here; the engine enforces it. The manifest is the sole
             // metadata source (R6), so the policy seeing this can already decide whether to
@@ -644,6 +648,7 @@ fn template_recovery_drill_broken() -> AuthoringResponse {
             entrypoints: vec![Entrypoint {
                 name: "handle".to_string(),
                 signature: "(Envelope) -> Outcome".to_string(),
+                contract: None,
             }],
             capabilities: Capabilities::default(),
             provides: vec![],

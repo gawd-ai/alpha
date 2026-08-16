@@ -1,6 +1,9 @@
 //! `transport-tcp` — the real authenticated peer link, the swap-in for the `loopback-gateway`.
 //!
-//! Bound to `Role::TRANSPORT`, so the kernel routes every `Address::Node(_,_)` envelope here.
+//! Bound to `Role::TRANSPORT`, so the kernel routes every `Address::Node(_,_)` and
+//! `Address::NodeRole(_,_)` envelope here. A numeric Node target is delivered exactly as named;
+//! NodeRole is resolved only on ingress by an attesting transport and only when the receiving host
+//! explicitly exposed that role.
 //! Authenticates each peer with a mutual ed25519 challenge-response handshake against a pre-shared
 //! pubkey allowlist — no PKI, no TOFU. After the handshake, envelopes and gossip travel as
 //! length-prefixed JSON (the same shape the loopback uses, so the wire format is one step's worth of
@@ -36,6 +39,10 @@
 //!   + a UDP/mDNS discovery beacon are the named next steps.
 //! - **No per-connection retry policy beyond "dialer reconnects on drop."** Bounded retry with
 //!   backoff arrives when the substrate needs it.
+//! - **No unbounded inbound handshakes.** By default at most
+//!   [`DEFAULT_MAX_INBOUND_HANDSHAKES`] accepted sockets may be authenticating at once per transport
+//!   instance; [`TransportTcp::with_max_inbound_handshakes`] may lower or otherwise finitely tune the
+//!   ceiling, and excess sockets are closed immediately.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -48,7 +55,7 @@ use std::time::Duration;
 
 use aether::{
     Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, NodeId, Origin,
-    OriginEvent, OriginVerdict, Outcome, Topic, KERNEL_ID, ORIGIN_EVENT_SCHEMA,
+    OriginEvent, OriginVerdict, Outcome, Role, Topic, KERNEL_ID, ORIGIN_EVENT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use sigil::{
@@ -67,6 +74,11 @@ const SIG_BYTES: usize = 64;
 /// notice a shutdown request without ever blocking indefinitely. Short enough that an unload
 /// returns within human timescales; long enough that the syscall churn is negligible.
 const POLL: Duration = Duration::from_millis(200);
+
+/// Aggregate per-transport cap on accepted sockets that have not completed authentication. Each
+/// handshake also retains its five-second per-socket read/write timeout; the cap bounds the threads
+/// and descriptors a slow unauthenticated client can occupy concurrently.
+pub const DEFAULT_MAX_INBOUND_HANDSHAKES: usize = 64;
 
 /// Per-peer outbound queue depth. Backpressure here is "we're not draining the peer fast enough"
 /// — bounded queue + `try_send` shedding keeps memory bounded under a sender flood (R9).
@@ -107,6 +119,52 @@ pub const MAX_MEMBER_ADDR_BYTES: usize = 512;
 #[inline]
 fn mlock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Shared aggregate accounting for inbound sockets that have not authenticated yet.
+struct InboundHandshakeSlots {
+    active: Arc<AtomicUsize>,
+    limit: AtomicUsize,
+}
+
+impl InboundHandshakeSlots {
+    fn new(limit: usize) -> Self {
+        Self { active: Arc::new(AtomicUsize::new(0)), limit: AtomicUsize::new(limit) }
+    }
+
+    fn try_acquire(&self) -> Option<InboundHandshakeSlot> {
+        let mut active = self.active.load(Ordering::Relaxed);
+        loop {
+            // Reload the configured limit on every CAS retry. Lowering the limit while handshakes
+            // are active never evicts an existing worker, but it immediately refuses new sockets
+            // until the active count falls below the new finite ceiling. A limit of zero is an
+            // explicit fail-closed posture: refuse every inbound handshake.
+            if active >= self.limit.load(Ordering::Acquire) {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(InboundHandshakeSlot { active: self.active.clone() }),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+/// Releases one unauthenticated-handshake reservation on every exit path, including unwinding.
+struct InboundHandshakeSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for InboundHandshakeSlot {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "inbound handshake slot underflow");
+    }
 }
 
 /// One known peer.
@@ -392,8 +450,8 @@ struct TransportState {
     gossip: AtomicBool,
     /// The dial address advertised to peers in gossip (defaults to listen_addr).
     advertise_addr: Mutex<String>,
-    /// NodeId → outbound queue. `handle(Node(peer, _))` pushes here; the per-peer writer thread
-    /// drains. Wrapped in Mutex because connect/disconnect rewrites it.
+    /// NodeId → outbound queue. `handle(Node(peer, _)|NodeRole(peer, _))` pushes here; the per-peer
+    /// writer thread drains. Wrapped in Mutex because connect/disconnect rewrites it.
     writers: Mutex<HashMap<NodeId, SyncSender<PeerFrame>>>,
     /// `(peer, transfer_id)` → local route for raw GX chunks received outside JSON envelopes.
     gx_routes: Mutex<HashMap<(NodeId, String), GxRoute>>,
@@ -408,6 +466,7 @@ struct TransportState {
     bus: Mutex<Option<Arc<dyn Bus>>>,
     me: Mutex<Option<CreatureId>>,
     stop: AtomicBool,
+    inbound_handshakes: InboundHandshakeSlots,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -472,6 +531,7 @@ impl TransportTcp {
             bus: Mutex::new(None),
             me: Mutex::new(None),
             stop: AtomicBool::new(false),
+            inbound_handshakes: InboundHandshakeSlots::new(DEFAULT_MAX_INBOUND_HANDSHAKES),
             threads: Mutex::new(Vec::new()),
         });
         let cfg = TransportConfig { self_key: cfg.self_key, self_node, listen_addr, peers };
@@ -509,6 +569,16 @@ impl TransportTcp {
     /// `transport.ctl` or gossip is refused; already-known members can still be updated.
     pub fn with_max_members(self, max_members: usize) -> Self {
         self.state.max_members.store(max_members, Ordering::Relaxed);
+        self
+    }
+
+    /// Set the aggregate number of inbound sockets allowed to authenticate concurrently.
+    ///
+    /// The default is [`DEFAULT_MAX_INBOUND_HANDSHAKES`]. Unlike the member-table cap, this resource
+    /// boundary has no unbounded mode: `0` deliberately refuses every inbound handshake, which is a
+    /// useful listener-disabled posture while preserving outbound dialing.
+    pub fn with_max_inbound_handshakes(self, max_inbound_handshakes: usize) -> Self {
+        self.state.inbound_handshakes.limit.store(max_inbound_handshakes, Ordering::Release);
         self
     }
 }
@@ -574,11 +644,12 @@ impl Creature for TransportTcp {
         if env.header.schema == GX_CHUNK_SCHEMA {
             return handle_gx_chunk_outbound(&self.state, &env);
         }
-        // We only handle Node-addressed envelopes (the router only delivers those here anyway).
-        let Address::Node(peer_node, _target_mid) = &env.header.to else {
-            return Outcome::none();
+        // We only handle node-scoped envelopes (the router only delivers those here anyway). Keep a
+        // NodeRole unresolved on egress; only the destination host knows its current exposed binding.
+        let peer_node = match &env.header.to {
+            Address::Node(peer_node, _) | Address::NodeRole(peer_node, _) => peer_node.clone(),
+            _ => return Outcome::none(),
         };
-        let peer_node = peer_node.clone();
         // Frame the envelope (WireFrame::Env) so membership-gossip frames can share the channel.
         // Look up the writer for that peer; if no connection yet, drop. We could buffer, but
         // buffering without bounds is the seed's R9 footgun; bounded buffering belongs to a
@@ -840,11 +911,18 @@ fn listener_loop(state: Arc<TransportState>, listener: TcpListener) {
     while !state.stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                let Some(handshake_slot) = state.inbound_handshakes.try_acquire() else {
+                    // The peer is unauthenticated, so there is no trustworthy identity to name in
+                    // an event. Refuse synchronously: do not queue a socket or spawn a thread that
+                    // would let a slow scanner grow resource use beyond the aggregate cap.
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                };
                 configure_stream_for_transport(&stream);
                 let state_h = state.clone();
                 let h = match Builder::new()
                     .name("transport-handshake-server".into())
-                    .spawn(move || server_handshake_and_run(state_h, stream))
+                    .spawn(move || server_handshake_and_run(state_h, stream, handshake_slot))
                 {
                     Ok(h) => h,
                     Err(e) => {
@@ -940,7 +1018,11 @@ fn dialer_loop(state: Arc<TransportState>, peer: PeerConfig) {
 
 // ---- handshake ----
 
-fn server_handshake_and_run(state: Arc<TransportState>, mut stream: TcpStream) {
+fn server_handshake_and_run(
+    state: Arc<TransportState>,
+    mut stream: TcpStream,
+    handshake_slot: InboundHandshakeSlot,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
@@ -1003,6 +1085,8 @@ fn server_handshake_and_run(state: Arc<TransportState>, mut stream: TcpStream) {
 
     // Authenticated. Hand the stream off to the per-peer reader/writer pair, carrying the pubkey the
     // client just proved possession of so inbound frames are verified under the *connection's* key.
+    // It no longer consumes an unauthenticated-handshake slot while connection workers are installed.
+    drop(handshake_slot);
     install_connection(state, stream, client_node, client_pubkey_hex);
 }
 
@@ -1395,8 +1479,13 @@ fn write_all_with_stop(
 /// would silently defeat any cross-node commit-and-reveal (a fair Distribute pick, a consensus
 /// tie-break), which is exactly why the realm-gateway/omega-federator preserve it on rewrite.
 fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId, peer_pubkey: &str) {
-    let target_mid = match &env.header.to {
-        Address::Node(node, mid) if *node == state.self_node => *mid,
+    enum InboundTarget {
+        Creature(CreatureId),
+        RemoteRole(Role),
+    }
+
+    let target = match &env.header.to {
+        Address::Node(node, mid) if *node == state.self_node => InboundTarget::Creature(*mid),
         Address::Node(node, _mid) => {
             eprintln!(
                 "transport-tcp: dropped an inbound frame from peer {} addressed to node {}, \
@@ -1405,14 +1494,58 @@ fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId, peer_pu
             );
             return;
         }
-        // The router should never deliver a non-Node envelope here; if it does we drop it
+        Address::NodeRole(node, role) if *node == state.self_node => {
+            InboundTarget::RemoteRole(role.clone())
+        }
+        Address::NodeRole(node, _role) => {
+            eprintln!(
+                "transport-tcp: dropped an inbound remote-role frame from peer {} addressed to \
+                 node {}, but this transport is node {}",
+                peer.0, node.0, state.self_node.0
+            );
+            return;
+        }
+        // The router should never deliver another address grain here; if it does we drop it
         // (re-routing locally would be undefined intent) but make the contract violation visible.
         other => {
             eprintln!(
-                "transport-tcp: dropped an inbound non-Node envelope addressed {other:?} from peer {}",
+                "transport-tcp: dropped an inbound non-node-scoped envelope addressed {other:?} \
+                 from peer {}",
                 peer.0
             );
             return;
+        }
+    };
+
+    // Clone the `Arc<dyn Bus>` out and DROP the guard before resolving/emitting — either operation
+    // re-enters host routing state, so holding `state.bus` across it would serialize every peer.
+    let bus = mlock(&state.bus).as_ref().cloned();
+    let Some(bus) = bus else { return };
+
+    let target_mid = match target {
+        InboundTarget::Creature(mid) => mid,
+        InboundTarget::RemoteRole(role) => {
+            // Remote capability resolution is inseparable from authenticated immediate-peer
+            // attribution. An ordinarily loaded transport may continue numeric relay for backwards
+            // compatibility, but it cannot resolve a host role or silently shed origin evidence.
+            if !bus.may_attest() {
+                eprintln!(
+                    "transport-tcp: refused remote role `{}` from peer {} because this transport \
+                     lacks the boot attestation grant",
+                    role.0, peer.0
+                );
+                publish_peer_event(state, peer, "remote_role_non_attesting_dropped");
+                return;
+            }
+            let Some(mid) = bus.remote_role_target(&role) else {
+                eprintln!(
+                    "transport-tcp: refused unexposed or unbound remote role `{}` from peer {}",
+                    role.0, peer.0
+                );
+                publish_peer_event(state, peer, "remote_role_unexposed_dropped");
+                return;
+            };
+            mid
         }
     };
 
@@ -1429,12 +1562,6 @@ fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId, peer_pu
         );
         return;
     }
-
-    // Clone the `Arc<dyn Bus>` out and DROP the guard before emitting — `emit` re-enters the router
-    // (table read + journal mutex + try_send), so holding `state.bus` across it would serialize
-    // every peer reader thread on one mutex and widen the poison/deadlock window (T6).
-    let bus = mlock(&state.bus).as_ref().cloned();
-    let Some(bus) = bus else { return };
 
     // Capture what we need from the header *before* the payload moves into the dispatch builder:
     // the correlation fields, the sender's per-link `seq` (replay guard) and original `from`
@@ -1477,8 +1604,9 @@ fn deliver_locally(state: &TransportState, env: Envelope, peer: &NodeId, peer_pu
         dispatch = dispatch.with_commitment(commit);
     }
 
-    // A transport loaded *without* the boot-only attestation grant relays as before — no origin, no
-    // verdict. Only an attesting transport (the production load path) attributes cross-node senders.
+    // A transport loaded *without* the boot-only attestation grant relays numeric Node traffic as
+    // before — no origin, no verdict. NodeRole was already refused above: resolving a capability
+    // without authenticated immediate-peer attribution would silently weaken its contract.
     if !bus.may_attest() {
         if let Err(e) = bus.emit(dispatch) {
             eprintln!(
@@ -1931,6 +2059,40 @@ mod tests {
     }
 
     #[test]
+    fn inbound_handshake_slots_enforce_the_aggregate_cap_and_reopen_on_drop() {
+        let slots = InboundHandshakeSlots::new(2);
+        let first = slots.try_acquire().expect("first slot");
+        let second = slots.try_acquire().expect("second slot");
+
+        assert!(slots.try_acquire().is_none(), "the aggregate cap refuses a third handshake");
+        assert_eq!(slots.active.load(Ordering::Relaxed), 2);
+
+        drop(first);
+        let replacement = slots.try_acquire().expect("dropping a guard reopens its slot");
+        assert_eq!(slots.active.load(Ordering::Relaxed), 2);
+
+        drop((second, replacement));
+        assert_eq!(slots.active.load(Ordering::Relaxed), 0);
+
+        slots.limit.store(0, Ordering::Release);
+        assert!(slots.try_acquire().is_none(), "zero is an explicit refuse-all ceiling");
+    }
+
+    #[test]
+    fn inbound_handshake_slot_is_released_when_the_worker_panics() {
+        let slots = InboundHandshakeSlots::new(1);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = slots.try_acquire().expect("slot before panic");
+            panic!("handshake worker specimen");
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(slots.active.load(Ordering::Relaxed), 0);
+        assert!(slots.try_acquire().is_some(), "unwinding releases capacity for the next peer");
+    }
+
+    #[test]
     fn rewrite_inbound_target_recurses_through_realm_and_omega() {
         use aether::RealmId;
         let peer = NodeId("peer-1".to_string());
@@ -2029,6 +2191,7 @@ mod tests {
             bus: Mutex::new(None),
             me: Mutex::new(None),
             stop: AtomicBool::new(false),
+            inbound_handshakes: InboundHandshakeSlots::new(DEFAULT_MAX_INBOUND_HANDSHAKES),
             threads: Mutex::new(Vec::new()),
         });
 
@@ -2130,6 +2293,32 @@ mod tests {
             "failed batch must not leave a partial bind frame in the queue"
         );
         assert!(rx.try_recv().is_err(), "failed batch must not enqueue any trailing frame either");
+    }
+
+    #[test]
+    fn outbound_node_role_is_framed_for_its_named_peer_without_source_resolution() {
+        let (key, _) = Ed25519KeyMaterial::generate().unwrap();
+        let mut transport = TransportTcp::new(TransportConfig {
+            self_key: key,
+            self_node: NodeId("me".into()),
+            listen_addr: "127.0.0.1:0".into(),
+            peers: vec![],
+        });
+        let peer = NodeId("peer".into());
+        let role = Role::new("executor");
+        let (tx, rx) = sync_channel::<PeerFrame>(1);
+        mlock(&transport.state.writers).insert(peer.clone(), tx);
+        let target = Address::NodeRole(peer, role);
+
+        let outcome = transport.handle(inbound_env(target.clone()));
+
+        assert!(outcome.dispatches.is_empty());
+        let queued = rx.try_recv().expect("NodeRole frame queued for the peer");
+        assert_eq!(queued.frames.len(), 1);
+        let Some(WireFrame::Env(envelope)) = WireFrame::parse(&queued.frames[0]) else {
+            panic!("queued frame was not an envelope")
+        };
+        assert_eq!(envelope.header.to, target, "egress preserves the unresolved remote role");
     }
 
     fn gx_chunk_env(peer: &str, payload: Vec<u8>) -> Envelope {
@@ -2577,6 +2766,17 @@ mod tests {
 
         deliver_locally(
             &state,
+            inbound_env(Address::NodeRole(NodeId("someone-else".into()), Role::new("executor"))),
+            &peer,
+            "",
+        );
+        assert!(
+            mlock(&bus.sent).is_empty(),
+            "wrong-node remote-role frames must be refused at the wire boundary"
+        );
+
+        deliver_locally(
+            &state,
             inbound_env(Address::Node(NodeId("me".into()), KERNEL_ID)),
             &peer,
             "",
@@ -2608,6 +2808,7 @@ mod tests {
     struct AttestingBus {
         attested: std::sync::Mutex<Vec<(Dispatch, Origin)>>,
         events: std::sync::Mutex<Vec<Dispatch>>,
+        remote_roles: std::sync::Mutex<HashMap<Role, CreatureId>>,
     }
 
     impl Bus for AttestingBus {
@@ -2624,6 +2825,9 @@ mod tests {
         }
         fn may_attest(&self) -> bool {
             true
+        }
+        fn remote_role_target(&self, role: &Role) -> Option<CreatureId> {
+            mlock(&self.remote_roles).get(role).copied()
         }
     }
 
@@ -2651,6 +2855,66 @@ mod tests {
                     .ok()
                     .is_some_and(|ev| ev.event == expected)
         })
+    }
+
+    #[test]
+    fn inbound_node_role_requires_attestation_and_explicit_exposure_then_tracks_rebind() {
+        let peer = NodeId("node-A".into());
+        let role = Role::new("executor");
+        let target = Address::NodeRole(NodeId("me".into()), role.clone());
+
+        let ordinary_state = test_state("me");
+        let ordinary = attach_recording_bus(&ordinary_state);
+        deliver_locally(&ordinary_state, inbound_env(target.clone()), &peer, "");
+        assert!(
+            !mlock(&ordinary.sent)
+                .iter()
+                .any(|dispatch| matches!(dispatch.to, Address::Creature(_))),
+            "an ordinary transport never resolves a remote role"
+        );
+        assert!(mlock(&ordinary.sent).iter().any(|dispatch| {
+            dispatch.schema == "peer_event"
+                && serde_json::from_slice::<PeerEvent>(&dispatch.payload)
+                    .ok()
+                    .is_some_and(|event| event.event == "remote_role_non_attesting_dropped")
+        }));
+
+        let state = test_state("me");
+        let bus = attach_attesting_bus(&state);
+        deliver_locally(&state, inbound_env(target.clone()), &peer, "");
+        assert!(mlock(&bus.attested).is_empty(), "unexposed role is not delivered");
+        assert!(saw_peer_event(&bus, "remote_role_unexposed_dropped"));
+
+        mlock(&bus.remote_roles).insert(role.clone(), KERNEL_ID);
+        deliver_locally(&state, inbound_env(target.clone()), &peer, "");
+        assert!(mlock(&bus.attested).is_empty(), "role exposure cannot bypass KERNEL_ID refusal");
+
+        mlock(&bus.remote_roles).insert(role.clone(), CreatureId(33));
+        let bad_pubkey = test_pubkey_hex();
+        deliver_locally(&state, inbound_env(target.clone()), &peer, &bad_pubkey);
+        {
+            let attested = mlock(&bus.attested);
+            assert_eq!(attested.len(), 1);
+            assert_eq!(attested[0].0.to, Address::Creature(CreatureId(33)));
+            assert_eq!(attested[0].1, Origin::node(peer.clone()));
+        }
+        assert_eq!(
+            last_verdict(&bus),
+            Some(OriginVerdict::BadSig),
+            "remote-role delivery preserves the existing non-enforcing verdict posture"
+        );
+
+        mlock(&bus.remote_roles).insert(role, CreatureId(44));
+        let mut rebound = inbound_env(target);
+        rebound.header.seq = 1;
+        deliver_locally(&state, rebound, &peer, &bad_pubkey);
+        let attested = mlock(&bus.attested);
+        assert_eq!(attested.len(), 2);
+        assert_eq!(
+            attested[1].0.to,
+            Address::Creature(CreatureId(44)),
+            "each frame resolves the host's current exposed binding"
+        );
     }
 
     /// An inbound frame to `CreatureId(3)` on this node, signed by `key`, optionally carrying a

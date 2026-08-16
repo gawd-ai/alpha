@@ -124,14 +124,15 @@ fn phase_self_authoring() -> Result<(), String> {
         .map_err(|e| format!("agent admits: {e}"))?;
     kernel.bind_role(Role::new(Role::AUTHORING), agent_id);
 
-    // The SDK crates the authored creature builds against live under cosmos/; the build
-    // cache stays under the true workspace root's target/.
+    // The SDK crates the authored creature builds against live under cosmos/. One canonical cache
+    // under the true workspace root's target/ is shared by all authoring demos/tests; process-unique
+    // crate names plus serial defaults make reuse safe and avoid duplicate cold SDK graphs.
     let mut build_cfg = BuildConfig::with_workspace_root(
         workspace_root().join("cosmos"),
         abode.clone(),
         author.clone(),
     );
-    build_cfg.target_dir = workspace_root().join("target").join("walkthrough-build-cache");
+    build_cfg.target_dir = workspace_root().join("target").join("gawd-build-cache");
     build_cfg.sandbox = Sandbox::None; // operator's choice; the sandbox seam is exercised in m3 tests
     build_cfg.cargo_timeout = Duration::from_secs(300);
     let build_id = kernel

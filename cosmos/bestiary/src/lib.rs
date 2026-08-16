@@ -48,7 +48,8 @@ pub use curator::{AICurator, CurationContext, CurationDecision, Curator, Determi
 pub use op::{BestiaryOp, BestiaryReply};
 pub use store::{
     BestiaryStore, CompactStats, CurationSnapshot, EntryProof, FsBestiaryStore, LogOp, LogRecord,
-    MergeOutcome, SignedSyncEntry, StoreError, DEFAULT_MAX_BESTIARY_ENTRIES,
+    MergeOutcome, SignedSyncEntry, StoreError, DEFAULT_MAX_BESTIARY_BLOB_BYTES,
+    DEFAULT_MAX_BESTIARY_ENTRIES, DEFAULT_MAX_BESTIARY_LOG_BYTES,
 };
 
 /// The `registry.op` schema string — the existing in-memory and durable stores both answer it

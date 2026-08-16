@@ -508,6 +508,7 @@ fn template_reverse_string(template_label: &str) -> AuthoringResponse {
             entrypoints: vec![Entrypoint {
                 name: "handle".to_string(),
                 signature: "(Envelope) -> Outcome".to_string(),
+                contract: None,
             }],
             capabilities: Capabilities::default(),
             provides: vec![],
@@ -554,6 +555,7 @@ fn template_fetch_url_title(template_label: &str) -> AuthoringResponse {
             entrypoints: vec![Entrypoint {
                 name: "handle".to_string(),
                 signature: "(Envelope) -> Outcome".to_string(),
+                contract: None,
             }],
             capabilities: Capabilities { net: NetCapability::Outbound, ..Default::default() },
             provides: vec![],

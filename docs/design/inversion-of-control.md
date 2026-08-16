@@ -8,7 +8,7 @@
 ## The principle
 
 A self-extending, AI-first substrate must let new models — for placement, admission, consensus,
-weighting, randomness, fitness, clock semantics, federation — be authored, deployed, and swapped
+weighting, randomness, fitness, scheduling, workflow, retry, clock semantics, federation — be authored, deployed, and swapped
 while the node runs. If the fabric bakes any of those in, the AI has to work around it; if the
 fabric *encodes* a particular one (which trust roots, which placement strategy, which fitness
 criterion), it has chosen sides among its own players. Both contradict the central axiom: GAWD
@@ -51,9 +51,9 @@ For any new concern, ask: **is this a mechanism, or a model?**
 The tell: if two reasonable operators would choose differently, it is a model, and the fabric must
 ship the socket instead of picking. The kernel is exactly three jobs — **lifecycle, routing,
 admission-mechanism** — and ships *no* placement, policy, consensus, weight, clock, fitness
-criterion, or randomness scheme. Everything woven on it — logging, transport, registry, the
-distributor, the authoring agent, the admission policy itself — is a hot-swappable creature. That is
-what keeps the kernel the fixed fabric an AI cannot re-author.
+criterion, scheduler, workflow, or randomness scheme. Everything woven on it — logging, transport,
+registry, the distributor, the authoring agent, the admission policy itself — is a hot-swappable
+creature. That is what keeps the kernel the fixed fabric an AI cannot re-author.
 
 ## Sockets are first-class
 
@@ -66,6 +66,13 @@ The role table generalizes the pattern: *any* role name is a socket. The shipped
 `control` — are each a concern the fabric refuses to model. `bind_role(role, id)` plugs a creature
 in; an unbound socket yields `NoProvider` rather than a default.
 
+The shared `gawdfn` application contract adds five more socket names without adding a kernel case:
+`function-home`, `function-executor`, `function-resolver`, `function-locator`, and
+`function-policy`. The first four name custody/execution mechanisms, and `function-policy` is where
+placement/retry judgment belongs. They all route through the same generic `Address::Role` table.
+Opaque value storage is presently the other supported injection form: `BlobAvailability` and
+`CheckpointBlobStore` trait objects supplied to the Home, not a phantom role with no message schema.
+
 Trust primitives ride every envelope structurally — `seq`, `stamp`, `sig`, `corr`, `commitment` —
 free of any specific model for what they *mean*. The fabric carries the order/permission/correlation
 material; a consumer's model decides how to weigh it.
@@ -77,6 +84,25 @@ canonical example: the kernel runs the mechanism (structural validation, signatu
 content-address recompute, artifact-hash check) and hands a `Admission` evidence record to an
 injected `Policy::admit`, which supplies the model — what to require, which roots to trust. The
 fabric ships the gate and the socket, never a worldview of its own.
+
+### The function/Job boundary: invariants versus intelligence
+
+The function system makes this split unusually important because a scheduler acts on durable
+authority. The fixed, cross-system side is `gawdfn`: immutable function identity, bounded versioned
+messages, signed records, legal Job states, attempt identity, caller-selected delivery mode, causal
+links, custody epochs, and canonical hashing. Alpha's reference home/executor/locator/blob organs
+implement the corresponding custody mechanisms: fsync-before-ack, dedup-before-execute,
+fail-closed recovery, signature/hash verification, and explicit same-epoch conflict. Replacing one is
+allowed, but an implementation must preserve those contract invariants; those are facts about the
+board, not strategy.
+
+Everything that chooses among valid facts stays authorable as a creature: alias ranking and trust,
+which deployment to use, scheduling, retry timing, priority, workflow/child orchestration,
+checkpoint cadence, result acceptance, retention, cost/data locality, and recovery escalation. The
+reference `policy-job-basic` is only a deterministic bounded filling. An AI may also author a new
+Function body (an ordinary creature) or inject a smarter blob backend. It does not need — and may not
+silently bypass — the home ledger's grant/custody rules to do so. This is how Alpha provides the
+mechanism while letting AIs author the operating system's intelligence.
 
 **Something-in-the-loop is just a creature** with the `net` capability. A bound resolver may answer
 instantly, cast a verifiable die, consult N somethings (humans, AIs, services, peers) and reconcile
@@ -131,6 +157,18 @@ intent ──▶ AUTHORING ──▶ source + manifest stub ──▶ BUILD ─�
   payload, authored source, generated dependency list/features, Cargo metadata fields, manifest-stub
   shape, compiler output capture, telemetry event text, and produced artifact bytes before those can
   amplify into filesystem writes, Cargo.toml generation, expensive compiler work, or bus replies.
+  Nested Cargo defaults to one build job and one codegen unit. Its target plus an isolated
+  `.cargo-home` (registry archives/indexes and unpacked sources included) share a finite 4 GiB default
+  budget, checked before the process, every ten seconds, and after exit with a bounded,
+  non-symlink-following traversal; accounting refusal is a non-retriable `Capacity` result. A
+  filesystem quota is still required for a strict hard cap because Cargo can write between samples.
+  A retained regular `.alpha-build-cargo.lock` serializes this complete preflight→Cargo→cleanup
+  interval across BuildCargo instances and Alpha processes. Acquisition polls without spinning and
+  consumes the same build timeout; Cargo's narrower target/package locks are integrity mechanisms,
+  not Alpha's resource-concurrency boundary.
+  The isolated home intentionally does not inherit the operator's global Cargo configuration,
+  credentials, or warmed registry cache; mirrors, offline operation, and authenticated/private
+  registries must be provisioned explicitly inside that budgeted boundary.
   `build-critter` is the sibling on the same socket for the scripted tier — it validates that Rhai
   source compiles and defines `fn handle(env)`, reuses the same manifest-stub shape gate before
   compiling, then signs the source bytes themselves as the artifact under `abi_tag = gawd_critter_v1`.
@@ -147,7 +185,11 @@ nothing new lands in the fabric. Three properties make the loop sound:
   `None` or `Custom(prefix)`; the operator prepends their containment vocabulary (`bwrap`,
   `firejail`, `docker run`, …) to the cargo argv. Build is a mechanism, sandbox is a model — the
   same lever, one level down. The seam is in the contract, not behind a feature flag: there is no
-  build that *can't* be sandboxed.
+  build that *can't* be sandboxed. On Unix the complete normal Cargo/compiler/linker tree inherits a
+  private process group. Timeout, accounting, or wait failure kills that group and reaps its leader;
+  after every ordinary success or compiler failure, Alpha also kills any residual group members
+  before it accounts the cache or accepts an artifact. A custom wrapper must not deliberately escape
+  that group; off Unix it must provide platform-native containment for the process tree itself.
 - **Compile failures are first-class.** `BuildReply::Failed { kind, stderr, … }` is the agent's
   input on retry. An LLM-backed agent reads the stderr; the templated agent flips a deterministic
   switch. Both honor the same contract, and a failed build never harms the node.

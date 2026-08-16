@@ -124,6 +124,16 @@ federation-scheduler = { path = "../creatures/federation-scheduler" }
 # carries a full turn → reply round-trip end to end through a real kernel.
 dialogue-initiator = { path = "../creatures/prototypes/dialogue/dialogue-initiator" }
 dialogue-responder = { path = "../creatures/prototypes/dialogue/dialogue-responder" }
+# Typed-function + durable-job composition: the shared wire contract, the reference home,
+# executor/resolver organs, and the deliberately simple injected placement/retry policy.
+gawdfn = { path = "../../foundation/gawdfn" }
+forge = { path = "../forge" }
+function-home = { path = "../creatures/function-home" }
+function-executor = { path = "../creatures/function-executor" }
+function-resolver = { path = "../creatures/function-resolver" }
+function-locator = { path = "../creatures/function-locator" }
+job-blob-fs = { path = "../creatures/job-blob-fs" }
+policy-job-basic = { path = "../creatures/prototypes/policies/policy-job-basic" }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 wat = "1"

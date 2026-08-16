@@ -5,11 +5,13 @@
 //! construction**: a freshly built [`rhai::Engine`] reaches nothing (no filesystem, network, clock,
 //! process, or rand — Rhai has no such builtins, and the `no_time` feature strips even
 //! `timestamp()`). We compile Rhai with `no_module` and additionally turn off runtime code-gen
-//! (`disable_symbol("eval")`) so a critter is exactly its signed, static source; the only host
-//! function we register is `emit`, whose effect is a [`Dispatch`] the kernel routes through the one
-//! capability-gated bus path. So `net:none` / `fs:[]` hold for a critter the same way they hold for a
-//! beast — properties of the loader, not runtime checks — and the router's `calls` gate
-//! applies unchanged at its single choke point.
+//! (`disable_symbol("eval")`) so a critter is exactly its signed, static source. Its only outward host
+//! function is `emit`, whose effect is a [`Dispatch`] the kernel routes through the one
+//! capability-gated bus path; `mem_get` / `mem_set` / `mem_del` expose only bounded, instance-local
+//! memory. The pure `json_parse` / `json_stringify` helpers only transform bounded values in memory;
+//! they confer no authority. So `net:none` / `fs:[]` hold for a critter the same way they hold for a
+//! beast — properties of the loader, not runtime checks — and the router's `calls` gate applies
+//! unchanged at its single choke point.
 //!
 //! Enforcement is the interpreter-limit mechanism, wired to the
 //! same budget-gradient surface as the beast: `capabilities.cpu_ms` becomes an
@@ -21,8 +23,8 @@
 //! **always installed** — a bounded [`DEFAULT_STRUCTURAL_CAP`] backstop when `mem_bytes` is unset
 //! (so one bulk-allocating builtin can't OOM the host past the op budget's reach), tightened to the
 //! declared value when set. A structural breach surfaces as a best-effort `Hard`/`Memory`
-//! [`BudgetSignal`] — **not** the byte-exact `ResourceLimiter` the beast tier has; `Wall`
-//! stays reserved.
+//! [`BudgetSignal`] — **not** the byte-exact `ResourceLimiter` the beast tier has. `wall_ms` is a
+//! live per-envelope cap sampled by the interpreter progress hook and surfaces as `Hard`/`Wall`.
 //!
 //! The artifact is UTF-8 Rhai **source text** (deterministic bytes, content-addressable, no
 //! interpreter-version serialization lock-in). A critter defines `fn handle(env)`; its return value
@@ -37,7 +39,9 @@ use aether::{
     Address, BudgetSignal, BudgetVector, Creature, CreatureCtx, CreatureId, Dispatch, Envelope,
     Intent, LimitKind, Outcome, Role, Topic,
 };
+use gawdfn::{FunctionCallMessageV1, Validate, MAX_JOB_MESSAGE_BYTES};
 use rhai::{Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, Map as RhaiMap, Scope, AST};
+use serde_json::Value as JsonValue;
 use sigil::{Backend, Manifest};
 
 use crate::{Artifact, BudgetControl, Engine, EngineError, LoadedModule};
@@ -98,6 +102,20 @@ pub const MAX_PERSIST_KEY_BYTES: usize = 256;
 /// build profiles and across the two engines. (Bounding parse depth also caps parser stack use.)
 pub const MAX_EXPR_DEPTH: usize = 64;
 pub const MAX_FN_EXPR_DEPTH: usize = 32;
+
+/// Hard byte ceiling for either side of one pure JSON conversion. The effective ceiling is the
+/// lower of this value and the critter's declared/default structural cap. JSON helpers execute as a
+/// host call (one interpreter operation), so they need their own byte/work bounds rather than
+/// relying on Rhai fuel alone.
+pub const MAX_JSON_BYTES: usize = 1024 * 1024;
+
+/// Maximum total values (objects, arrays, and leaves) traversed by one JSON helper call. This caps
+/// host-side work even for compact inputs such as deeply populated arrays.
+pub const MAX_JSON_NODES: usize = 65_536;
+
+/// Maximum JSON container nesting. Kept explicit and profile-independent just like the Rhai parser
+/// depth caps; it also keeps conversion recursion safely shallow.
+pub const MAX_JSON_DEPTH: usize = 64;
 
 /// The critter (script) engine. A unit struct on purpose: it carries no per-engine configuration, so
 /// every existing `Arc::new(ScriptEngine)` construction site stays untouched (the operation-budget
@@ -173,6 +191,8 @@ impl Engine for ScriptEngine {
         engine.set_max_string_size(cap);
         engine.set_max_array_size(cap);
         engine.set_max_map_size(cap);
+        register_json_helpers(&mut engine, cap.min(MAX_JSON_BYTES));
+        register_function_helpers(&mut engine);
         // Pin parse-time expression depth so it does not silently differ between debug and release (or
         // from `build-critter`'s author gate). See [`MAX_EXPR_DEPTH`].
         engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_FN_EXPR_DEPTH);
@@ -486,6 +506,178 @@ impl ScriptInstance {
     }
 }
 
+/// Register the critter's two pure JSON bridge functions. They intentionally accept/return text
+/// rather than blobs: typed application protocols are UTF-8 JSON, while byte-exact opaque payloads
+/// remain available as `env.payload`. Neither helper reaches an ambient service or retains state.
+fn register_json_helpers(engine: &mut RhaiEngine, byte_cap: usize) {
+    engine.register_fn(
+        "json_parse",
+        move |text: rhai::ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
+            parse_json(text.as_str(), byte_cap)
+                .map_err(|error| format!("json_parse: {error}").into())
+        },
+    );
+    engine.register_fn(
+        "json_stringify",
+        move |value: Dynamic| -> Result<String, Box<EvalAltResult>> {
+            stringify_json(&value, byte_cap)
+                .map_err(|error| format!("json_stringify: {error}").into())
+        },
+    );
+}
+
+/// Register the proof-bearing Function call gate used by critter adapters. It is pure verification:
+/// no key, bus, clock, store, or policy authority enters the script. A call is exposed as valid only
+/// when its exact Home-signed grant verifies and the authenticated local envelope route matches the
+/// grant-pinned executor and target CreatureIds.
+fn register_function_helpers(engine: &mut RhaiEngine) {
+    engine.register_fn(
+        "function_call_verify",
+        |text: rhai::ImmutableString,
+         from: rhai::ImmutableString,
+         to: rhai::ImmutableString|
+         -> Result<bool, Box<EvalAltResult>> {
+            verify_function_call_route(text.as_str(), from.as_str(), to.as_str())
+                .map_err(|error| format!("function_call_verify: {error}").into())
+        },
+    );
+}
+
+fn verify_function_call_route(text: &str, from: &str, to: &str) -> Result<bool, String> {
+    if text.len() > MAX_JOB_MESSAGE_BYTES {
+        return Err(format!("input is {} bytes, exceeds {MAX_JOB_MESSAGE_BYTES}", text.len()));
+    }
+    let message = serde_json::from_str::<FunctionCallMessageV1>(text)
+        .map_err(|error| format!("invalid Function call JSON: {error}"))?;
+    let FunctionCallMessageV1::Call { call } = message else {
+        return Ok(false);
+    };
+    call.validate().map_err(|error| error.to_string())?;
+    Ok(from == format!("creature:{}", call.executor_dispatch.payload.executor_creature)
+        && to == format!("creature:{}", call.executor_dispatch.payload.target_creature))
+}
+
+fn parse_json(text: &str, byte_cap: usize) -> Result<Dynamic, String> {
+    if text.len() > byte_cap {
+        return Err(format!("input is {} bytes, exceeds {byte_cap}", text.len()));
+    }
+    let value = serde_json::from_str::<JsonValue>(text)
+        .map_err(|error| format!("invalid JSON: {error}"))?;
+    let mut nodes = 0;
+    validate_json_value(&value, 0, &mut nodes)?;
+    rhai::serde::to_dynamic(value)
+        .map_err(|error| format!("cannot represent JSON in Rhai: {error}"))
+}
+
+fn stringify_json(value: &Dynamic, byte_cap: usize) -> Result<String, String> {
+    let mut nodes = 0;
+    validate_dynamic_json(value, byte_cap, 0, &mut nodes)?;
+    let value = rhai::serde::from_dynamic::<JsonValue>(value)
+        .map_err(|error| format!("value is not JSON-compatible: {error}"))?;
+    let encoded =
+        serde_json::to_string(&value).map_err(|error| format!("JSON encoding failed: {error}"))?;
+    if encoded.len() > byte_cap {
+        return Err(format!("output is {} bytes, exceeds {byte_cap}", encoded.len()));
+    }
+    Ok(encoded)
+}
+
+fn count_json_node(depth: usize, nodes: &mut usize) -> Result<(), String> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(format!("nesting exceeds {MAX_JSON_DEPTH} levels"));
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_JSON_NODES {
+        return Err(format!("value count exceeds {MAX_JSON_NODES}"));
+    }
+    Ok(())
+}
+
+fn validate_json_value(value: &JsonValue, depth: usize, nodes: &mut usize) -> Result<(), String> {
+    count_json_node(depth, nodes)?;
+    match value {
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::String(_) => Ok(()),
+        JsonValue::Number(number) => {
+            // Rhai's integer is i64. Refuse a JSON u64 that would otherwise become an opaque custom
+            // Dynamic (or lose precision as f64); floating-point JSON remains supported.
+            if number.as_i64().is_none() && number.as_u64().is_some() {
+                Err("integer is outside Rhai's signed 64-bit range".into())
+            } else if number.as_f64().is_some_and(f64::is_finite) {
+                Ok(())
+            } else {
+                Err("number is outside Rhai's finite numeric range".into())
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                validate_json_value(value, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        JsonValue::Object(values) => {
+            for value in values.values() {
+                validate_json_value(value, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_dynamic_json(
+    value: &Dynamic,
+    byte_cap: usize,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), String> {
+    count_json_node(depth, nodes)?;
+    // Shared Dynamics can be cyclic. JSON cannot, so refusing them before descending both preserves
+    // JSON semantics and prevents a hostile value from making host-side traversal recurse forever.
+    if value.is_shared() {
+        return Err("shared/cyclic values are not JSON-compatible".into());
+    }
+    if value.is_unit() || value.is_bool() || value.is_int() {
+        return Ok(());
+    }
+    if value.is_float() {
+        return value
+            .as_float()
+            .map_err(|actual| format!("expected float, got {actual}"))
+            .and_then(|number| {
+                number
+                    .is_finite()
+                    .then_some(())
+                    .ok_or_else(|| "non-finite floats are not JSON-compatible".into())
+            });
+    }
+    if value.is_string() {
+        let string = value
+            .as_immutable_string_ref()
+            .map_err(|actual| format!("expected string, got {actual}"))?;
+        return (string.len() <= byte_cap)
+            .then_some(())
+            .ok_or_else(|| format!("string is {} bytes, exceeds {byte_cap}", string.len()));
+    }
+    if value.is_array() {
+        let values =
+            value.as_array_ref().map_err(|actual| format!("expected array, got {actual}"))?;
+        for value in values.iter() {
+            validate_dynamic_json(value, byte_cap, depth + 1, nodes)?;
+        }
+        return Ok(());
+    }
+    if value.is_map() {
+        let values = value.as_map_ref().map_err(|actual| format!("expected map, got {actual}"))?;
+        for (key, value) in values.iter() {
+            if key.len() > byte_cap {
+                return Err(format!("object key is {} bytes, exceeds {byte_cap}", key.len()));
+            }
+            validate_dynamic_json(value, byte_cap, depth + 1, nodes)?;
+        }
+        return Ok(());
+    }
+    Err(format!("Rhai type `{}` is not JSON-compatible", value.type_name()))
+}
+
 /// `cpu_ms` → operation budget. `0` ⇒ `0`, which is Rhai's "unlimited" sentinel for
 /// `set_max_operations` (operator opt-out, mirroring the beast's unbounded-fuel default).
 fn budget_to_ops(cpu_ms: u64, ops_per_ms: u64) -> u64 {
@@ -505,7 +697,7 @@ fn crossed(consumed: u64, limit: u64, threshold_pct: u8) -> bool {
 /// `payload` (a Blob), `text` (a bounded lossy UTF-8 view of the payload — Rhai has no Blob→String
 /// builtin, so this is how a critter does string work), `text_truncated` (whether that view clipped
 /// the original bytes), `schema` (string), `from` (an address string the critter can echo back to
-/// `emit`), and `corr` (int, when present).
+/// `emit`), `to` (the local destination), and `corr` (int, when present).
 fn marshal_env(env: &Envelope, mem_cap: u64) -> Dynamic {
     let mut m = RhaiMap::new();
     m.insert("payload".into(), Dynamic::from_blob(env.payload.clone()));
@@ -518,6 +710,7 @@ fn marshal_env(env: &Envelope, mem_cap: u64) -> Dynamic {
     m.insert("text_truncated".into(), text_truncated.into());
     m.insert("schema".into(), env.header.schema.clone().into());
     m.insert("from".into(), addr_to_string(&env.header.from).into());
+    m.insert("to".into(), addr_to_string(&env.header.to).into());
     if let Some(corr) = env.header.corr {
         // Rhai's INT is i64; a corr above i64::MAX is exposed to the script as a wrapped negative.
         // Reply correlation is unaffected (`Dispatch::reply_to_env` copies the original u64), so this
@@ -646,6 +839,81 @@ mod tests {
         assert!(!crossed(89, 100, 90));
         assert!(crossed(90, 100, 90));
         assert!(crossed(100, 100, 0), "threshold 0 always crosses a capped, used budget");
+    }
+
+    #[test]
+    fn json_helpers_roundtrip_a_typed_call_and_preserve_the_attempt() {
+        let mut c = critter(
+            r#"
+            fn handle(env) {
+                let message = json_parse(env.text);
+                let invocation = message["call"];
+                let result = #{
+                    operation: "result",
+                    result: #{
+                        attempt: invocation.attempt,
+                        outcome: #{
+                            Ok: #{
+                                kind: "inline",
+                                value: #{ answer: invocation.input.value.value + 1 }
+                            }
+                        }
+                    }
+                };
+                json_stringify(result)
+            }
+            "#,
+        );
+        let request = br#"{"operation":"call","call":{"attempt":{"job":"job-dynamic","number":7},"function":{"manifest_content_address":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entrypoint":"add_one"},"input":{"kind":"inline","value":{"value":41}}}}"#;
+        let first = reply_text(&c.handle(mem_env(request)));
+        let second = reply_text(&c.handle(mem_env(request)));
+        assert_eq!(first, second, "same in-memory value has deterministic JSON bytes");
+        assert_eq!(
+            first,
+            r#"{"operation":"result","result":{"attempt":{"job":"job-dynamic","number":7},"outcome":{"Ok":{"kind":"inline","value":{"answer":42}}}}}"#,
+            "object keys serialize in deterministic lexical order"
+        );
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&first).expect("valid result JSON"),
+            serde_json::json!({
+                "operation": "result",
+                "result": {
+                    "attempt": { "job": "job-dynamic", "number": 7 },
+                    "outcome": {
+                        "Ok": { "kind": "inline", "value": { "answer": 42 } }
+                    }
+                }
+            }),
+            "the script copies the dynamic AttemptId verbatim into FunctionResultV1"
+        );
+    }
+
+    #[test]
+    fn json_helpers_enforce_bytes_depth_nodes_and_numeric_domain() {
+        assert!(parse_json("{}", 1).unwrap_err().contains("exceeds"));
+        assert!(parse_json("18446744073709551615", 64).unwrap_err().contains("signed 64-bit"));
+
+        let mut nested = JsonValue::Null;
+        for _ in 0..=MAX_JSON_DEPTH {
+            nested = JsonValue::Array(vec![nested]);
+        }
+        let mut nodes = 0;
+        assert!(validate_json_value(&nested, 0, &mut nodes).unwrap_err().contains("nesting"));
+
+        let many = JsonValue::Array(vec![JsonValue::Null; MAX_JSON_NODES]);
+        let mut nodes = 0;
+        assert!(validate_json_value(&many, 0, &mut nodes).unwrap_err().contains("value count"));
+    }
+
+    #[test]
+    fn json_stringify_rejects_non_json_rhai_values_and_oversized_output() {
+        assert!(stringify_json(&Dynamic::from_blob(vec![1, 2, 3]), 64)
+            .unwrap_err()
+            .contains("not JSON-compatible"));
+        assert!(stringify_json(&Dynamic::from("too long"), 4).unwrap_err().contains("exceeds"));
+        assert!(stringify_json(&Dynamic::from_float(f64::NAN), 64)
+            .unwrap_err()
+            .contains("non-finite"));
     }
 
     // ---- persistent critter memory (Tier-1 #2) -----------------------------------------------

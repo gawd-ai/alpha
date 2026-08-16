@@ -24,6 +24,7 @@
 //! [`Kernel`]: sanctum::Kernel
 
 pub mod demo;
+pub mod functions;
 pub mod http;
 pub mod mcp;
 pub mod node;

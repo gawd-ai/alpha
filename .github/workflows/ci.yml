@@ -5,24 +5,71 @@ on:
     branches: [ master ]
   pull_request:
 
+# A newer push supersedes an older candidate on the same ref. Never run two Wasmtime-heavy clean
+# workspaces concurrently for one branch, and never tag a commit whose run was cancelled by a newer
+# candidate (RELEASE.md's exact-run check fails closed in that case).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: "2"
+  CARGO_BUILD_JOBS: "1"
   # CI does clean builds, so incremental compilation only bloats the runner disk (it grows
   # `target/` with rebuild scaffolding that is never reused across a fresh job). Off.
   CARGO_INCREMENTAL: "0"
+  # Local profiles retain line tables for useful backtraces. The clean hosted gate has no reuse
+  # value for debug sections, and dozens of Wasmtime-linked integration binaries can otherwise
+  # exhaust the runner disk even though their executable behavior is identical.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_TEST_THREADS: "1"
 
 jobs:
   ci:
-    name: fmt · clippy · build · docs · test · package · demos
+    name: fmt · clippy · build · docs · test · demos
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Patch hygiene compares the checked-out commit (or PR merge commit) with its base.
+          fetch-depth: 2
 
-      # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
+      # Wasmtime's optional `parallel-compilation` feature creates a Rayon pool outside Cargo's
+      # one-job limit. Check the source declarations before compiling anything so resource-posture
+      # drift fails before it can fan out or populate a large target tree.
+      - name: Wasmtime serial-compilation guard
+        run: |
+          set -eu
+          declarations="$(find . -path ./target -prune -o -name Cargo.toml -type f \
+            -exec grep -lE '^[[:space:]]*wasmtime[[:space:]]*=' {} + | LC_ALL=C sort)"
+          test "$declarations" = "./cosmos/anima/Cargo.toml"
+          grep -Fqx \
+            'wasmtime = { version = "46.0.2", default-features = false, features = ["cranelift", "runtime"] }' \
+            cosmos/anima/Cargo.toml
+          if grep -Eq '^name = "rayon(-core)?"$' Cargo.lock; then
+            echo "Rayon entered Cargo.lock; refusing a compiler pool outside the one-CPU boundary" >&2
+            exit 1
+          fi
+
+      # rust-toolchain.toml selects the exact release toolchain + required components
+      # (rustfmt, clippy).
       # `rustup show` installs them on first use.
       - name: Set up Rust (from rust-toolchain.toml)
         run: rustup show
+
+      # Cargo's one build job does not constrain LLVM, the linker, or test subprocesses. Select the
+      # first CPU in this runner's allowed cpuset; every heavyweight command below starts through
+      # `taskset`, and its children inherit that affinity. This is a hard CPU boundary, unlike
+      # `nice`, and works when containers expose a non-zero-based cpuset (for example 8-15).
+      - name: Select one-CPU execution boundary
+        run: |
+          allowed="$(taskset -pc $$ | sed 's/^.*: //')"
+          first="${allowed%%[-,]*}"
+          test -n "$first"
+          taskset --cpu-list "$first" true
+          echo "ALPHA_CI_CPU=$first" >> "$GITHUB_ENV"
 
       # Cache only the cargo download caches — NOT `target/`. This workspace statically links
       # wasmtime into nearly every binary (~220 MB each with debuginfo), so a cached `target/` grows
@@ -41,56 +88,69 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      - name: Patch hygiene
+        run: git diff --check HEAD^ HEAD
+
       - name: Clippy (warnings are errors)
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --locked --workspace
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo build --locked --workspace
 
       - name: Docs (rustdoc warnings are errors)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+        run: |
+          taskset --cpu-list "$ALPHA_CI_CPU" env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+          # The documentation result has already been gated and no later phase consumes rendered
+          # HTML. Remove only this exact generated tree; keep compiled dependencies for tests/demos.
+          cargo clean --doc
 
       # The suite includes the composed end-to-end loops and the cargo-compile
-      # tests, so the first CI run is compile-heavy; subsequent runs hit the cache.
+      # tests, so the first compile in this job is heavy; later gates reuse this job's `target/`.
       - name: Test
-        run: cargo test --locked --workspace -- --test-threads=1
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked --workspace -- --test-threads=1
 
       # The α front door: a smoke test that the single entry point builds and dispatches.
       # `alpha node` / `alpha mcp` / `alpha demo` are exercised by the workspace tests above;
       # the standalone demo crates are gated below. `version` proves the front-door dispatch itself.
       - name: Front door — alpha version (the α entry point dispatches)
-        run: cargo run --locked -p alpha -- version
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p alpha -- version
+
+      - name: Fabric pole — omega version (the Ω entry point dispatches)
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p omega -- version
 
       # The onboarding demo is the first thing a newcomer runs; gate it in CI so it
       # can never silently rot. It drives a real author→compile→sign→load→run→migrate
       # loop (the authoring step shells out to cargo), so it is compile-heavy on a cold cache.
       - name: Demo — walkthrough (the onboarding loop runs end to end)
-        run: cargo run --locked -p walkthrough
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p walkthrough
 
       # The federation demo boots several Sanctums across 2–3 Realms over real loopback TCP and
       # narrates the cross-node + cross-Realm fabric; gate the default 2×2 so the multi-node path
       # can never silently rot. Fast (seconds) — no cargo authoring in this one.
       - name: Demo — federation (the multi-Realm fabric runs end to end)
-        run: cargo run --locked -p federation
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p federation
 
-      # The opt-in real-model author (`agent-mind`) lives behind `--features openai`, which links
-      # `ureq` + a ring-backed rustls TLS stack the default build never touches. Gate the feature so
-      # the cfg'd composition root (omni) and the creature can't silently rot. No live model call is
-      # made in CI (no network, no key) — this only compiles + clippies + unit-tests the feature.
-      - name: Clippy + test (the opt-in `openai` author feature)
+      # The opt-in real-model author (`agent-mind`) and `bestiary-live` model path live behind
+      # `--features openai`, which links `ureq` + a ring-backed rustls TLS stack the default build
+      # never touches. Gate those cfg branches so the composition roots and creatures cannot rot.
+      # No live model call is made in CI (no network, no key): this compiles, clippies, and runs the
+      # model-independent unit tests only.
+      - name: Clippy + test (the opt-in `openai` features)
         run: |
-          cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
-          cargo clippy --locked -p alpha --features openai -- -D warnings
-          cargo test --locked -p agent-mind --features openai
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p alpha --features openai -- -D warnings
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p bestiary-live --all-targets --features openai -- -D warnings
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked -p agent-mind --features openai -- --test-threads=1
 
   # Supply-chain + license gate (config in `deny.toml`). Runs in parallel with the build job:
   # a new dependency carrying a security advisory, an out-of-policy license, or an unexpected
-  # source fails CI rather than landing silently. `--features openai` is REQUIRED here: the modern
+  # source fails CI rather than landing silently. `--all-features` is REQUIRED here: the modern
   # cargo resolver prunes unused optional deps from `cargo metadata`, so without it the `ureq`/TLS/
   # ICU tree (Unicode-3.0, CDLA-Permissive-2.0) is invisible to the gate.
   deny:
     name: cargo-deny (advisories · bans · licenses · sources — incl. the openai tree)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2

@@ -34,9 +34,10 @@
 //!
 //! Static ports `19_910 / 19_911` so the test is trivially debuggable; explicitly distinct from
 //! `m2_two_node`'s `19_900 / 19_901` so the two suites can run in parallel without colliding.
-//! The build creature's cargo cache lives at
-//! `<root>/target/v01-build-cargo-cache` so it doesn't fight `m3_authoring_loop`'s cargo cache for
-//! the lockfile.
+//! Cargo-backed authoring tests share `<root>/target/gawd-build-cache`, avoiding a duplicate SDK
+//! artifact graph for every test binary. build-cargo's retained cache lock serializes every instance
+//! and process using that directory; Cargo's own target/package locks remain integrity guards, not
+//! the resource-concurrency boundary.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,11 +89,10 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Dedicated cargo cache for this test so it doesn't share a lockfile with `m3_authoring_loop`'s
-/// cache (`m3-build-cargo-cache`). Cold first build takes 30–60s for the transitive deps; warm
-/// reuses sit under 5s.
+/// Canonical authoring cache shared across tests/demos. Process-unique authored crate names and the
+/// serial repository defaults make reuse safe while avoiding another cold SDK dependency graph.
 fn shared_build_cache() -> PathBuf {
-    workspace_root().join("target").join("v01-build-cargo-cache")
+    workspace_root().join("target").join("gawd-build-cache")
 }
 
 // ----- signed-manifest helpers ------------------------------------------------------------------

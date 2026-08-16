@@ -14,6 +14,6 @@ send <id> "hello world"   (schema "world")   →   "yes"
 send <id> "hello world"   (schema "xyz")     →   "no"
 ```
 
-The honest **stateless** example: the engine gives each `handle` call a fresh scope, so a critter
-cannot accumulate state across messages — every answer derives only from *this* envelope. (`env.schema`
-is just a convenient second string to compare against; persistence is a `daemon`/`beast` concern.)
+The honest **stateless** example: every answer derives only from *this* envelope. Critters can retain
+bounded instance-local state explicitly through `mem_get` / `mem_set` / `mem_del`; `contains` does not.
+(`env.schema` is just a convenient second string to compare against.)

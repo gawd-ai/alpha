@@ -24,7 +24,7 @@ for a critter) are *separate* — the manifest describes and authorizes them.
 | `name` | string (**required**) | Creature name. |
 | `version` | string (**required**) | Semver string (validated non-empty; full semver later). |
 | `abi` | `{ backend, abi_tag, target[] }` | Execution tier + entry-boundary compatibility tag + opaque target labels. |
-| `entrypoints` | `[{ name, signature }]` | Advertised typed entries (e.g. `handle`). Each needs a non-empty `name` + `signature`; no duplicates. |
+| `entrypoints` | `[{ name, signature, contract? }]` | Advertised typed entries. `contract` is an optional `gawdfn::EntrypointContractV1`; names are unique. |
 | `capabilities` | `Capabilities` | What the creature may do (see below). Enforced only when an operator opts in. |
 | `requirements` | `Requirements` | What a host must offer (`accelerators`, `sensors`, `min_mem_bytes`, `connectivity?`, `jurisdiction?`). Matched by the Distributor against a node's embodiment. |
 | `provenance` | `Provenance` | Authorship + integrity: `author?` (the **Abode** public key), `source_hash?`, `build_hash?`, `signature?`, `realm?`. |
@@ -34,7 +34,8 @@ for a critter) are *separate* — the manifest describes and authorizes them.
 **`abi.backend`** is one of `daemon` (native `.so`), `beast` (WASM), or `critter` (Rhai script) —
 serialized lowercase. **`capabilities`** carries `fs[]`, `net` (`none` | `loopback` | `outbound` |
 `any`, default `none`), `cpu_ms`, `mem_bytes`, `calls[]` (which addresses/roles/intents it may send
-to — empty = unrestricted dev default), and the optional `budget_warn_at` threshold. Every
+to — empty = unrestricted dev default), optional `wall_ms`, and the optional `budget_warn_at`
+threshold. Every
 field except `name`/`version`/`abi` defaults, so a minimal manifest is small.
 
 ## Minimal valid manifest, per tier
@@ -73,6 +74,13 @@ Construct one in Rust with `Manifest::new(name, version, backend, abi_tag)` and 
 `Manifest::parse(bytes)` to validate untrusted JSON. Parsing is capped at 1 MiB and never panics:
 oversized or malformed input becomes a structured `ManifestError`. Structural validation also bounds
 metadata strings and repeated fields so a manifest remains metadata, not a bulk-data carrier.
+
+An entrypoint may append a machine-readable `contract` with bounded Draft 2020-12 input/output/error
+schemas, an effect declaration, and cooperative progress/steer/cancel/checkpoint flags. Function
+inputs have an object-root schema; outputs and errors may be any JSON value. This remains metadata:
+the engines still invoke the one `handle(Envelope)` ABI and an application adapter dispatches the
+entrypoint name. When `contract` is absent serde elides it, preserving legacy manifest and signing
+bytes exactly.
 
 ## Machine-readable schema
 

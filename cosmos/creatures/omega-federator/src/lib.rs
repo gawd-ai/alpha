@@ -55,7 +55,8 @@
 use std::collections::HashMap;
 
 use aether::{
-    Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, NodeId, Outcome, RealmId, Topic,
+    Address, Creature, CreatureCtx, CreatureId, Dispatch, Envelope, NodeId, Outcome, RealmId, Role,
+    Topic,
 };
 use bestiary::{artifact_hash_shape_error, QuarantineNotice, MAX_REGISTRY_SIGNAL_FIELD_BYTES};
 use registry_mem::{RegistryOp, RegistryReply};
@@ -219,10 +220,11 @@ impl ReputationWeigher for UnitWeigher {
 pub enum NoOmegaRouteReason {
     /// No peer mapped for the named Realm in the federator's view.
     UnmappedRealm,
-    /// The inner `target` names something this single-hop gateway can't reach: a nested federation
-    /// grain (Role/Topic/Intent/Realm/Omega), or a `Node` that isn't the Realm's gateway Sanctum
-    /// (reaching a non-gateway Sanctum inside the peer Realm needs an intra-Realm relay — a later
-    /// enhancement). `Creature(m)` and `Node(gateway, m)` are the forwarded forms.
+    /// The inner `target` names something this single-hop gateway can't reach: a bare ambient
+    /// capability or nested federation grain (Role/Topic/Intent/Realm/Omega), or a `Node`/`NodeRole`
+    /// that isn't the Realm's gateway Sanctum (reaching a non-gateway Sanctum inside the peer Realm
+    /// needs an intra-Realm relay — a later enhancement). `Creature(m)`, `Node(gateway, m)`, and
+    /// `NodeRole(gateway, role)` are the forwarded forms.
     UnsupportedTarget,
 }
 
@@ -445,6 +447,17 @@ impl OmegaFederator {
         }
     }
 
+    /// Capability counterpart to [`Self::addr_for`]. The exact mapped gateway node remains in the
+    /// cross-node address; a self mapping collapses to the ordinary local Role path and never loops
+    /// through a transport looking for a peer named self.
+    fn addr_for_role(&self, peer_node: &NodeId, role: Role) -> Address {
+        if *peer_node == self.cfg.self_node {
+            Address::Role(role)
+        } else {
+            Address::NodeRole(peer_node.clone(), role)
+        }
+    }
+
     fn me_id(&self) -> Option<CreatureId> {
         self.me
     }
@@ -495,15 +508,15 @@ impl OmegaFederator {
                 ));
             }
         };
-        // Resolve the inner target to a creature on the Realm's gateway Sanctum. `Creature(m)` names
-        // it directly; `Node(gateway, m)` names the same creature with the gateway Sanctum spelled
-        // out — the form a cross-Realm placement offer carries, since an offer tags the answering
-        // Sanctum's node. A `Node` naming a *non-gateway* Sanctum inside the peer Realm would need the
-        // gateway to relay intra-Realm — a later enhancement, not this single-hop path — so it's an
-        // honest no-route rather than a silent misdelivery.
-        let target_module = match target {
-            Address::Creature(m) => m,
-            Address::Node(ref n, m) if *n == peer => m,
+        // Resolve the inner target on the Realm's mapped gateway Sanctum. Creature/Node retain their
+        // numeric behavior. NodeRole is the only admitted capability form: spelling the exact mapped
+        // node prevents a bare `Omega(R, Role)` from becoming an ambient Realm-wide capability.
+        // A Node/NodeRole naming a non-gateway Sanctum would need an intra-Realm relay this single-hop
+        // gateway does not provide, so it remains an honest no-route.
+        let routed_target = match target {
+            Address::Creature(module) => self.addr_for(&peer, module),
+            Address::Node(ref node, module) if *node == peer => self.addr_for(&peer, module),
+            Address::NodeRole(ref node, role) if *node == peer => self.addr_for_role(&peer, role),
             other => {
                 return Outcome::send(self.no_route(
                     env,
@@ -511,17 +524,17 @@ impl OmegaFederator {
                     NoOmegaRouteReason::UnsupportedTarget,
                     Some(format!(
                         "omega-federator forwards `Omega(R, Creature(m))` or \
-                         `Omega(R, Node(gateway, m))`; got {other:?}"
+                         `Omega(R, Node(gateway, m))` or \
+                         `Omega(R, NodeRole(gateway, role))`; got {other:?}"
                     )),
                 ));
             }
         };
 
-        // Re-route Node(peer, target). Preserve reply_to / corr / schema / payload / commitment
-        // byte-for-byte so the eventual responder answers the *original* requester — exactly the
-        // realm-gateway discipline, so a cross-Realm SEER consult (placement, etc.) round-trips.
+        // Re-route the admitted exact target. Preserve reply_to / corr / schema / payload /
+        // commitment byte-for-byte so the eventual responder answers the *original* requester.
         let reply_to = env.reply_target();
-        let mut d = Dispatch::to(self.addr_for(&peer, target_module), env.payload.clone())
+        let mut d = Dispatch::to(routed_target, env.payload.clone())
             .with_schema(&env.header.schema)
             .with_reply_to(reply_to);
         if let Some(corr) = env.header.corr {
@@ -1483,6 +1496,71 @@ mod tests {
     }
 
     #[test]
+    fn omega_node_role_forwards_only_for_the_exact_mapped_gateway() {
+        let mut f = fed(0xB5);
+        let role = Role::new("function-executor");
+        let mut env = Envelope {
+            header: header(
+                Address::Omega {
+                    realm: RealmId::new("guests"),
+                    target: Box::new(Address::NodeRole(NodeId(PEER_NODE.into()), role.clone())),
+                },
+                "app.execute",
+                Some(17),
+            ),
+            payload: b"signed-application-proof".to_vec(),
+        };
+        env.header.commitment = Some("commitment".into());
+
+        let out = f.handle(env);
+
+        assert_eq!(out.dispatches.len(), 1);
+        let dispatch = &out.dispatches[0];
+        assert_eq!(
+            dispatch.to,
+            Address::NodeRole(NodeId(PEER_NODE.into()), role),
+            "Omega preserves the unresolved role for the destination transport"
+        );
+        assert_eq!(dispatch.schema, "app.execute");
+        assert_eq!(dispatch.payload, b"signed-application-proof");
+        assert_eq!(dispatch.corr, Some(17));
+        assert_eq!(dispatch.commitment.as_deref(), Some("commitment"));
+        assert_eq!(dispatch.reply_to, Some(Address::Creature(CreatureId(100))));
+    }
+
+    #[test]
+    fn omega_node_role_self_mapping_collapses_to_local_role() {
+        let mut realm_to_peer = HashMap::new();
+        realm_to_peer.insert(RealmId::new("local-alias"), NodeId(SELF_NODE.into()));
+        let mut f = OmegaFederator::new(FederatorConfig {
+            self_node: NodeId(SELF_NODE.into()),
+            self_realm: RealmId::new(SELF_REALM),
+            local_registry: REGISTRY,
+            abode_key: key(0xB6),
+            realm_to_peer,
+            weigher: Box::new(UnitWeigher),
+        });
+        f.set_me_for_tests(ME);
+        let role = Role::new("function-executor");
+        let env = Envelope {
+            header: header(
+                Address::Omega {
+                    realm: RealmId::new("local-alias"),
+                    target: Box::new(Address::NodeRole(NodeId(SELF_NODE.into()), role.clone())),
+                },
+                "app.execute",
+                Some(18),
+            ),
+            payload: b"proof".to_vec(),
+        };
+
+        let out = f.handle(env);
+
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].to, Address::Role(role));
+    }
+
+    #[test]
     fn omega_node_non_gateway_target_yields_unsupported_target() {
         // A `Node` inside the peer Realm that isn't its gateway Sanctum needs an intra-Realm relay
         // this single-hop gateway doesn't do — an honest no-route, never a silent misdelivery.
@@ -1500,6 +1578,28 @@ mod tests {
         };
         let d = &f.handle(env).dispatches[0];
         let reply: NoOmegaRouteReply = serde_json::from_slice(&d.payload).unwrap();
+        assert_eq!(reply.reason, NoOmegaRouteReason::UnsupportedTarget);
+    }
+
+    #[test]
+    fn omega_node_role_non_gateway_target_yields_unsupported_target() {
+        let mut f = fed(0xB7);
+        let env = Envelope {
+            header: header(
+                Address::Omega {
+                    realm: RealmId::new("guests"),
+                    target: Box::new(Address::NodeRole(
+                        NodeId("node-Z".into()),
+                        Role::new("function-executor"),
+                    )),
+                },
+                "app.execute",
+                Some(1),
+            ),
+            payload: b"x".to_vec(),
+        };
+        let dispatch = &f.handle(env).dispatches[0];
+        let reply: NoOmegaRouteReply = serde_json::from_slice(&dispatch.payload).unwrap();
         assert_eq!(reply.reason, NoOmegaRouteReason::UnsupportedTarget);
     }
 

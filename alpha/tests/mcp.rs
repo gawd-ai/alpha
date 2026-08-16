@@ -95,7 +95,7 @@ fn handshake_tools_list_and_unknown_method() {
     mcp.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let list = mcp.recv();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 19, "the tool catalog has 19 entries");
+    assert_eq!(tools.len(), 27, "the tool catalog has 27 entries");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     // TRD-003 R1: pin the EXACT catalog so an add/remove/rename is caught (not just the count). This
     // is the MCP column of the verb×surface parity matrix; `alpha_allow_ai` is deliberately absent
@@ -110,10 +110,18 @@ fn handshake_tools_list_and_unknown_method() {
         "alpha_bind",
         "alpha_cluster",
         "alpha_cluster_connect",
+        "alpha_function_deploy",
+        "alpha_function_deployments",
+        "alpha_function_resolve",
+        "alpha_function_undeploy",
         "alpha_intent",
         "alpha_journal",
         "alpha_list",
         "alpha_load",
+        "alpha_job_control",
+        "alpha_job_events",
+        "alpha_job_get",
+        "alpha_job_submit",
         "alpha_registry_fetch",
         "alpha_registry_fetch_load",
         "alpha_registry_list",
@@ -139,6 +147,14 @@ fn handshake_tools_list_and_unknown_method() {
         "alpha_registry_list",
         "alpha_registry_fetch_load",
         "alpha_bestiary_prove",
+        "alpha_function_deploy",
+        "alpha_function_resolve",
+        "alpha_function_undeploy",
+        "alpha_function_deployments",
+        "alpha_job_submit",
+        "alpha_job_get",
+        "alpha_job_events",
+        "alpha_job_control",
     ] {
         assert!(names.contains(&expected), "tool `{expected}` is in the catalog: {names:?}");
     }
@@ -165,6 +181,24 @@ fn handshake_tools_list_and_unknown_method() {
         json!(true),
         "registry fetch-load loads code, so it is a mutation, not read-only"
     );
+    for read in ["alpha_function_deployments", "alpha_job_get", "alpha_job_events"] {
+        let tool = tools.iter().find(|tool| tool["name"] == json!(read)).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], json!(true), "{read} is an ungated read");
+    }
+    for mutation in [
+        "alpha_function_resolve",
+        "alpha_function_deploy",
+        "alpha_function_undeploy",
+        "alpha_job_submit",
+        "alpha_job_control",
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == json!(mutation)).unwrap();
+        assert_ne!(
+            tool["annotations"]["readOnlyHint"],
+            json!(true),
+            "{mutation} is allow-AI gated"
+        );
+    }
 
     mcp.send(json!({ "jsonrpc": "2.0", "id": 3, "method": "frobnicate" }));
     let err = mcp.recv();

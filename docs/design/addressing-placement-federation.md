@@ -22,6 +22,7 @@ a federation-grain address is the *same* envelope as a local one, with one more 
 pub enum Address {
     Creature(CreatureId),          // identity: a specific local creature
     Node(NodeId, CreatureId),      // identity: a creature on a peer node, via the transport socket
+    NodeRole(NodeId, Role),        // capability: an explicitly exposed role on one exact peer node
     Kernel,                        // the kernel's own control surface
     Topic(Topic),                  // fan-out to every subscriber of a topic
     Role(Role),                    // capability: whoever is bound to this IoC socket
@@ -31,16 +32,24 @@ pub enum Address {
 }
 ```
 
-Two modes coexist. **Identity addressing** (`Creature` / `Node` / `Kernel` / `Topic`) names *this*
-creature or node. **Capability addressing** (`Role` / `Intent`) names *whoever* is bound to fill a
-concern — the IoC socket. Both are the same envelope, resolved differently by the router; an unbound
-capability address returns `NoProvider`, exactly as an unbound gateway does.
+Three local delivery shapes coexist. **Identity addressing** (`Creature` / `Node` / `Kernel`) names
+*this* creature or node. `Topic` fans out to every subscriber. **Capability addressing** (`Role` /
+`NodeRole` / `Intent`) names *whoever* is bound to fill a concern — the IoC socket. `NodeRole`
+narrows discovery to one exact node: the source sends it through transport, and the receiving
+attesting transport resolves only a host binding explicitly exposed with `Kernel::bind_remote_role`.
+That route is discovery, not end-to-end authority; application proofs still decide whether an
+operation is valid. These shapes use the same envelope and are resolved differently: an unbound
+`Role`/`Intent` returns `NoProvider`, while an unexposed or unbound `NodeRole` fails closed at the
+receiving transport.
 
-**`Realm` and `Omega` wrap an inner `target`.** Because the inner target is itself an `Address`, a
-Realm envelope can name any destination — a creature, a role, an intent, a topic — *inside* the
-named Realm. The gateway unwraps one layer and re-routes; `transport-tcp` never learns what a Realm
-is, because it only ever sees `Node(peer, m)` after the unwrap. This is the same composition-by-depth
-trick `Intent` and `Role` already use for capability addressing, lifted to federation depth.
+**`Realm` and `Omega` wrap an inner `target`.** Because the inner target is itself an `Address`, the
+wire shape can express any destination inside the named Realm. A gateway unwraps one layer and
+re-routes only the subset its implementation can reach. The reference `realm-gateway` forwards an
+inner `Creature(m)` as `Node(peer, m)`. `omega-federator` admits `Creature(m)`, an exact
+`Node(gateway, m)`, or an exact `NodeRole(gateway, role)` for the Realm's mapped gateway Sanctum;
+bare ambient capabilities and targets on another Sanctum fail closed. Consequently
+`transport-tcp` sees `Node` or `NodeRole`, never the `Realm`/`Omega` wrapper. This is the same
+composition-by-depth trick used for capability addressing, lifted to federation depth.
 
 **Nesting is bounded.** `MAX_ADDRESS_NESTING_DEPTH = 8` caps how many `Realm` / `Omega` wrappers an
 envelope may carry. Real federation uses one wrapper (`Realm(R, Creature(m))`) or two
@@ -150,26 +159,44 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
   the daemon's own key** (`ForeignAuthor`). The on-disk log is a self-owned journal, not a federation
   inbox: peer entries never arrive as foreign records replayed at bind — they arrive only through
   `PushEntries`, verified and **re-signed under the local identity** on ingest.
-- **Bounded by default, like the in-memory registry.** The durable store refuses new
-  `(RealmId, artifact_hash)` keys past `DEFAULT_MAX_BESTIARY_ENTRIES` and rejects an artifact above the
-  128 MiB ceiling, with `0` the explicit unbounded opt-out (`with_max_entries` / `with_max_artifact_bytes`);
-  published manifests are also re-run through `Manifest::validate`, whose metadata strings and lists
-  are capped before the store retains them. `recover()` replays an existing catalogue even above the
-  current cap. The JSONL journal itself is capped per record before append, compaction rewrite, and
-  recovery line allocation; the advisory `.head` tip hint is also read under a small cap and ignored
-  if malformed; artifacts live in blobs, never in log lines. The legacy `ListEntries` full-artifact
+- **Bounded by default, like the in-memory registry.** The durable store retains at most **1,024**
+  distinct `(RealmId, artifact_hash)` keys across live entries and permanent tombstones
+  (`DEFAULT_MAX_BESTIARY_ENTRIES`), rejects an artifact above the **128 MiB** ceiling, caps unique
+  physical blob files (including orphans) to that same 1,024-file ceiling and **4 GiB** aggregate
+  bytes (`DEFAULT_MAX_BESTIARY_BLOB_BYTES`), and caps durable JSONL across all Realms at **256 MiB**
+  (`DEFAULT_MAX_BESTIARY_LOG_BYTES`); each limit has an explicit `0` opt-out
+  (`with_max_entries` / `with_max_artifact_bytes` / `with_max_blob_bytes` /
+  `with_max_log_bytes`). Published manifests are also re-run through `Manifest::validate`, whose
+  metadata strings and lists are capped before the store retains them. The nonzero retained-key cap
+  also bounds physical blob-file count, including orphans, so tiny content cannot bypass the byte
+  budget through inode/metadata exhaustion. `recover()` fails closed if the retained-key,
+  physical-blob-count, aggregate-blob, or aggregate-journal cap is exceeded, and rejects symlink,
+  special, or otherwise unaccountable blob-directory entries. Each JSONL record is also capped before
+  append, compaction rewrite, and recovery line allocation; compaction dry-runs every Realm against
+  the planned aggregate before its first replacement and grows only one Realm buffer geometrically
+  at a time. Startup removes only exact regular Bestiary atomic-temp names.
+  Steady-state aggregate caps exclude atomic temps: a write can transiently require one additional
+  artifact (128 MiB by default) and compaction one additional rewritten Realm chain. An uncertain
+  append or partial compaction latches the store unhealthy; no reads, writes, compaction, or
+  replication proceed until a complete recovery re-establishes the catalog and chain heads. The
+  advisory `.head` tip hint is read under a small cap and ignored if malformed; artifacts live in
+  blobs, never in log lines. The legacy
+  `ListEntries` full-artifact
   anti-entropy reply, the daemon's autonomous `PushEntries` snapshot, and the curator's artifact-byte
   snapshot are also capped by total artifact bytes before the store reads/clones blobs into the
   payload. A `PushEntries` batch is count-capped before the daemon iterates entries or calls the store;
   the autonomous outbound batch uses the same count cap before blob stats/reads. Metadata lookup stays
   byte-light for catalog visibility, but fetch/GX planning separately proves the backing blob is under
   the active artifact cap before advertising bytes or chunks. The retained replication-peer list is
-  also capped and shape-checked at daemon construction. `0` in daemon config is the explicit
-  unbounded opt-out. A publish past the entry cap is a
+  also capped and shape-checked at daemon construction; `0` in that constructor's peer-limit
+  parameter is the explicit unbounded opt-out. A publish past the entry cap is a
   wire-honest error (not a false `Published`); a federation `PushEntries` of a *new* key into a full
   catalogue is skipped (best-effort lattice merge) rather than failing the whole batch.
   Quarantine markers use the same shared shape caps, and the durable store refuses a sticky
   attesting-peer union that would grow beyond the peer cap.
+  The opt-in `alpha node --functions` composition retains the local no-replication posture and runs
+  compaction only when the store became dirty, at most once per hour. It does not wake hourly to
+  rewrite an unchanged catalogue or silently invent federation peers.
 - **Verifiable entry proofs.** `ProveEntry` returns a standalone `EntryProof` — the daemon signs
   `(realm, artifact_hash, manifest_hash, first_seen, attester)` with its Abode key. Anyone verifies it
   with the attester's pubkey, and because it commits to the compaction-stable `first_seen` rather than a
@@ -203,6 +230,39 @@ Pull-based federation applies the same content-address discipline before it writ
 `artifact_hash` is not canonical lowercase SHA-256 or does not match `sha256(artifact_bytes)`, and
 only then emits a realm-scoped `Publish` plus any reputation/quarantine re-apply ops. A malformed peer catalog
 therefore cannot use anti-entropy to smuggle an inconsistent registry row into the local Bestiary.
+
+The Bestiary is also the durable **deployment artifact** plane for typed Functions: an explicit
+deployment references one immutable manifest content address, entrypoint, and artifact hash, and may
+carry an `EntryProof`. It is deliberately **not** the mutable Job database. Bestiary operations form a
+catalogue/curation lattice and foreign sync entries are verified then re-signed into the local
+journal; a Job needs ordered attempts, cancellation races, and preservation of the executor's original
+foreign signed receipt. Those facts live in the function home/executor ledgers described in
+[`functions-and-jobs.md`](functions-and-jobs.md#two-ledgers-one-authority-for-each-fact).
+
+## Function resolution, placement, and location
+
+A typed Function adds three separate questions; collapsing them would let a model silently rewrite
+identity:
+
+1. **Definition:** `function-resolver` maps an exact
+   `(Realm, name, version, entrypoint)` alias to one immutable
+   `FunctionId { manifest_content_address, entrypoint }` and artifact hash from Bestiary metadata. It
+   collapses identical replicated rows and rejects zero or multiple distinct matches. It does not rank
+   by reputation, freshness, price, or fitness.
+2. **Deployment/attempt placement:** a creature bound to `function-policy` selects among admissible
+   live deployment receipts and decides retries, cost/data locality, priority, and workflow. The
+   reference `policy-job-basic` is deterministic and bounded; an AI-authored scheduler can replace it.
+   The selected alias resolution and deployment are pinned in the accepted Job before any grant, so a
+   later alias update cannot change a running Job.
+3. **Home location:** `function-locator` verifies signed `HomeLeaseV1` observations. A higher custody
+   epoch supersedes a lower one. Within an epoch, only a strictly higher-sequence coordinator refresh
+   may replace a lease when Home, epoch, Realm/node, authority, custody/handoff, checkpoint, and time
+   observations are identical. Every other divergence is `Conflict`; sequence never permits a
+   location or authority rewrite. Discovery/gossip and expiry policy remain replaceable.
+
+Current Omega routing still needs a configured Realm gateway and explicit inner creature/role target;
+it is not a universal `HomeId → Address` service. The locator role and
+`gawd.function.locate.v1` schema make that future mechanism composable without adding a router case.
 
 ## Embodiment and placement: the Distributor
 
@@ -342,9 +402,12 @@ existing wire — registry ops for catalog sync, the SEER `consensus` topic for 
 four things, and admission gates them all:
 
 1. **Cross-Realm routing.** An `Omega { realm, target: Creature(m) }` envelope resolves `realm → peer`
-   and re-routes `Node(peer, m)`, preserving `reply_to` / `corr` / `schema` / `payload` /
-   `commitment` byte-for-byte — the same composition-by-depth as the realm gateway. An unmapped Realm
-   or non-creature target yields a structured `omega.no_route` reply.
+   and re-routes `Node(peer, m)`. Exact `Node(peer, m)` and `NodeRole(peer, role)` targets are also
+   admitted when `peer` is that Realm's mapped gateway Sanctum; the latter stays `NodeRole` so the
+   receiving attesting transport resolves only an explicitly remote-exposed host binding. Every form
+   preserves `reply_to` / `corr` / `schema` / `payload` / `commitment` byte-for-byte — the same
+   composition-by-depth as the realm gateway. An unmapped Realm, a bare ambient capability, or a
+   target on a different Sanctum yields a structured `omega.no_route` reply.
 2. **Pull-based anti-entropy.** A `PullFrom` control op sends `RegistryOp::ListEntries` to a peer's
    registry and merges the returned catalog into the *local* registry through the existing
    realm-scoped `Publish` write path. The merge is **pinned to the requested Realm**, not the Realm a peer
@@ -383,11 +446,11 @@ primitives; the *models* over them are injected per deployment.
 | Primitive | Answers | Carried by |
 |---|---|---|
 | **time** | when, in what unfolding | `stamp` (prefer logical/causal over a wall clock) |
-| **order / sequence** | who acted first; causality | `seq` / `causal`, the hash-chained journal |
+| **order / sequence** | who acted first; causality | envelope `seq`; explicit signed hash-chained application logs where durability is required |
 | **weight** | how much a party counts | reputation earned over history (the registry slot) |
 | **consensus** | what we agree is true | the SEER `consensus` topic |
 | **permission** | who authorized; is it them | `sig` — provenance + signature |
-| **history** | the honest record of before | the registry lineage + the journal |
+| **history** | the honest record of before | registry lineage and durable application ledgers; the router journal is only a bounded diagnostic window |
 | **verifiable randomness** | is a "random" value truly random | the `commitment` slot |
 
 GAWD makes these *expressible*; it dictates none of their meaning. No measure of time is mandated, no

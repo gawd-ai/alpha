@@ -4,6 +4,6 @@
 # `use_small_heuristics = "Max"` packs structs/calls/arrays onto a single line up to
 # `max_width` instead of stock rustfmt's narrower per-construct thresholds — this is
 # what matches the way the substrate was written. Both options are stable, so
-# `cargo fmt --check` works on the pinned stable toolchain (no nightly required).
+# `cargo fmt --check` works on the pinned release toolchain (no nightly required).
 max_width = 100
 use_small_heuristics = "Max"

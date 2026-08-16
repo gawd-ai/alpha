@@ -50,14 +50,21 @@ fn control_payload(
     corr: u64,
     payload: Vec<u8>,
 ) -> VerbResult {
+    let reply_capability = format!("control-test-capability-{corr}");
     bus.send(
         Dispatch::to(Address::Role(Role::new(Role::CONTROL)), payload)
             .with_schema(CONTROL_SCHEMA)
             .with_reply_to(Address::Creature(probe_id))
-            .with_corr(corr),
+            .with_corr(corr)
+            .with_commitment(reply_capability.clone()),
     )
     .expect("control envelope routes to Role::CONTROL");
     let reply = recv_corr(rx, corr, Duration::from_secs(20)).expect("a VerbResult reply");
+    assert_eq!(
+        reply.header.commitment.as_deref(),
+        Some(reply_capability.as_str()),
+        "ControlCore must echo the opaque request capability on every reply"
+    );
     serde_json::from_slice::<VerbResult>(&reply.payload).expect("payload is a VerbResult")
 }
 
@@ -76,6 +83,51 @@ impl Creature for LargeReply {
     fn bind(&mut self, _ctx: CreatureCtx) {}
     fn handle(&mut self, env: Envelope) -> Outcome {
         Outcome::reply(&env, vec![b'a'; MAX_PRESENTED_PAYLOAD_BYTES + 1])
+    }
+}
+
+struct LateThenCorrect {
+    bus: Option<Arc<dyn aether::Bus>>,
+    seen: usize,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl LateThenCorrect {
+    fn new() -> Self {
+        Self { bus: None, seen: 0, workers: Vec::new() }
+    }
+}
+
+impl Creature for LateThenCorrect {
+    fn bind(&mut self, ctx: CreatureCtx) {
+        self.bus = Some(ctx.bus);
+    }
+
+    fn handle(&mut self, env: Envelope) -> Outcome {
+        self.seen += 1;
+        let (delay, payload) = if self.seen == 1 {
+            (Duration::from_millis(2_200), b"late-first".to_vec())
+        } else {
+            (Duration::from_millis(500), b"second-correct".to_vec())
+        };
+        let bus = self.bus.as_ref().expect("bound test creature").clone();
+        let reply_to = env.reply_target();
+        let corr = env.header.corr;
+        self.workers.push(std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let mut dispatch = Dispatch::to(reply_to, payload);
+            if let Some(corr) = corr {
+                dispatch = dispatch.with_corr(corr);
+            }
+            let _ = bus.emit(dispatch);
+        }));
+        Outcome::none()
+    }
+
+    fn shutdown(&mut self, _deadline: aether::Deadline) {
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -140,6 +192,35 @@ fn sequential_worker_jobs_each_get_their_own_reply() {
         Some("two"),
         "second send: {:?}",
         b.json
+    );
+
+    kernel.shutdown_all(aether::Deadline::default());
+}
+
+#[test]
+fn late_timed_out_reply_cannot_satisfy_the_next_worker_job() {
+    let (kernel, _ai) = node(true);
+    let target = kernel
+        .load_instance(
+            Manifest::new("late-then-correct", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+            Box::new(LateThenCorrect::new()),
+        )
+        .expect("delayed responder loads");
+
+    let first =
+        control(&kernel, 20, &Verb::Send { id: target.0, text: "first".into(), node: None });
+    assert_eq!(first.json.get("timeout").and_then(|value| value.as_bool()), Some(true));
+
+    // The first response arrives 200 ms into this second wait. With the old per-VerbCtx reset both
+    // internal requests used corr=1, so that stale payload won the race. The worker now carries one
+    // monotonic cursor across jobs and waits through corr=1 for the real corr=2 response.
+    let second =
+        control(&kernel, 21, &Verb::Send { id: target.0, text: "second".into(), node: None });
+    assert_eq!(
+        second.json.get("reply").and_then(|value| value.as_str()),
+        Some("second-correct"),
+        "late reply from the timed-out first job must remain ineligible: {:?}",
+        second.json
     );
 
     kernel.shutdown_all(aether::Deadline::default());

@@ -64,10 +64,15 @@ fn a_reload_loop_1000x_alternating_versions_freshness_and_rss_stability() {
     let k = kernel();
     let (probe, bus, rx) = k.open_endpoint(Capabilities::default());
 
-    // The artifacts are owned once — `Clone` (F14) lets the loop reuse them each cycle without
-    // re-allocating PathBuf or copying bytes.
-    let v1 = Artifact::Path(v1_so);
-    let v2 = Artifact::Path(v2_so);
+    // Pre-stage each version once. On Linux these are immutable sealed memfds, so `Clone` (F14)
+    // safely reuses one exact-byte capability without copying ~21 GB across the 1000-cycle proof.
+    // The loader still performs a fresh dlopen/dlclose each cycle; the alternating behavior below
+    // proves it does not confuse the two capabilities. Other targets defensively restage their
+    // read-only tempfile fallback at each Kernel boundary.
+    let v1_manifest = daemon_manifest("echo-daemon");
+    let v2_manifest = daemon_manifest("echo-daemon-v2");
+    let v1 = Artifact::Path(v1_so).prepare_for_load(&v1_manifest).expect("pre-stage v1");
+    let v2 = Artifact::Path(v2_so).prepare_for_load(&v2_manifest).expect("pre-stage v2");
 
     const CYCLES: usize = 1000;
     const WARMUP: usize = 100;
@@ -81,9 +86,9 @@ fn a_reload_loop_1000x_alternating_versions_freshness_and_rss_stability() {
     for cycle in 0..CYCLES {
         let (manifest, artifact, expected_suffix): (Manifest, &Artifact, &[u8]) = if cycle % 2 == 0
         {
-            (daemon_manifest("echo-daemon"), &v1, b"") // v1: plain reversal
+            (v1_manifest.clone(), &v1, b"") // v1: plain reversal
         } else {
-            (daemon_manifest("echo-daemon-v2"), &v2, b"\x02") // v2: reversal + sentinel
+            (v2_manifest.clone(), &v2, b"\x02") // v2: reversal + sentinel
         };
         let id = k
             .load(manifest, artifact.clone())

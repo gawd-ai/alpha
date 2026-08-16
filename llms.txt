@@ -36,4 +36,6 @@ realm-scale concepts, and the broader objective say GAWD.
 
 ## Browse the code
 - `cosmos/creatures/` production-capable organs ([index](cosmos/creatures/README.md)) · `cosmos/creatures/prototypes/<seam>/` injected models ([legend](cosmos/creatures/prototypes/README.md)) · `cosmos/creatures/prototypes/fixtures/` test specimens.
-- API docs: `cargo doc --workspace --no-deps --open` (every crate carries `//!` docs).
+- API docs: `cargo doc -p <crate> --no-deps --open` (every crate carries `//!` docs). Keep local
+  checks focused; the full workspace documentation gate runs once for the exact release commit in
+  resource-constrained CI.

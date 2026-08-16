@@ -3,19 +3,24 @@
 //! Each `creatures/prototypes/critters/<name>/<name>.rhai` is the cheap, no-compiler on-ramp to authoring (the
 //! sibling of the reference `echo-critter`). This suite is ALSO the compile+run proof of every Rhai
 //! builtin the examples use — `to_upper`, `.contains`, `.split`, object maps, the `in` operator, blob
-//! ops, and `emit` — plus the `env.text` marshalling. If the engine surface ever drifts, one of these
-//! trips here rather than silently in a user's first critter.
+//! ops, `emit`, and bounded JSON conversion — plus the `env.text` marshalling. If the engine surface
+//! ever drifts, one of these trips here rather than silently in a user's first critter.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aether::{Address, CreatureId, Deadline, Dispatch, StubSigner, StubVerifier, Topic};
-use anima::{Artifact, NativeEngine, ScriptEngine, WasmEngine};
+use anima::{Artifact, NativeEngine, ScriptEngine, WasmEngine, CRITTER_ABI_TAG};
+use gawdfn::{
+    canonical_hash, AbodeKeyBindingV1, AttemptId, AuthoritySigner, DeliveryModeV1, DeploymentId,
+    DeploymentReceiptV1, Ed25519SeedSigner, ExecutionGrantV1, ExecutorDispatchV1,
+    FunctionCallMessageV1, FunctionCallV1, FunctionId, HomeAuthorityV1, HomeId, JobId,
+    OperationalCapabilityV1, OperationalKeyGrantV1, SignedRecordV1, Validate, ValueRefV1,
+    SCHEMA_CALL_V1, SCHEMA_EXECUTE_V1, SCHEMA_FUNCTION_DEPLOY_V1, SCHEMA_HOME_V1,
+};
 use policy_dev::DevPolicy;
 use sanctum::Kernel;
 use sigil::{Backend, Capabilities, Manifest};
-
-const CRITTER_ABI_TAG: &str = "gawd_critter_v1";
 
 fn kernel() -> Arc<Kernel> {
     Kernel::new(
@@ -54,6 +59,113 @@ fn ask(k: &Arc<Kernel>, target: CreatureId, payload: &[u8], schema: &str) -> Vec
     )
     .expect("send to critter");
     rx.recv_timeout(Duration::from_secs(2)).expect("critter reply arrives").payload
+}
+
+fn signed_add_one_call(
+    executor_route: CreatureId,
+    target: CreatureId,
+) -> (AttemptId, FunctionCallMessageV1) {
+    let root = Ed25519SeedSigner::from_seed([81; 32]).expect("root seed");
+    let operational = Ed25519SeedSigner::from_seed([82; 32]).expect("operational seed");
+    let executor = Ed25519SeedSigner::from_seed([83; 32]).expect("executor seed");
+    let home = HomeId::new(root.public_key());
+    let authority = HomeAuthorityV1 {
+        abode: SignedRecordV1::sign(
+            SCHEMA_HOME_V1,
+            AbodeKeyBindingV1 {
+                abode: home.clone(),
+                root_public_key: root.public_key().into(),
+                issued_at_unix_ms: None,
+            },
+            &root,
+        )
+        .expect("Abode root binding"),
+        operational: SignedRecordV1::sign(
+            SCHEMA_HOME_V1,
+            OperationalKeyGrantV1 {
+                home: home.clone(),
+                epoch: 1,
+                operational_public_key: operational.public_key().into(),
+                valid_from_unix_ms: None,
+                expires_at_unix_ms: None,
+                capabilities: vec![OperationalCapabilityV1::JobHome],
+                evidence: vec![],
+            },
+            &root,
+        )
+        .expect("operational Home grant"),
+        prepared: None,
+    };
+    let function = FunctionId {
+        manifest_content_address: format!("sha256:{}", "a".repeat(64)),
+        entrypoint: "add_one".into(),
+    };
+    let attempt = AttemptId { home: home.clone(), job: JobId::new("job-from-executor"), number: 7 };
+    let deployment = SignedRecordV1::sign(
+        SCHEMA_FUNCTION_DEPLOY_V1,
+        DeploymentReceiptV1 {
+            deployment: DeploymentId::new("typed-add-one-critter-test"),
+            function: function.clone(),
+            artifact_hash: format!("sha256:{}", "b".repeat(64)),
+            realm: "test-realm".into(),
+            node: "test-node".into(),
+            executor: executor.public_key().into(),
+            executor_creature: executor_route.0.to_string(),
+            creature: target.0.to_string(),
+            evidence: vec![],
+            registered_at_unix_ms: None,
+        },
+        &executor,
+    )
+    .expect("executor-signed deployment");
+    let input = ValueRefV1::Inline { value: serde_json::json!({ "value": 41 }) };
+    let grant = SignedRecordV1::sign(
+        SCHEMA_EXECUTE_V1,
+        ExecutionGrantV1 {
+            attempt: attempt.clone(),
+            request_hash: format!("sha256:{}", "c".repeat(64)),
+            home_epoch: 1,
+            home_route_sequence: 1,
+            home_realm: "test-realm".into(),
+            home_node: "home-node".into(),
+            home_coordinator: "1".into(),
+            owner: home,
+            authority,
+            function: function.clone(),
+            deployment,
+            input: input.clone(),
+            delivery: DeliveryModeV1::AtMostOnce,
+            grant_sequence: 1,
+            issued_at_unix_ms: None,
+            deadline_unix_ms: None,
+        },
+        &operational,
+    )
+    .expect("Home-signed execution grant");
+    let executor_dispatch = SignedRecordV1::sign(
+        SCHEMA_CALL_V1,
+        ExecutorDispatchV1 {
+            attempt: attempt.clone(),
+            grant_hash: canonical_hash(&grant).expect("grant hash"),
+            deployment: grant.payload.deployment.payload.deployment.clone(),
+            executor_creature: executor_route.0.to_string(),
+            target_creature: target.0.to_string(),
+        },
+        &executor,
+    )
+    .expect("current executor route proof");
+    (
+        attempt.clone(),
+        FunctionCallMessageV1::Call {
+            call: Box::new(FunctionCallV1 {
+                attempt,
+                function,
+                input,
+                grant: Box::new(grant),
+                executor_dispatch,
+            }),
+        },
+    )
 }
 
 #[test]
@@ -122,6 +234,71 @@ fn route_by_prefix_critter_emits_to_the_prefixed_address() {
     let got = rx.recv_timeout(Duration::from_secs(2)).expect("the emit lands on topic:fitness");
     assert_eq!(got.payload, b"log:hi");
 
+    k.shutdown_all(Deadline::default());
+}
+
+#[test]
+fn typed_add_one_critter_returns_a_valid_result_for_the_dynamic_attempt() {
+    let k = kernel();
+    let id = load(
+        &k,
+        "typed-add-one",
+        include_bytes!("../../creatures/prototypes/critters/typed-add-one/typed-add-one.rhai"),
+    );
+    let (executor_route, bus, rx) = k.open_endpoint(Capabilities::default());
+    let (attempt, message) = signed_add_one_call(executor_route, id);
+    bus.send(
+        Dispatch::to(Address::Creature(id), aether::wire::to_bytes(&message))
+            .with_reply_to(Address::Creature(executor_route))
+            .with_schema(SCHEMA_CALL_V1),
+    )
+    .expect("executor sends proof-bearing call");
+    let reply =
+        rx.recv_timeout(Duration::from_secs(2)).expect("valid proof-bearing call replies").payload;
+    let result = serde_json::from_slice::<FunctionCallMessageV1>(&reply).expect("typed JSON reply");
+    result.validate().expect("reply satisfies the frozen Function call contract");
+    match result {
+        FunctionCallMessageV1::Result { result } => {
+            assert_eq!(
+                result.attempt, attempt,
+                "AttemptId is copied, never invented by the script"
+            );
+            assert_eq!(
+                result.outcome,
+                Ok(ValueRefV1::Inline { value: serde_json::json!({ "answer": 42 }) })
+            );
+        }
+        other => panic!("expected FunctionResultV1, got {other:?}"),
+    }
+
+    let (forged_sender, forged_bus, forged_rx) = k.open_endpoint(Capabilities::default());
+    forged_bus
+        .send(
+            Dispatch::to(Address::Creature(id), aether::wire::to_bytes(&message))
+                .with_reply_to(Address::Creature(forged_sender))
+                .with_schema(SCHEMA_CALL_V1),
+        )
+        .expect("deliver wrong-sender specimen");
+    assert!(
+        forged_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a valid captured call arriving from another creature is not exposed to the script"
+    );
+
+    let mut tampered = message;
+    let FunctionCallMessageV1::Call { call } = &mut tampered else {
+        unreachable!("fixture is a call")
+    };
+    call.grant.payload.input = ValueRefV1::Inline { value: serde_json::json!({ "value": 99 }) };
+    bus.send(
+        Dispatch::to(Address::Creature(id), aether::wire::to_bytes(&tampered))
+            .with_reply_to(Address::Creature(executor_route))
+            .with_schema(SCHEMA_CALL_V1),
+    )
+    .expect("deliver tampered-grant specimen");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a grant whose signed payload was altered is not exposed to the script"
+    );
     k.shutdown_all(Deadline::default());
 }
 

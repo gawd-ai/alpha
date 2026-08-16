@@ -19,7 +19,9 @@
 
 use aether::{Creature, CreatureCtx, Dispatch, Envelope, Outcome};
 use build_cargo::{validate_manifest_stub_shape, BuildErrorKind, BuildReply, ManifestStub};
+use rhai::{Dynamic, Engine as RhaiEngine, EvalAltResult};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sigil::crypto::hex_encode;
 use sigil::{Abi, Backend, Ed25519KeyMaterial, Manifest, Provenance};
@@ -39,6 +41,14 @@ const MAX_BUILD_CRITTER_OP_BYTES: usize = 8 * 1024 * 1024;
 /// A critter ships as source text. Keep this roomy for generated scripts but reject pathological
 /// model output before Rhai parsing/compilation.
 const MAX_CRITTER_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// Keep the author gate's pure-host surface and pressure bounds byte-for-byte aligned in meaning
+/// with `anima::ScriptEngine`. These values are duplicated here to avoid making the small no-cargo
+/// builder depend on anima's full Wasmtime runtime graph; the real-Kernel integration test is the
+/// executable drift guard.
+const DEFAULT_STRUCTURAL_CAP: u64 = 1024 * 1024;
+const MAX_JSON_BYTES: usize = 1024 * 1024;
+const MAX_JSON_NODES: usize = 65_536;
+const MAX_JSON_DEPTH: usize = 64;
 
 /// What an authoring agent sends to build a critter — the no-cargo analog of
 /// [`build_cargo::BuildOp`]. A `#[serde(tag = "op")]` enum so future ops land additively.
@@ -112,6 +122,17 @@ impl BuildCritter {
         // release. Rhai's defaults are halved in debug builds, so without this the gate and the loader
         // could disagree across profiles. Keep these two values identical to `ScriptEngine`.
         engine.set_max_expr_depths(64, 32);
+        let structural_cap = if stub.capabilities.mem_bytes > 0 {
+            stub.capabilities.mem_bytes
+        } else {
+            DEFAULT_STRUCTURAL_CAP
+        };
+        let structural_cap = usize::try_from(structural_cap).unwrap_or(usize::MAX);
+        engine.set_max_string_size(structural_cap);
+        engine.set_max_array_size(structural_cap);
+        engine.set_max_map_size(structural_cap);
+        register_json_helpers(&mut engine, structural_cap.min(MAX_JSON_BYTES));
+        register_function_helpers(&mut engine);
         let ast = match engine.compile(source) {
             Ok(ast) => ast,
             Err(e) => {
@@ -215,6 +236,173 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(hasher.finalize().as_slice())
 }
 
+/// Register exactly the same pure JSON host calls as `anima::ScriptEngine`. Keeping the actual
+/// conversions here (not placeholder signatures) makes the author-time engine an honest mirror if
+/// validation grows to evaluate fixtures later; neither function has I/O, clock, random, or bus
+/// authority.
+fn register_json_helpers(engine: &mut RhaiEngine, byte_cap: usize) {
+    engine.register_fn(
+        "json_parse",
+        move |text: rhai::ImmutableString| -> Result<Dynamic, Box<EvalAltResult>> {
+            parse_json(text.as_str(), byte_cap)
+                .map_err(|error| format!("json_parse: {error}").into())
+        },
+    );
+    engine.register_fn(
+        "json_stringify",
+        move |value: Dynamic| -> Result<String, Box<EvalAltResult>> {
+            stringify_json(&value, byte_cap)
+                .map_err(|error| format!("json_stringify: {error}").into())
+        },
+    );
+}
+
+fn register_function_helpers(engine: &mut RhaiEngine) {
+    engine.register_fn(
+        "function_call_verify",
+        |text: rhai::ImmutableString,
+         from: rhai::ImmutableString,
+         to: rhai::ImmutableString|
+         -> Result<bool, Box<EvalAltResult>> {
+            verify_function_call_route(text.as_str(), from.as_str(), to.as_str())
+                .map_err(|error| format!("function_call_verify: {error}").into())
+        },
+    );
+}
+
+fn verify_function_call_route(text: &str, from: &str, to: &str) -> Result<bool, String> {
+    use gawdfn::{FunctionCallMessageV1, Validate, MAX_JOB_MESSAGE_BYTES};
+
+    if text.len() > MAX_JOB_MESSAGE_BYTES {
+        return Err(format!("input is {} bytes, exceeds {MAX_JOB_MESSAGE_BYTES}", text.len()));
+    }
+    let message = serde_json::from_str::<FunctionCallMessageV1>(text)
+        .map_err(|error| format!("invalid Function call JSON: {error}"))?;
+    let FunctionCallMessageV1::Call { call } = message else {
+        return Ok(false);
+    };
+    call.validate().map_err(|error| error.to_string())?;
+    Ok(from == format!("creature:{}", call.executor_dispatch.payload.executor_creature)
+        && to == format!("creature:{}", call.executor_dispatch.payload.target_creature))
+}
+
+fn parse_json(text: &str, byte_cap: usize) -> Result<Dynamic, String> {
+    if text.len() > byte_cap {
+        return Err(format!("input is {} bytes, exceeds {byte_cap}", text.len()));
+    }
+    let value = serde_json::from_str::<JsonValue>(text)
+        .map_err(|error| format!("invalid JSON: {error}"))?;
+    let mut nodes = 0;
+    validate_json_value(&value, 0, &mut nodes)?;
+    rhai::serde::to_dynamic(value)
+        .map_err(|error| format!("cannot represent JSON in Rhai: {error}"))
+}
+
+fn stringify_json(value: &Dynamic, byte_cap: usize) -> Result<String, String> {
+    let mut nodes = 0;
+    validate_dynamic_json(value, byte_cap, 0, &mut nodes)?;
+    let value = rhai::serde::from_dynamic::<JsonValue>(value)
+        .map_err(|error| format!("value is not JSON-compatible: {error}"))?;
+    let encoded =
+        serde_json::to_string(&value).map_err(|error| format!("JSON encoding failed: {error}"))?;
+    if encoded.len() > byte_cap {
+        return Err(format!("output is {} bytes, exceeds {byte_cap}", encoded.len()));
+    }
+    Ok(encoded)
+}
+
+fn count_json_node(depth: usize, nodes: &mut usize) -> Result<(), String> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(format!("nesting exceeds {MAX_JSON_DEPTH} levels"));
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_JSON_NODES {
+        return Err(format!("value count exceeds {MAX_JSON_NODES}"));
+    }
+    Ok(())
+}
+
+fn validate_json_value(value: &JsonValue, depth: usize, nodes: &mut usize) -> Result<(), String> {
+    count_json_node(depth, nodes)?;
+    match value {
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::String(_) => Ok(()),
+        JsonValue::Number(number) => {
+            if number.as_i64().is_none() && number.as_u64().is_some() {
+                Err("integer is outside Rhai's signed 64-bit range".into())
+            } else if number.as_f64().is_some_and(f64::is_finite) {
+                Ok(())
+            } else {
+                Err("number is outside Rhai's finite numeric range".into())
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                validate_json_value(value, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        JsonValue::Object(values) => {
+            for value in values.values() {
+                validate_json_value(value, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_dynamic_json(
+    value: &Dynamic,
+    byte_cap: usize,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), String> {
+    count_json_node(depth, nodes)?;
+    if value.is_shared() {
+        return Err("shared/cyclic values are not JSON-compatible".into());
+    }
+    if value.is_unit() || value.is_bool() || value.is_int() {
+        return Ok(());
+    }
+    if value.is_float() {
+        return value
+            .as_float()
+            .map_err(|actual| format!("expected float, got {actual}"))
+            .and_then(|number| {
+                number
+                    .is_finite()
+                    .then_some(())
+                    .ok_or_else(|| "non-finite floats are not JSON-compatible".into())
+            });
+    }
+    if value.is_string() {
+        let string = value
+            .as_immutable_string_ref()
+            .map_err(|actual| format!("expected string, got {actual}"))?;
+        return (string.len() <= byte_cap)
+            .then_some(())
+            .ok_or_else(|| format!("string is {} bytes, exceeds {byte_cap}", string.len()));
+    }
+    if value.is_array() {
+        let values =
+            value.as_array_ref().map_err(|actual| format!("expected array, got {actual}"))?;
+        for value in values.iter() {
+            validate_dynamic_json(value, byte_cap, depth + 1, nodes)?;
+        }
+        return Ok(());
+    }
+    if value.is_map() {
+        let values = value.as_map_ref().map_err(|actual| format!("expected map, got {actual}"))?;
+        for (key, value) in values.iter() {
+            if key.len() > byte_cap {
+                return Err(format!("object key is {} bytes, exceeds {byte_cap}", key.len()));
+            }
+            validate_dynamic_json(value, byte_cap, depth + 1, nodes)?;
+        }
+        return Ok(());
+    }
+    Err(format!("Rhai type `{}` is not JSON-compatible", value.type_name()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +453,60 @@ mod tests {
             Some(manifest.compute_content_address().as_str()),
             "content address binds the manifest body"
         );
+    }
+
+    #[test]
+    fn compile_gate_registers_the_bounded_json_surface_used_by_typed_functions() {
+        let mut engine = RhaiEngine::new();
+        register_json_helpers(&mut engine, 1024);
+        let output = engine
+            .eval::<String>(
+                r#"
+                let message = json_parse(`{"operation":"call","call":{"attempt":{"job":"j","number":3}}}`);
+                json_stringify(#{
+                    operation: "result",
+                    result: #{ attempt: message["call"].attempt, outcome: #{ Ok: () } }
+                })
+                "#,
+            )
+            .expect("the author gate exposes the same JSON signatures as ScriptEngine");
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&output).unwrap(),
+            serde_json::json!({
+                "operation": "result",
+                "result": {
+                    "attempt": { "job": "j", "number": 3 },
+                    "outcome": { "Ok": null }
+                }
+            })
+        );
+        assert!(parse_json(&format!("\"{}\"", "x".repeat(32)), 16)
+            .unwrap_err()
+            .contains("exceeds"));
+    }
+
+    #[test]
+    fn authors_a_typed_function_critter_that_uses_json_helpers() {
+        let source = r#"
+            fn handle(env) {
+                let message = json_parse(env.text);
+                let invocation = message["call"];
+                json_stringify(#{
+                    operation: "result",
+                    result: #{
+                        attempt: invocation.attempt,
+                        outcome: #{ Ok: #{ kind: "inline", value: invocation.input.value } }
+                    }
+                })
+            }
+        "#;
+        let bc = BuildCritter::new(key(), "author");
+        match bc.author(source, &stub()) {
+            BuildReply::Built { artifact, .. } => assert_eq!(artifact, source.as_bytes()),
+            BuildReply::Failed { kind, message, .. } => {
+                panic!("typed Function critter should pass compile gate: {kind:?}: {message}")
+            }
+        }
     }
 
     #[test]

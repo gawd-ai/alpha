@@ -2,9 +2,10 @@
 //!
 //! **Identity addressing** ([`Address::Creature`] / [`Node`](Address::Node) /
 //! [`Kernel`](Address::Kernel) / [`Topic`](Address::Topic)) talks to *this* creature/node.
-//! **Capability addressing** ([`Address::Role`] / [`Intent`](Address::Intent)) routes to *whoever*
-//! is bound to fill it — the inversion-of-control socket. Both are the *same envelope*, resolved
-//! differently by the [`Router`](crate::Router); that symmetry is integration risk **R8**.
+//! **Capability addressing** ([`Address::Role`] / [`NodeRole`](Address::NodeRole) /
+//! [`Intent`](Address::Intent)) routes to *whoever* is bound to fill it — the inversion-of-control
+//! socket, optionally scoped to one exact node. Both are the *same envelope*, resolved differently
+//! by the [`Router`](crate::Router); that symmetry is integration risk **R8**.
 //!
 //! **Federation grain** ([`Realm`](Address::Realm) /
 //! [`Omega`](Address::Omega)). Both wrap an inner address (the *target* in the named federation
@@ -26,6 +27,15 @@ pub struct CreatureId(pub u64);
 #[derive(Clone, Default, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct NodeId(pub String);
 
+/// Exact capability key for one [`Address::NodeRole`] destination.
+///
+/// Node and role names are open strings, so delimiter-only concatenation is ambiguous. This encoding
+/// prefixes each UTF-8 byte string with its decimal byte length; a parser can therefore recover both
+/// components uniquely even when either contains `/`, `:`, Unicode, or another component's text.
+pub fn node_role_capability_key(node: &NodeId, role: &Role) -> String {
+    format!("node-role:{}:{}:{}:{}", node.0.len(), node.0, role.0.len(), role.0)
+}
+
 // RealmId is the federation address grain AND a trust assertion on `Provenance`
 // (the author claims their work belongs to this Realm — sigil's `Provenance.realm`). Since
 // sigil is the base contract crate and aether depends on it (not the other way around),
@@ -41,7 +51,7 @@ pub struct Role(pub String);
 impl Role {
     /// The Distributor hook — `Intent` envelopes route to whoever fills this.
     pub const DISTRIBUTOR: &'static str = "distributor";
-    /// The off-node egress — `Node`-addressed envelopes route to whoever fills this.
+    /// The off-node egress — `Node`/`NodeRole`-addressed envelopes route to whoever fills this.
     pub const TRANSPORT: &'static str = "transport";
     /// The admission decision-maker.
     pub const POLICY: &'static str = "policy";
@@ -158,6 +168,11 @@ pub enum Address {
     /// Identity: a creature on a peer node — routed *off-node* via the bound `transport` creature.
     /// "Route off-node" is not a new subsystem; it is one more delivery case (**R4**).
     Node(NodeId, CreatureId),
+    /// Capability: the explicitly remote-exposed role on one exact node. The source router sends
+    /// this through its bound transport; the receiving attesting transport resolves it to that
+    /// node's *current* host binding. Unexposed/unbound roles fail closed, and the route is discovery
+    /// only — application proofs remain the end-to-end authority.
+    NodeRole(NodeId, Role),
     /// The kernel's own control surface.
     Kernel,
     /// Fan-out to every subscriber of a topic.
@@ -170,7 +185,8 @@ pub enum Address {
     /// [`Role::REALM_GATEWAY`] creature, which unwraps `target` and re-routes — locally for
     /// same-Realm peers, via [`Role::TRANSPORT`] for cross-Realm. Unbound → `NoProvider`. The
     /// `target` is itself an `Address` so a Realm envelope can name any destination (Creature /
-    /// Node / Role / Intent / Topic / Kernel) inside the named Realm — composition by depth.
+    /// Node / NodeRole / Role / Intent / Topic / Kernel) inside the named Realm — composition by
+    /// depth.
     ///
     /// **Capability grain:** the bus-level `capabilities.calls` gate authorizes a
     /// `Realm` target by the Realm *name* (`realm:<id>`), **not** by the inner `target` — trust
@@ -196,7 +212,7 @@ pub const MAX_ADDRESS_NESTING_DEPTH: usize = 8;
 impl Address {
     /// Federation-wrapper nesting depth: how many [`Realm`](Self::Realm) / [`Omega`](Self::Omega)
     /// layers wrap the innermost identity/capability target. A non-federation address
-    /// (Creature/Node/Kernel/Topic/Role/Intent) is depth 0; `Realm(_, Creature)` is depth 1;
+    /// (Creature/Node/NodeRole/Kernel/Topic/Role/Intent) is depth 0; `Realm(_, Creature)` is depth 1;
     /// `Omega(_, Realm(_, Creature))` is depth 2. **Iterative** (no recursion) so computing it is
     /// itself safe on a hostile, deeply-wrapped input.
     pub fn nesting_depth(&self) -> usize {
@@ -225,6 +241,10 @@ mod tests {
     #[test]
     fn nesting_depth_counts_only_federation_wrappers() {
         assert_eq!(Address::Creature(CreatureId(1)).nesting_depth(), 0);
+        assert_eq!(
+            Address::NodeRole(NodeId("peer".into()), Role::new("executor")).nesting_depth(),
+            0
+        );
         assert_eq!(Address::Kernel.nesting_depth(), 0);
         assert_eq!(wrap(Address::Creature(CreatureId(1)), 1).nesting_depth(), 1);
         // Mixed Realm/Omega still counts every wrapper layer.

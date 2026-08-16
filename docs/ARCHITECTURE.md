@@ -14,6 +14,13 @@
 > and metered sandboxed script `critter` (Rhai). The budget gradient and authoring-as-conversation
 > seams both have live consumers. The substrate ships *sockets and mechanisms*; it deliberately
 > ships **no models**.
+>
+> **v0.4.4 status.** The typed-function/durable-Job foundation and its reference organs are an
+> additive application layer on this substrate. Its Met contract and suite-compositional proof are
+> described in
+> [`TRD-006`](trd/TRD-006-typed-functions-and-durable-jobs.md) and
+> [`design/functions-and-jobs.md`](design/functions-and-jobs.md). It remains an application protocol,
+> not a new kernel primitive; the proof does not claim crash-resume inside an unfinished GX transfer.
 
 ## The thesis
 
@@ -37,6 +44,7 @@ demos/                     # narrated, runnable demos (walkthrough, federation, 
 docs/                      # CONCEPTS / ARCHITECTURE / ROADMAP / TOPICS + design notes …
 foundation/                # shared GAWD foundations Alpha CONSUMES but does not own (cross-system, gawd-prefixed, externalize later):
   gawdxfer/                #   the GX bulk-transfer contract: chunk-frame codec + chunk math + streaming SHA-256; shared with sctl
+  gawdfn/                  #   typed function + durable-Job identities, records, schemas, signatures, and validation
 cosmos/                    # everything between α and Ω — the interior the front door opens onto:
   sigil/                   #   the at-rest contract (Manifest type + crypto)
   aether/                  #   the bus spine (Envelope, Address, Router, Creature seam, journal)
@@ -44,28 +52,31 @@ cosmos/                    # everything between α and Ω — the interior the f
   sanctum/                 #   the kernel library (lifecycle + routing + admission); memcheck harnesses in tests/memcheck/ (ASan/Miri/Valgrind)
   forge/                   #   the creature-authoring surface (declare_creature! + NativeBus + managed::spawn)
   abode/  seer/            #   first-class concept crates: snapshot contract + Query/Answer primitive
-  realm/                #   the trust domain (owns its realm-gateway seam + realm::serve); Ω (omega) is a root pole, above
-  omega-contract/       #   the lean Ω wire contract (omega.deferred + GATEWAY_ROLE + reserved OmegaServices); re-exported by the omega server
+  realm/  bestiary/        #   the trust domain + durable registry contract/store
+  mind/                    #   injected model seam shared by authoring and curation organs
+  omega-contract/          #   lean Ω wire contract; re-exported by the omega server
   omni/                    #   the spine-only control core every surface drives over the bus
   creatures/               #   production-capable reference organs (mostly native; critter source ships as bytes):
                            #     transport-tcp                     (ed25519 + framed TCP)
-                           #     registry-mem                      (Bestiary seed)
-                           #     build-cargo                       (sandboxed native compile)
+                           #     registry-mem, bestiary-daemon     (ephemeral + durable registry fillings)
+                           #     build-cargo                       (native compile; operator-injected sandbox)
                            #     build-critter                     (no-cargo critter builder)
-                           #     agent-templated, agent-curious    (authoring; the latter consults a conversation)
+                           #     agent-templated, agent-curious, agent-mind  (reference authoring fillings)
                            #     surface-http, surface-mcp         (loadable control surfaces)
                            #     distributor-requirements          (the Distributor; consumes placement SEER)
                            #     embodiment-advertiser             (answers placement Queries with node embodiment)
-                           #     abode-migrator                    (single-active-fork Abode hand-off)
+                           #     abode-migrator                    (in-memory Abode hand-off reference; not durable home authority)
                            #     omega-federator                (cross-Realm pull anti-entropy + reputation + quarantine)
                            #     fitness-selector                  (signed promotion on an injected criterion — Loop 2)
                            #     immune-response                   (trust-gated reversible quarantine — Loop 4)
                            #     verifiable-die                    (commit-reveal randomness over the `commitment` slot)
                            #     abode-reconciler                  (CRDT fork/merge on an injected lattice)
+                           #     function-{home,executor,locator,resolver} + job-blob-fs  (v0.4.4 Job mechanisms)
   creatures/prototypes/    #   injected reference-strategy MODELS — not substrate:
                            #     distributors/{distributor-roundrobin, …}         (IoC composability proof)
                            #     reputation/reputation-roundrobin                 (reputation-weighted distributor)
                            #     policies/{policy-dev, policy-signed, …}          (admission policies)
+                           #     policies/policy-job-basic                         (bounded deterministic Job policy)
                            #     policies/policy-budget                           (consumes the BudgetSignal)
                            #     policies/policy-quarantine-{trust-all,trust-realm,aware}  (immune gates)
                            #     scorers/scorer-{success-rate,latency,roundrobin} (injected FitnessScorer models)
@@ -92,18 +103,24 @@ Kernel↔control, Topic fan-out) and across the lifecycle (the same `Envelope` c
 a manifest from author → compile → admit → load → run → ship → publish).
 
 - **`Envelope`** — payload + header. The header is where trust primitives live:
-  `from` / `to`, `seq` (per-sender monotone counter), `causal[]` (happens-before
-  links), `stamp` (a *logical* clock, never `SystemTime::now()`), `sig` (a creature
+  `from` / `to`, `seq` (per-sender monotone counter), the reserved `causal[]` slot,
+  `stamp` (a *logical* clock, never `SystemTime::now()`), `sig` (a creature
   may sign — admission `may` require it, per injected policy), `corr` (correlation
-  id so a reply matches its request across async / multi-turn / external delay). The
-  journal at the router is the append-only ordered history.
-- **`Address`** — `Creature(CreatureId) | Node(NodeId, CreatureId) | Kernel | Topic(Topic) |
-  Role(Role) | Intent(Intent{ outcome, requirements }) | Realm{ realm, target } |
-  Omega{ realm, target }`. *Identity* addressing (`Creature`/`Node`/`Kernel`/`Topic`)
-  and *capability* addressing (`Intent`/`Role`) are the same envelope, resolved
-  differently. `Intent`/`Role` route to whichever creature is **bound** to the socket;
-  with no binding the router returns a structured `RouteError::NoProvider` — the fabric
-  never substitutes a model of its own. The `Realm`/`Omega` federation grain
+  id so a reply matches its request across async / multi-turn / external delay). Current
+  creature `Dispatch` cannot populate `causal[]`, and bus sealing writes it empty; durable Job
+  causality therefore lives in `gawdfn::JobEventV1`, not in the header. The router journal is a
+  bounded, in-memory, drop-oldest diagnostic window — not a durable event store.
+- **`Address`** — `Creature(CreatureId) | Node(NodeId, CreatureId) | NodeRole(NodeId, Role) |
+  Kernel | Topic(Topic) | Role(Role) | Intent(Intent{ outcome, requirements }) |
+  Realm{ realm, target } | Omega{ realm, target }`. *Identity* addressing
+  (`Creature`/`Node`/`Kernel`), topic fan-out, and *capability* addressing
+  (`Intent`/`Role`/`NodeRole`) are the same envelope, resolved differently.
+  `Intent`/`Role` route to whichever creature is **bound** to the socket. `NodeRole`
+  scopes capability discovery to one exact node and resolves only an explicitly
+  remote-exposed host binding (`Kernel::bind_remote_role`); it does not replace
+  application-level authorization or proofs. An unbound `Intent`/`Role` returns a structured
+  `RouteError::NoProvider`; an unexposed or unbound `NodeRole` fails closed at the receiving
+  transport. The fabric never substitutes a model of its own. The `Realm`/`Omega` federation grain
   wraps an inner `target` address and resolves via a bound gateway creature —
   composition by depth, not a parallel routing system.
 - **`Router`** — a sharded address table + per-creature inboxes + the journal + the
@@ -120,7 +137,7 @@ a manifest from author → compile → admit → load → run → ship → publi
 ## The two contracts
 
 **`Manifest`** — `name`, `version`, `abi { backend, abi_tag, target }`, `entrypoints[]`,
-`capabilities { fs, net, cpu_ms, mem_bytes, calls }`, `requirements { accelerators,
+`capabilities { fs, net, cpu_ms, mem_bytes, wall_ms, calls }`, `requirements { accelerators,
 sensors, min_mem, connectivity, jurisdiction }`, `provenance { author = Abode-key,
 source_hash, build_hash, signature }`, `content_address`, `provides[]`.
 `Manifest::validate` gates entrypoint shape and `provides` shape so an authored
@@ -131,6 +148,29 @@ operator can `bind` it.
 
 **`Envelope`** — described above. One wire format, carrying the trust primitives,
 real `ring` ed25519 signatures, and a capability check at admission.
+
+## The function/Job foundation (`gawdfn`) — an application contract
+
+`foundation/gawdfn` is a shared GAWD contract that Alpha **consumes but does not own**. It is not a
+third kernel contract and does not change `Creature`, `Envelope`, or any engine. It defines bounded,
+versioned data and verification mechanics for:
+
+- immutable `FunctionId { manifest_content_address, entrypoint }` identities and friendly aliases;
+- typed entrypoint contracts, attached additively as `sigil::Entrypoint.contract`;
+- explicit deployment receipts and alias-resolution pins;
+- asynchronous Job specifications, handles, states, signed events, attempts, progress, steer, and
+  causal child links; and
+- portable home checkpoints, custody grants, and home leases.
+
+Eight frozen signed domains define that application protocol. Seven are carried as top-level
+schemas over ordinary envelopes:
+`gawd.function.deploy.v1`, `gawd.function.job.v1`, `gawd.function.execute.v1`,
+`gawd.function.call.v1`, `gawd.function.home.v1`, `gawd.function.locate.v1`, and
+`gawd.function.policy.v1`; `gawd.function.custody.rewrap.v1` is the nested KMS request/receipt
+signature domain inside the Home handoff. The reference
+organs below fill the contract-owned function roles. Resolver, placement, retry timing, workflow,
+retention, trust, and recovery choices remain injected creature policy. See
+[`functions-and-jobs.md`](design/functions-and-jobs.md).
 
 ## The kernel (`sanctum`) — three jobs, model-free
 
@@ -156,7 +196,10 @@ woven *on* it is hot-swappable, but the fabric itself is not.
 
 ## The engines (`anima`)
 
-- **`NativeEngine`** — `libloading` `dlopen` + the safe-unload sequence. A
+- **`NativeEngine`** — exact-byte retained staging + `libloading` `dlopen` + the safe-unload
+  sequence. Linux/Android stream into a sealed memfd and load its process-unique `/proc/self/fd`
+  capability; other targets use a random private/read-only fallback with a narrower same-UID claim.
+  Admission hashes the representation the engine opens rather than reopening a mutable source. A
   generation counter on the handle lets the router refuse stale routes after
   deregister; the SDK's managed-`spawn` registry joins every creature-spawned thread
   before the kernel `dlclose`s the library; the kernel's thread-count guard catches
@@ -169,11 +212,12 @@ woven *on* it is hot-swappable, but the fabric itself is not.
 - **`ScriptEngine`** — the critter tier: a bare Rhai interpreter
   with no filesystem, network, clock, process, rand, imports, or runtime `eval`.
   The artifact is UTF-8 Rhai source (`abi_tag = gawd_critter_v1`) defining
-  `fn handle(env)`. `cpu_ms` becomes a per-envelope operation budget, `budget_warn_at`
-  emits the same `Warn` signal as the beast tier, and
-  `KernelControl::ExtendBudget` lifts the next handle's operation ceiling. `mem_bytes`
-  maps to Rhai structural caps (string / array / map size), a best-effort memory guard
-  rather than the beast tier's byte-exact limiter.
+  `fn handle(env)`. `cpu_ms` becomes a per-envelope operation budget; optional `wall_ms`
+  becomes a progress-hook deadline. `budget_warn_at` emits the same `Warn` signal as the beast tier,
+  and `KernelControl::ExtendBudget` lifts the next handle's operation/wall ceiling. `mem_bytes` maps
+  to fixed-at-load Rhai structural caps (string / array / map size), a best-effort memory guard rather
+  than the beast tier's byte-exact limiter. Bounded instance-local memory and pure JSON/Function-proof
+  helpers add no ambient authority.
 
 ## The SDK (`forge`)
 
@@ -198,7 +242,8 @@ POD-only.
   `Creature`, `NodeId`, `Outcome`, `Role`, `Topic`, plus `Manifest`,
   `Capabilities`, `Requirements`, etc.
 
-**The SDK depends only on `aether` + `sigil` — never on the kernel.**
+**The SDK depends on contract/authoring leaves (`aether`, `seer`, `sigil`, and `gawdfn`) — never on
+the kernel.**
 Creatures cannot call into the kernel; they emit envelopes through their `Bus`.
 Every FFI glue function catches panics (`std::panic::catch_unwind`) before returning
 across the `extern "C"` boundary — the fabric-integrity floor for the FFI
@@ -217,12 +262,14 @@ column below shows each crate's home.
 | `cosmos/creatures/prototypes/fixtures/echo-daemon` | native | The reference creature — reverses its payload. The thing the reload loop runs 1000× to prove safe-unload. |
 | `cosmos/creatures/prototypes/fixtures/echo-daemon-v2` | native | A second native creature proving the reload-as-a-new-version path (different version, same shape). |
 | `cosmos/creatures/prototypes/fixtures/loopback-gateway` | native | The local↔remote symmetry test — routes `Node(self, …)` envelopes through a local socket as serialized bytes; proves the wire format is real without a remote peer. |
-| `cosmos/creatures/transport-tcp` | native | The cross-node creature — ed25519 handshake + framed TCP. Bridges `aether::Address::Node(…)` to a real peer Sanctum. |
+| `cosmos/creatures/transport-tcp` | native | The cross-node creature — ed25519 handshake + framed TCP. Bridges exact numeric `aether::Address::Node(…)` routes and explicitly remote-exposed `NodeRole(…)` bindings to a real peer Sanctum. |
 | `cosmos/creatures/registry-mem` | native | The Bestiary seed — content-addressed `publish` / `fetch`; a manifest + bytes addressed by `artifact_hash`. |
-| `cosmos/creatures/build-cargo` | native | The sandboxed compiler — takes the author's `crate_name + source + manifest_stub + deps + template`, compiles in an isolated cargo workspace, returns `BuildReply::Built { manifest, artifact }` with the artifact signed by the Abode key. |
+| `cosmos/creatures/bestiary-daemon` | native | The durable `Role::REGISTRY` filling — Realm-sharded content-addressed artifacts/catalog entries, a signed local journal, entry proofs, curation, and bounded pull anti-entropy. It stores package availability, not live deployments or the mutable Job ledger. |
+| `cosmos/creatures/build-cargo` | native | The compiler — takes the author's `crate_name + source + manifest_stub + deps + template`, compiles in an isolated cargo workspace, and returns `BuildReply::Built { manifest, artifact }` signed by the Abode key. `Sandbox::None` is the default; operators inject containment with `Sandbox::Custom`. |
 | `cosmos/creatures/build-critter` | native | The no-cargo BUILD sibling for critters: validates Rhai source, assembles a `Backend::Critter` manifest (`gawd_critter_v1`), signs it, and returns the source bytes as the artifact through the same `BuildReply` shape as `build-cargo`. |
 | `cosmos/creatures/agent-templated` | native | The deterministic authoring creature — matches the request against a template catalog, emits an `AuthoringResponse`. |
 | `cosmos/creatures/agent-curious` | native | The consultative authoring creature — when no template matches, emits `AuthoringQuery`, parks the conversation, resumes terminally on `AuthoringAnswer`. Reduction theorem preserved (single-shot `Request → Reply` works unchanged). |
+| `cosmos/creatures/agent-mind` | native | The opt-in model-backed authoring filling. It consumes the injected `mind::Model` seam and binds the same authoring socket as the deterministic references. |
 | `cosmos/creatures/prototypes/fixtures/panic-daemon` | native | Misbehavior specimen — panics in `handle`; verifies the FFI seam catches it and routes to unload. |
 | `cosmos/creatures/prototypes/fixtures/runaway-thread-daemon` | native | Misbehavior specimen — spawns via raw `std::thread::spawn`; verifies the kernel's thread-count guard refuses `dlclose` (bounded leak, not UAF). |
 | `cosmos/creatures/prototypes/fixtures/welbehaved-thread-daemon` | native | Control specimen — spawns via `managed::spawn`; verifies join-on-unload is clean. |
@@ -230,17 +277,23 @@ column below shows each crate's home.
 | `cosmos/creatures/prototypes/critters/echo-critter` | critter (Rhai) | The reference script-tier creature: a single `echo.rhai` source artifact, loaded as bytes through `ScriptEngine`, with no Cargo crate or compiled `.so`. |
 | `cosmos/creatures/distributor-requirements` | native | **The Loop-3 keystone.** The Distributor: bound to `Role::DISTRIBUTOR`, consults SEER on the `placement` topic for every Intent (even N=1 local), reconciles `EmbodimentOffer`s by an injected `PickModel` (FirstFit / RoundRobin), routes the Intent to the picked target (local or peer). Companion: `embodiment-advertiser`. |
 | `cosmos/creatures/embodiment-advertiser` | native | One per Sanctum; configured with `self_node` + a list of `(CreatureId, Embodiment)` offers. Answers placement Queries with the matching subset, tagged by `node + creature_id` for the distributor's local-or-peer collapse. |
-| `cosmos/creatures/abode-migrator` | native | **The self moves.** Hands an Abode off between Sanctums as a single active fork: snapshots `aether::abode` state, ships it signed, and the destination admits it through a 6-gate check before the source seals `Authoritative → Migrated`. Restore policy is injected. |
+| `cosmos/creatures/abode-migrator` | native | **Portable-state hand-off reference.** Ships a signed `abode::AbodeSnapshot` through an injected restore gate. Its payload and pending hand-off are memory-only, and the destination currently becomes authoritative before the source seals; it is not the crash-safe authority protocol used for a durable Job home. |
 | `cosmos/creatures/omega-federator` | native | **Cross-Realm federation.** An `OMEGA_GATEWAY` consumer: pull anti-entropy across Realms, signed reputation over SEER consensus, and a quarantine path. Writes reputation/quarantine onto the registry `Entry`. |
 | `cosmos/creatures/fitness-selector` | native | **Loop 2 (author → select → promote).** Aggregates the proprioceptive fitness signal per watched creature, scores each by an *injected* `FitnessScorer`, and signs a self-verifying promotion onto the registry reputation slot. The substrate ships no fitness criterion. |
 | `cosmos/creatures/immune-response` | native | **Loop 4 (defend).** The dual of the selector: subscribes to PROPRIOCEPTION and, on a sensed fault, applies a reversible quarantine gated by an *injected* `QuarantineTrust`. Defense overrides selection. |
 | `cosmos/creatures/verifiable-die` | native | **Verifiable randomness.** A commit-and-reveal die over the envelope `commitment` slot; any peer can later verify a "random" pick was not secretly chosen. |
 | `cosmos/creatures/abode-reconciler` | native | **Abode fork & merge.** Reconciles two forks of an Abode over an *injected* merge lattice (CRDT-style). |
+| `cosmos/creatures/function-home` | native | **v0.4.4 Job authority mechanism.** A fail-closed, signed, hash-chained home ledger for submit/status/events, commands, grants, causal children, and verified execution observations. Scheduling and workflow stay outside it. |
+| `cosmos/creatures/function-executor` | native | **v0.4.4 execution mechanism.** Realm-local durable deployment/claim dedup and signed attempt/refusal facts; injected Kernel introspection checks the current CreatureId occupant's exact manifest/artifact identity before invocation through the existing handle path. |
+| `cosmos/creatures/function-resolver` | native | **v0.4.4 resolution mechanism.** Resolves one exact Realm/name/version/entrypoint alias to one immutable content address and refuses ambiguity. Ranking/trust stay injected. |
+| `cosmos/creatures/function-locator` | native | **v0.4.4 location mechanism.** Tracks signed home leases; higher epochs supersede lower ones, while a same-epoch higher sequence may refresh only the coordinator over an otherwise identical authority/custody/location binding. |
+| `cosmos/creatures/job-blob-fs` | native library | **v0.4.4 value mechanism.** Bounded fail-closed filesystem CAS for opaque input/result/checkpoint bytes, including ciphertext; it decides no retention, authorization, or encryption policy. |
 | `cosmos/creatures/prototypes/distributors/distributor-roundrobin` | native | **Injected prototype, NOT substrate.** Binds to `Role::DISTRIBUTOR`; a minimal-viable round-robin demo that proves the `Intent` socket works. Coexists with the real Distributor as the IoC-composability proof — two distributor creatures can coexist; operator picks one with `bind_role`. |
 | `cosmos/creatures/prototypes/reputation/reputation-roundrobin` | native | **Injected prototype, NOT substrate.** A reputation-weighted distributor `PickModel` — consumes the reputation slot. |
 | `cosmos/creatures/prototypes/policies/policy-dev` | native | **Injected prototype, NOT substrate.** Permissive dev policy — admits everything. |
 | `cosmos/creatures/prototypes/policies/policy-signed` | native | **Injected prototype, NOT substrate.** Requires an Abode-signed manifest + verified build-hash. |
 | `cosmos/creatures/prototypes/policies/policy-budget` | native | **Injected prototype, NOT substrate.** Consumes the `BudgetSignal { level, kind, vector }`; ships `BudgetApoptosis` and `BudgetGraceful` siblings. |
+| `cosmos/creatures/prototypes/policies/policy-job-basic` | native | **Injected prototype, NOT substrate.** Deterministic bounded placement/retry filling for the `function-policy` socket; an AI-authored scheduler or workflow policy replaces it without changing Job custody. |
 | `cosmos/creatures/prototypes/policies/policy-abode-allowlist` | native | **Injected prototype, NOT substrate.** Reference `RestorePolicy` for the abode-migrator's admission gate. |
 | `cosmos/creatures/prototypes/policies/policy-prefer-promoted` | native | **Injected prototype, NOT substrate.** Admits by the fitness-selector's signed promotion (vs. an `AllowAll` baseline). |
 | `cosmos/creatures/prototypes/policies/policy-quarantine-{trust-all,trust-realm,aware}` | native | **Injected prototypes, NOT substrate.** `QuarantineTrust` gates for immune-response; `-aware` makes defense override selection. |
@@ -254,7 +307,8 @@ column below shows each crate's home.
 |---|---|
 | **creature** (daemon / beast / critter) | ✅ daemon + beast + critter real |
 | **Sanctum** (node) | ✅ `sanctum`, run as `alpha node` (operator/authoring) or `omega serve` (federation/gateway) |
-| **Abode** (portable per-identity state) | ✅ authorship key + `aether::abode` snapshot + hand-off migration + fork/merge reconciler |
+| **Abode** (portable per-identity state) | ✅ authorship key + `abode::AbodeSnapshot` + hand-off migration + fork/merge reconciler |
+| **Function / Job** (typed capability + durable invocation) | ✅ v0.4.4 foundation, reference organs, and suite-compositional two-Realm process acceptance |
 | **Realm** (federated mesh) | ✅ the `Realm` address grain + `realm-gateway`; cross-node ship over ed25519 TCP |
 | **Omega** (global federation + Bestiary) | ✅ the `Omega` grain + `omega-gateway` + `omega-federator` (pull anti-entropy + reputation + quarantine), run as a server by `omega serve` |
 
@@ -268,7 +322,7 @@ here. Each is discipline, not omission.
   the beast tier's byte-exact linear-memory limiter. A workload that needs exact memory
   caps should run as a beast.
 - **Built-in models.** No placement intelligence, trust policy, consensus / weight scheme, fitness
-  criterion, or clock semantics lives in the fabric. The substrate ships the *sockets* and prototype
+  criterion, scheduler, workflow, retry timing, or clock semantics lives in the fabric. The substrate ships the *sockets* and prototype
   creatures (`cosmos/creatures/prototypes/*`) only; production models are injected per deployment. This is the central
   invariant, not a gap. The shipped mechanisms — the Distributor, reputation, fitness
   selection, immune quarantine, verifiable randomness — are each a creature bound to a socket, never
@@ -276,6 +330,13 @@ here. Each is discipline, not omission.
 - **Cross-tier runtime migration.** A creature authored as a beast and re-instantiated as a native
   daemon (or vice versa) at runtime is unsolved — both load through one `Engine::load` path, but the
   artifact formats differ. See the hard problems below.
+- **Running-execution migration or exactly-once side effects.** A Job home can move; an already
+  executing attempt does not. Callers choose at-most-once or at-least-once delivery. Exactly once
+  requires cooperation from an idempotent or transactional external sink and is not promised by
+  the fabric.
+- **A universal global locator.** v0.4.4 carries signed home leases and a replaceable locator role;
+  discovery, gossip, quorum, and global routing policy remain injected mechanisms/models. Current
+  Omega routes to an explicitly configured gateway/target.
 - **Production security hardening / external audit.** The fabric-integrity floor is enforced by
   construction and the native trust limit is stated honestly, but Alpha has not been
   audited and is not hardened for hostile production. See [`../SECURITY.md`](../SECURITY.md).
@@ -297,3 +358,7 @@ here. Each is discipline, not omission.
    every FFI seam) but cannot fully contain malicious in-process native code; an
    operator who loads native vouches for it. Stated plainly, not pretended
    otherwise.
+4. **Non-equivocating authority under partition.** A portable home uses monotone epoch grants and
+   fail-closed hand-off, but freely delegated host keys cannot prove exclusive authority during a
+   partition. Strict non-equivocation needs an injected root/quorum/lease authority that durably
+   issues only one next epoch. Silence is never permission for a frozen source to thaw.

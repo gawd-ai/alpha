@@ -51,11 +51,11 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Share the authoring-loop build cache with `m3_authoring_loop.rs` — the reverse-daemon's
-/// transitive crates (forge + aether + …) compile once and are warm for both files. build-cargo
-/// materializes a process-unique work dir + per-build cargo crate name, so sharing is collision-safe.
+/// Share one canonical authoring cache across Omni, demos, and every Cargo-backed authoring proof.
+/// build-cargo materializes a process-unique work dir + per-build cargo crate name, so sharing is
+/// collision-safe; the repository's serial defaults avoid lock contention.
 fn shared_build_cache() -> PathBuf {
-    workspace_root().join("target").join("m3-build-cargo-cache")
+    workspace_root().join("target").join("gawd-build-cache")
 }
 
 struct World {

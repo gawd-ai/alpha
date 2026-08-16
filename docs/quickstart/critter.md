@@ -16,6 +16,7 @@ fn handle(env) {
     // env.text_truncated — true when env.text clipped the payload
     // env.schema  — the request's schema tag (a string)
     // env.from    — sender address string, e.g. "creature:7" (echo-able to emit)
+    // env.to      — this envelope's local destination address
     // env.corr    — int correlation id (only on correlated requests)
     env.text.to_upper()        // return a Blob/string to reply; return () for no reply
 }
@@ -24,6 +25,18 @@ fn handle(env) {
 That's a complete request→reply creature. To send elsewhere instead of (or as well as) replying, call
 `emit(addr, blob)` where `addr` is `creature:N` / `role:R` / `topic:T` / `intent:X` / `kernel` — each
 `emit` passes the kernel's `calls` capability gate.
+
+Typed JSON protocols use two pure helpers: `json_parse(text)` returns Rhai maps/arrays/scalars and
+`json_stringify(value)` returns deterministic compact JSON text. For example, a Function critter can
+first require `function_call_verify(env.text, env.from, env.to)`, then parse `env.text`, compute a
+value, copy `message["call"].attempt` into its result, and stringify a `gawd.function.call.v1` reply.
+The verifier checks the Home grant, executor dispatch signature, and exact local route; it exposes no
+key or policy authority. See
+[`typed-add-one`](../../cosmos/creatures/prototypes/critters/typed-add-one).
+That checked-in source is also the typed causal-child target in the real two-process TRD-006 proof; it
+is signed, loaded through `Kernel::load`, independently measured, registered, and invoked through the
+ordinary `ScriptEngine`. The proof's parent progress and Steer outcome come from a separate blocking
+daemon fixture, not from this critter.
 
 ## 2. Two ways to run it
 
@@ -51,19 +64,23 @@ alpha> send 8 hello
 
 ## 3. Four things that will bite you
 
-1. **Stateless per envelope.** Each call gets a fresh scope — no state survives between messages.
+1. **Fresh scope, explicit memory.** Local variables reset each call. Use bounded `mem_get`,
+   `mem_set`, and `mem_del` for state that survives for this loaded instance; it is dropped on unload.
 2. **`emit` payloads are Blobs**, and `emit` is `calls`-gated — the script never holds bus authority.
 3. **`env.text` is a preview.** It is bounded by the declared/default memory cap and a 1 MiB ceiling;
    check `env.text_truncated` when partial text is not acceptable.
-4. **No in-script JSON.** Use `split` + an object map instead. (The interpreter caps expression-nesting
-   depth, but the cap is high and pinned identically in debug and release; `rot13` assigns step by step
-   for readability and metering, not because the one-liner would be rejected.)
+4. **JSON is bounded and value-only.** `json_parse` / `json_stringify` accept JSON-compatible values,
+   not Blobs or host objects. Each conversion is capped by `mem_bytes` (or the default structural
+   cap), a 1 MiB ceiling, 64 nesting levels, and 65,536 values. An over-cap or invalid conversion is a
+   script error and emits no partial reply.
 
 ## 4. Containment
 
-The engine is bare by construction: no filesystem, network, clock, process, or rand. `cpu_ms` becomes
-an operation budget (the critter analog of WASM fuel); a breach is a structured budget signal, never a
-hang. `mem_bytes` maps to best-effort structural caps. See [the substrate design note](../design/substrate.md).
+The engine is bare by construction: no filesystem, network, script-visible clock, process, or rand.
+`cpu_ms` becomes an operation budget (the critter analog of WASM fuel), and `wall_ms` a live
+progress-hook deadline; a breach is a structured budget signal, never a hang. `mem_bytes` maps to
+best-effort structural caps. The JSON helpers only transform bounded in-memory values; they add no
+ambient authority. See [the substrate design note](../design/substrate.md).
 
 ## Next
 

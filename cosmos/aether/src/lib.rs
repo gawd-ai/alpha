@@ -37,7 +37,8 @@ pub mod wire;
 // trust-domain and Ω authority above the bus.
 
 pub use address::{
-    Address, CreatureId, Intent, NodeId, RealmId, Role, Topic, MAX_ADDRESS_NESTING_DEPTH,
+    node_role_capability_key, Address, CreatureId, Intent, NodeId, RealmId, Role, Topic,
+    MAX_ADDRESS_NESTING_DEPTH,
 };
 pub use bus::{Bus, BusError, BusHandle, Ed25519Signer, Signer, StubSigner};
 pub use envelope::{
@@ -161,6 +162,45 @@ mod tests {
             env.header.sig,
             "clearing origin must change the signed bytes — origin is inside the signature"
         );
+    }
+
+    #[test]
+    fn remote_role_resolution_requires_both_host_exposure_and_the_attesting_grant() {
+        let r = router();
+        let (first, _first_rx) = r.register(Capabilities::default());
+        let (second, _second_rx) = r.register(Capabilities::default());
+        let (ordinary_id, _ordinary_rx) = r.register(Capabilities::default());
+        let (transport_id, _transport_rx) = r.register(Capabilities::default());
+        let role = Role::new("executor");
+        let ordinary = bus(&r, ordinary_id);
+        let attesting = BusHandle::new_attesting(
+            transport_id,
+            r.clone(),
+            Arc::new(StubSigner::new("transport")),
+        );
+
+        r.bind_role(role.clone(), first);
+        assert_eq!(ordinary.remote_role_target(&role), None);
+        assert_eq!(attesting.remote_role_target(&role), None, "local binding is not exposed");
+
+        r.bind_remote_role(role.clone(), first);
+        assert_eq!(
+            ordinary.remote_role_target(&role),
+            None,
+            "ordinary creatures cannot inspect it"
+        );
+        assert_eq!(attesting.remote_role_target(&role), Some(first));
+
+        r.bind_role(role.clone(), second);
+        assert_eq!(
+            attesting.remote_role_target(&role),
+            None,
+            "an ordinary rebind clears prior exposure rather than inheriting it"
+        );
+        r.bind_remote_role(role.clone(), second);
+        assert_eq!(attesting.remote_role_target(&role), Some(second));
+        r.deregister(second);
+        assert_eq!(attesting.remote_role_target(&role), None, "unload revokes exposure");
     }
 
     #[test]
@@ -406,6 +446,21 @@ mod tests {
         assert_eq!(env.payload, b"hello-empy");
     }
 
+    #[test]
+    fn node_role_routes_to_transport_without_local_resolution() {
+        let r = router();
+        let (transport, transport_rx) = r.register(Capabilities::default());
+        r.bind_role(Role::new(Role::TRANSPORT), transport);
+        let (sender, _sender_rx) = r.register(Capabilities::default());
+        let target = Address::NodeRole(NodeId("peer-b".into()), Role::new("executor"));
+
+        bus(&r, sender).send(Dispatch::to(target.clone(), b"work".to_vec())).unwrap();
+
+        let envelope = transport_rx.recv().unwrap();
+        assert_eq!(envelope.header.to, target, "transport receives the unresolved capability");
+        assert_eq!(envelope.payload, b"work");
+    }
+
     /// Wire-format round-trip for every `Address` variant,
     /// including the federation grains. The Realm/Omega shapes serialize symmetrically with
     /// the identity/capability variants: same envelope, more depth (composition by depth, not a new wire format —
@@ -419,6 +474,7 @@ mod tests {
         let cases: Vec<Address> = vec![
             Address::Creature(CreatureId(7)),
             Address::Node(NodeId("peer".into()), CreatureId(7)),
+            Address::NodeRole(NodeId("peer".into()), Role::new("executor")),
             Address::Kernel,
             Address::Topic(Topic::new("proprio")),
             Address::Role(Role::new("distributor")),
@@ -455,6 +511,20 @@ mod tests {
             let back: Address = serde_json::from_slice(&bytes).expect("deserialize");
             assert_eq!(*a, back, "round-trip failed for {a:?}");
         }
+    }
+
+    #[test]
+    fn node_role_is_additive_without_changing_the_existing_node_wire() {
+        assert_eq!(
+            serde_json::to_string(&Address::Node(NodeId("peer".into()), CreatureId(7))).unwrap(),
+            r#"{"Node":["peer",7]}"#,
+            "the shipped numeric Node representation remains byte-identical"
+        );
+        assert_eq!(
+            serde_json::to_string(&Address::NodeRole(NodeId("peer".into()), Role::new("executor")))
+                .unwrap(),
+            r#"{"NodeRole":["peer","executor"]}"#
+        );
     }
 
     #[test]
@@ -698,6 +768,58 @@ mod tests {
         assert_eq!(brx.recv().unwrap().payload, b"hi-b");
     }
 
+    #[test]
+    fn node_role_capability_accepts_exact_or_existing_coarse_node_authority() {
+        let r = router();
+        let (transport, transport_rx) = r.register(Capabilities::default());
+        r.bind_role(Role::new(Role::TRANSPORT), transport);
+        let target = Address::NodeRole(NodeId("peer-b".into()), Role::new("executor"));
+        let exact = node_role_capability_key(&NodeId("peer-b".into()), &Role::new("executor"));
+
+        for (calls, payload) in
+            [(vec![exact], b"exact".as_slice()), (vec!["node:peer-b".into()], b"coarse".as_slice())]
+        {
+            let (sender, _sender_rx) =
+                r.register(Capabilities { calls, ..Capabilities::default() });
+            bus(&r, sender).send(Dispatch::to(target.clone(), payload.to_vec())).unwrap();
+            assert_eq!(transport_rx.recv().unwrap().payload, payload);
+        }
+
+        let (denied, _denied_rx) = r.register(Capabilities {
+            calls: vec!["role:executor".into()],
+            ..Capabilities::default()
+        });
+        let error = bus(&r, denied).send(Dispatch::to(target, b"denied".to_vec())).unwrap_err();
+        assert!(matches!(error, RouteError::Denied { from } if from == denied));
+        assert!(transport_rx.try_recv().is_err(), "denied NodeRole never reaches transport");
+    }
+
+    #[test]
+    fn node_role_capability_key_is_injective_across_adversarial_component_boundaries() {
+        let first_node = NodeId("a/b".into());
+        let first_role = Role::new("c");
+        let second_node = NodeId("a".into());
+        let second_role = Role::new("b/c");
+        let first = node_role_capability_key(&first_node, &first_role);
+        let second = node_role_capability_key(&second_node, &second_role);
+
+        assert_ne!(first, second, "component boundaries are committed by byte length");
+
+        let r = router();
+        let (transport, transport_rx) = r.register(Capabilities::default());
+        r.bind_role(Role::new(Role::TRANSPORT), transport);
+        let (sender, _sender_rx) =
+            r.register(Capabilities { calls: vec![first], ..Capabilities::default() });
+        let bus = bus(&r, sender);
+        bus.send(Dispatch::to(Address::NodeRole(first_node, first_role), b"first".to_vec()))
+            .unwrap();
+        assert_eq!(transport_rx.recv().unwrap().payload, b"first");
+        let error = bus
+            .send(Dispatch::to(Address::NodeRole(second_node, second_role), b"collision".to_vec()))
+            .unwrap_err();
+        assert!(matches!(error, RouteError::Denied { from } if from == sender));
+    }
+
     /// The `BudgetSignal` wire shape (level + kind + vector) serde-roundtrips
     /// for every level and kind variant. The wire is the substrate's commitment: a downstream policy
     /// creature that binds to this shape today gets the same shape when richer engines (Warn-emitters,
@@ -771,6 +893,38 @@ mod tests {
         assert_eq!(
             hex, EXPECTED,
             "envelope signing_payload tripwire fired; investigate field changes"
+        );
+    }
+
+    /// Signed-wire tripwire for the additive [`Address::NodeRole`] variant. The legacy Creature
+    /// fixture above remains pinned independently; this one commits the exact named JSON variant,
+    /// node, and role bytes that a source transport signs and a destination transport verifies.
+    #[test]
+    fn envelope_signing_payload_with_node_role_is_locked() {
+        use sha2::{Digest, Sha256};
+        let env = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(1)),
+                to: Address::NodeRole(NodeId("node/B:1".into()), Role::new("function/executor:v1")),
+                reply_to: Some(Address::Creature(CreatureId(99))),
+                seq: 7,
+                causal: vec![3, 5],
+                stamp: 1234,
+                sig: "must-be-stripped".into(),
+                corr: Some(42),
+                commitment: Some("commit-abc".into()),
+                schema: "test".into(),
+                origin: None,
+            },
+            payload: b"hello world".to_vec(),
+        };
+        let mut h = Sha256::new();
+        h.update(env.signing_payload());
+        let hex = format!("{:x}", h.finalize());
+        const EXPECTED: &str = "92fa0bbae120bf4e64513b3cb6a5ed1e01e6ee8497634b80d9795582c8b19f73";
+        assert_eq!(
+            hex, EXPECTED,
+            "NodeRole signing_payload tripwire fired; investigate Address serialization"
         );
     }
 

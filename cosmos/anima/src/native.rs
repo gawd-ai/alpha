@@ -6,6 +6,10 @@
 
 use std::os::raw::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use aether::ffi::{
     BindCtxFfi, CreatureVTableV1, NativeCtor, ABI_TAG, NATIVE_CTOR_SYMBOL, RC_BACKPRESSURE,
@@ -62,15 +66,16 @@ impl Engine for NativeEngine {
                 sigil::MAX_MANIFEST_BYTES
             )));
         }
-        // **Native-from-bytes.** When the substrate ships a creature over the wire (an
-        // `Artifact::Bytes`), we spill it to a unique temp file and `dlopen` that — `dlopen`'s
-        // entrypoint requires a path. The temp file's lifetime is bound to the resources so it
-        // is removed when (and only after) the library unmaps on the safe unload path. The
-        // leak path (`Box::leak` on resources) consequently leaks both library and tempfile
-        // together — a consistent bounded leak. The shipped bytes are capped like every other
-        // byte-materializing load — a local *path* load stays uncapped (`dlopen` maps it).
-        let (path, tempfile) = match artifact {
-            Artifact::Path(p) => (p.clone(), None),
+        // `dlopen` reopens a pathname, so admission must never hash one path and let the engine open
+        // a mutable source path later. Kernel loads arrive as `StagedNative`: a retained sealed
+        // memfd on Linux/Android, or a random private/read-only best-effort file elsewhere, whose
+        // digest was computed while those exact bytes were written. Direct Engine callers get the
+        // same mechanism here.
+        // Source paths stream with O(1) memory and no size cap; shipped bytes keep their existing
+        // finite materialization cap.
+        let stage = match artifact {
+            Artifact::StagedNative(stage) => stage.clone(),
+            Artifact::Path(path) => Arc::new(NativeArtifactStage::from_path(path, &manifest.name)?),
             Artifact::Bytes(bytes) => {
                 if crate::artifact_len_exceeds_limit(bytes.len(), crate::MAX_ARTIFACT_BYTES) {
                     return Err(EngineError::Load(format!(
@@ -79,11 +84,10 @@ impl Engine for NativeEngine {
                         crate::MAX_ARTIFACT_BYTES
                     )));
                 }
-                let spilled = spill_to_tempfile(bytes, &manifest.name)?;
-                let path = spilled.path.clone();
-                (path, Some(spilled))
+                Arc::new(NativeArtifactStage::from_bytes(bytes, &manifest.name)?)
             }
         };
+        let path = stage.path().to_path_buf();
 
         // SAFETY: loading foreign code is inherently unsafe — native is *trusted-by-admission*
         // (the honest containment limit; foreign/mobile code arrives only in sandboxed tiers, never
@@ -94,13 +98,10 @@ impl Engine for NativeEngine {
         let vtable: *mut CreatureVTableV1 = {
             let ctor: Symbol<NativeCtor> = unsafe { lib.get(NATIVE_CTOR_SYMBOL) }
                 .map_err(|e| EngineError::Load(format!("symbol gawd_creature_v1: {e}")))?;
-            // The constructor is foreign `extern "C"` code: trusted-by-admission, but a panic in it
-            // must NOT unwind across the C ABI (that is UB). Isolate it like every other FFI seam in
-            // this file — a panicking ctor becomes a clean `Load` error, not a process abort. (T7)
-            match catch_unwind(AssertUnwindSafe(|| ctor())) {
-                Ok(v) => v,
-                Err(_) => return Err(EngineError::Load("native constructor panicked".into())),
-            }
+            // This is a non-unwinding C ABI: a panic must be caught *inside* the guest before it
+            // reaches this call. `forge::declare_creature!` does so and returns null on failure;
+            // independently authored native creatures must uphold the same ABI rule.
+            ctor()
             // `ctor` (a borrow of `lib`) is dropped here, so `lib` can move into resources below.
         };
         if vtable.is_null() {
@@ -108,83 +109,370 @@ impl Engine for NativeEngine {
         }
 
         let instance = NativeInstance { vtable, host_ctx: None };
-        // Resources hold the library AND the optional tempfile guard. Field declaration order
-        // is the drop order — `lib` first (dlclose runs), `_tempfile` second (file unlinked).
-        // On Linux unlinking after dlclose is the conventional / safest order; even unlinking
-        // earlier would be sound because the inode persists while the file is mapped, but the
-        // explicit ordering is the version we want documented in code.
-        let resources = NativeResources { lib, _tempfile: tempfile };
+        // Resources hold the library AND its exact staged artifact. Field declaration order is the
+        // drop order — `lib` first (`dlclose`), `_stage` second (close memfd or unlink fallback).
+        // The kernel leak path leaks this whole resources value, deliberately retaining both the
+        // mapping and the pathname for a runaway native thread rather than risking UAF.
+        let resources = NativeResources { lib, _stage: stage };
         Ok(LoadedModule::new(Box::new(instance), Box::new(resources)))
     }
 }
 
-/// Native tier's `LoadedModule::resources` payload. Holds the dlopen'd library plus, when the
-/// artifact arrived as in-memory bytes (the ship path), a tempfile guard that unlinks the
-/// spilled file once the library unloads. **Neither field is read after construction** — the
-/// whole purpose of holding them is the destructor (`dlclose` on `lib`, unlink on `_tempfile`),
-/// so the `dead_code` lint would fire without explicit suppression.
+/// Native tier's `LoadedModule::resources` payload. Holds the dlopen'd library plus the exact
+/// staged artifact guard that closes/unlinks its backing capability once the library unloads.
+/// **Neither field is read after construction** — their purpose is drop order (`dlclose`, then
+/// cleanup), so the `dead_code` lint would fire without explicit suppression.
 #[allow(dead_code)]
 struct NativeResources {
     lib: Library,
-    _tempfile: Option<SpilledArtifact>,
+    _stage: Arc<NativeArtifactStage>,
 }
 
-/// A tempfile that auto-removes on drop. Avoids pulling in the `tempfile` crate: the only thing we
-/// need is "create a unique path, write bytes, remove on drop." The path is content-addressed for
-/// debuggability — if a load fails, the operator sees the same hash that's in the manifest.
-struct SpilledArtifact {
-    path: std::path::PathBuf,
+/// One native artifact copied into a retained load capability. Linux/Android use a sealed memfd;
+/// other targets use an OS-random private temporary directory and read-only file without claiming
+/// same-UID immutability.
+///
+/// Construction fields are private. Copying hashes every successfully written chunk; Linux then
+/// seals against write/grow/shrink and re-hashes the sealed bytes before admission trusts them.
+/// `Arc` clones extend one cleanup lifetime through `dlclose` (or the deliberate leak path).
+pub struct NativeArtifactStage {
+    backing: NativeStageBacking,
+    path: PathBuf,
+    sha256_hex: String,
 }
 
-impl Drop for SpilledArtifact {
-    fn drop(&mut self) {
-        // Best-effort cleanup. A failed unlink (no permission, race) leaves the file on disk —
-        // honestly visible to the operator, not silently swallowed via panic.
-        let _ = std::fs::remove_file(&self.path);
-    }
+enum NativeStageBacking {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    SealedMemfd(memfd::Memfd),
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    PrivateTemp { directory: PathBuf },
 }
 
-fn spill_to_tempfile(bytes: &[u8], name_hint: &str) -> Result<SpilledArtifact, EngineError> {
-    use sha2::Digest;
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_SPILL_ID: AtomicU64 = AtomicU64::new(0);
-
-    // Filename: gawd-<pid>-<spill-id>-<hash8>-<name>.so. The monotonically increasing spill id makes
-    // two same-process loads of the same content/name distinct, while `create_new` below prevents us
-    // from ever truncating a stale or concurrently-created path.
-    let mut h = sha2::Sha256::new();
-    h.update(bytes);
-    let digest = format!("{:x}", h.finalize());
-    let safe_name = safe_temp_name_hint(name_hint);
-
-    for _ in 0..1024 {
-        let spill_id = NEXT_SPILL_ID.fetch_add(1, Ordering::Relaxed);
-        let filename =
-            format!("gawd-{}-{}-{}-{}.so", std::process::id(), spill_id, &digest[..8], safe_name);
-        let path = std::env::temp_dir().join(filename);
-
-        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(EngineError::Load(format!("create tempfile {}: {e}", path.display())))
-            }
-        };
-        if let Err(e) = file.write_all(bytes) {
-            let _ = std::fs::remove_file(&path);
-            return Err(EngineError::Load(format!("write tempfile {}: {e}", path.display())));
+impl NativeArtifactStage {
+    pub(super) fn from_path(source_path: &Path, name_hint: &str) -> Result<Self, EngineError> {
+        let mut source = std::fs::File::open(source_path).map_err(|e| {
+            EngineError::Load(format!("open native source {}: {e}", source_path.display()))
+        })?;
+        let metadata = source.metadata().map_err(|e| {
+            EngineError::Load(format!("inspect native source {}: {e}", source_path.display()))
+        })?;
+        if !metadata.is_file() {
+            return Err(EngineError::Load(format!(
+                "native source {} is not a regular file",
+                source_path.display()
+            )));
         }
-        // Close the file handle (via drop) before we hand the path to dlopen — keeping the writer
-        // open through dlopen is fine on Linux but unnecessary, and we want the file's bytes flushed.
-        drop(file);
-        return Ok(SpilledArtifact { path });
+        Self::copy_from(&mut source, name_hint, Some(source_path))
     }
 
-    Err(EngineError::Load(
-        "could not allocate a unique native tempfile path after 1024 attempts".into(),
-    ))
+    pub(super) fn from_bytes(bytes: &[u8], name_hint: &str) -> Result<Self, EngineError> {
+        Self::copy_from(&mut std::io::Cursor::new(bytes), name_hint, None)
+    }
+
+    fn copy_from(
+        source: &mut dyn std::io::Read,
+        name_hint: &str,
+        source_path: Option<&Path>,
+    ) -> Result<Self, EngineError> {
+        use sha2::Digest;
+        use std::io::Write;
+
+        let (mut stage, mut target) = Self::create(name_hint)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = source.read(&mut buffer).map_err(|error| {
+                EngineError::Load(match source_path {
+                    Some(path) => format!("read native source {}: {error}", path.display()),
+                    None => format!("read shipped native artifact: {error}"),
+                })
+            })?;
+            if read == 0 {
+                break;
+            }
+            target.write_all(&buffer[..read]).map_err(|error| {
+                EngineError::Load(format!(
+                    "write native staging artifact {}: {error}",
+                    stage.path.display()
+                ))
+            })?;
+            hasher.update(&buffer[..read]);
+        }
+        target.flush().map_err(|error| {
+            EngineError::Load(format!(
+                "flush native staging artifact {}: {error}",
+                stage.path.display()
+            ))
+        })?;
+        let streamed_sha256 = format!("{:x}", hasher.finalize());
+        stage.finish(target, streamed_sha256)?;
+        Ok(stage)
+    }
+
+    fn create(name_hint: &str) -> Result<(Self, std::fs::File), EngineError> {
+        let safe_name = safe_temp_name_hint(name_hint);
+
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            use std::os::fd::AsRawFd;
+
+            let memfd = memfd::MemfdOptions::default()
+                .allow_sealing(true)
+                .create(format!("gawd-native-{safe_name}"))
+                .map_err(|error| {
+                    EngineError::Load(format!("create native staging memfd: {error}"))
+                })?;
+            let target = memfd.as_file().try_clone().map_err(|error| {
+                EngineError::Load(format!("duplicate native staging memfd writer: {error}"))
+            })?;
+            let path = unique_proc_fd_path(memfd.as_raw_fd());
+            std::fs::metadata(&path).map_err(|error| {
+                EngineError::Load(format!(
+                    "native staging requires an accessible /proc/self/fd capability {}: {error}",
+                    path.display()
+                ))
+            })?;
+            Ok((
+                Self {
+                    backing: NativeStageBacking::SealedMemfd(memfd),
+                    path,
+                    sha256_hex: String::new(),
+                },
+                target,
+            ))
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            for _ in 0..128 {
+                let random_suffix = random_stage_suffix()?;
+                let directory =
+                    std::env::temp_dir().join(format!("gawd-native-{random_suffix}-{safe_name}"));
+                match create_private_directory(&directory) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(EngineError::Load(format!(
+                            "create native staging directory {}: {error}",
+                            directory.display()
+                        )))
+                    }
+                }
+
+                let path = directory.join("artifact.so");
+                let stage = Self {
+                    backing: NativeStageBacking::PrivateTemp { directory },
+                    path: path.clone(),
+                    sha256_hex: String::new(),
+                };
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                return match options.open(&path) {
+                    Ok(file) => Ok((stage, file)),
+                    Err(error) => Err(EngineError::Load(format!(
+                        "create native staging artifact {}: {error}",
+                        path.display()
+                    ))),
+                };
+            }
+            Err(EngineError::Load(
+                "could not allocate a random private native staging directory after 128 attempts"
+                    .into(),
+            ))
+        }
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn finish(
+        &mut self,
+        target: std::fs::File,
+        streamed_sha256: String,
+    ) -> Result<(), EngineError> {
+        drop(target);
+        let NativeStageBacking::SealedMemfd(memfd) = &self.backing;
+        let required = [
+            memfd::FileSeal::SealShrink,
+            memfd::FileSeal::SealGrow,
+            memfd::FileSeal::SealWrite,
+            memfd::FileSeal::SealSeal,
+        ];
+        memfd.add_seals(&required).map_err(|error| {
+            EngineError::Load(format!("seal native staging memfd {}: {error}", self.path.display()))
+        })?;
+
+        // A same-UID process can enumerate `/proc/<pid>/fd` while the copy is in progress. Hash only
+        // after all seals are installed and require it to equal the streaming digest, detecting any
+        // write that raced construction. The bytes cannot change after this comparison.
+        let sealed_sha256 = hash_open_path(&self.path, "sealed native staging memfd")?;
+        if sealed_sha256 != streamed_sha256 {
+            return Err(EngineError::Load(format!(
+                "native staging bytes changed before sealing {}",
+                self.path.display()
+            )));
+        }
+        self.sha256_hex = sealed_sha256;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    fn finish(
+        &mut self,
+        target: std::fs::File,
+        streamed_sha256: String,
+    ) -> Result<(), EngineError> {
+        make_staged_file_read_only(&target, &self.path)?;
+        // Ephemeral staging is not crash-durable, so flush errors matter but fsync would not add an
+        // identity property. This fallback is random/private/read-only best effort, not a claim that
+        // the same UID cannot restore write permission.
+        drop(target);
+        self.sha256_hex = streamed_sha256;
+        Ok(())
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn construction_sha256_hex(&self) -> &str {
+        &self.sha256_hex
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pub(crate) fn is_kernel_sealed(&self) -> Result<bool, EngineError> {
+        let NativeStageBacking::SealedMemfd(memfd) = &self.backing;
+        let seals = memfd.seals().map_err(|error| {
+            EngineError::Load(format!("inspect native staging memfd seals: {error}"))
+        })?;
+        Ok([
+            memfd::FileSeal::SealShrink,
+            memfd::FileSeal::SealGrow,
+            memfd::FileSeal::SealWrite,
+            memfd::FileSeal::SealSeal,
+        ]
+        .iter()
+        .all(|seal| seals.contains(seal)))
+    }
+}
+
+impl Drop for NativeArtifactStage {
+    fn drop(&mut self) {
+        // Ordinary unload reaches here after dlclose; the deliberate native leak path retains the
+        // guard. Linux cleanup is the memfd closing after this body. Other targets unlink/rmdir.
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            #[cfg(not(unix))]
+            if let Ok(metadata) = std::fs::metadata(&self.path) {
+                let mut permissions = metadata.permissions();
+                permissions.set_readonly(false);
+                let _ = std::fs::set_permissions(&self.path, permissions);
+            }
+            let _ = std::fs::remove_file(&self.path);
+            let NativeStageBacking::PrivateTemp { directory } = &self.backing;
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+            let _ = std::fs::remove_dir(path);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn make_staged_file_read_only(file: &std::fs::File, path: &Path) -> Result<(), EngineError> {
+    let mut permissions = file
+        .metadata()
+        .map_err(|error| {
+            EngineError::Load(format!(
+                "inspect native staging artifact {}: {error}",
+                path.display()
+            ))
+        })?
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o400);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    file.set_permissions(permissions).map_err(|error| {
+        EngineError::Load(format!("protect native staging artifact {}: {error}", path.display()))
+    })
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn random_stage_suffix() -> Result<String, EngineError> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| EngineError::Load(format!("obtain native staging randomness: {error}")))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn hash_open_path(path: &Path, description: &str) -> Result<String, EngineError> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        EngineError::Load(format!("open {description} {}: {error}", path.display()))
+    })?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            EngineError::Load(format!("read {description} {}: {error}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Produce a process-unique spelling of the retained descriptor capability without introducing a
+/// mutable symlink. Each `./` or `../fd/` component resolves back to `/proc/self/fd`, but the unique
+/// complete string prevents the dynamic loader's pathname cache from confusing a newly allocated
+/// memfd with an older DSO after the kernel reuses its numeric descriptor. All 64 counter bits are
+/// encoded in a bounded (< 512 byte) path, so a spelling repeats only after exhausting the full
+/// process-local `u64` namespace; unlike temp-name probing, there is no finite collision loop or
+/// filesystem object an attacker can pre-create.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn unique_proc_fd_path(raw_fd: std::os::fd::RawFd) -> PathBuf {
+    static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
+
+    let id = NEXT_PATH_ID.fetch_add(1, Ordering::Relaxed);
+    let mut path = String::from("/proc/self/fd/");
+    for bit in 0..u64::BITS {
+        if id & (1_u64 << bit) == 0 {
+            path.push_str("./");
+        } else {
+            path.push_str("../fd/");
+        }
+    }
+    path.push_str(&raw_fd.to_string());
+    PathBuf::from(path)
 }
 
 fn safe_temp_name_hint(name_hint: &str) -> String {
@@ -338,24 +626,112 @@ impl Drop for NativeInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct SourceFile(PathBuf);
+
+    impl SourceFile {
+        fn new(bytes: &[u8]) -> Self {
+            static NEXT_SOURCE: AtomicU64 = AtomicU64::new(0);
+            for _ in 0..1024 {
+                let id = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("anima-native-source-{}-{id}", std::process::id()));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                match options.open(&path) {
+                    Ok(mut file) => {
+                        use std::io::Write;
+                        file.write_all(bytes).unwrap();
+                        return Self(path);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create source fixture: {error}"),
+                }
+            }
+            panic!("could not allocate source fixture")
+        }
+    }
+
+    impl Drop for SourceFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
-    fn native_byte_spills_use_unique_create_new_paths() {
+    fn native_byte_stages_are_private_unique_hashed_and_cleaned() {
         let bytes = b"not actually a shared object";
 
-        let a = spill_to_tempfile(bytes, "same/name").expect("first spill");
-        let b = spill_to_tempfile(bytes, "same/name").expect("second spill");
+        let a = NativeArtifactStage::from_bytes(bytes, "same/name").expect("first stage");
+        let b = NativeArtifactStage::from_bytes(bytes, "same/name").expect("second stage");
 
-        assert_ne!(a.path, b.path, "same content/name loads must not reuse a tempfile path");
+        assert_ne!(a.path, b.path, "same content/name loads must not reuse one load capability");
         assert_eq!(std::fs::read(&a.path).unwrap(), bytes);
         assert_eq!(std::fs::read(&b.path).unwrap(), bytes);
+        assert_eq!(a.sha256_hex, format!("{:x}", sha2::Sha256::digest(bytes)));
+        assert_eq!(b.sha256_hex, a.sha256_hex);
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            assert!(a.is_kernel_sealed().unwrap());
+            assert!(b.is_kernel_sealed().unwrap());
+            assert!(a.path.starts_with("/proc/self/fd"));
+            assert!(b.path.starts_with("/proc/self/fd"));
+        }
+        #[cfg(all(unix, not(any(target_os = "android", target_os = "linux"))))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let NativeStageBacking::PrivateTemp { directory: a_dir } = &a.backing;
+            let NativeStageBacking::PrivateTemp { directory: b_dir } = &b.backing;
+            assert_ne!(a_dir, b_dir);
+            assert_eq!(std::fs::metadata(a_dir).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&a.path).unwrap().permissions().mode() & 0o777, 0o400);
+        }
 
         let a_path = a.path.clone();
         let b_path = b.path.clone();
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        let (a_dir, b_dir) = {
+            let NativeStageBacking::PrivateTemp { directory: a_dir } = &a.backing;
+            let NativeStageBacking::PrivateTemp { directory: b_dir } = &b.backing;
+            (a_dir.clone(), b_dir.clone())
+        };
         drop(a);
         drop(b);
-        assert!(!a_path.exists(), "first spill unlinks on drop");
-        assert!(!b_path.exists(), "second spill unlinks on drop");
+        assert!(!a_path.exists(), "first stage capability disappears on drop");
+        assert!(!b_path.exists(), "second stage capability disappears on drop");
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        {
+            assert!(!a_dir.exists(), "first private stage directory is removed on drop");
+            assert!(!b_dir.exists(), "second private stage directory is removed on drop");
+        }
+    }
+
+    #[test]
+    fn native_path_stage_is_independent_of_a_later_source_path_swap() {
+        let source = SourceFile::new(b"source-v1");
+
+        let staged = NativeArtifactStage::from_path(&source.0, "loaded").unwrap();
+        std::fs::write(&source.0, b"replacement-v2").unwrap();
+
+        assert_eq!(std::fs::read(staged.path()).unwrap(), b"source-v1");
+        assert_eq!(
+            staged.construction_sha256_hex(),
+            format!("{:x}", sha2::Sha256::digest(b"source-v1"))
+        );
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn sealed_native_stage_rejects_same_uid_overwrite() {
+        let stage = NativeArtifactStage::from_bytes(b"sealed-v1", "sealed").unwrap();
+
+        let error = std::fs::write(stage.path(), b"replacement-v2")
+            .expect_err("WRITE/GROW/SHRINK seals must reject mutation through /proc/self/fd");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(stage.path()).unwrap(), b"sealed-v1");
+        assert!(stage.is_kernel_sealed().unwrap());
     }
 
     #[test]

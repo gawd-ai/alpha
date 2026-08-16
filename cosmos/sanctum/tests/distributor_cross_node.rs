@@ -8,8 +8,8 @@
 //! 2. **Node A boots second** with: transport-tcp + echo_A (advertised cpu:2) + advertiser_A
 //!    (carrying that offer) + **distributor-requirements** whose `peer_advertisers` includes
 //!    `(NodeId("node-B"), advertiser_B_id)`.
-//! 3. **The probe on A** subscribes to PROPRIOCEPTION and waits for `peer_connected` for node-B
-//!    (the transport handshake completes; cross-node addressable).
+//! 3. **The probe on A** repeatedly sends a typed placement Query directly to advertiser_B until a
+//!    valid Answer naming echo_B crosses the mutually authenticated application route back to A.
 //! 4. **The probe on A** issues `Intent{outcome:"reverse", requirements:["cpu >= 4"]}` addressed
 //!    to the bound distributor.
 //! 5. **A's distributor consults**: emits SEER `placement` Queries to advertiser_A *and* to
@@ -31,20 +31,20 @@
 //! - It is not a transport test — transport-tcp is exercised by `m2_two_node` already.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aether::{
-    Address, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, InboxReceiver,
-    Intent, NodeId, Outcome, Role, StubSigner,
+    Address, BusHandle, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope,
+    InboxReceiver, Intent, NodeId, Outcome, Role, StubSigner,
 };
 use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use distributor_requirements::{Distributor, PickModel};
 use embodiment_advertiser::{EmbodimentAdvertiser, OfferEntry};
 use policy_signed::SignedPolicy;
 use sanctum::Kernel;
-use seer::topics::placement;
+use seer::{topics::placement, SeerEnvelope, SeerKind, SeerTopic, SCHEMA as SEER_SCHEMA};
 use sigil::{Backend, Capabilities, Ed25519KeyMaterial, Ed25519Verifier, Manifest};
-use transport_tcp::{PeerConfig, PeerEvent, TransportConfig, TransportTcp};
+use transport_tcp::{PeerConfig, TransportConfig, TransportTcp};
 
 // ----- ports + node identities (distinct from v01_end_to_end + m2_two_node) ---------------------
 
@@ -112,9 +112,9 @@ fn recv_match<F: Fn(&Envelope) -> bool>(
     pred: F,
     budget: Duration,
 ) -> Option<Envelope> {
-    let deadline = std::time::Instant::now() + budget;
-    while std::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
             Ok(env) if env.header.corr == Some(corr) && pred(&env) => return Some(env),
             _ => continue,
@@ -123,25 +123,77 @@ fn recv_match<F: Fn(&Envelope) -> bool>(
     None
 }
 
-/// Wait for a `peer_event` payload on the probe's inbox naming a specific peer + event. Used to
-/// gate the test on transport handshake completion before issuing the Intent (otherwise the SEER
-/// Query gets dropped silently by transport-tcp's pre-handshake guard).
-fn wait_for_peer_event(rx: &InboxReceiver, peer: &str, event: &str, budget: Duration) -> bool {
-    let deadline = std::time::Instant::now() + budget;
-    while std::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
-            Ok(env) if env.header.schema == "peer_event" => {
-                if let Ok(ev) = serde_json::from_slice::<PeerEvent>(&env.payload) {
-                    if ev.peer == peer && ev.event == event {
-                        return true;
-                    }
-                }
+/// Wait for the complete authenticated application route, not transport's one-shot handshake
+/// event. The event may be published before this test opens its probe; more importantly, it does not
+/// prove that a SEER Query can reach B's advertiser and its Answer can return to A. Every attempt
+/// uses a fresh correlation so a late Answer cannot satisfy the placement operation that follows.
+fn await_remote_advertiser_route(
+    bus: &BusHandle,
+    rx: &InboxReceiver,
+    advertiser: CreatureId,
+    expected_target: CreatureId,
+    mut corr: u64,
+) -> u64 {
+    let deadline = Instant::now() + scaled(Duration::from_secs(10));
+    while Instant::now() < deadline {
+        let query_id = 1;
+        let query = SeerEnvelope::query(
+            SeerTopic::Placement,
+            corr,
+            query_id,
+            &placement::QueryBody {
+                requirements: vec!["cpu >= 4".into()],
+                outcome: Some("readiness-probe".into()),
+                target_realm: None,
+            },
+        );
+        bus.send(
+            Dispatch::to(Address::Node(NodeId(NODE_B.into()), advertiser), query.to_bytes())
+                .with_schema(SEER_SCHEMA)
+                .with_reply_to(Address::Creature(bus.id()))
+                .with_corr(corr),
+        )
+        .expect("readiness Query enters A's local bus");
+
+        let remaining_total = deadline.saturating_duration_since(Instant::now());
+        let attempt_deadline =
+            Instant::now() + scaled(Duration::from_millis(350)).min(remaining_total);
+        while Instant::now() < attempt_deadline {
+            let remaining = attempt_deadline.saturating_duration_since(Instant::now());
+            let Ok(env) = rx.recv_timeout(remaining.min(Duration::from_millis(50))) else {
+                continue;
+            };
+            if env.header.corr != Some(corr) || env.header.schema != SEER_SCHEMA {
+                continue;
             }
-            _ => continue,
+            let Ok(answer) = SeerEnvelope::parse_bounded(&env.payload) else {
+                continue;
+            };
+            let SeerEnvelope {
+                topic: SeerTopic::Placement,
+                corr: answer_corr,
+                kind: SeerKind::Answer { query_id: answer_query_id, body },
+            } = answer
+            else {
+                continue;
+            };
+            if answer_corr != corr || answer_query_id != query_id {
+                continue;
+            }
+            let Ok(body) = serde_json::from_value::<placement::AnswerBody>(body) else {
+                continue;
+            };
+            if body.matches.iter().any(|offer| {
+                offer.node == NODE_B
+                    && offer.creature_id == expected_target.0
+                    && offer.embodiment.cpu == 4
+            }) {
+                return corr.saturating_add(1);
+            }
         }
+        corr = corr.saturating_add(1);
     }
-    false
+    panic!("authenticated placement Query/Answer route to node B did not become ready");
 }
 
 // ----- node B (booted first; lends advertiser_B_id to A) ---------------------------------------
@@ -149,7 +201,6 @@ fn wait_for_peer_event(rx: &InboxReceiver, peer: &str, event: &str, budget: Dura
 struct NodeB {
     kernel: Arc<Kernel>,
     advertiser_id: CreatureId,
-    #[allow(dead_code)]
     echo_id: CreatureId,
 }
 
@@ -282,9 +333,8 @@ fn boot_node_a(
         .expect("A distributor admits");
     k.bind_role(Role::new(Role::DISTRIBUTOR), distributor_id);
 
-    // Probe — subscribed to PROPRIOCEPTION so we can gate on peer_connected.
+    // Probe for application-level transport readiness and the final placement reply.
     let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
-    k.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe_id);
 
     NodeA { kernel: k, probe_id, probe_bus, probe_rx }
 }
@@ -304,15 +354,14 @@ fn distributor_cross_node_match() {
     let b = boot_node_b(&abode, node_b_key);
     let a = boot_node_a(&abode, node_a_key, b.advertiser_id);
 
-    // Gate on peer_connected before issuing the Intent — transport-tcp drops envelopes silently
-    // until the handshake completes, and there's no point in racing the test against that.
-    let handshake_ok =
-        wait_for_peer_event(&a.probe_rx, NODE_B, "peer_connected", scaled(Duration::from_secs(5)));
-    assert!(handshake_ok, "A↔B transport handshake must complete before the placement consult");
+    // A one-shot peer event can race probe subscription and only proves transport state. Exercise
+    // the exact authenticated SEER Query/Answer path the distributor needs, retrying with fresh
+    // correlations until B's real advertiser proves both directions are application-routable.
+    let intent_corr =
+        await_remote_advertiser_route(&a.probe_bus, &a.probe_rx, b.advertiser_id, b.echo_id, 1);
 
     // Issue the cross-node-required Intent. A's local advertiser has cpu:2 (no match); B's has
     // cpu:4 (the only match). The distributor must consult both, reconcile to B, route to B.
-    let intent_corr = 1u64;
     a.probe_bus
         .send(
             Dispatch::to(

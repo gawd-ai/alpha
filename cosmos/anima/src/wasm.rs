@@ -43,6 +43,26 @@ use std::time::Duration;
 
 use crate::{Artifact, BudgetControl, Engine, EngineError, LoadedModule};
 
+/// Wasmtime exposes `Config::parallel_compilation` only when its optional
+/// `parallel-compilation` Cargo feature is compiled. Alpha deliberately omits that feature, so no
+/// Rayon worker pool exists and module compilation is structurally serial. This compatibility shim
+/// lets the constructor still spell the runtime posture explicitly: when another dependency ever
+/// unifies that Wasmtime feature into a downstream graph, Wasmtime's inherent method shadows this
+/// no-op and the same call actively disables its worker pool.
+///
+/// Keep this method name identical to Wasmtime's inherent method; the shadowing is intentional.
+#[allow(dead_code)] // Shadowed (and therefore unused) when Wasmtime's optional method is available.
+trait ParallelCompilationConfigExt {
+    fn parallel_compilation(&mut self, enabled: bool) -> &mut Self;
+}
+
+impl ParallelCompilationConfigExt for WtConfig {
+    fn parallel_compilation(&mut self, enabled: bool) -> &mut Self {
+        assert!(!enabled, "the no-worker-pool Wasmtime build cannot enable parallel compilation");
+        self
+    }
+}
+
 /// Sentinel error wrapped inside wasmtime's `anyhow::Error` chain to mark a grow that the
 /// limiter refused for budget reasons. We use a typed marker (not a magic string) so
 /// `diagnose_trap` can downcast cleanly and tell budget-grow-refusals apart from other
@@ -86,8 +106,9 @@ pub struct WasmEngine {
 }
 
 impl WasmEngine {
-    /// Constructs with `DEFAULT_FUEL_PER_MS`, `consume_fuel(true)`, and `epoch_interruption(true)` on
-    /// the wasmtime config, plus the engine-global epoch ticker at `DEFAULT_EPOCH_TICK_MS`.
+    /// Constructs with `DEFAULT_FUEL_PER_MS`, serial module compilation, `consume_fuel(true)`, and
+    /// `epoch_interruption(true)` on the wasmtime config, plus the engine-global epoch ticker at
+    /// `DEFAULT_EPOCH_TICK_MS`.
     /// `consume_fuel`/`epoch_interruption` must be set at engine build time (not per-store), so they
     /// are always on. A creature with `cpu_ms == 0` gets `u64::MAX` fuel; one with `wall_ms == None`
     /// gets an effectively-unlimited epoch deadline — both effectively unlimited.
@@ -99,6 +120,12 @@ impl WasmEngine {
     /// `wall_ms` more precisely (and lets a test trip a wall cap fast); `tick_ms` is clamped to ≥1.
     pub fn with_tick_ms(tick_ms: u64) -> Self {
         let mut cfg = WtConfig::new();
+        // Wasmtime otherwise defaults to compiling a module's functions on a Rayon pool. That pool
+        // is outside Cargo's job limit and libtest's thread limit, so a single beast load could
+        // still saturate the host. Alpha excludes Wasmtime's optional `parallel-compilation` feature
+        // entirely; the extension shim above makes this a no-op in that lean build and the inherent
+        // Wasmtime setter makes it a real fail-safe if feature unification ever brings the pool in.
+        cfg.parallel_compilation(false);
         cfg.consume_fuel(true);
         // Wall-clock enforcement for the beast tier rides wasmtime epoch interruption — an
         // engine-build-time tunable on the shared engine. Once on, EVERY store must get an epoch
@@ -597,5 +624,29 @@ fn classify(err: &wasmtime::Error) -> EngineError {
         EngineError::BudgetBreach(kind)
     } else {
         EngineError::Load(format!("wasm trap: {err}"))
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    /// The runtime setter is feature-gated inside Wasmtime itself, so the primary resource boundary
+    /// is the dependency declaration: no `parallel-compilation` feature means no Rayon worker pool
+    /// is compiled. Keep a cheap drift guard beside the constructor instead of compiling a module
+    /// merely to infer thread use.
+    #[test]
+    fn wasmtime_dependency_keeps_parallel_compilation_out() {
+        let dependency = include_str!("../Cargo.toml")
+            .lines()
+            .find(|line| line.trim_start().starts_with("wasmtime ="))
+            .expect("anima must declare its Wasmtime dependency explicitly");
+
+        assert!(
+            dependency.contains("default-features = false"),
+            "Wasmtime defaults include its parallel-compilation worker pool: {dependency}"
+        );
+        assert!(
+            !dependency.contains("parallel-compilation"),
+            "Wasmtime parallel compilation bypasses Alpha's one-CPU posture: {dependency}"
+        );
     }
 }

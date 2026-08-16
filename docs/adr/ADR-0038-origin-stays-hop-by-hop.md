@@ -55,7 +55,7 @@ rule.
 ## Implementation sketch
 
 - **Files:** `cosmos/seer/src/lib.rs` — the `pub mod dialogue` block (L987); its `AnswerBody`
-  (L1003, today just `pub reply: String`) gains optional `signer_pubkey` + `signature` fields,
+  (L1003, originally just `pub reply: String`) gains optional `signer_pubkey` + `signature` fields,
   `#[serde(default, skip_serializing_if = "Option::is_none")]` (there is **no** `cosmos/seer/src/topics/`
   directory — every SEER topic body is an inline module in `lib.rs`);
   `cosmos/creatures/prototypes/dialogue/dialogue-responder` (sign the answer) +

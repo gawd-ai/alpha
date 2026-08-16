@@ -25,6 +25,18 @@ anima = { path = "../cosmos/anima" }
 sigil = { path = "../cosmos/sigil" }
 sanctum = { path = "../cosmos/sanctum" }
 omni = { path = "../cosmos/omni" }
+# The Function/Job runtime is an explicit outer-composition option. These are mechanism organs and
+# contract leaves; Alpha injects the local trust/admission/catalog policies when the operator passes
+# `alpha node --functions <config>`.
+gawdfn = { workspace = true }
+bestiary = { path = "../cosmos/bestiary" }
+bestiary-daemon = { path = "../cosmos/creatures/bestiary-daemon" }
+function-home = { path = "../cosmos/creatures/function-home" }
+function-executor = { path = "../cosmos/creatures/function-executor" }
+function-resolver = { path = "../cosmos/creatures/function-resolver" }
+function-locator = { path = "../cosmos/creatures/function-locator" }
+job-blob-fs = { path = "../cosmos/creatures/job-blob-fs" }
+policy-job-basic = { path = "../cosmos/creatures/prototypes/policies/policy-job-basic" }
 # The injected-model config type. Optional: only the `openai` feature names `mind::ModelConfig` (to
 # build it from the operator's `--author-*` flags); the default build links neither it nor `ureq`.
 mind = { path = "../cosmos/mind", optional = true }

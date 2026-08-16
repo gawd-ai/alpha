@@ -23,7 +23,13 @@ use std::time::Duration;
 use aether::{
     Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, Outcome, RealmId,
 };
+use gawdfn::{
+    DeploymentQueryV1, DeploymentReceiptV1, DeploymentRequestV1, EventQueryV1, JobControlV1,
+    JobGetV1, JobSubmitV1, ResolutionReceiptV1, ResolveRequestV1, SignedRecordV1,
+    UndeployRequestV1,
+};
 use omni::{ControlTarget, Verb, VerbResult, CONTROL_RESULT_SCHEMA, CONTROL_SCHEMA};
+use serde::de::DeserializeOwned;
 
 use serde_json::{json, Value};
 
@@ -71,9 +77,14 @@ struct SurfaceState {
     bus: Mutex<Option<Arc<dyn Bus>>>,
     me: Mutex<Option<CreatureId>>,
     corr: AtomicU64,
-    pending: Mutex<HashMap<u64, Sender<VerbResult>>>,
+    pending: Mutex<HashMap<u64, PendingReply>>,
     target: ControlTarget,
     stop: AtomicBool,
+}
+
+struct PendingReply {
+    capability: String,
+    tx: Sender<VerbResult>,
 }
 
 impl SurfaceState {
@@ -83,16 +94,25 @@ impl SurfaceState {
     fn bus(&self) -> Option<Arc<dyn Bus>> {
         self.bus.lock().unwrap().clone()
     }
-    fn register_pending(&self, corr: u64, tx: Sender<VerbResult>) -> Result<(), VerbResult> {
+    fn register_pending(
+        &self,
+        corr: u64,
+        capability: String,
+        tx: Sender<VerbResult>,
+    ) -> Result<(), VerbResult> {
         let mut pending = self.pending.lock().unwrap();
         if pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
             return Err(surface_busy(pending.len()));
         }
-        pending.insert(corr, tx);
+        pending.insert(corr, PendingReply { capability, tx });
         Ok(())
     }
-    fn take_pending(&self, corr: u64) -> Option<Sender<VerbResult>> {
-        self.pending.lock().unwrap().remove(&corr)
+    fn take_pending(&self, corr: u64, capability: Option<&str>) -> Option<Sender<VerbResult>> {
+        let mut pending = self.pending.lock().unwrap();
+        let matches = pending
+            .get(&corr)
+            .is_some_and(|expected| capability == Some(expected.capability.as_str()));
+        matches.then(|| pending.remove(&corr).expect("matched pending reply").tx)
     }
     fn remove_pending(&self, corr: u64) {
         self.pending.lock().unwrap().remove(&corr);
@@ -153,7 +173,7 @@ impl Creature for SurfaceMcp {
         // loop's request waiting on this corr.
         if env.header.schema == CONTROL_RESULT_SCHEMA {
             if let Some(corr) = env.header.corr {
-                if let Some(tx) = self.state.take_pending(corr) {
+                if let Some(tx) = self.state.take_pending(corr, env.header.commitment.as_deref()) {
                     let res = omni::parse_control_result(&env.payload)
                         .unwrap_or_else(omni::control_result_decode_failure);
                     let _ = tx.send(res);
@@ -326,19 +346,25 @@ fn initialize_result(params: &Value) -> Value {
         "instructions":
             "alpha-mcp drives a running Alpha Sanctum over GAWD's own bus: each tool call is \
              a Verb envelope routed to Role::CONTROL, and the result rides back. The MCP \
-             server is itself a headless Sanctum (a control-hub node). DEV posture: the target node's dev policy \
-             admits everything and the bus signer is a stub; not a hardened deployment. Mutating tools \
+             server is itself a headless Sanctum (a control-hub node). DEV posture: the bundled dev \
+             admission policy admits everything. A local non-clustered hub uses a stub bus signer; a \
+             remote hub and clustered target use their authenticated ed25519 node identities. Neither \
+             posture is a hardened deployment. Mutating tools \
              (alpha_author, alpha_author_critter, alpha_load, alpha_registry_publish, \
-             alpha_registry_fetch_load, alpha_send, \
+             alpha_registry_fetch_load, alpha_function_resolve, alpha_function_deploy, alpha_function_undeploy, alpha_job_submit, \
+             alpha_job_control, alpha_send, \
              alpha_intent, alpha_bind, alpha_unload, alpha_cluster_connect) are gated by the target \
-             node's allow-AI switch, which a \
-             human grants with `allow-ai on` at that node's REPL; while it is off they return an \
-             `ai-not-allowed` error. There is deliberately NO tool to flip that switch — the gate is \
-             local-REPL-only (`allow-ai on/off`) by design, so a remote AI can never grant itself \
-             permission; that is why no `alpha_allow_ai` tool exists. Read-only tools (alpha_status, alpha_list, alpha_journal, alpha_watch, \
-             alpha_registry_fetch, alpha_registry_list, alpha_bestiary_prove, alpha_cluster) are not \
-             blocked by allow-AI. Call alpha_ai_status before mutating so the human \
-             watching the node can see your activity and revoke. Prefer alpha_author_critter (Rhai, \
+             node's allow-AI switch; while it is off they return an `ai-not-allowed` error. In local \
+             mode this MCP node is headless, so only `alpha mcp --allow-ai` at startup opens its gate. \
+             In remote mode the target owns the gate: grant at the target's REPL or boot that target \
+             with `--allow-ai`; the hub's own flag cannot change it. There is deliberately NO tool to \
+             flip the switch, so a remote AI can never grant itself permission; that is why no \
+             `alpha_allow_ai` tool exists. Read-only tools (alpha_status, alpha_list, alpha_journal, alpha_watch, \
+             alpha_registry_fetch, alpha_registry_list, alpha_bestiary_prove, \
+             alpha_function_deployments, alpha_job_get, alpha_job_events, alpha_cluster) are not \
+             blocked by allow-AI. Call alpha_ai_status before mutating so an operator can observe your \
+             activity; an interactive target can revoke at its REPL, while a headless target closes \
+             the gate by restarting without `--allow-ai`. Prefer alpha_author_critter (Rhai, \
              milliseconds) over alpha_author (a cold cargo build can take minutes and blocks the call)."
     })
 }
@@ -392,15 +418,25 @@ fn request_control(state: &SurfaceState, verb: Verb, timeout: Duration) -> VerbR
         Ok(payload) => payload,
         Err(res) => return res,
     };
+    let reply_capability = match omni::fresh_control_reply_capability() {
+        Ok(capability) => capability,
+        Err(detail) => {
+            return VerbResult::err(
+                json!({ "error": "control-reply-capability-unavailable", "detail": detail }),
+                "control reply capability could not be generated; request was not sent",
+            )
+        }
+    };
     let corr = state.corr.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = channel::<VerbResult>();
-    if let Err(res) = state.register_pending(corr, tx) {
+    if let Err(res) = state.register_pending(corr, reply_capability.clone(), tx) {
         return res;
     };
     let d = Dispatch::to(state.target.address(), payload)
         .with_schema(CONTROL_SCHEMA)
         .with_reply_to(Address::Creature(me))
-        .with_corr(corr);
+        .with_corr(corr)
+        .with_commitment(reply_capability);
     if let Err(e) = bus.emit(d) {
         state.remove_pending(corr);
         return VerbResult::err(
@@ -448,6 +484,21 @@ fn no_args() -> Value {
     json!({ "type": "object", "properties": {}, "additionalProperties": false })
 }
 
+fn signed_record_arg(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "properties": {
+            "schema": { "type": "string" },
+            "signer": { "type": "string" },
+            "payload": { "type": "object" },
+            "signature": { "type": "string" }
+        },
+        "required": ["schema", "signer", "payload", "signature"],
+        "additionalProperties": false
+    })
+}
+
 /// The full tool list returned by `tools/list`. (Same surface as the legacy HTTP-backed proxy, so an
 /// MCP host sees no change — only the transport beneath changed, to GAWD's own bus.)
 fn tool_list() -> Value {
@@ -464,11 +515,19 @@ fn tool_list() -> Value {
         tool("alpha_registry_list", "Snapshot the catalogue (the Bestiary): each entry's artifact hash, name, version, Realm, reputation, and quarantine flag. Optional `realm` scopes to one Realm; omit to list all. Read-only.", json!({ "type": "object", "properties": { "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit to list every Realm." } }, "additionalProperties": false }), true),
         tool("alpha_registry_fetch_load", "Fetch a creature artifact over GX (bounded, resumable chunks) from a registry, integrity-check it, and LOAD it into this node. Omit `node` to fetch from the local registry; set `node` + `registry_id` to fetch from a peer over the cluster. Optional `realm`. A large transfer can take a while (the call blocks). Loads code → gated by allow-AI.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string", "maxLength": MAX_HASH_ARG_BYTES }, "node": { "type": "string", "maxLength": MAX_NODE_ARG_BYTES, "description": "Optional peer node-id; with registry_id, fetches cross-node over the cluster." }, "registry_id": { "type": "integer", "description": "The peer registry's creature id — required when `node` is set (registry addressing is node-local)." }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES, "description": "Optional Realm name; omit for the local Realm." }, "chunk_size": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "description": "Optional GX chunk size; omit to let the registry choose." } }, "required": ["artifact_hash"], "additionalProperties": false }), false),
         tool("alpha_bestiary_prove", "Ask the durable Bestiary for a standalone, signed EntryProof attestation over (realm, artifact_hash) — survives compaction and is independently verifiable. Only a durable bestiary-daemon answers (the in-memory stub returns an error). Read-only.", json!({ "type": "object", "properties": { "artifact_hash": { "type": "string", "maxLength": MAX_HASH_ARG_BYTES }, "realm": { "type": "string", "maxLength": MAX_REALM_ARG_BYTES } }, "required": ["artifact_hash", "realm"], "additionalProperties": false }), true),
+        tool("alpha_function_resolve", "Resolve an already-signed gawdfn selector to one immutable signed function receipt. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": signed_record_arg("Signed ResolveRequestV1") }, "required": ["request"], "additionalProperties": false }), false),
+        tool("alpha_function_deploy", "Load and register an exact resolved function from a manifest + artifact already on the NODE's filesystem (not a client upload). Requires signed deployment authorization and resolution receipt. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": signed_record_arg("Signed DeploymentRequestV1"), "resolution": signed_record_arg("Signed ResolutionReceiptV1"), "manifest_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES }, "artifact_path": { "type": "string", "maxLength": MAX_PATH_ARG_BYTES } }, "required": ["request", "resolution", "manifest_path", "artifact_path"], "additionalProperties": false }), false),
+        tool("alpha_function_undeploy", "Durably tombstone one exact deployment at its stable executor, verify its signed acknowledgement is bound to the current role responder, then unload only the exact manifest and measured artifact bytes still occupying the deployment receipt's local target id. Requires signed undeploy authorization and the exact signed deployment receipt. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": signed_record_arg("Signed UndeployRequestV1"), "deployment": signed_record_arg("Signed DeploymentReceiptV1") }, "required": ["request", "deployment"], "additionalProperties": false }), false),
+        tool("alpha_function_deployments", "Read a bounded list of signed live deployment receipts from the function executor.", json!({ "type": "object", "properties": { "query": { "type": "object", "properties": { "function": { "type": "object", "properties": { "manifest_content_address": { "type": "string" }, "entrypoint": { "type": "string" } }, "required": ["manifest_content_address", "entrypoint"], "additionalProperties": false }, "realm": { "type": "string" }, "node": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": gawdfn::MAX_EVENT_PAGE_ITEMS } }, "required": ["limit"], "additionalProperties": false } }, "required": ["query"], "additionalProperties": false }), true),
+        tool("alpha_job_submit", "Submit an already-signed job with exact signed resolution and deployment pins. Returns durable Accepted only; execution remains asynchronous. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": signed_record_arg("Signed JobSubmitV1"), "resolution": signed_record_arg("Signed ResolutionReceiptV1"), "deployment": signed_record_arg("Signed DeploymentReceiptV1") }, "required": ["request", "resolution", "deployment"], "additionalProperties": false }), false),
+        tool("alpha_job_get", "Read a job as the complete route-bound relay request plus signed snapshot response proof.", json!({ "type": "object", "properties": { "request": signed_record_arg("Signed JobGetV1") }, "required": ["request"], "additionalProperties": false }), true),
+        tool("alpha_job_events", "Read a bounded event page as the complete route-bound relay request plus signed page response proof.", json!({ "type": "object", "properties": { "request": signed_record_arg("Signed EventQueryV1") }, "required": ["request"], "additionalProperties": false }), true),
+        tool("alpha_job_control", "Apply an already-signed cooperative steer, cancel, or access command at the job home. Gated by allow-AI.", json!({ "type": "object", "properties": { "request": signed_record_arg("Signed JobControlV1") }, "required": ["request"], "additionalProperties": false }), false),
         tool("alpha_send", "Send a text message to a creature by creature id and read its reply. Add `node` to route to a creature on a peer node over the cluster. Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" }, "text": { "type": "string", "maxLength": MAX_TEXT_ARG_BYTES }, "node": { "type": "string", "maxLength": MAX_NODE_ARG_BYTES, "description": "Optional peer node-id — routes the send across the cluster." } }, "required": ["id", "text"], "additionalProperties": false }), false),
         tool("alpha_intent", "Express an intent on a Role (outcome + text) and read the reply from whatever creature is bound there. Gated by allow-AI.", json!({ "type": "object", "properties": { "outcome": { "type": "string", "maxLength": omni::MAX_CONTROL_ROLE_NAME_BYTES }, "text": { "type": "string", "maxLength": MAX_TEXT_ARG_BYTES } }, "required": ["outcome", "text"], "additionalProperties": false }), false),
         tool("alpha_bind", "Bind a loaded creature to a Role so intents addressed to that Role route to it. Gated by allow-AI.", json!({ "type": "object", "properties": { "role": { "type": "string", "maxLength": omni::MAX_CONTROL_ROLE_NAME_BYTES, "pattern": "^[A-Za-z0-9._-]+$" }, "id": { "type": "integer" } }, "required": ["role", "id"], "additionalProperties": false }), false),
         tool("alpha_unload", "Unload a creature by creature id (runs its orderly teardown). Gated by allow-AI.", json!({ "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"], "additionalProperties": false }), false),
-        tool("alpha_ai_status", "Announce what you (the AI) are doing on this shared node — surfaced live to the human at the node's REPL/stream so they can watch and revoke. Call it before a mutating action. Not gated.", json!({ "type": "object", "properties": { "working": { "type": "boolean" }, "activity": { "type": "string", "maxLength": MAX_AI_STATUS_ARG_BYTES }, "message": { "type": "string", "maxLength": MAX_AI_STATUS_ARG_BYTES } }, "required": ["working"], "additionalProperties": false }), false),
+        tool("alpha_ai_status", "Record what you (the AI) are doing on this shared node so every control surface reports the same current activity. MCP stores the update; unlike the HTTP endpoint, it does not itself push a tape/WebSocket frame. Call it before a mutating action. Not gated.", json!({ "type": "object", "properties": { "working": { "type": "boolean" }, "activity": { "type": "string", "maxLength": MAX_AI_STATUS_ARG_BYTES }, "message": { "type": "string", "maxLength": MAX_AI_STATUS_ARG_BYTES } }, "required": ["working"], "additionalProperties": false }), false),
         tool("alpha_cluster", "Read this node's view of the cluster graph: which peer Sanctums it knows and which are connected. Read-only.", no_args(), true),
         tool("alpha_cluster_connect", "Admit + dial a cluster peer (the cluster join); gossip then spreads it across the mesh. Gated by allow-AI.", json!({ "type": "object", "properties": { "node_id": { "type": "string", "maxLength": MAX_NODE_ARG_BYTES }, "addr": { "type": "string", "maxLength": MAX_ADDR_ARG_BYTES }, "pubkey": { "type": "string", "maxLength": MAX_PUBKEY_ARG_BYTES } }, "required": ["node_id", "addr", "pubkey"], "additionalProperties": false }), false),
     ])
@@ -505,6 +564,14 @@ fn dispatch(state: &SurfaceState, name: &str, args: &Value) -> (bool, Value) {
             return (true, journal.json);
         }
         return (false, json!({ "status": status.json, "journal": journal.json }));
+    }
+    if let Some(typed) = function_job_verb(name, args) {
+        let verb = match typed {
+            Ok(verb) => verb,
+            Err(error) => return (true, json!({ "error": error })),
+        };
+        let res = request_control(state, verb, READ_TIMEOUT);
+        return (!res.ok, res.json);
     }
     let (verb, timeout) = match name {
         "alpha_status" => (Verb::Status, READ_TIMEOUT),
@@ -603,6 +670,50 @@ fn dispatch(state: &SurfaceState, name: &str, args: &Value) -> (bool, Value) {
     (!res.ok, res.json)
 }
 
+fn function_job_verb(name: &str, args: &Value) -> Option<Result<Verb, String>> {
+    let parsed = match name {
+        "alpha_function_resolve" => typed_arg::<SignedRecordV1<ResolveRequestV1>>(args, "request")
+            .map(|request| Verb::FunctionResolve { request }),
+        "alpha_function_deploy" => (|| {
+            Ok(Verb::FunctionDeploy {
+                request: typed_arg::<SignedRecordV1<DeploymentRequestV1>>(args, "request")?,
+                resolution: typed_arg::<SignedRecordV1<ResolutionReceiptV1>>(args, "resolution")?,
+                manifest_path: sarg(args, "manifest_path"),
+                artifact_path: sarg(args, "artifact_path"),
+            })
+        })(),
+        "alpha_function_undeploy" => (|| {
+            Ok(Verb::FunctionUndeploy {
+                request: typed_arg::<SignedRecordV1<UndeployRequestV1>>(args, "request")?,
+                deployment: typed_arg::<SignedRecordV1<DeploymentReceiptV1>>(args, "deployment")?,
+            })
+        })(),
+        "alpha_function_deployments" => typed_arg::<DeploymentQueryV1>(args, "query")
+            .map(|query| Verb::FunctionDeployments { query }),
+        "alpha_job_submit" => (|| {
+            Ok(Verb::JobSubmit {
+                request: Box::new(typed_arg::<SignedRecordV1<JobSubmitV1>>(args, "request")?),
+                resolution: typed_arg::<SignedRecordV1<ResolutionReceiptV1>>(args, "resolution")?,
+                deployment: typed_arg::<SignedRecordV1<DeploymentReceiptV1>>(args, "deployment")?,
+            })
+        })(),
+        "alpha_job_get" => typed_arg::<SignedRecordV1<JobGetV1>>(args, "request")
+            .map(|request| Verb::JobGet { request }),
+        "alpha_job_events" => typed_arg::<SignedRecordV1<EventQueryV1>>(args, "request")
+            .map(|request| Verb::JobEvents { request }),
+        "alpha_job_control" => typed_arg::<SignedRecordV1<JobControlV1>>(args, "request")
+            .map(|request| Verb::JobControl { request }),
+        _ => return None,
+    };
+    Some(parsed)
+}
+
+fn typed_arg<T: DeserializeOwned>(args: &Value, key: &str) -> Result<T, String> {
+    let value =
+        args.get(key).cloned().ok_or_else(|| format!("missing required parameter `{key}`"))?;
+    serde_json::from_value(value).map_err(|e| format!("parameter `{key}` is invalid: {e}"))
+}
+
 // ---- argument validation (mirrors the advertised inputSchema) ----------------------------------
 
 #[derive(Clone, Copy)]
@@ -611,6 +722,7 @@ enum ArgType {
     U64,
     U32,
     Bool,
+    Object,
 }
 
 impl ArgType {
@@ -620,6 +732,7 @@ impl ArgType {
             ArgType::U64 => "non-negative integer",
             ArgType::U32 => "integer in u32 range",
             ArgType::Bool => "boolean",
+            ArgType::Object => "object",
         }
     }
     fn matches(self, v: &Value) -> bool {
@@ -628,6 +741,7 @@ impl ArgType {
             ArgType::U64 => v.as_u64().is_some(),
             ArgType::U32 => v.as_u64().is_some_and(|n| u32::try_from(n).is_ok()),
             ArgType::Bool => v.is_boolean(),
+            ArgType::Object => v.is_object(),
         }
     }
 }
@@ -654,6 +768,10 @@ impl ArgSpec {
 
     const fn bool(name: &'static str, required: bool) -> Self {
         Self { name, ty: ArgType::Bool, required, max_bytes: None }
+    }
+
+    const fn object(name: &'static str, required: bool) -> Self {
+        Self { name, ty: ArgType::Object, required, max_bytes: None }
     }
 }
 
@@ -685,6 +803,22 @@ const ARGS_BESTIARY_PROVE: &[ArgSpec] = &[
     ArgSpec::string("artifact_hash", true, MAX_HASH_ARG_BYTES),
     ArgSpec::string("realm", true, MAX_REALM_ARG_BYTES),
 ];
+const ARGS_FUNCTION_RESOLVE: &[ArgSpec] = &[ArgSpec::object("request", true)];
+const ARGS_FUNCTION_DEPLOY: &[ArgSpec] = &[
+    ArgSpec::object("request", true),
+    ArgSpec::object("resolution", true),
+    ArgSpec::string("manifest_path", true, MAX_PATH_ARG_BYTES),
+    ArgSpec::string("artifact_path", true, MAX_PATH_ARG_BYTES),
+];
+const ARGS_FUNCTION_UNDEPLOY: &[ArgSpec] =
+    &[ArgSpec::object("request", true), ArgSpec::object("deployment", true)];
+const ARGS_FUNCTION_DEPLOYMENTS: &[ArgSpec] = &[ArgSpec::object("query", true)];
+const ARGS_JOB_SUBMIT: &[ArgSpec] = &[
+    ArgSpec::object("request", true),
+    ArgSpec::object("resolution", true),
+    ArgSpec::object("deployment", true),
+];
+const ARGS_JOB_REQUEST: &[ArgSpec] = &[ArgSpec::object("request", true)];
 const ARGS_SEND: &[ArgSpec] = &[
     ArgSpec::u64("id", true),
     ArgSpec::string("text", true, MAX_TEXT_ARG_BYTES),
@@ -723,6 +857,14 @@ fn known_tool(name: &str) -> bool {
             | "alpha_registry_list"
             | "alpha_registry_fetch_load"
             | "alpha_bestiary_prove"
+            | "alpha_function_resolve"
+            | "alpha_function_deploy"
+            | "alpha_function_undeploy"
+            | "alpha_function_deployments"
+            | "alpha_job_submit"
+            | "alpha_job_get"
+            | "alpha_job_events"
+            | "alpha_job_control"
             | "alpha_send"
             | "alpha_intent"
             | "alpha_bind"
@@ -743,6 +885,12 @@ fn arg_specs(name: &str) -> &'static [ArgSpec] {
         "alpha_registry_list" => ARGS_REGISTRY_LIST,
         "alpha_registry_fetch_load" => ARGS_REGISTRY_FETCH_LOAD,
         "alpha_bestiary_prove" => ARGS_BESTIARY_PROVE,
+        "alpha_function_resolve" => ARGS_FUNCTION_RESOLVE,
+        "alpha_function_deploy" => ARGS_FUNCTION_DEPLOY,
+        "alpha_function_undeploy" => ARGS_FUNCTION_UNDEPLOY,
+        "alpha_function_deployments" => ARGS_FUNCTION_DEPLOYMENTS,
+        "alpha_job_submit" => ARGS_JOB_SUBMIT,
+        "alpha_job_get" | "alpha_job_events" | "alpha_job_control" => ARGS_JOB_REQUEST,
         "alpha_send" => ARGS_SEND,
         "alpha_intent" => ARGS_INTENT,
         "alpha_bind" => ARGS_BIND,
@@ -873,12 +1021,12 @@ mod tests {
 
         for corr in 0..MAX_PENDING_CONTROL_REQUESTS as u64 {
             let (tx, rx) = channel();
-            st.register_pending(corr, tx).expect("under cap");
+            st.register_pending(corr, format!("cap-{corr}"), tx).expect("under cap");
             receivers.push(rx);
         }
 
         let (tx, _rx) = channel();
-        let err = st.register_pending(999_999, tx).expect_err("at cap refuses");
+        let err = st.register_pending(999_999, "cap-new".into(), tx).expect_err("at cap refuses");
         assert!(!err.ok);
         assert_eq!(err.json["error"].as_str(), Some("surface-busy"));
         assert_eq!(err.json["limit"].as_u64(), Some(MAX_PENDING_CONTROL_REQUESTS as u64));
@@ -888,10 +1036,35 @@ mod tests {
             "refused request is not parked"
         );
 
-        assert!(st.take_pending(0).is_some(), "existing corr is removable");
+        assert!(
+            st.take_pending(0, Some("cap-0")).is_some(),
+            "existing corr and capability are removable"
+        );
         let (tx, rx) = channel();
-        st.register_pending(999_999, tx).expect("space reopens after one is removed");
+        st.register_pending(999_999, "cap-new".into(), tx)
+            .expect("space reopens after one is removed");
         receivers.push(rx);
+    }
+
+    #[test]
+    fn forged_control_reply_cannot_consume_a_pending_mcp_request() {
+        let st = test_state();
+        let (tx, _rx) = channel();
+        st.register_pending(41, "unguessable-request-capability".into(), tx).unwrap();
+
+        assert!(
+            st.take_pending(41, Some("attacker-guessed-corr-only")).is_none(),
+            "a matching predictable corr with the wrong capability is inert"
+        );
+        assert_eq!(st.pending.lock().unwrap().len(), 1, "the legitimate waiter remains parked");
+        assert!(
+            st.take_pending(41, None).is_none(),
+            "a legacy corr-only reply cannot consume the waiter"
+        );
+        assert!(
+            st.take_pending(41, Some("unguessable-request-capability")).is_some(),
+            "only the exact echoed request capability completes the request"
+        );
     }
 
     #[test]
@@ -920,6 +1093,125 @@ mod tests {
 
         assert!(err.contains("chunk_size"), "names the field: {err}");
         assert!(err.contains("u32"), "explains the range: {err}");
+    }
+
+    #[test]
+    fn function_job_tools_require_structured_contract_arguments() {
+        let error = validate_args("alpha_job_get", &json!({ "request": "opaque-json" }))
+            .expect_err("signed records are objects, not surface-private strings");
+        assert!(error.contains("request"));
+        assert!(error.contains("object"));
+
+        validate_args(
+            "alpha_job_submit",
+            &json!({ "request": {}, "resolution": {}, "deployment": {} }),
+        )
+        .expect("the typed decoder, then omni, performs the nested contract checks");
+
+        validate_args("alpha_function_undeploy", &json!({ "request": {}, "deployment": {} }))
+            .expect("undeploy carries two structured signed records");
+        let error = validate_args("alpha_function_undeploy", &json!({ "request": {} }))
+            .expect_err("the exact deployment receipt is required control evidence");
+        assert!(error.contains("deployment"));
+
+        let error = validate_args(
+            "alpha_function_deploy",
+            &json!({
+                "request": {},
+                "resolution": {},
+                "manifest_path": "m".repeat(MAX_PATH_ARG_BYTES + 1),
+                "artifact_path": "/node/artifact.wasm"
+            }),
+        )
+        .expect_err("node-local deployment paths retain the shared path cap");
+        assert!(error.contains("manifest_path"));
+        assert!(error.contains("exceeds"));
+    }
+
+    #[test]
+    fn deployment_tool_maps_to_the_fixed_typed_verb() {
+        let args = json!({ "query": { "realm": "trusted", "limit": 4 } });
+        validate_args("alpha_function_deployments", &args).unwrap();
+        let verb = function_job_verb("alpha_function_deployments", &args)
+            .expect("known function tool")
+            .expect("typed query");
+        assert!(matches!(
+            verb,
+            Verb::FunctionDeployments {
+                query: DeploymentQueryV1 {
+                    realm: Some(realm),
+                    limit: 4,
+                    ..
+                }
+            } if realm == "trusted"
+        ));
+    }
+
+    #[test]
+    fn job_submit_tool_maps_structured_proofs_to_the_shared_async_verb() {
+        let home = gawdfn::HomeId::new("home");
+        let function = gawdfn::FunctionId {
+            manifest_content_address: format!("sha256:{}", "a".repeat(64)),
+            entrypoint: "run".into(),
+        };
+        let selector = gawdfn::FunctionSelectorV1::Id { function: function.clone() };
+        let unsigned = |schema: &str, payload: Value| json!({ "schema": schema, "signer": "", "payload": payload, "signature": "" });
+        let request = unsigned(
+            gawdfn::SCHEMA_JOB_V1,
+            serde_json::to_value(gawdfn::JobSubmitV1 {
+                home,
+                caller_idempotency_key: "mcp-parity".into(),
+                function: selector.clone(),
+                input: gawdfn::ValueRefV1::Inline { value: json!({}) },
+                delivery: gawdfn::DeliveryModeV1::AtMostOnce,
+                allow_duplicate_effects: false,
+                parent: None,
+                causal: vec![],
+                access: gawdfn::JobAccessV1::default(),
+                evidence: vec![],
+                result_recipients: vec![],
+                submitted_at_unix_ms: None,
+            })
+            .unwrap(),
+        );
+        let resolution = unsigned(
+            gawdfn::SCHEMA_FUNCTION_DEPLOY_V1,
+            serde_json::to_value(gawdfn::ResolutionReceiptV1 {
+                selector,
+                function: function.clone(),
+                artifact_hash: format!("sha256:{}", "b".repeat(64)),
+                resolved_at_unix_ms: None,
+                evidence: vec![],
+            })
+            .unwrap(),
+        );
+        let deployment = unsigned(
+            gawdfn::SCHEMA_FUNCTION_DEPLOY_V1,
+            serde_json::to_value(gawdfn::DeploymentReceiptV1 {
+                deployment: gawdfn::DeploymentId::new("deployment"),
+                function,
+                artifact_hash: format!("sha256:{}", "b".repeat(64)),
+                realm: "local".into(),
+                node: "node".into(),
+                executor: String::new(),
+                executor_creature: "1".into(),
+                creature: "2".into(),
+                evidence: vec![],
+                registered_at_unix_ms: None,
+            })
+            .unwrap(),
+        );
+        let args = json!({
+            "request": request,
+            "resolution": resolution,
+            "deployment": deployment
+        });
+
+        validate_args("alpha_job_submit", &args).unwrap();
+        let verb = function_job_verb("alpha_job_submit", &args)
+            .expect("job submit is in the exact Function/Job tool set")
+            .expect("structured records decode");
+        assert!(matches!(verb, Verb::JobSubmit { .. }));
     }
 
     #[test]

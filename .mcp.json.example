@@ -2,7 +2,7 @@
   "mcpServers": {
     "alpha": {
       "command": "/abs/path/to/target/release/alpha",
-      "args": ["mcp"]
+      "args": ["mcp", "--allow-ai"]
     }
   }
 }

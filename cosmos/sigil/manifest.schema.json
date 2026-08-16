@@ -63,7 +63,55 @@
       "additionalProperties": false,
       "properties": {
         "name": { "type": "string", "maxLength": 128, "description": "Entry name, e.g. `handle`. Non-empty; unique within the manifest." },
-        "signature": { "type": "string", "maxLength": 512, "description": "Typed descriptor, e.g. `(Envelope) -> Outcome`. Non-empty." }
+        "signature": { "type": "string", "maxLength": 512, "description": "Legacy human-readable typed descriptor, e.g. `(Envelope) -> Outcome`. Non-empty." },
+        "contract": { "$ref": "#/$defs/EntrypointContractV1" }
+      }
+    },
+    "EntrypointContractV1": {
+      "type": "object",
+      "description": "Optional machine-readable function contract. Draft 2020-12 schemas describe application JSON multiplexed through the existing creature handle ABI.",
+      "required": ["description", "input_schema", "output_schema", "effect", "controls"],
+      "additionalProperties": false,
+      "properties": {
+        "description": { "type": "string", "maxLength": 65536 },
+        "input_schema": { "$ref": "#/$defs/SchemaRefV1" },
+        "output_schema": { "$ref": "#/$defs/SchemaRefV1" },
+        "error_schema": { "$ref": "#/$defs/SchemaRefV1" },
+        "effect": { "enum": ["read_only", "idempotent", "non_idempotent", "unknown"] },
+        "controls": { "$ref": "#/$defs/FunctionControlsV1" }
+      }
+    },
+    "SchemaRefV1": {
+      "type": "object",
+      "description": "A bounded inline Draft 2020-12 schema or a content-addressed external schema. Variant shape is also enforced by Rust serde/validation.",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["inline", "blob"] },
+        "schema": {},
+        "blob": { "$ref": "#/$defs/BlobRefV1" },
+        "root": { "enum": ["any", "object", "array", "string", "number", "integer", "boolean", "null"] }
+      }
+    },
+    "BlobRefV1": {
+      "type": "object",
+      "required": ["digest", "size", "media_type"],
+      "additionalProperties": false,
+      "properties": {
+        "digest": { "type": "string", "maxLength": 71 },
+        "size": { "type": "integer", "minimum": 0 },
+        "media_type": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "FunctionControlsV1": {
+      "type": "object",
+      "required": ["progress", "steer", "cancel", "checkpoint"],
+      "additionalProperties": false,
+      "properties": {
+        "progress": { "type": "boolean" },
+        "steer": { "type": "boolean" },
+        "cancel": { "type": "boolean" },
+        "checkpoint": { "type": "boolean" }
       }
     },
     "Capabilities": {

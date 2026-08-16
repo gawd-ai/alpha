@@ -1,6 +1,6 @@
 # cargo-deny — the supply-chain + license gate for the Alpha workspace.
 #
-# Run locally with `cargo install cargo-deny && cargo deny check`; CI enforces it on every push
+# Run locally with `cargo install cargo-deny && cargo deny --all-features check`; CI enforces it on every push
 # (.github/workflows/ci.yml). The intent is critical-infrastructure hygiene: a new dependency that
 # carries a security advisory, an out-of-policy license, or an unexpected source fails the gate
 # rather than landing silently.
@@ -15,6 +15,12 @@ version = 2
 # A yanked crate is treated as a hard failure; the RustSec advisory DB (vulnerabilities,
 # unmaintained, unsound) is enforced by the `version = 2` defaults.
 yanked = "deny"
+# Rhai 1.25.1 still uses `smartstring` as the backing store for `ImmutableString`; the dependency is
+# not optional (including under `default-features = false`) and every smartstring release is covered
+# by this *unmaintained*, not vulnerable/unsound, advisory. Replacing it therefore means replacing or
+# maintaining a fork of the scripting engine. Keep the exception narrow and visible while upstream
+# migrates; vulnerabilities and every other unmaintained/unsound advisory remain deny-by-default.
+ignore = ["RUSTSEC-2026-0249"]
 
 [licenses]
 version = 2

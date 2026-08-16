@@ -18,22 +18,23 @@ use std::sync::Arc;
 use aether::{Creature, Deadline, LimitKind};
 use sigil::{Backend, Manifest};
 
-pub use native::NativeEngine;
-pub use script::ScriptEngine;
+pub use native::{NativeArtifactStage, NativeEngine};
+pub use script::{ScriptEngine, CRITTER_ABI_TAG, MAX_JSON_BYTES, MAX_JSON_DEPTH, MAX_JSON_NODES};
 pub use wasm::WasmEngine;
 
 /// Maximum bytes a byte-loaded artifact may occupy at the loader boundary.
 ///
-/// The daemon/native tier can still load a trusted local `.so` by path for `dlopen` with no size
-/// cap — admission's integrity hash *streams* a path-backed artifact ([`Artifact::sha256_hex`]),
-/// so a large-but-legit native creature is never refused by this constant. The cap applies
-/// wherever a tier materializes artifact bytes in memory: `beast`/`critter` path loads, any
-/// in-memory `Artifact::Bytes` (including the native ship→spill path). Keep this in `anima` so
+/// The daemon/native tier can still load a trusted local `.so` by path with no size cap — the source
+/// descriptor streams into a retained stage while its admission hash is computed (a sealed memfd on
+/// Linux/Android), so a large-but-legit native creature is never refused by this constant. The cap
+/// applies wherever a tier materializes artifact bytes in memory: `beast`/`critter` path loads, any
+/// in-memory `Artifact::Bytes` (including the native ship→stage path). Keep this in `anima` so
 /// direct engine callers get the same defense-in-depth boundary as the `omni` control surface.
 pub const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 
-/// What to load: a path on disk (native needs this — `dlopen` takes a path) or raw bytes (a shipped
-/// artifact; beasts compile straight from bytes).
+/// What to load: a source path on disk, raw shipped bytes, or a native artifact already copied into
+/// the per-load exact-byte staging form used between admission and `dlopen` (kernel-sealed on
+/// Linux/Android; OS-random and read-only, without a same-UID immutability claim, elsewhere).
 ///
 /// `Clone` is the reload-loop requirement: the loop owns one `Artifact` spec and re-loads from it
 /// every cycle without inventing a fresh `PathBuf` or copying `Vec<u8>` at the call site.
@@ -41,6 +42,11 @@ pub const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 pub enum Artifact {
     Path(PathBuf),
     Bytes(Vec<u8>),
+    /// Native staging artifact. The public enum variant keeps [`Engine`] implementations
+    /// object-safe. The kernel verifies and safely reuses a sealed Linux/Android capability; it
+    /// recopies the mutable-by-same-UID fallback on other platforms. Clones share one retained
+    /// staging lifetime.
+    StagedNative(Arc<NativeArtifactStage>),
 }
 
 impl Artifact {
@@ -61,6 +67,71 @@ impl Artifact {
                 }
                 Ok(b.clone())
             }
+            Artifact::StagedNative(stage) => read_artifact_path_bounded(stage.path(), max_bytes),
+        }
+    }
+
+    /// Prepare the exact artifact representation that admission and the selected engine will share.
+    ///
+    /// Native source paths are opened once and streamed into a retained staging artifact (a sealed
+    /// memfd on Linux/Android, random private/read-only best effort elsewhere); native in-memory
+    /// bytes use the same primitive after enforcing [`MAX_ARTIFACT_BYTES`]. A non-native path is
+    /// opened once and materialized into bounded bytes, so admission and the beast/critter engine
+    /// also share one immutable representation. The kernel calls this only after resolving the
+    /// manifest's engine, preserving deterministic `NoEngine` before artifact I/O.
+    pub fn prepare_for_load(self, manifest: &Manifest) -> Result<Self, EngineError> {
+        match self {
+            // A sealed memfd is an immutable kernel capability, so it is safe (and important for
+            // reload cost) to share that exact Arc across loads. The non-Linux fallback is merely
+            // read-only/private best effort: always copy and remeasure it at the Kernel boundary.
+            Self::StagedNative(stage) if manifest.abi.backend == Backend::Daemon => {
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                {
+                    if !stage.is_kernel_sealed()? {
+                        return Err(EngineError::Load(
+                            "native staged memfd is missing required immutability seals".into(),
+                        ));
+                    }
+                    Ok(Self::StagedNative(stage))
+                }
+                #[cfg(not(any(target_os = "android", target_os = "linux")))]
+                {
+                    NativeArtifactStage::from_path(stage.path(), &manifest.name)
+                        .map(|fresh| Self::StagedNative(Arc::new(fresh)))
+                }
+            }
+            Self::StagedNative(_) => Err(EngineError::Load(
+                "a native staged artifact cannot be reused for a non-daemon backend".into(),
+            )),
+            Self::Path(path) if manifest.abi.backend == Backend::Daemon => {
+                NativeArtifactStage::from_path(&path, &manifest.name)
+                    .map(|stage| Self::StagedNative(Arc::new(stage)))
+            }
+            Self::Bytes(bytes) if manifest.abi.backend == Backend::Daemon => {
+                if artifact_len_exceeds_limit(bytes.len(), MAX_ARTIFACT_BYTES) {
+                    return Err(EngineError::Load(format!(
+                        "shipped native artifact is {} bytes, exceeds {} byte limit",
+                        bytes.len(),
+                        MAX_ARTIFACT_BYTES
+                    )));
+                }
+                NativeArtifactStage::from_bytes(&bytes, &manifest.name)
+                    .map(|stage| Self::StagedNative(Arc::new(stage)))
+            }
+            Self::Path(path) => {
+                read_artifact_path_bounded(&path, MAX_ARTIFACT_BYTES).map(Self::Bytes)
+            }
+            bytes @ Self::Bytes(_) => Ok(bytes),
+        }
+    }
+
+    /// Staging pathname used by the native engine (`/proc/self/fd/...` for a retained sealed memfd
+    /// on Linux/Android; a random private tempfile elsewhere). Exposed for loader diagnostics and
+    /// deterministic integration proof; it is not a stable artifact identity (use the hash).
+    pub fn staged_native_path(&self) -> Option<&Path> {
+        match self {
+            Self::StagedNative(stage) => Some(stage.path()),
+            Self::Path(_) | Self::Bytes(_) => None,
         }
     }
 
@@ -68,7 +139,9 @@ impl Artifact {
     /// memory**: a file streams through the hasher in fixed-size chunks; in-memory bytes hash
     /// directly. Admission's `provenance.build_hash` integrity gate uses this, so hashing is
     /// O(1) memory and a large-but-legit native `.so` loaded by local path is never refused by
-    /// [`MAX_ARTIFACT_BYTES`] — that cap bounds *byte-materializing* loads, not integrity reads.
+    /// [`MAX_ARTIFACT_BYTES`] — that cap bounds *byte-materializing* loads, not integrity reads. A
+    /// staged value returns its construction digest: Linux/Android seals make it permanent; the
+    /// kernel recopies and remeasures a caller-retained fallback on other platforms.
     pub fn sha256_hex(&self) -> Result<String, EngineError> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -88,6 +161,9 @@ impl Artifact {
                 }
             }
             Artifact::Bytes(b) => hasher.update(b),
+            Artifact::StagedNative(stage) => {
+                return Ok(stage.construction_sha256_hex().to_string())
+            }
         }
         Ok(format!("{:x}", hasher.finalize()))
     }
@@ -98,8 +174,13 @@ pub(crate) fn artifact_len_exceeds_limit(len: usize, max_bytes: u64) -> bool {
 }
 
 fn read_artifact_path_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, EngineError> {
-    let metadata = std::fs::metadata(path)
+    // Open once, then inspect and read through that descriptor. A path swap after `open` cannot
+    // make admission hash one file while the engine consumes another.
+    let file = std::fs::File::open(path)
         .map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| EngineError::Load(format!("inspect {}: {e}", path.display())))?;
     if !metadata.is_file() {
         return Err(EngineError::Load(format!("read {}: not a regular file", path.display())));
     }
@@ -111,9 +192,6 @@ fn read_artifact_path_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, En
             max_bytes
         )));
     }
-
-    let file = std::fs::File::open(path)
-        .map_err(|e| EngineError::Load(format!("read {}: {e}", path.display())))?;
     let cap = usize::try_from(metadata.len())
         .unwrap_or(usize::MAX)
         .min(usize::try_from(max_bytes).unwrap_or(usize::MAX));

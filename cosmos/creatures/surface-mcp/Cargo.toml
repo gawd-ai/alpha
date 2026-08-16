@@ -17,4 +17,6 @@ aether = { path = "../../aether" }
 # The verb vocabulary + the control-envelope schemas + the local/remote target. No HTTP client, no
 # tokio — a stdio server is a single blocking stream, and control rides the in-process bus.
 omni = { path = "../../omni" }
+gawdfn = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }

@@ -17,6 +17,7 @@ aether = { path = "../../aether" }
 sigil = { path = "../../sigil" }
 # The verb vocabulary + the control-envelope schemas this surface speaks on the bus.
 omni = { path = "../../omni" }
+gawdfn = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # A lean posture: axum's ws feature, a multi-thread tokio for the

@@ -47,9 +47,17 @@ closed.
 ## Authenticated transport
 
 `transport-tcp` is the creature bound to `Role::TRANSPORT`. The router sends every
-`Address::Node(_, _)` envelope to whoever fills that role, so "route off-node" is one more delivery
-case, not a separate subsystem. An operator who wants a different topology — a hub broker, a routed
-overlay — ships their own creature for the role; the fabric picks no network model.
+`Address::Node(_, _)` and `Address::NodeRole(_, _)` envelope to whoever fills that role, so "route
+off-node" is one more delivery case, not a separate subsystem. An operator who wants a different
+topology — a hub broker, a routed overlay — ships their own creature for the role; the fabric picks
+no network model.
+
+`NodeRole(node, role)` is exact host-scoped discovery, not an ambient remote capability. The
+receiving composition must opt the role in with `Kernel::bind_remote_role`; an ordinary local role
+binding is invisible remotely. Only a transport installed through the boot-only attesting path can
+resolve it after authenticating the immediate peer, and it rewrites the destination to the current
+local creature before delivery. Stable application signatures still authorize the operation—the
+role lookup only removes a stale process-local `CreatureId` from the route.
 
 The link is **TCP** (loopback by default, any `host:port` by config). TCP carries the data plane
 because it already gives reliable, ordered, backpressured delivery; carrying envelopes over UDP
@@ -82,6 +90,13 @@ properties hold it together:
 
 A peer that cannot sign with an allowlisted key cannot establish a session. The allowlist is the
 trust gate; the ed25519 proof is what binds a connection to an allowlisted identity.
+
+The listener also bounds work *before* that proof exists. One transport instance admits at most
+**64 aggregate unauthenticated inbound handshakes** by default, and every candidate socket has a
+five-second read/write timeout. An over-cap socket is shut down synchronously before a worker thread
+is created; the RAII slot is released on every return or panic and as soon as the signature verifies.
+`with_max_inbound_handshakes(0)` is deliberately fail-closed: it refuses every inbound handshake,
+not an unbounded lab posture.
 
 ### Frames and bounds
 
@@ -157,8 +172,11 @@ Malformed bytes are dropped quietly — hostile input never panics a transport t
 
 When an `Address::Node(peer, mid)` envelope reaches the transport, the local sender addressed a
 creature `mid` on `peer`; the transport frames it and ships it. On the receiving node the inbound
-frame names `Node(receiver, mid)`, which the transport unwraps to a local `Creature(mid)`
-delivery. Two header rewrites make a reply find its way home:
+frame names `Node(receiver, mid)`, which the transport unwraps to a local `Creature(mid)` delivery.
+`NodeRole(peer, role)` follows the same link but remains unresolved until that destination's
+attesting transport finds an explicitly remote-exposed current binding; an absent, local-only, or
+wrong-node binding is refused without numeric fallback. Two header rewrites then make a reply find
+its way home:
 
 - **`reply_to` is resealed.** A `reply_to: Creature(x)` from the peer means "creature `x` on the
   peer node" from the receiver's vantage, so it is rewritten to `Node(peer, x)` — the eventual

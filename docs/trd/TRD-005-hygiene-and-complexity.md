@@ -44,8 +44,8 @@ it ranges over.
   the tripwire — change the fixture deliberately, never to silence the test.*
 - **R4 — `cargo fmt` is a reliable gate under the pinned toolchain (CLOSE).** A known, pre-existing
   large fmt diff (~118 files) appears whenever `cargo fmt` runs with a rustfmt other than the pinned
-  one. The toolchain is pinned at `rust-toolchain.toml` (`channel = "stable"`, `components = ["rustfmt",
-  "clippy"]`). v0.4.3 MUST land **one clean `cargo fmt` run under the pinned toolchain** as an isolated
+  one. The release toolchain is pinned at `rust-toolchain.toml` (`channel = "1.97.1"`,
+  `components = ["rustfmt", "clippy"]`). v0.4.3 MUST land **one clean `cargo fmt` run under the pinned toolchain** as an isolated
   formatting-only commit, so `cargo fmt --check` is afterward a trustworthy CI gate with no standing
   diff. (Cannot be run in this design pass — this requirement specifies the action and the toolchain
   source; the `/goal` pass executes it.)

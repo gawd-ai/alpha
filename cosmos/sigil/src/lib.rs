@@ -13,6 +13,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use gawdfn::EntrypointContractV1;
+use gawdfn::Validate as _;
+
 pub mod crypto;
 pub use crypto::{Ed25519KeyMaterial, Ed25519Verifier};
 
@@ -134,8 +137,19 @@ pub struct Abi {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entrypoint {
     pub name: String,
-    /// Typed descriptor — free-form text today; a structured schema later.
+    /// Legacy human-readable descriptor. It remains signed and stable for existing manifests.
     pub signature: String,
+    /// Optional machine-readable Draft 2020-12 input/output/effect contract. It is additive
+    /// metadata multiplexed through the existing creature `handle(Envelope)` ABI; it does not add
+    /// an engine entrypoint. Eliding `None` preserves every legacy manifest/signing byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<EntrypointContractV1>,
+}
+
+impl Entrypoint {
+    pub fn new(name: impl Into<String>, signature: impl Into<String>) -> Self {
+        Self { name: name.into(), signature: signature.into(), contract: None }
+    }
 }
 
 /// Network reach a creature declares. Enforced only when an operator opts in;
@@ -366,6 +380,14 @@ impl Manifest {
                 &ep.signature,
                 MAX_MANIFEST_ENTRYPOINT_SIGNATURE_BYTES,
             )?;
+            if let Some(contract) = &ep.contract {
+                contract.validate().map_err(|err| {
+                    ManifestError::Invalid(format!(
+                        "entrypoint `{}` has invalid structured contract: {err}",
+                        ep.name
+                    ))
+                })?;
+            }
             if !seen_entry.insert(ep.name.as_str()) {
                 return Err(ManifestError::Invalid(format!("duplicate entrypoint `{}`", ep.name)));
             }
@@ -707,10 +729,7 @@ mod tests {
 
         m = Manifest::new("n", "0.1.0", Backend::Daemon, "gawd_creature_v1");
         m.entrypoints =
-            vec![
-                Entrypoint { name: "handle".into(), signature: "(Envelope) -> Outcome".into() };
-                MAX_MANIFEST_ENTRYPOINTS + 1
-            ];
+            vec![Entrypoint::new("handle", "(Envelope) -> Outcome"); MAX_MANIFEST_ENTRYPOINTS + 1];
         let err = m.validate().unwrap_err();
         assert!(
             matches!(&err, ManifestError::Invalid(msg) if msg.contains("entrypoints")),
@@ -821,6 +840,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_entrypoint_wire_is_byte_identical_when_contract_is_absent() {
+        let entrypoint = Entrypoint::new("handle", "(Envelope) -> Outcome");
+        assert_eq!(
+            serde_json::to_string(&entrypoint).unwrap(),
+            r#"{"name":"handle","signature":"(Envelope) -> Outcome"}"#
+        );
+        let parsed: Entrypoint =
+            serde_json::from_str(r#"{"name":"handle","signature":"(Envelope) -> Outcome"}"#)
+                .unwrap();
+        assert_eq!(parsed, entrypoint);
+    }
+
+    #[test]
+    fn structured_entrypoint_contract_is_signed_validated_metadata() {
+        let mut manifest = Manifest::new("typed", "1.0.0", Backend::Beast, "gawd_creature_v1");
+        manifest.entrypoints.push(Entrypoint {
+            name: "reverse".into(),
+            signature: "({text: string}) -> string".into(),
+            contract: Some(EntrypointContractV1 {
+                description: "Reverse text".into(),
+                input_schema: gawdfn::SchemaRefV1::Inline {
+                    schema: serde_json::json!({ "type": "object" }),
+                },
+                output_schema: gawdfn::SchemaRefV1::Inline {
+                    schema: serde_json::json!({ "type": "string" }),
+                },
+                error_schema: None,
+                effect: gawdfn::EffectClassV1::ReadOnly,
+                controls: gawdfn::FunctionControlsV1 { progress: true, ..Default::default() },
+            }),
+        });
+        manifest.validate().unwrap();
+        let typed_address = manifest.compute_content_address();
+
+        manifest.entrypoints[0].contract = None;
+        assert_ne!(typed_address, manifest.compute_content_address());
+    }
+
+    #[test]
+    fn structured_entrypoint_rejects_non_object_input_schema() {
+        let json = r#"{
+            "name": "typed", "version": "1.0.0",
+            "abi": { "backend": "beast", "abi_tag": "gawd_creature_v1" },
+            "entrypoints": [{
+                "name": "bad", "signature": "(string) -> string",
+                "contract": {
+                    "description": "bad input root",
+                    "input_schema": { "kind": "inline", "schema": { "type": "string" } },
+                    "output_schema": { "kind": "inline", "schema": { "type": "string" } },
+                    "effect": "unknown",
+                    "controls": { "progress": false, "steer": false, "cancel": false, "checkpoint": false }
+                }
+            }]
+        }"#;
+        let err = Manifest::parse(json.as_bytes()).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid(message) if message.contains("object root")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn content_address_is_deterministic_and_build_sensitive() {
         let mut m = Manifest::new("c", "0.1.0", Backend::Daemon, "gawd_creature_v1");
         let a = m.compute_content_address();
@@ -855,8 +936,7 @@ mod tests {
 
         // Different entrypoints → different address.
         let mut d = a.clone();
-        d.entrypoints =
-            vec![Entrypoint { name: "handle".into(), signature: "(Envelope) -> Outcome".into() }];
+        d.entrypoints = vec![Entrypoint::new("handle", "(Envelope) -> Outcome")];
         assert_ne!(addr_a, d.compute_content_address(), "entrypoints must affect the address");
 
         // `content_address` itself does NOT affect the result (it would be circular).
@@ -887,6 +967,7 @@ mod tests {
             entrypoints: vec![Entrypoint {
                 name: "handle".into(),
                 signature: "(Envelope) -> Outcome".into(),
+                contract: None,
             }],
             capabilities: Capabilities {
                 fs: vec!["/tmp".into()],
@@ -955,6 +1036,7 @@ mod tests {
             entrypoints: vec![Entrypoint {
                 name: "handle".into(),
                 signature: "(Envelope) -> Outcome".into(),
+                contract: None,
             }],
             capabilities: Capabilities {
                 fs: vec!["/tmp".into()],

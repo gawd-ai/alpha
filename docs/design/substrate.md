@@ -34,13 +34,49 @@ pick a tier *for* the operator to enforce containment. Which tier to use, and wh
 all, is the operator's self-determined call. The same declared capabilities can ship as a daemon or
 a beast; the tier is the containment choice, the manifest is the description.
 
+Alpha builds Wasmtime with default features off and only its `cranelift` + `runtime` surfaces. In
+particular, the optional `parallel-compilation`/Rayon pool is absent, so a module compile cannot fan
+out behind Cargo's one-job resource boundary. The engine still spells
+`Config::parallel_compilation(false)` through a compatibility seam: if another dependency ever
+unifies that optional Wasmtime feature, the inherent setter takes over and disables the pool before
+engine construction. A source/lockfile guard fails CI if the lean declaration or no-Rayon invariant
+drifts.
+
 Artifacts that a tier must materialize as bytes are capped at 128 MiB at the `anima::Artifact`
 reader boundary. That covers beast/critter path loads, in-memory artifact loads before WASM
-compile or Rhai UTF-8 parsing, and the native ship→spill path (wire-shipped `.so` bytes). A native
-daemon loaded by local path still passes directly to `dlopen` with no size cap, because a daemon
-is trusted-by-admission and the OS loader, not the substrate, maps the local `.so` — admission's
-`build_hash` integrity check streams the file through the hasher rather than materializing it, so
-the cap never gates a path-loaded native creature.
+compile or Rhai UTF-8 parsing, and wire-shipped native `.so` bytes. A beast/critter path is opened
+once into bounded bytes before admission; its engine receives those same bytes, not a pathname it
+can reopen later.
+
+Every native load likewise uses one retained stage. A local source path is opened once and streamed
+with O(1) memory while hashing each written chunk; native `Artifact::Bytes` uses the same primitive
+after its 128 MiB cap. On Linux/Android the stage is an anonymous memfd. Alpha closes the duplicate
+writer, applies the kernel's write/grow/shrink/further-seal seals, re-hashes the sealed bytes and
+requires that digest to equal the streaming digest, then admits and `dlopen`s a process-unique
+spelling of its retained `/proc/self/fd` capability. The unique spelling prevents loader pathname
+cache collisions when the kernel reuses a numeric fd; it is made only from kernel-resolved `.` and
+`..` components, not a mutable symlink. Seal or `/proc` capability failure is fail-closed. The memfd
+stays retained through `dlclose`, and the deliberate native leak path retains it with the library.
+
+Other platforms use a 128-bit OS-random, `create_new` private directory and read-only staged file.
+Unix fallbacks set directory mode 0700 and file mode 0400; non-Unix targets make no ACL-hardening
+claim. This closes the ordinary operator source-path swap because the source is no longer reopened,
+but it is explicitly not Linux-equivalent immutability: the same OS identity may be able to restore
+write permission between admission and load. The fallback is defense in depth, not a containment
+boundary against code already running as the node's user.
+
+Staging has a real native compatibility cost. The loaded object's pathname—and therefore ELF
+`$ORIGIN`—is the descriptor pseudo-directory on Linux/Android or the random staging directory on
+other targets, never the operator's source directory. Alpha does not copy adjacent private libraries
+there. A daemon whose `DT_NEEDED` entries depend on
+`$ORIGIN`/sibling `.so` files will therefore fail to load unless those dependencies are available by
+another reviewed loader path (for example a system/absolute rpath), or are linked into the daemon.
+Code that inspects its own module pathname or relies on pathname-based `dlopen` coalescing likewise
+sees a unique staged path. Staging copies the artifact once when the capability is prepared; sealed
+stage clones may be reused safely across reloads. Non-Linux fallbacks require the platform temporary
+directory to permit executable mappings (`noexec` can reject a load); hardened Linux memfd execution
+policy can also reject loading. These tradeoffs are intentional: exact admitted-byte identity takes
+priority over preserving mutable source-path behavior.
 
 ## The ABI
 
@@ -94,9 +130,12 @@ The manifest carries:
 - **identity** — `name`, `version`, and the `abi` block (backend, abi_tag, and an opaque, open-ended
   `target` the substrate assigns no meaning to — an injected matcher weighs it against a node's
   advertised embodiment).
-- **`entrypoints`** — typed descriptors an authoring agent generates against.
-- **`capabilities`** — `fs`, `net`, `cpu_ms`, `mem_bytes`, and `calls` (the bus-level send
-  allowlist), plus an opt-in `budget_warn_at` advisory threshold.
+- **`entrypoints`** — named descriptors an authoring agent generates against. Each retains its
+  signed human-readable `signature` and may add an optional machine-readable
+  `gawdfn::EntrypointContractV1` (bounded input/output JSON Schema, media types, and controls). `None`
+  elides from legacy manifests byte-for-byte.
+- **`capabilities`** — `fs`, `net`, `cpu_ms`, `mem_bytes`, optional `wall_ms`, and `calls` (the
+  bus-level send allowlist), plus an opt-in `budget_warn_at` advisory threshold.
 - **`requirements`** — what a host must offer (accelerators, sensors, memory, connectivity,
   jurisdiction) for placement.
 - **`provides`** — which inversion-of-control roles the creature can fill, for binding into a socket.
@@ -120,6 +159,14 @@ appending an optional field is additive but reordering or renaming one invalidat
 in flight. Byte-stability tripwire tests lock both the signing payload and the identity payload to
 known fixtures to catch silent drift.
 
+**A typed Function is one of these entrypoints, not a fourth tier or another exported symbol.** Its
+immutable identity is the signed manifest content address plus entrypoint name. An executor carries a
+`gawd.function.call.v1` envelope to the already-loaded creature and multiplexes the entrypoint through
+the same `handle` call shown above. Explicit deployment records where that immutable definition is
+live; an asynchronous Job records the resolved deployment pin before execution. The kernel, engines,
+and `gawd_creature_v1` ABI are unchanged. See
+[`functions-and-jobs.md`](functions-and-jobs.md).
+
 Verification is a **mechanism** the substrate ships (ed25519 over the signing payload); *which* keys
 are trust roots is an injected policy, never defined in the contract. Admission gathers evidence —
 signature validity, content-address self-consistency, structural validity — and an injected `Policy`
@@ -137,10 +184,10 @@ substrate solves this per tier, and the discipline is the load-bearing part of t
 drops the **instance** (the native `destroy` runs while the library is still mapped), then drops the
 **resources** (`dlclose` runs **last**). The same order is encoded structurally: `LoadedModule`
 declares `instance` before `resources`, and struct fields drop in declaration order, so even an
-implicit drop tears down in the right sequence. When a native artifact arrived as in-memory bytes,
-the resources also hold a tempfile guard that unlinks the spilled `.so` *after* the library unmaps —
-declared after the library, so it drops second. Spilled paths are per-load unique and opened with
-`create_new`, so two same-content loads in one process never truncate or reuse the same `.so` path.
+implicit drop tears down in the right sequence. Native resources also hold the staged-artifact guard
+that unlinks the exact `.so` and removes its per-load directory *after* the library unmaps—declared
+after the library, so it drops second. Staged paths are per-load unique and opened with `create_new`,
+so two same-content loads in one process never truncate or reuse the same `.so` path.
 
 **Creatures do no self-teardown.** The kernel owns the drain. Unload deregisters the creature from
 the router (no new envelopes reach it), the drain thread reads the disconnect, the creature's
@@ -160,9 +207,10 @@ ships a *discipline*, not a contract — `forge::spawn` is the compatible fire-a
 **The kernel's thread-count guard is the floor.** A creature that bypasses the discipline (a raw or
 detached thread) is caught by a `/proc/self/task` snapshot diff — tids before `bind` versus after
 `shutdown`. When the guard fires, the kernel **leaks the resources**: it `Box::leak`s the `Library`
-so the `.so` stays mapped, the runaway thread keeps dereferencing live code, and the proprioception
-bus publishes `unload_leaked_resources`. This is a **bounded leak — one library per misbehavior, and
-never a use-after-free.** A healthy creature beside the offender keeps serving and unloads normally.
+and its stage guard, so both the mapping and exact staged file remain, the runaway thread keeps
+dereferencing live code, and the proprioception bus publishes `unload_leaked_resources`. This is a
+**bounded leak—one library plus one staged artifact per misbehavior, and never a use-after-free.** A
+healthy creature beside the offender keeps serving and unloads normally.
 
 **The unload deadline is real.** `Kernel::unload` waits on a per-drain signal channel; on timeout it
 abandons the drain detached and returns `UnloadTimeout`. The substrate never hangs on a misbehaving
@@ -209,23 +257,24 @@ Enforcement is per tier:
 |---|---|---|---|
 | `fs`, `net` | Closed by construction — no host imports, no FS or net to reach. | Closed by construction — the bare engine reaches nothing; `import` and `eval` are removed. | Trusted-by-admission. The declarations are evidence an injected policy reads at admit; OS-level confinement is the operator's deployment seam. |
 | `cpu_ms` | `wasmtime` fuel, refilled per envelope. | A Rhai **operation budget** (`set_max_operations`), refilled per envelope. | Read at admit; not metered at runtime. |
-| `wall_ms` | An opt-in per-envelope **wall-clock** cap, enforced by one engine-global `wasmtime` epoch ticker; an exceeded deadline traps as a `Hard` `Wall` signal. | Not enforced (the script tier has no external interrupt thread). | Read at admit; not metered at runtime. |
+| `wall_ms` | An opt-in per-envelope **wall-clock** cap, enforced by one engine-global `wasmtime` epoch ticker; an exceeded deadline traps as a `Hard` `Wall` signal. | An opt-in live per-envelope deadline sampled by Rhai's progress hook; expiry terminates with a `Hard` `Wall` signal. | Read at admit; not metered at runtime. |
 | `mem_bytes` | A custom `ResourceLimiter` refuses growth past the cap — byte-exact. | Rhai's structural caps (string/array/map size) — **best-effort counts, not bytes**, with an always-on backstop. | Read at admit; the operator's OS-level seam. |
 | `calls` | Router-side allowlist at the one bus choke point; a disallowed envelope is never delivered. Empty = unrestricted. | Same router gate. | Same router gate. |
 
 **Beast and critter have teeth.** A beast that declares a host import fails to instantiate, so
 `net:none` and `fs:[]` are properties of the loader, not runtime checks. Its `cpu_ms` is real fuel
 and its `mem_bytes` is a real byte-exact cap. A critter is contained the same way — its one host
-function, `emit`, only parks a dispatch the kernel routes through the gated bus path; it holds no bus
-authority itself, and `no_module` plus a disabled `eval` make it exactly its signed, static source.
-Its `cpu_ms` is a real operation budget; its `mem_bytes` is honestly best-effort (structural counts,
-with a bounded default backstop so one bulk-allocating builtin can't OOM the host). The loader also
-keeps the convenience string view honest: `env.text` is a lossy UTF-8 preview capped by the effective
-memory cap and a 1 MiB ceiling, while `env.payload` remains the full byte-exact `Blob`.
+function with an outward effect, `emit`, only parks a dispatch the kernel routes through the gated bus
+path; its bounded `mem_*` host functions retain only instance-local values. It holds no bus authority
+itself, and `no_module` plus a disabled `eval` make it exactly its signed, static source. Its `cpu_ms`
+is a real operation budget; its `mem_bytes` is honestly best-effort (structural counts, with a bounded
+default backstop so one bulk-allocating builtin can't OOM the host). The loader also keeps the
+convenience string view honest: `env.text` is a lossy UTF-8 preview capped by the effective memory cap
+and a 1 MiB ceiling, while `env.payload` remains the full byte-exact `Blob`.
 
-**The beast tier also bounds wall time.** `capabilities.wall_ms` is an opt-in per-envelope ceiling on
+**The metered tiers also bound wall time.** `capabilities.wall_ms` is an opt-in per-envelope ceiling on
 *elapsed* time — the backstop for work that consumes little fuel but still blocks or spins. It is
-enforced through `wasmtime`'s **epoch interruption**: the engine enables epoch interruption once, a
+enforced for beasts through `wasmtime`'s **epoch interruption**: the engine enables epoch interruption once, a
 single engine-global ticker thread advances the epoch on a fixed cadence (a weak engine handle, so the
 ticker never keeps the engine alive), and each `handle` arms a per-store deadline of `ceil(wall_ms /
 tick)` epochs; an exceeded deadline surfaces as a trap and becomes a `Hard` `BudgetSignal { kind:
@@ -235,9 +284,9 @@ the beast (a beast has no host imports, so there is nothing external to block in
 **fail-closed** — if the ticker thread ever fails to spawn, the engine logs the degradation and
 *refuses to load* any beast that declares `wall_ms`, rather than silently ignore the cap. A beast with
 no `wall_ms` runs under an effectively unlimited deadline, exactly as `cpu_ms == 0` means unlimited
-fuel. The critter and native tiers leave `wall_ms` unenforced (the script tier would need an external
-interrupt thread; the native tier is trusted-by-admission), so only the **beast** tier reads it as a
-live cap today.
+fuel. A critter reads the same live ceiling on each handle and samples its deadline from Rhai's
+progress hook; it terminates as `Hard`/`Wall` after the bounded sampling interval. Native remains
+trusted-by-admission and does not meter wall time.
 
 **The daemon stays honest about its limits.** The substrate does not pretend to confine in-process
 native code mid-flight. The capability declarations are evidence an injected admission policy reads —

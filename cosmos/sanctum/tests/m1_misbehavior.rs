@@ -14,11 +14,13 @@
 //!   bounded leak (library stays mapped), no UAF when the runaway thread later dereferences live
 //!   mapped code. The healthy creature beside it is unaffected — the fabric contains the violation.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aether::{Address, Deadline, Dispatch, Topic};
-use anima::{Artifact, NativeEngine, ScriptEngine, WasmEngine};
+use anima::{Artifact, Engine, EngineError, LoadedModule, NativeEngine, ScriptEngine, WasmEngine};
 use policy_dev::DevPolicy;
 use sanctum::{Kernel, Proprioception};
 use sigil::{Backend, Capabilities, Manifest};
@@ -40,13 +42,37 @@ fn serial_lock() -> &'static Mutex<()> {
 }
 
 fn kernel() -> Arc<Kernel> {
+    kernel_with_native(Arc::new(NativeEngine))
+}
+
+fn kernel_with_native(native: Arc<dyn Engine>) -> Arc<Kernel> {
     Kernel::new(
-        vec![Arc::new(NativeEngine), Arc::new(WasmEngine::new()), Arc::new(ScriptEngine)],
+        vec![native, Arc::new(WasmEngine::new()), Arc::new(ScriptEngine)],
         Arc::new(aether::StubSigner::new("test-node")),
         Arc::new(aether::StubVerifier),
         Arc::new(DevPolicy),
         128,
     )
+}
+
+struct CaptureNativeStages {
+    paths: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+impl Engine for CaptureNativeStages {
+    fn backend(&self) -> Backend {
+        Backend::Daemon
+    }
+
+    fn load(&self, artifact: &Artifact, manifest: &Manifest) -> Result<LoadedModule, EngineError> {
+        if let Some(path) = artifact.staged_native_path() {
+            self.paths
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(manifest.name.clone(), path.to_path_buf());
+        }
+        NativeEngine.load(artifact, manifest)
+    }
 }
 
 fn daemon_manifest(name: &str) -> Manifest {
@@ -119,7 +145,8 @@ fn d1_welbehaved_thread_creature_unloads_cleanly_with_no_leak_event() {
 #[test]
 fn d2_runaway_thread_creature_triggers_the_kernel_leak_path_not_uaf() {
     let _serial = serial_lock().lock().unwrap_or_else(|p| p.into_inner());
-    let k = kernel();
+    let stage_paths = Arc::new(Mutex::new(HashMap::new()));
+    let k = kernel_with_native(Arc::new(CaptureNativeStages { paths: stage_paths.clone() }));
     let runaway_so = native_cdylib("runaway_thread_daemon");
     let echo_so = native_cdylib("echo_daemon");
 
@@ -129,6 +156,13 @@ fn d2_runaway_thread_creature_triggers_the_kernel_leak_path_not_uaf() {
     let runaway_id =
         k.load(daemon_manifest("runaway-thread-daemon"), Artifact::Path(runaway_so)).unwrap();
     let echo_id = k.load(daemon_manifest("echo-daemon"), Artifact::Path(echo_so)).unwrap();
+    let runaway_stage = stage_paths
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get("runaway-thread-daemon")
+        .cloned()
+        .expect("capture runaway's exact staged capability");
+    assert!(runaway_stage.exists(), "runaway stage is retained while loaded");
 
     // Sanity: runaway is reachable before the misbehavior is detected.
     let (probe, bus, prx) = k.open_endpoint(Capabilities::default());
@@ -150,6 +184,10 @@ fn d2_runaway_thread_creature_triggers_the_kernel_leak_path_not_uaf() {
     assert!(
         got_leak_event,
         "kernel must publish `unload_leaked_resources` when a runaway tid is detected; events: {seen:?}"
+    );
+    assert!(
+        runaway_stage.exists(),
+        "the leak path must retain the exact native stage with the still-mapped library"
     );
 
     // The runaway is off the bus (router deregistered) — routing returns NoSuchModule, not UB.

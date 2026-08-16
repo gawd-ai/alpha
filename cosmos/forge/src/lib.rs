@@ -22,6 +22,23 @@ pub use aether::ffi;
 
 pub use managed::{spawn, try_spawn};
 
+/// Diagnostics must never become a second panic at a native ABI boundary. `eprintln!` panics when
+/// stderr fails; this helper treats both write failures and panicking formatters as best-effort and
+/// deliberately leaks an adversarial panic payload whose `Drop` itself panics.
+fn best_effort_stderr(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = stderr.write_fmt(args);
+        let _ = stderr.write_all(b"\n");
+    }));
+    if let Err(payload) = result {
+        std::mem::forget(payload);
+    }
+}
+
 /// Creature-side bus shim for native daemons (`.so`). Wraps the host-supplied send callback so the
 /// creature uses the same [`Bus`] API in-process or across FFI. Cheap to clone (just a fn pointer +
 /// raw pointer + id).
@@ -116,10 +133,10 @@ pub mod managed {
 
         pub fn spawn<F: FnOnce() + Send + 'static>(&self, name: &str, f: F) {
             if let Err(e) = self.try_spawn(name, f) {
-                eprintln!(
+                crate::best_effort_stderr(format_args!(
                     "forge: failed to spawn managed thread {:?}: {e}",
                     thread_name_for_log(name)
-                );
+                ));
             }
         }
 
@@ -184,7 +201,10 @@ pub mod managed {
     /// the consequence to a leaked library rather than UAF.
     pub fn spawn<F: FnOnce() + Send + 'static>(name: &str, f: F) {
         if let Err(e) = try_spawn(name, f) {
-            eprintln!("forge: failed to spawn thread {:?}: {e}", thread_name_for_log(name));
+            crate::best_effort_stderr(format_args!(
+                "forge: failed to spawn thread {:?}: {e}",
+                thread_name_for_log(name)
+            ));
         }
     }
 
@@ -205,7 +225,8 @@ pub mod managed {
 /// Internal glue the `declare_creature!` macro expands into. Public-but-hidden so the macro can refer
 /// to it; not part of the creature-facing API.
 ///
-/// **Every glue function catches panics** (`std::panic::catch_unwind`) before returning across the
+/// **Every glue function, including construction, catches panics** (`std::panic::catch_unwind`)
+/// before returning across the
 /// `extern "C"` boundary. Unwinding across `extern "C"` is undefined behavior — the catch is the
 /// fabric-integrity floor (R9) for the FFI seam, mirroring the kernel-side `catch_unwind` in
 /// `run_drain`. A panic in `handle` returns [`ffi::RC_PANIC`](aether::ffi::RC_PANIC) so the host can
@@ -258,6 +279,76 @@ pub mod glue {
         }
     }
 
+    extern "C" fn bind_entry<T: Creature>(data: *mut c_void, ctx: *const BindCtxFfi) {
+        // The outer catch covers infrastructure/error-reporting code as well as user callbacks.
+        // SAFETY: this entry is installed only in the vtable paired with `CreatureBox<T>`.
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| unsafe { bind::<T>(data, ctx) })) {
+            unsafe { (*(data as *mut CreatureBox<T>)).poisoned = true };
+            std::mem::forget(payload);
+        }
+    }
+
+    extern "C" fn handle_entry<T: Creature>(
+        data: *mut c_void,
+        env_ptr: *const u8,
+        env_len: usize,
+    ) -> i32 {
+        // SAFETY: this entry is installed only in the vtable paired with `CreatureBox<T>`.
+        match catch_unwind(AssertUnwindSafe(|| unsafe { handle::<T>(data, env_ptr, env_len) })) {
+            Ok(rc) => rc,
+            Err(payload) => {
+                unsafe { (*(data as *mut CreatureBox<T>)).poisoned = true };
+                std::mem::forget(payload);
+                RC_PANIC
+            }
+        }
+    }
+
+    extern "C" fn shutdown_entry<T: Creature>(data: *mut c_void, deadline_ms: u64) {
+        // SAFETY: this entry is installed only in the vtable paired with `CreatureBox<T>`.
+        if let Err(payload) =
+            catch_unwind(AssertUnwindSafe(|| unsafe { shutdown::<T>(data, deadline_ms) }))
+        {
+            std::mem::forget(payload);
+        }
+    }
+
+    extern "C" fn destroy_entry<T: Creature>(data: *mut c_void) {
+        // SAFETY: this entry is installed only in the vtable paired with `CreatureBox<T>`.
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| unsafe { destroy::<T>(data) })) {
+            std::mem::forget(payload);
+        }
+    }
+
+    /// Construct the complete native vtable without allowing `T::default` or allocation-adjacent
+    /// user code to unwind across the exported non-unwinding C ABI. A null result is the ABI's
+    /// fail-closed construction error; the native loader already rejects it as `EngineError::Load`.
+    pub fn construct<T: Creature + Default>() -> *mut crate::ffi::CreatureVTableV1 {
+        match catch_unwind(AssertUnwindSafe(|| {
+            let user = T::default();
+            let cb = Box::new(CreatureBox::<T>::new(user));
+            let data = Box::into_raw(cb) as *mut c_void;
+            let vtable = crate::ffi::CreatureVTableV1 {
+                data,
+                bind: bind_entry::<T>,
+                handle: handle_entry::<T>,
+                shutdown: shutdown_entry::<T>,
+                destroy: destroy_entry::<T>,
+            };
+            Box::into_raw(Box::new(vtable))
+        })) {
+            Ok(vtable) => vtable,
+            Err(payload) => {
+                crate::best_effort_stderr(format_args!(
+                    "forge: creature panicked during construction ({})",
+                    panic_msg(&*payload)
+                ));
+                std::mem::forget(payload);
+                std::ptr::null_mut()
+            }
+        }
+    }
+
     /// Drop guard that clears the managed-thread thread-local on any exit — Ok return *or* panic
     /// unwinding through it. Without this, a panic in user code would leave a stale `Arc<Threads>`
     /// in the thread-local; the next creature on this thread would silently inherit it.
@@ -292,11 +383,12 @@ pub mod glue {
         // A panic in user `bind` would unwind across `extern "C"` (UB). Catch it; mark poisoned so
         // the first `handle` returns RC_PANIC and the host unloads us.
         if let Err(e) = catch_unwind(AssertUnwindSafe(|| cb.user.bind(module_ctx))) {
-            eprintln!(
+            cb.poisoned = true;
+            crate::best_effort_stderr(format_args!(
                 "forge: creature panicked in bind ({}); marking poisoned — the host will unload it",
                 panic_msg(&*e)
-            );
-            cb.poisoned = true;
+            ));
+            std::mem::forget(e);
         }
     }
 
@@ -327,8 +419,12 @@ pub mod glue {
             Err(e) => {
                 // Creature-fault isolation at the FFI seam (R9). Mark poisoned so we never call user
                 // code again — its state is unknown after the unwind — and tell the host to unload.
-                eprintln!("forge: creature panicked in handle ({})", panic_msg(&*e));
                 cb.poisoned = true;
+                crate::best_effort_stderr(format_args!(
+                    "forge: creature panicked in handle ({})",
+                    panic_msg(&*e)
+                ));
+                std::mem::forget(e);
                 return RC_PANIC;
             }
         };
@@ -339,7 +435,10 @@ pub mod glue {
         if let Some(bus) = &cb.bus {
             for d in outcome.dispatches {
                 if let Err(e) = bus.emit(d) {
-                    eprintln!("forge: creature {:?} dropped a dispatch: {e}", bus.whoami());
+                    crate::best_effort_stderr(format_args!(
+                        "forge: creature {:?} dropped a dispatch: {e}",
+                        bus.whoami()
+                    ));
                 }
             }
         }
@@ -365,7 +464,11 @@ pub mod glue {
         if let Err(e) =
             catch_unwind(AssertUnwindSafe(|| cb.user.shutdown(Deadline::from_millis(deadline_ms))))
         {
-            eprintln!("forge: creature panicked in shutdown ({})", panic_msg(&*e));
+            crate::best_effort_stderr(format_args!(
+                "forge: creature panicked in shutdown ({})",
+                panic_msg(&*e)
+            ));
+            std::mem::forget(e);
         }
         // **The join barrier.** Every thread the creature registered via `forge::spawn` is
         // joined HERE — before the kernel runs `destroy` and `dlclose`. This is the discipline
@@ -373,7 +476,9 @@ pub mod glue {
         // whose threads never return will hang here until the kernel's unload deadline catches it
         // (run_drain → done_signal → KernelError::UnloadTimeout), at which point the drain is
         // abandoned detached and the kernel's thread-count guard refuses `dlclose` (bounded leak).
-        let _ = catch_unwind(AssertUnwindSafe(|| cb.threads.join_all()));
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| cb.threads.join_all())) {
+            std::mem::forget(payload);
+        }
     }
 
     /// # Safety
@@ -384,7 +489,11 @@ pub mod glue {
         // `extern "C"`. The Box is freed either way (catch_unwind owns the closure result).
         let bx = Box::from_raw(data as *mut CreatureBox<T>);
         if let Err(e) = catch_unwind(AssertUnwindSafe(move || drop(bx))) {
-            eprintln!("forge: creature panicked in Drop during destroy ({})", panic_msg(&*e));
+            crate::best_effort_stderr(format_args!(
+                "forge: creature panicked in Drop during destroy ({})",
+                panic_msg(&*e)
+            ));
+            std::mem::forget(e);
         }
     }
 }
@@ -412,38 +521,7 @@ macro_rules! declare_creature {
     ($t:ty) => {
         #[no_mangle]
         pub extern "C" fn gawd_creature_v1() -> *mut $crate::ffi::CreatureVTableV1 {
-            let user: $t = <$t as ::std::default::Default>::default();
-            let cb = ::std::boxed::Box::new($crate::glue::CreatureBox::<$t>::new(user));
-            let data = ::std::boxed::Box::into_raw(cb) as *mut ::std::os::raw::c_void;
-
-            extern "C" fn bind_glue(
-                data: *mut ::std::os::raw::c_void,
-                ctx: *const $crate::ffi::BindCtxFfi,
-            ) {
-                unsafe { $crate::glue::bind::<$t>(data, ctx) }
-            }
-            extern "C" fn handle_glue(
-                data: *mut ::std::os::raw::c_void,
-                env_ptr: *const u8,
-                env_len: usize,
-            ) -> i32 {
-                unsafe { $crate::glue::handle::<$t>(data, env_ptr, env_len) }
-            }
-            extern "C" fn shutdown_glue(data: *mut ::std::os::raw::c_void, deadline_ms: u64) {
-                unsafe { $crate::glue::shutdown::<$t>(data, deadline_ms) }
-            }
-            extern "C" fn destroy_glue(data: *mut ::std::os::raw::c_void) {
-                unsafe { $crate::glue::destroy::<$t>(data) }
-            }
-
-            let vt = $crate::ffi::CreatureVTableV1 {
-                data,
-                bind: bind_glue,
-                handle: handle_glue,
-                shutdown: shutdown_glue,
-                destroy: destroy_glue,
-            };
-            ::std::boxed::Box::into_raw(::std::boxed::Box::new(vt))
+            $crate::glue::construct::<$t>()
         }
     };
 }
@@ -457,6 +535,286 @@ pub mod prelude {
     pub use sigil::{
         Abi, Backend, Capabilities, Entrypoint, Manifest, NetCapability, Provenance, Requirements,
     };
+}
+
+/// Typed Function helpers for the existing single [`Creature::handle`](aether::Creature::handle)
+/// boundary.
+///
+/// A Function is not a second ABI. The executor sends one versioned
+/// [`gawdfn::FunctionCallMessageV1`] through an ordinary [`Envelope`](aether::Envelope), and author
+/// code demultiplexes the signed entrypoint name here. These helpers keep the schema tag, bounds,
+/// immutable identity check, and reply correlation identical across native, WASM, and Rhai
+/// adapters; they make no placement, retry, trust, or scheduling decision.
+pub mod function {
+    use std::fmt;
+
+    use aether::{Address, CreatureId, Dispatch, Envelope};
+    use gawdfn::{
+        AttemptId, ControlDispositionV1, ExecutionControlV1, FunctionCallMessageV1, FunctionCallV1,
+        FunctionId, FunctionResultV1, SignedRecordV1, Validate, ValueRefV1, MAX_JOB_MESSAGE_BYTES,
+        SCHEMA_CALL_V1,
+    };
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
+    /// A bounded failure at the typed-call adapter. This is a wire/identity error, never an
+    /// execution-policy verdict.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum FunctionWireError {
+        WrongSchema { actual: String },
+        TooLarge { len: usize, limit: usize },
+        Decode(String),
+        UnexpectedOperation,
+        Invalid(String),
+        WrongFunction { expected: FunctionId, actual: FunctionId },
+        NotInline,
+    }
+
+    impl fmt::Display for FunctionWireError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::WrongSchema { actual } => {
+                    write!(f, "expected schema `{SCHEMA_CALL_V1}`, received `{actual}`")
+                }
+                Self::TooLarge { len, limit } => {
+                    write!(f, "function message is {len} bytes, exceeds {limit}")
+                }
+                Self::Decode(error) => write!(f, "cannot decode function message: {error}"),
+                Self::UnexpectedOperation => f.write_str("expected a function call operation"),
+                Self::Invalid(error) => write!(f, "invalid function message: {error}"),
+                Self::WrongFunction { expected, actual } => write!(
+                    f,
+                    "call targets {}#{}, expected {}#{}",
+                    actual.manifest_content_address,
+                    actual.entrypoint,
+                    expected.manifest_content_address,
+                    expected.entrypoint
+                ),
+                Self::NotInline => f.write_str("value is a blob reference, not inline JSON"),
+            }
+        }
+    }
+
+    impl std::error::Error for FunctionWireError {}
+
+    /// Build a correlated call dispatch. `reply_to` is explicit because an executor may use a
+    /// dedicated endpoint instead of its creature identity.
+    pub fn call(
+        to: Address,
+        reply_to: Address,
+        corr: u64,
+        call: FunctionCallV1,
+    ) -> Result<Dispatch, FunctionWireError> {
+        call.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        let message = FunctionCallMessageV1::Call { call: Box::new(call) };
+        let payload = serde_json::to_vec(&message)
+            .map_err(|error| FunctionWireError::Decode(error.to_string()))?;
+        ensure_bound(payload.len())?;
+        Ok(Dispatch::to(to, payload)
+            .with_schema(SCHEMA_CALL_V1)
+            .with_reply_to(reply_to)
+            .with_corr(corr))
+    }
+
+    /// Decode and structurally validate any typed Function call from an Envelope.
+    pub fn parse_call(env: &Envelope) -> Result<FunctionCallV1, FunctionWireError> {
+        if env.header.schema != SCHEMA_CALL_V1 {
+            return Err(FunctionWireError::WrongSchema { actual: env.header.schema.clone() });
+        }
+        ensure_bound(env.payload.len())?;
+        let message: FunctionCallMessageV1 = serde_json::from_slice(&env.payload)
+            .map_err(|error| FunctionWireError::Decode(error.to_string()))?;
+        let FunctionCallMessageV1::Call { call } = message else {
+            return Err(FunctionWireError::UnexpectedOperation);
+        };
+        call.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        require_executor_route(
+            env,
+            &call.executor_dispatch.payload.executor_creature,
+            &call.executor_dispatch.payload.target_creature,
+        )?;
+        Ok(*call)
+    }
+
+    fn require_executor_route(
+        env: &Envelope,
+        executor_route: &str,
+        target_route: &str,
+    ) -> Result<(), FunctionWireError> {
+        let executor = canonical_creature_id(executor_route, "executor")?;
+        let target = canonical_creature_id(target_route, "target")?;
+        if env.header.from != Address::Creature(executor) {
+            return Err(FunctionWireError::Invalid(
+                "function call did not arrive from its grant-pinned executor".into(),
+            ));
+        }
+        if env.header.to != Address::Creature(target) {
+            return Err(FunctionWireError::Invalid(
+                "function call did not arrive at its grant-pinned deployment target".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn canonical_creature_id(
+        value: &str,
+        label: &'static str,
+    ) -> Result<CreatureId, FunctionWireError> {
+        let parsed = value.parse::<u64>().map_err(|_| {
+            FunctionWireError::Invalid(format!(
+                "function {label} route is not a numeric CreatureId"
+            ))
+        })?;
+        if parsed == 0 || parsed.to_string() != value {
+            return Err(FunctionWireError::Invalid(format!(
+                "function {label} route is not one canonical positive CreatureId"
+            )));
+        }
+        Ok(CreatureId(parsed))
+    }
+
+    /// Decode a call and require the immutable signed Function identity expected by this adapter.
+    pub fn parse_call_for(
+        env: &Envelope,
+        expected: &FunctionId,
+    ) -> Result<FunctionCallV1, FunctionWireError> {
+        let call = parse_call(env)?;
+        if &call.function != expected {
+            return Err(FunctionWireError::WrongFunction {
+                expected: expected.clone(),
+                actual: call.function,
+            });
+        }
+        Ok(call)
+    }
+
+    /// Decode and verify one Home-endorsed cooperative control for its exact attempt.
+    ///
+    /// This verifies the old Home's exact durable acceptance event, the current Home endorsement,
+    /// original execution grant, stable-executor current-route signature, schema/size bounds, and
+    /// both envelope endpoints before application code can observe the command.
+    pub fn parse_control(
+        env: &Envelope,
+    ) -> Result<(AttemptId, SignedRecordV1<ExecutionControlV1>), FunctionWireError> {
+        if env.header.schema != SCHEMA_CALL_V1 {
+            return Err(FunctionWireError::WrongSchema { actual: env.header.schema.clone() });
+        }
+        ensure_bound(env.payload.len())?;
+        let message: FunctionCallMessageV1 = serde_json::from_slice(&env.payload)
+            .map_err(|error| FunctionWireError::Decode(error.to_string()))?;
+        message.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        let FunctionCallMessageV1::Control { control } = message else {
+            return Err(FunctionWireError::UnexpectedOperation);
+        };
+        require_executor_route(
+            env,
+            &control.executor_dispatch.payload.executor_creature,
+            &control.executor_dispatch.payload.target_creature,
+        )?;
+        Ok((control.attempt, *control.endorsement))
+    }
+
+    /// Build a correlation-preserving reply to a typed Function call.
+    pub fn reply(
+        request: &Envelope,
+        result: FunctionResultV1,
+    ) -> Result<Dispatch, FunctionWireError> {
+        result.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        let message = FunctionCallMessageV1::Result { result };
+        let payload = serde_json::to_vec(&message)
+            .map_err(|error| FunctionWireError::Decode(error.to_string()))?;
+        ensure_bound(payload.len())?;
+        Ok(Dispatch::reply_to_env(request, payload).with_schema(SCHEMA_CALL_V1))
+    }
+
+    /// Report cooperative progress to the executor that issued `request`. The executor, not the
+    /// target, signs the durable Job receipt after authenticating the deployment sender.
+    pub fn progress(
+        request: &Envelope,
+        attempt: AttemptId,
+        sequence: u64,
+        progress: ValueRefV1,
+    ) -> Result<Dispatch, FunctionWireError> {
+        attempt.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        if sequence == 0 {
+            return Err(FunctionWireError::Invalid("progress sequence must be non-zero".into()));
+        }
+        progress.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        call_observation(request, FunctionCallMessageV1::Progress { attempt, sequence, progress })
+    }
+
+    /// Report a cooperative checkpoint reference to the issuing executor.
+    pub fn checkpoint(
+        request: &Envelope,
+        attempt: AttemptId,
+        sequence: u64,
+        checkpoint: ValueRefV1,
+    ) -> Result<Dispatch, FunctionWireError> {
+        attempt.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        if sequence == 0 {
+            return Err(FunctionWireError::Invalid("checkpoint sequence must be non-zero".into()));
+        }
+        checkpoint.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        call_observation(
+            request,
+            FunctionCallMessageV1::Checkpoint { attempt, sequence, checkpoint },
+        )
+    }
+
+    /// Truthfully acknowledge a cooperative control after the target has applied or refused it.
+    pub fn control_result(
+        request: &Envelope,
+        disposition: ControlDispositionV1,
+        detail: Option<String>,
+    ) -> Result<Dispatch, FunctionWireError> {
+        let (attempt, control) = parse_control(request)?;
+        call_observation(
+            request,
+            FunctionCallMessageV1::ControlResult {
+                attempt,
+                control: control.payload.caller_request.payload.control,
+                disposition,
+                detail,
+            },
+        )
+    }
+
+    fn call_observation(
+        request: &Envelope,
+        message: FunctionCallMessageV1,
+    ) -> Result<Dispatch, FunctionWireError> {
+        message.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        let payload = serde_json::to_vec(&message)
+            .map_err(|error| FunctionWireError::Decode(error.to_string()))?;
+        ensure_bound(payload.len())?;
+        Ok(Dispatch::reply_to_env(request, payload).with_schema(SCHEMA_CALL_V1))
+    }
+
+    /// Convert a serializable value into the bounded inline-JSON form used by a Function call.
+    pub fn inline<T: Serialize>(value: &T) -> Result<ValueRefV1, FunctionWireError> {
+        let value = serde_json::to_value(value)
+            .map_err(|error| FunctionWireError::Decode(error.to_string()))?;
+        let value = ValueRefV1::Inline { value };
+        value.validate().map_err(|error| FunctionWireError::Invalid(error.to_string()))?;
+        Ok(value)
+    }
+
+    /// Decode bounded inline JSON. Blob resolution deliberately remains a `job-blob` concern.
+    pub fn from_inline<T: DeserializeOwned>(value: &ValueRefV1) -> Result<T, FunctionWireError> {
+        let ValueRefV1::Inline { value } = value else {
+            return Err(FunctionWireError::NotInline);
+        };
+        serde_json::from_value(value.clone())
+            .map_err(|error| FunctionWireError::Decode(error.to_string()))
+    }
+
+    fn ensure_bound(len: usize) -> Result<(), FunctionWireError> {
+        if len > MAX_JOB_MESSAGE_BYTES {
+            Err(FunctionWireError::TooLarge { len, limit: MAX_JOB_MESSAGE_BYTES })
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// **SEER helpers.** Typed wrappers that build a [`Dispatch`] carrying a
@@ -555,6 +913,35 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static FAKE_SENDS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DropPanics;
+
+    impl Drop for DropPanics {
+        fn drop(&mut self) {
+            panic!("panic payload drop fault specimen")
+        }
+    }
+
+    struct PanickingDefault;
+
+    impl Default for PanickingDefault {
+        fn default() -> Self {
+            std::panic::panic_any(DropPanics)
+        }
+    }
+
+    impl aether::Creature for PanickingDefault {
+        fn bind(&mut self, _ctx: aether::CreatureCtx) {}
+
+        fn handle(&mut self, _env: aether::Envelope) -> aether::Outcome {
+            aether::Outcome::none()
+        }
+    }
+
+    #[test]
+    fn panicking_default_with_panicking_payload_drop_is_a_null_result_not_an_abi_unwind() {
+        assert!(glue::construct::<PanickingDefault>().is_null());
+    }
 
     extern "C" fn fake_send(_ctx: *mut c_void, _ptr: *const u8, _len: usize) -> i32 {
         FAKE_SENDS.fetch_add(1, Ordering::Relaxed);
@@ -792,6 +1179,413 @@ mod tests {
                 other => panic!("expected Thought, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn function_helpers_preserve_schema_corr_and_immutable_identity() {
+        use aether::{Envelope, Header};
+        use gawdfn::{
+            canonical_hash, AbodeKeyBindingV1, AttemptId, AuthoritySigner, DeliveryModeV1,
+            DeploymentId, DeploymentReceiptV1, Ed25519SeedSigner, ExecutionGrantV1,
+            ExecutorDispatchV1, FunctionCallV1, FunctionId, HomeAuthorityV1, HomeId, JobId,
+            OperationalCapabilityV1, OperationalKeyGrantV1, SignedRecordV1, SCHEMA_CALL_V1,
+            SCHEMA_EXECUTE_V1, SCHEMA_FUNCTION_DEPLOY_V1, SCHEMA_HOME_V1,
+        };
+
+        let function = FunctionId {
+            manifest_content_address: format!("sha256:{}", "a".repeat(64)),
+            entrypoint: "summarize".into(),
+        };
+        let root = Ed25519SeedSigner::from_seed([31; 32]).unwrap();
+        let operational = Ed25519SeedSigner::from_seed([32; 32]).unwrap();
+        let executor = Ed25519SeedSigner::from_seed([33; 32]).unwrap();
+        let home = HomeId::new(root.public_key());
+        let authority = HomeAuthorityV1 {
+            abode: SignedRecordV1::sign(
+                SCHEMA_HOME_V1,
+                AbodeKeyBindingV1 {
+                    abode: home.clone(),
+                    root_public_key: root.public_key().into(),
+                    issued_at_unix_ms: None,
+                },
+                &root,
+            )
+            .unwrap(),
+            operational: SignedRecordV1::sign(
+                SCHEMA_HOME_V1,
+                OperationalKeyGrantV1 {
+                    home: home.clone(),
+                    epoch: 1,
+                    operational_public_key: operational.public_key().into(),
+                    valid_from_unix_ms: None,
+                    expires_at_unix_ms: None,
+                    capabilities: vec![OperationalCapabilityV1::JobHome],
+                    evidence: vec![],
+                },
+                &root,
+            )
+            .unwrap(),
+            prepared: None,
+        };
+        let attempt = AttemptId { home: home.clone(), job: JobId::new("job-1"), number: 1 };
+        let deployment = SignedRecordV1::sign(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            DeploymentReceiptV1 {
+                deployment: DeploymentId::new("deployment-forge-test"),
+                function: function.clone(),
+                artifact_hash: format!("sha256:{}", "b".repeat(64)),
+                realm: "realm-a".into(),
+                node: "node-a".into(),
+                executor: executor.public_key().into(),
+                executor_creature: "10".into(),
+                creature: "20".into(),
+                evidence: vec![],
+                registered_at_unix_ms: None,
+            },
+            &executor,
+        )
+        .unwrap();
+        let input = crate::function::inline(&serde_json::json!({"text":"hello"})).unwrap();
+        let grant = SignedRecordV1::sign(
+            SCHEMA_EXECUTE_V1,
+            ExecutionGrantV1 {
+                attempt: attempt.clone(),
+                request_hash: format!("sha256:{}", "c".repeat(64)),
+                home_epoch: 1,
+                home_route_sequence: 1,
+                home_realm: "realm-a".into(),
+                home_node: "home-node".into(),
+                home_coordinator: "30".into(),
+                owner: home,
+                authority,
+                function: function.clone(),
+                deployment,
+                input: input.clone(),
+                delivery: DeliveryModeV1::AtMostOnce,
+                grant_sequence: 1,
+                issued_at_unix_ms: None,
+                deadline_unix_ms: None,
+            },
+            &operational,
+        )
+        .unwrap();
+        let executor_dispatch = SignedRecordV1::sign(
+            SCHEMA_CALL_V1,
+            ExecutorDispatchV1 {
+                attempt: attempt.clone(),
+                grant_hash: canonical_hash(&grant).unwrap(),
+                deployment: grant.payload.deployment.payload.deployment.clone(),
+                executor_creature: "10".into(),
+                target_creature: "20".into(),
+            },
+            &executor,
+        )
+        .unwrap();
+        let call = FunctionCallV1 {
+            attempt,
+            function: function.clone(),
+            input,
+            grant: Box::new(grant),
+            executor_dispatch,
+        };
+        let from = Address::Creature(CreatureId(10));
+        let to = Address::Creature(CreatureId(20));
+        let dispatch = crate::function::call(to.clone(), from.clone(), 77, call.clone()).unwrap();
+        assert_eq!(dispatch.schema, SCHEMA_CALL_V1);
+        assert_eq!(dispatch.corr, Some(77));
+        assert_eq!(dispatch.reply_to, Some(from.clone()));
+
+        let env = Envelope {
+            header: Header {
+                from,
+                to,
+                reply_to: dispatch.reply_to,
+                seq: 1,
+                causal: vec![],
+                stamp: 1,
+                sig: "test".into(),
+                corr: dispatch.corr,
+                commitment: None,
+                schema: dispatch.schema,
+                origin: None,
+            },
+            payload: dispatch.payload,
+        };
+        assert_eq!(crate::function::parse_call_for(&env, &function).unwrap(), call);
+
+        let wrong = FunctionId {
+            manifest_content_address: format!("sha256:{}", "b".repeat(64)),
+            entrypoint: "summarize".into(),
+        };
+        assert!(matches!(
+            crate::function::parse_call_for(&env, &wrong),
+            Err(crate::function::FunctionWireError::WrongFunction { .. })
+        ));
+
+        let progress = crate::function::progress(
+            &env,
+            call.attempt.clone(),
+            1,
+            crate::function::inline(&serde_json::json!({"stage":"reading"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(progress.schema, SCHEMA_CALL_V1);
+        assert_eq!(progress.corr, Some(77));
+        assert_eq!(progress.to, Address::Creature(CreatureId(10)));
+        let message: gawdfn::FunctionCallMessageV1 =
+            serde_json::from_slice(&progress.payload).unwrap();
+        assert!(matches!(message, gawdfn::FunctionCallMessageV1::Progress { sequence: 1, .. }));
+    }
+
+    #[test]
+    fn function_control_helpers_verify_endorsement_and_echo_exact_attempt() {
+        use aether::{Envelope, Header};
+        use gawdfn::{
+            canonical_hash, AbodeKeyBindingV1, AuthoritySigner, ControlDispositionV1, ControlId,
+            DeliveryModeV1, DeploymentId, DeploymentReceiptV1, Ed25519SeedSigner,
+            ExecutionControlV1, ExecutionGrantV1, ExecutorControlDispatchV1, FunctionCallMessageV1,
+            FunctionControlV1, FunctionId, HomeAuthorityV1, HomeId, JobControlKindV1, JobControlV1,
+            JobEventKindV1, JobEventV1, JobHandleV1, JobId, JobStateV1, OperationalCapabilityV1,
+            OperationalKeyGrantV1, SignedRecordV1, ValueRefV1, SCHEMA_CALL_V1, SCHEMA_EXECUTE_V1,
+            SCHEMA_FUNCTION_DEPLOY_V1, SCHEMA_HOME_V1, SCHEMA_JOB_V1,
+        };
+
+        let root = Ed25519SeedSigner::from_seed([41; 32]).unwrap();
+        let operational = Ed25519SeedSigner::from_seed([42; 32]).unwrap();
+        let executor = Ed25519SeedSigner::from_seed([43; 32]).unwrap();
+        let home = HomeId::new(root.public_key());
+        let authority = HomeAuthorityV1 {
+            abode: SignedRecordV1::sign(
+                SCHEMA_HOME_V1,
+                AbodeKeyBindingV1 {
+                    abode: home.clone(),
+                    root_public_key: root.public_key().into(),
+                    issued_at_unix_ms: None,
+                },
+                &root,
+            )
+            .unwrap(),
+            operational: SignedRecordV1::sign(
+                SCHEMA_HOME_V1,
+                OperationalKeyGrantV1 {
+                    home: home.clone(),
+                    epoch: 1,
+                    operational_public_key: operational.public_key().into(),
+                    valid_from_unix_ms: None,
+                    expires_at_unix_ms: None,
+                    capabilities: vec![
+                        OperationalCapabilityV1::JobHome,
+                        OperationalCapabilityV1::JobControl,
+                    ],
+                    evidence: vec![],
+                },
+                &root,
+            )
+            .unwrap(),
+            prepared: None,
+        };
+        let attempt =
+            gawdfn::AttemptId { home: home.clone(), job: JobId::new("job-control"), number: 1 };
+        let control_id = ControlId::new("control-1");
+        let caller_request = SignedRecordV1::sign(
+            SCHEMA_JOB_V1,
+            JobControlV1 {
+                handle: JobHandleV1 { home: home.clone(), job: attempt.job.clone() },
+                expected_home_epoch: 1,
+                control: control_id.clone(),
+                issued_at_unix_ms: None,
+                kind: JobControlKindV1::Cancel { reason: "stop".into() },
+            },
+            &root,
+        )
+        .unwrap();
+        let accepted_event = SignedRecordV1::sign(
+            SCHEMA_JOB_V1,
+            JobEventV1 {
+                handle: caller_request.payload.handle.clone(),
+                home_epoch: 1,
+                authority: authority.clone(),
+                sequence: 2,
+                occurred_at_unix_ms: None,
+                state_after: JobStateV1::Running,
+                cancel_requested: true,
+                kind: JobEventKindV1::ControlRequested {
+                    request: Box::new(caller_request.clone()),
+                    attempt: Some(attempt.clone()),
+                },
+                foreign_receipt: None,
+            },
+            &operational,
+        )
+        .unwrap();
+        let function = FunctionId {
+            manifest_content_address: format!("sha256:{}", "a".repeat(64)),
+            entrypoint: "controlled".into(),
+        };
+        let deployment = SignedRecordV1::sign(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            DeploymentReceiptV1 {
+                deployment: DeploymentId::new("control-deployment"),
+                function: function.clone(),
+                artifact_hash: format!("sha256:{}", "b".repeat(64)),
+                realm: "realm-a".into(),
+                node: "node-a".into(),
+                executor: executor.public_key().into(),
+                executor_creature: "10".into(),
+                creature: "20".into(),
+                evidence: vec![],
+                registered_at_unix_ms: None,
+            },
+            &executor,
+        )
+        .unwrap();
+        let grant = SignedRecordV1::sign(
+            SCHEMA_EXECUTE_V1,
+            ExecutionGrantV1 {
+                attempt: attempt.clone(),
+                request_hash: format!("sha256:{}", "c".repeat(64)),
+                home_epoch: 1,
+                home_route_sequence: 1,
+                home_realm: "realm-a".into(),
+                home_node: "home-node".into(),
+                home_coordinator: "30".into(),
+                owner: home,
+                authority: authority.clone(),
+                function,
+                deployment,
+                input: ValueRefV1::Inline { value: serde_json::json!({"value": 1}) },
+                delivery: DeliveryModeV1::AtMostOnce,
+                grant_sequence: 1,
+                issued_at_unix_ms: None,
+                deadline_unix_ms: None,
+            },
+            &operational,
+        )
+        .unwrap();
+        let endorsed = SignedRecordV1::sign(
+            SCHEMA_EXECUTE_V1,
+            ExecutionControlV1 {
+                caller_request,
+                accepted_event: Box::new(accepted_event),
+                attempt: attempt.clone(),
+                grant_hash: canonical_hash(&grant).unwrap(),
+                home_epoch: 1,
+                home_route_sequence: 1,
+                home_sequence: 2,
+                home_realm: "realm-a".into(),
+                home_node: "home-node".into(),
+                home_coordinator: "30".into(),
+                authority,
+            },
+            &operational,
+        )
+        .unwrap();
+        let dispatch = SignedRecordV1::sign(
+            SCHEMA_CALL_V1,
+            ExecutorControlDispatchV1 {
+                attempt: attempt.clone(),
+                grant_hash: canonical_hash(&grant).unwrap(),
+                control_hash: canonical_hash(&endorsed).unwrap(),
+                deployment: grant.payload.deployment.payload.deployment.clone(),
+                executor_creature: "10".into(),
+                target_creature: "20".into(),
+            },
+            &executor,
+        )
+        .unwrap();
+        let proof = FunctionControlV1 {
+            attempt: attempt.clone(),
+            endorsement: Box::new(endorsed.clone()),
+            grant: Box::new(grant.clone()),
+            executor_dispatch: dispatch,
+        };
+        let envelope = |from: u64, to: u64, message: FunctionCallMessageV1| Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(from)),
+                to: Address::Creature(CreatureId(to)),
+                reply_to: None,
+                seq: 1,
+                causal: vec![],
+                stamp: 1,
+                sig: "test".into(),
+                corr: Some(77),
+                commitment: None,
+                schema: SCHEMA_CALL_V1.into(),
+                origin: None,
+            },
+            payload: serde_json::to_vec(&message).unwrap(),
+        };
+        let request =
+            envelope(10, 20, FunctionCallMessageV1::Control { control: Box::new(proof.clone()) });
+        let (parsed_attempt, parsed_control) = crate::function::parse_control(&request).unwrap();
+        assert_eq!(parsed_attempt, attempt);
+        assert_eq!(parsed_control, endorsed);
+
+        let reply = crate::function::control_result(
+            &request,
+            ControlDispositionV1::Rejected,
+            Some("already stopped".into()),
+        )
+        .unwrap();
+        let reply: FunctionCallMessageV1 = serde_json::from_slice(&reply.payload).unwrap();
+        assert!(matches!(
+            reply,
+            FunctionCallMessageV1::ControlResult {
+                attempt: echoed_attempt,
+                control,
+                disposition: ControlDispositionV1::Rejected,
+                ..
+            } if echoed_attempt == attempt && control == control_id
+        ));
+
+        let wrong_sender =
+            envelope(11, 20, FunctionCallMessageV1::Control { control: Box::new(proof.clone()) });
+        assert!(matches!(
+            crate::function::parse_control(&wrong_sender),
+            Err(crate::function::FunctionWireError::Invalid(_))
+        ));
+
+        let wrong_target =
+            envelope(10, 21, FunctionCallMessageV1::Control { control: Box::new(proof.clone()) });
+        assert!(matches!(
+            crate::function::parse_control(&wrong_target),
+            Err(crate::function::FunctionWireError::Invalid(_))
+        ));
+
+        let mut wrong_hash = proof.clone();
+        wrong_hash.executor_dispatch.payload.control_hash = format!("sha256:{}", "d".repeat(64));
+        wrong_hash.executor_dispatch =
+            SignedRecordV1::sign(SCHEMA_CALL_V1, wrong_hash.executor_dispatch.payload, &executor)
+                .unwrap();
+        let wrong_hash =
+            envelope(10, 20, FunctionCallMessageV1::Control { control: Box::new(wrong_hash) });
+        assert!(matches!(
+            crate::function::parse_control(&wrong_hash),
+            Err(crate::function::FunctionWireError::Invalid(_))
+        ));
+
+        let mut forged = proof;
+        forged.endorsement.payload.home_sequence += 1;
+        let forged = envelope(10, 20, FunctionCallMessageV1::Control { control: Box::new(forged) });
+        assert!(matches!(
+            crate::function::parse_control(&forged),
+            Err(crate::function::FunctionWireError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn function_inline_decoder_refuses_unresolved_blobs() {
+        use gawdfn::{BlobRefV1, ValueRefV1};
+
+        let value = ValueRefV1::Blob {
+            blob: BlobRefV1 {
+                digest: format!("sha256:{}", "c".repeat(64)),
+                size: 1,
+                media_type: "application/json".into(),
+            },
+        };
+        let decoded = crate::function::from_inline::<serde_json::Value>(&value);
+        assert_eq!(decoded.unwrap_err(), crate::function::FunctionWireError::NotInline);
     }
 
     #[test]

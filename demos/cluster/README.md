@@ -33,6 +33,12 @@ cd demos/cluster
 
 Each step prints what it did and what to run next. Node logs/pids/pubkeys land in `./run/`.
 
+The lifecycle helpers require Linux `/proc` plus `flock`. Boot and teardown hold one stable
+`run/.lifecycle.lock`, so concurrent commands cannot unlink or replace one another's PID records.
+Each record binds a PID to the kernel boot id and `/proc/<pid>/stat` start time; a stale, reused, or
+unverifiable identity is never signalled. Partial boot rolls back only children started by that boot,
+and teardown uses bounded TERM-then-KILL waits, retaining the record if death cannot be proved.
+
 ## Run it across three real machines
 
 Every script reads hosts/ports from the environment (see [`env.sh`](env.sh)). On three boxes, point the

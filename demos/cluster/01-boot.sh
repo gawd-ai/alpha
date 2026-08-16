@@ -17,18 +17,172 @@ source ./env.sh
 [ -x "$BIN" ]   || { echo "✗ $BIN not found — run ./00-build.sh first"; exit 1; }
 [ -x "$OMEGA" ] || { echo "✗ $OMEGA not found — run ./00-build.sh first"; exit 1; }
 mkdir -p "$RUN"
+acquire_cluster_lifecycle_lock
+
+# Refuse to overwrite a live or unverifiable node PID file. Only a validated record whose exact
+# incarnation is confirmed gone is removed before this run owns anything.
+preflight_pid_file() {
+  local name="$1" pid_file="$RUN/$name.pid" record pid identity state
+  [[ -e "$pid_file" ]] || return 0
+
+  if ! record="$(node_pid_record_from_file "$pid_file")"; then
+    echo "✗ invalid PID file $pid_file; refusing to overwrite it" >&2
+    return 1
+  fi
+  pid="${record%%$'\n'*}"
+  identity="${record#*$'\n'}"
+  if node_pid_record_is_live "$pid" "$identity"; then
+    echo "✗ node $name already appears live (pid $pid from $pid_file); run ./09-teardown.sh first" >&2
+    return 1
+  else
+    state=$?
+  fi
+  if ((state == 3)); then
+    echo "✗ cannot verify whether $pid_file still owns live pid $pid; refusing to overwrite it" >&2
+    return 1
+  fi
+
+  if ((state == 2)); then
+    echo "  ! removing stale PID file for node $name (pid $pid was reused by another process)"
+  else
+    echo "  ! removing stale PID file for node $name (recorded process is down)"
+  fi
+  if ! remove_node_pid_if_matches "$pid_file" "$pid" "$identity"; then
+    echo "✗ stale PID file $pid_file changed during preflight; refusing to overwrite it" >&2
+    return 1
+  fi
+}
+
+preflight_ok=1
+for name in A B C; do
+  preflight_pid_file "$name" || preflight_ok=0
+done
+((preflight_ok == 1)) || exit 1
+
+# Only processes appended to these arrays belong to this boot attempt. Any later failure or signal
+# rolls those processes back in reverse order; pre-existing processes are never touched.
+declare -a OWNED_NAMES=()
+declare -a OWNED_PIDS=()
+declare -a OWNED_PID_FILES=()
+declare -a OWNED_IDENTITIES=()
+rollback_armed=1
+
+# `jobs -pr` names only running direct children still owned by this shell. It is the exact fallback
+# during the few commands between spawn and `/proc` identity capture; a completed child is reaped by
+# `wait` and its numerical PID is never signalled after leaving this job table.
+owned_child_is_running() {
+  local wanted_pid="$1" child_pid
+  while IFS= read -r child_pid; do
+    [[ "$child_pid" == "$wanted_pid" ]] && return 0
+  done < <(jobs -pr)
+  return 1
+}
+
+stop_owned_child() {
+  local pid="$1" label="$2" attempt
+  owned_child_is_running "$pid" || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    owned_child_is_running "$pid" || return 0
+    sleep 0.1
+  done
+  echo "  ! $label (pid $pid) did not stop after 5s; sending SIGKILL" >&2
+  owned_child_is_running "$pid" || return 0
+  kill -KILL "$pid" 2>/dev/null || true
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    owned_child_is_running "$pid" || return 0
+    sleep 0.1
+  done
+  ! owned_child_is_running "$pid"
+}
+
+rollback_boot() {
+  local status="$?" cleanup_failed=0 index name pid pid_file identity
+  trap - EXIT
+  trap '' HUP INT TERM
+  if [[ -n "$NODE_PID_TEMP_FILE" ]]; then
+    rm -f -- "$NODE_PID_TEMP_FILE"
+    NODE_PID_TEMP_FILE=""
+  fi
+
+  if ((rollback_armed == 1 && ${#OWNED_PIDS[@]} > 0)); then
+    echo >&2
+    echo "! boot did not complete; stopping nodes started by this attempt" >&2
+    for ((index = ${#OWNED_PIDS[@]} - 1; index >= 0; index--)); do
+      name="${OWNED_NAMES[index]}"
+      pid="${OWNED_PIDS[index]}"
+      pid_file="${OWNED_PID_FILES[index]}"
+      identity="${OWNED_IDENTITIES[index]}"
+      echo "▸ rolling back node $name (pid $pid)" >&2
+      if { [[ -n "$identity" ]] && stop_node_pid "$pid" "$identity" "node $name"; } || \
+          { [[ -z "$identity" ]] && stop_owned_child "$pid" "node $name"; }; then
+        # A completed background child is safe to reap now; never wait while it still appears live.
+        wait "$pid" 2>/dev/null || true
+        if [[ ! -e "$pid_file" ]]; then
+          echo "  ✓ node $name stopped" >&2
+        elif [[ -n "$identity" ]] && remove_node_pid_if_matches "$pid_file" "$pid" "$identity"; then
+          echo "  ✓ node $name stopped" >&2
+        else
+          echo "  ! node $name stopped, but $pid_file changed; leaving it untouched" >&2
+        fi
+      else
+        cleanup_failed=1
+      fi
+    done
+  fi
+
+  if ((status == 0 && cleanup_failed != 0)); then
+    status=1
+  fi
+  exit "$status"
+}
+
+trap rollback_boot EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 boot() { # bin subcmd name host cport aport key seed [extra_args...]
-  local bin="$1" subcmd="$2" name="$3" host="$4" cport="$5" aport="$6" key="$7" seed="$8"; shift 8
+  local bin="$1" subcmd="$2" name="$3" host="$4" cport="$5" aport="$6" key="$7" seed="$8"
+  local pid identity owned_index deferred_signal=0 pid_file="$RUN/$name.pid"
+  shift 8
   echo "▸ booting node $name (\`$(basename "$bin") $subcmd\`)  cluster=$host:$cport  api=$host:$aport"
+
+  # Defer termination across spawn + ownership capture. Bash runs signal traps between commands; a
+  # deferred code lets us record `$!` before honouring the signal, closing the orphan window.
+  trap 'deferred_signal=129' HUP
+  trap 'deferred_signal=130' INT
+  trap 'deferred_signal=143' TERM
   "$bin" "$subcmd" --node-id "$name" \
     --cluster-listen "$host:$cport" \
     --cluster-key "$seed" \
     --listen "$host:$aport" --api-key "$key" \
     --allow-ai --headless "$@" \
-    >"$RUN/$name.log" 2>&1 &
-  echo $! >"$RUN/$name.pid"
-  wait_health "$host" "$aport" || { echo "✗ node $name did not come up; see $RUN/$name.log"; exit 1; }
+    >"$RUN/$name.log" 2>&1 {CLUSTER_LIFECYCLE_LOCK_FD}>&- &
+  pid=$!
+  OWNED_NAMES+=("$name")
+  OWNED_PIDS+=("$pid")
+  OWNED_PID_FILES+=("$pid_file")
+  OWNED_IDENTITIES+=("")
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  ((deferred_signal == 0)) || exit "$deferred_signal"
+
+  identity="$(node_process_identity "$pid")" || {
+    echo "✗ could not capture node $name process identity (pid $pid)" >&2
+    exit 1
+  }
+  owned_index=$((${#OWNED_IDENTITIES[@]} - 1))
+  OWNED_IDENTITIES[owned_index]="$identity"
+  write_node_pid_file "$pid_file" "$pid" "$identity" || {
+    echo "✗ could not atomically write $pid_file" >&2
+    exit 1
+  }
+  wait_health "$host" "$aport" 50 "$pid" "$identity" || {
+    echo "✗ node $name did not come up; see $RUN/$name.log"
+    exit 1
+  }
   # Capture the node's pubkey (printed once at boot) so later steps can introduce it. Both
   # `alpha node` and `omega serve` print a "node pubkey = …" line, so this works for either pole.
   grep -m1 "node pubkey = " "$RUN/$name.log" | sed 's/.*node pubkey = //' >"$RUN/$name.pub"
@@ -41,6 +195,11 @@ boot "$OMEGA" serve A "$A_HOST" "$A_CPORT" "$A_APORT" "$A_KEY" "$A_SEED" --realm
 APUB="$(node_pub A)"
 boot "$BIN" node B "$B_HOST" "$B_CPORT" "$B_APORT" "$B_KEY" "$B_SEED" --seed "A@$A_HOST:$A_CPORT#$APUB"
 boot "$BIN" node C "$C_HOST" "$C_CPORT" "$C_APORT" "$C_KEY" "$C_SEED" --seed "A@$A_HOST:$A_CPORT#$APUB"
+
+# All three nodes are healthy and their PID files belong to this completed run. Disarm failure and
+# signal rollback so they intentionally outlive this launcher.
+rollback_armed=0
+trap - EXIT HUP INT TERM
 
 echo
 echo "✓ three nodes up (A = omega serve, B/C = alpha node). Next: ./02-join.sh  (introduce B and C to A; gossip forms the full mesh)"

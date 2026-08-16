@@ -1,0 +1,16 @@
+[package]
+name = "function-locator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reference finite signed Home-lease locator: higher epochs and coordinator-only revisions advance; same-epoch binding divergence conflicts."
+
+[dependencies]
+aether = { path = "../../aether" }
+gawdfn = { path = "../../../foundation/gawdfn" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

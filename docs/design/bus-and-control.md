@@ -12,7 +12,7 @@ control is plain bus traffic.
 
 `aether` is the substrate spine. It ships the routing fabric and nothing a model
 should own: creature inboxes, the inversion-of-control role-binding table, topic
-fan-out, and an append-only history journal. It carries the trust primitives
+fan-out, and a bounded in-memory history window. It carries the trust primitives
 *structurally* — they ride on every envelope, so no later layer exists "before"
 them — and it decides no policy.
 
@@ -26,7 +26,9 @@ contract:
   final responder answers the *original* requester directly. Fire-and-correlate,
   never proxying. `None` means "reply to `from`".
 - `seq` — a per-sender monotone counter. Order, not a global total order.
-- `causal` — happens-before links, empty unless a creature asserts causality.
+- `causal` — a reserved happens-before slot. Current creature `Dispatch` has no
+  field for it and bus sealing writes it empty; application-level Job causality
+  is explicit in `gawdfn::CausalLinkV1`/`JobEventV1` instead.
 - `stamp` — a node-logical tick, **never a wall clock**. *Time is a change of
   state*: every routed envelope advances the node's logical clock, and the
   router assigns the stamp after signing.
@@ -40,8 +42,9 @@ contract:
 - `schema` — the payload's content-type, so typed send/recv survives the dynamic
   boundary.
 
-The payload is opaque bytes — the *same type* local and remote, so a sandboxed
-native creature is a natural bus citizen rather than a special case. On the wire
+The payload is opaque bytes — the *same type* local and remote, so an admitted native creature is a
+natural bus citizen rather than a special case. Native daemons are trusted in-process code, not a
+sandboxed tier. On the wire
 the payload serializes as a hex string, not a JSON array of numbers, which keeps
 an 8 MB shipped artifact a single fast-parsing token. Header metadata has a
 separate serialized-byte cap before signing, routing, journaling, or remote
@@ -75,13 +78,15 @@ because admitted peers route *data* across the mesh, never drive a peer's kernel
 
 ### Addressing
 
-Two addressing modes, the *same* envelope, resolved differently by the router:
+Three delivery shapes, the *same* envelope, resolved differently by the router:
 
-- **Identity** — `Creature`, `Node`, `Kernel`, `Topic`: talk to *this*
-  creature, node, or channel.
-- **Capability** — `Role`, `Intent`: route to *whoever* is bound to fill the
-  concern. This is the inversion-of-control socket; the fabric ships the socket,
-  never the model.
+- **Identity** — `Creature`, `Node`, `Kernel`: talk to *this* creature or node.
+- **Fan-out** — `Topic`: deliver to every subscriber of a channel.
+- **Capability** — `Role`, `NodeRole`, `Intent`: route to *whoever* is bound to
+  fill the concern. `NodeRole` scopes that discovery to an explicitly
+  remote-exposed binding on one exact node; application proofs remain the
+  authority. This is the inversion-of-control socket; the fabric ships the
+  socket, never the model.
 
 Federation composes by depth: `Realm` and `Omega` wrap an inner target and
 resolve through a bound gateway creature — the same IoC discipline as
@@ -110,15 +115,16 @@ bound".
 
 ### The journal
 
-The router appends every routed envelope to an in-memory, append-only history
+The router appends every routed envelope to an in-memory history
 journal — `from`, `to`, `seq`, `stamp`, `corr` — bounded as a drop-oldest ring.
 It is an audit and proprioception *window*, never durable storage, so a
 long-lived node's journal memory stays O(cap), not O(envelopes-ever-routed);
 the header-byte cap also prevents one row from carrying unbounded routing
 metadata.
 Because control, authoring, sense, and federation are *all* bus traffic, the
-journal is one stream where the whole node's behavior is legible — and a
-`corr`-correlated conversation can be reconstructed from it after the fact.
+journal is one metadata stream where recent node behavior is legible. Rows do not
+retain payloads, and older rows are dropped; durable conversations and Jobs need
+their own application store.
 
 ### Take no side
 
@@ -147,7 +153,7 @@ the JSON payload of an ordinary `Envelope` whose `header.schema` is `"seer"`. It
 discriminates by **typed topic**, never by per-role schema string:
 
 ```rust
-pub enum SeerTopic { Authoring, Placement, Policy, Budget, Fitness, Consensus, Curation }
+pub enum SeerTopic { Authoring, Placement, Policy, Budget, Fitness, Consensus, Curation, Dialogue }
 
 pub enum SeerKind {
     Query    { query_id, body },   // the initiator asks
@@ -169,8 +175,8 @@ Live SEER consumers parse with `SeerEnvelope::parse_bounded`, capped by default 
 That keeps high-volume consult/sense traffic inside the hostile-input floor
 without adding a router-level topic table.
 
-**Reserved topics.** `Authoring` (the curiosity seam) and `Placement` (the
-distributor consult) have live consumers; `Consensus` carries signed reputation
+**Reserved topics.** `Authoring` (the curiosity seam), `Placement` (the
+distributor consult), and named-peer `Dialogue` have live consumers; `Consensus` carries signed reputation
 deltas for cross-Realm federation. `Policy`, `Budget`, `Fitness`, and `Curation`
 are reserved topics with draft typed bodies — their sockets exist, awaiting a
 concrete consumer to pin the exact payload. `Curation` is the durable Bestiary's
@@ -203,6 +209,28 @@ Because `Thought` and `Progress` are observable, a creature whose reasoning ride
 SEER is selectable by reasoning quality on that topic, not only by outcome — the
 SEER stream is per-topic selection and audit material for the fitness and immune
 loops.
+
+## Functions and Jobs are application schemas on this bus
+
+The v0.4.4 function system adds no router case and no SEER topic. The shared
+`foundation/gawdfn` contract defines seven top-level schemas carried by ordinary envelopes:
+`gawd.function.{deploy,job,execute,call,home,locate,policy}.v1`. Those schemas separate
+deployment, canonical home-ledger operations, executor grants/receipts, the typed
+entrypoint call multiplexed through `Creature::handle`, custody hand-off, home lookup,
+and replaceable placement/retry decisions. Their roles are contract-owned strings (`function-home`,
+`function-executor`, `function-resolver`, `function-locator`, and `function-policy`), resolved by
+the same `Address::Role` path as every existing socket. Blob access is a direct injected storage
+trait in this slice; there is deliberately no role name without a corresponding application schema.
+An eighth signed domain, `gawd.function.custody.rewrap.v1`, binds the nested destination KMS request
+and receipt carried inside the Home protocol. It adds no top-level message union or adapter role.
+
+Generic SEER `Progress` and `Steer` remain useful live projections, but they are
+not durable Job truth: SEER steer is opaque and optional. The home ledger first
+records a typed `JobControlV1` and later a matching acknowledgement; it records
+bounded monotone progress observations with Job, attempt, epoch, and sequence.
+Likewise, `corr` remains conversational correlation, not an idempotency or
+exactly-once token. See [`functions-and-jobs.md`](functions-and-jobs.md) and the
+wire table in [`TOPICS.md`](../TOPICS.md#3-typed-function-and-job-schemas).
 
 ## Control as a bus contract
 
@@ -259,12 +287,13 @@ control core runs on two lanes:
 - **Fast, probe-free verbs** (`status`, `list`, `journal`, `bind`, `unload`,
   `load`, `allow-ai`, `ai-status`, `watch`) run **inline on the kernel's drain
   thread** — microseconds — and reply directly.
-- **Request/reply orchestration** (`author`, `author --critter`, `registry
-  publish`, `registry fetch`, `registry list`, `bestiary prove`, `send`,
-  `intent`, `cluster`, `cluster join`) is forwarded to a **single worker
-  thread** that owns its own probe endpoint and `corr` space and emits the reply
-  itself — these verbs round-trip a `RegistryOp` / `BestiaryOp` to the bound
-  `Role::REGISTRY` and need a probe to await the reply. A build in the worker
+- **Request/reply orchestration** (`author`, `author --critter`, all four
+  `registry` operations including `fetch-load`, `bestiary prove`, the four
+  `function` operations, the four `job` operations, `send`, `intent`, `cluster`,
+  and `cluster join`) is forwarded to a **single worker thread** that owns its
+  own probe endpoint and `corr` space and emits the reply itself. These verbs
+  await a reply from an author/build organ, Registry/Bestiary, an injected
+  Function/Job role, a target creature, or transport; a build in the worker
   never stalls an inline `status`.
 
 Long-running progress (an `author`'s "compiling…") rides a SEER topic, a
@@ -273,23 +302,27 @@ wants to stream it subscribes — fan-out, not request/reply.
 
 ### Registry and Bestiary verbs
 
-Four verbs let a surface drive the bound registry without holding it. `registry
+Five control verbs let a surface drive the bound Registry/Bestiary without holding it. `registry
 publish` reads a manifest and an artifact **from node-local paths** (the same
 operator caveat as `load`: these are files on the node, not a client upload),
 parses and ships them as a `RegistryOp::Publish`; `registry fetch` returns the
 entry's *metadata* (name, version, content address, artifact length) rather than
 inlining the bytes, using the byte-light `RegistryOp::FetchMetadata` path (an
 optional `realm` scopes it); `registry list` enumerates a Realm's catalogue via
-the byte-light `RegistryOp::ListMetadata` path. Full `RegistryOp::ListEntries`
+the byte-light `RegistryOp::ListMetadata` path. `registry fetch-load` obtains an
+artifact through a local or explicitly named peer registry using bounded,
+resumable GX chunks, verifies it, and loads it into this node. Full
+`RegistryOp::ListEntries`
 remains the anti-entropy wire for federation pulls because it intentionally
 carries artifact bytes. The control core therefore parses `registry fetch` and
 `registry list` replies under metadata-sized caps; only artifact-producing build
-and anti-entropy paths use artifact-sized caps. Each carries an optional `realm`
-(omitted → the local Realm). `bestiary prove` rides the additive `bestiary.op`
+and anti-entropy paths use artifact-sized caps. The four `registry` operations
+carry an optional `realm` (omitted → the local Realm). `bestiary prove` requires
+an explicit Realm and rides the additive `bestiary.op`
 schema and asks for a verifiable `EntryProof` — only a durable `bestiary-daemon`
-answers it; the in-memory stub returns a structured error. `registry publish` is
-the only mutating one of the four and is gated like every other mutation; the
-three reads are not.
+answers it; the in-memory stub returns a structured error. `registry publish`
+and `registry fetch-load` are gated mutations; `registry fetch`, `registry list`,
+and `bestiary prove` are read-only.
 
 ### Remote control is free
 
@@ -305,7 +338,17 @@ secure.
 A control surface is anything that owns an external boundary and translates it to
 and from `Role::CONTROL`. Every surface is a **loadable creature** that holds no
 kernel: it emits a `control_verb` envelope under its own id with `reply_to`
-itself, and matches the `control_result` reply by `corr`. The pattern is the one
+itself. HTTP and MCP select a waiter by `corr`, but never treat that predictable
+number as sufficient reply binding: every request also carries a fresh 256-bit
+OS-random reply capability in the existing opaque `commitment` slot. `ControlCore`
+echoes it on inline, error, and worker replies, and a surface consumes its waiter
+only on an exact `(corr, capability)` match. The authenticated transport already
+preserves `commitment` in both directions, so the same proof works for a remote
+MCP hub. A creature that guesses a live correlation number cannot race a forged
+`control_result` into either surface. This is an anti-spoof bearer challenge within
+trusted authenticated Realm relays, not end-to-end cryptographic authentication of
+the responder: a relay allowed to read the capability is inside that trust boundary.
+The pattern is the one
 the `transport` creature already proves — own a listener, bridge it to the bus,
 tear it down cleanly on shutdown.
 
@@ -339,11 +382,17 @@ path dependencies.
 `surface-http` owns an Axum/tokio runtime. Its `bind` spawns a multi-thread
 runtime racing the server against a shutdown signal; `shutdown` fires the signal,
 joins the runtime thread, and drops the listener so the port is freed and a
-re-load on the same port succeeds. REST endpoints map one-to-one to verbs —
-`/api/status|creatures|journal` and `GET /api/registry/fetch|list` +
-`/api/bestiary/prove` read, `/api/author|author/critter|load|send|intent|bind|
-unload|cluster|cluster/connect` + `POST /api/registry/publish` mutating,
-`/api/ai/status`. Every endpoint except `GET /api/health` is auth-guarded by a
+re-load on the same port succeeds. REST endpoints map one-to-one to verbs. The
+read operations are `GET /api/status`, `/api/creatures`, `/api/journal`,
+`/api/cluster`, `/api/registry/fetch`, `/api/registry/list`, and
+`/api/bestiary/prove`, plus the structured-query POST routes
+`/api/functions/deployments`, `/api/jobs/get`, and `/api/jobs/events`. Gated POST
+mutations are `/api/author`, `/api/author/critter`, `/api/load`,
+`/api/registry/publish`, `/api/registry/fetch-load`, `/api/functions/resolve`,
+`/api/functions/deploy`, `/api/functions/undeploy`, `/api/jobs/submit`,
+`/api/jobs/control`, `/api/send`, `/api/intent`, `/api/bind`, `/api/unload`, and
+`/api/cluster/connect`. `POST /api/ai/status` is the intentionally ungated
+activity announcement. Every endpoint except `GET /api/health` is auth-guarded by a
 **Bearer key** compared in
 constant time; `GET /api/ws` is authenticated by `?token=` because a browser
 WebSocket upgrade cannot set an `Authorization` header. The WebSocket streams the
@@ -359,7 +408,8 @@ extraction, and body/query string fields are byte-capped before `Verb`
 construction, so one request cannot turn into oversized retained command
 metadata. The public WebSocket upgrade scans only a bounded raw `token` query.
 Every verb, including reads, is a `Role::CONTROL` round-trip, answered inline by
-the co-located `ControlCore`. Its pending `corr → oneshot` table is bounded too:
+the co-located `ControlCore`. Its pending `(corr, random reply capability) →
+oneshot` table is bounded too:
 if too many HTTP requests are already waiting on control replies, the surface
 returns `503` with `surface-busy` instead of allocating another parked request
 until a timeout drains.
@@ -371,8 +421,9 @@ in the GAWD fabric, in an MCP control-hub profile — `alpha mcp`. There is no s
 process: the `surface-mcp` creature owns the process stdin/stdout directly,
 terminates newline-delimited JSON-RPC 2.0 (tools-only, protocol `2025-11-25`),
 and turns each tool call into a `Verb` envelope on the node's own bus. The MCP
-server *is* a bus citizen, not an HTTP client. Like the HTTP surface, it bounds
-its parked `corr → reply` table and returns a structured `surface-busy` result
+server *is* a bus citizen, not an HTTP client. Like the HTTP surface, it binds
+each parked reply to both `corr` and a one-use random reply capability, bounds
+that table, and returns a structured `surface-busy` result
 inside the tool response instead of allocating unbounded waiters.
 Tool-call arguments are validated against the advertised schema before `Verb`
 construction, with byte caps on string fields and bounded previews for unknown
@@ -383,22 +434,29 @@ On shutdown it asks the stdio loop to stop, joins it if stdin has reached EOF, a
 otherwise detaches the still-blocked reader rather than hanging node teardown on
 an uninterruptible `read_line`.
 
-The server id is `alpha-mcp` and the 19 tool verbs are `alpha_*` —
+The server id is `alpha-mcp` and the 27 tool verbs are `alpha_*` —
 `alpha_status` / `alpha_list` / `alpha_journal` / `alpha_watch` /
 `alpha_cluster` / `alpha_registry_fetch` / `alpha_registry_list` /
-`alpha_bestiary_prove` read-only (carrying `readOnlyHint`), and `alpha_author` /
+`alpha_bestiary_prove` / `alpha_function_deployments` / `alpha_job_get` /
+`alpha_job_events` read-only (carrying `readOnlyHint`), and `alpha_author` /
 `alpha_author_critter` / `alpha_load` / `alpha_registry_publish` /
-`alpha_registry_fetch_load` / `alpha_send` / `alpha_intent` / `alpha_bind` /
+`alpha_registry_fetch_load` / `alpha_function_resolve` / `alpha_function_deploy` /
+`alpha_function_undeploy` / `alpha_job_submit` /
+`alpha_job_control` / `alpha_send` / `alpha_intent` / `alpha_bind` /
 `alpha_unload` / `alpha_cluster_connect` mutating, plus the `alpha_ai_status`
 announcement. One binary, two profiles, one `ControlTarget`:
 
 - **Local (default)** — the hub boots its own `authoring` / `build` /
   critter-builder organs and a `ControlCore`, and the surface targets
-  `ControlTarget::Local`: a self-contained MCP server that authors, loads, and
-  runs on itself. `--minimal` skips the organs for a bare control-only plane.
-- **Remote (`--target <node-id@control-id>` + `--seed …`)** — the hub joins the
-  mesh and targets `ControlTarget::Node`; the verb crosses to the peer's own
-  `ControlCore`, which resolves `authoring` and `build` *there*. No local organs.
+  `ControlTarget::Local`. The hub is headless: pass `--allow-ai` at startup to
+  author, load, or otherwise mutate; without it, read-only tools still work but
+  mutations are refused. `--minimal` skips the organs for a bare control-only
+  plane.
+- **Remote (`--target <node-id@control-id>` + `--node-id <id>` + `--listen
+  <addr>` + at least one `--seed …`)** — the hub joins the mesh and targets
+  `ControlTarget::Node`; the verb crosses to the peer's own `ControlCore`, which
+  resolves `authoring` and `build` *there*. No local organs. The target owns its
+  allow-AI gate; `--allow-ai` on the hub has no effect in this profile.
 
 Because the hub joins the mesh as a node, "reach a remote sanctum" is the
 authenticated mesh, not a new problem. Mesh-peer trust only *delivers* the
@@ -410,15 +468,19 @@ world's protocol, terminated at the boundary, never absorbed into the cosmology.
 
 ## Human and AI share one node
 
-A human at the REPL and an AI over MCP co-drive the *same* live node, safely and
-visibly. The node-level `AiControl` is a shared allow-AI gate plus an AI activity
-status. The gate defaults **off**:
+When a remote MCP hub targets an interactive `alpha node`, a human at that
+node's REPL and the AI co-drive the *same* live node, safely and visibly. HTTP on
+that node has the same relationship. A self-contained `alpha mcp`, `alpha http`,
+or `omega serve` process is headless and has no local REPL. The target
+node-level `AiControl` is a shared allow-AI gate plus an AI activity status. The
+gate defaults **off**:
 
 - The **local REPL is never gated** — the terminal is the trusted human seat, so
   it drives `run_verb` directly, ungated.
-- A **gated (remote) front-end** — the HTTP plane, the MCP hub, any control over
-  the bus — may not run a *mutating* verb until a human grants access (`allow-ai
-  on` at the REPL, or `--allow-ai` at boot). A blocked mutation returns a clear
+- A **gated front-end** — the HTTP plane, the MCP hub, any control over the bus —
+  may not run a *mutating* verb until the target operator grants access
+  (`allow-ai on` at an interactive target's REPL, or `--allow-ai` when booting a
+  headless target). A blocked mutation returns a clear
   `ai-not-allowed` error (HTTP 403). The gate is checked inside `run_verb`
   itself, exactly once, the single home for the decision.
 - **Read-only verbs are never blocked by allow-AI** — HTTP reads still require
@@ -426,13 +488,16 @@ status. The gate defaults **off**:
   its mesh identity. An AI can always observe once it has reached the control
   surface, but it only acts under grant.
 
-`ControlCore` runs gated, because control over the bus is a remote front-end; the
-mutating verbs (`author`, `author --critter`, `load`, `registry publish`, `send`,
-`intent`, `bind`, `unload`, `cluster join`) are exactly the ones the gate guards.
-`allow-ai` itself
-is REPL-only — a gated caller cannot flip its own gate. The AI announces what it
-is doing through `alpha_ai_status`, surfaced live on the operator's tape and the
-WebSocket stream, so a human can watch the AI work and revoke mid-flight. The
+`ControlCore` runs gated, because control over the bus is an external front-end;
+the mutating verbs (`author`, `author --critter`, `load`, `registry publish`,
+`registry fetch-load`, `function resolve`, `function deploy`, `function
+undeploy`, `job submit`, `job control`, `send`, `intent`, `bind`, `unload`, and
+`cluster join`) are exactly the ones the gate guards. `allow-ai` itself is
+local-REPL-only — a gated caller cannot flip its own gate. A headless target must
+therefore be started with `--allow-ai` and restarted without it to close the
+gate. The AI records what it is doing through `alpha_ai_status`, so every surface can subsequently
+report the same current activity. The HTTP endpoint additionally prints and broadcasts that update
+live; MCP/direct-bus status is stored but is not itself a pushed tape/WebSocket frame. The
 activity/message text is stripped of terminal control characters and bounded in
 the shared `omni` state, so HTTP, MCP, and direct bus control all store and
 display the same safe text.

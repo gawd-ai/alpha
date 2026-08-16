@@ -1,0 +1,15 @@
+[package]
+name = "policy-job-basic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Deterministic bounded reference policy for selecting exact-function deployments and deciding whether an asynchronous job may retry."
+
+[dependencies]
+gawdfn = { path = "../../../../../foundation/gawdfn" }
+aether = { path = "../../../../aether" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -4,11 +4,16 @@ A **TRD** states *what must be true* for one subsystem — requirements (MUST), 
 the tests that prove them — independent of the specific code that satisfies them. Where a TRD requires a
 **decision**, that decision is recorded as an [ADR](../adr/README.md) and linked from the TRD.
 
-These TRDs were authored for the **v0.4.3 convergence pass**. v0.4.2 shipped the cross-mesh *rails* for
+TRD-001–005 were authored for the **v0.4.3 convergence pass**. v0.4.2 shipped the cross-mesh *rails* for
 the v0.5.0 headline (AIs interacting across the meshed Ω). v0.4.3's bar is **convergence, not features**:
 make the current surface genuinely *work* and *make sense*, close bug/security/resource holes, tie loose
 ends, and remove needless complexity — so that **before v0.5.0 the system is already a stable AI-OS / ASI
 fabric**, and v0.5.0 lands as *composition* (swap reference agents for LLM-backed ones), not a rewrite.
+
+**TRD-006 starts the v0.4.4 series.** It is intentionally an additive application/foundation contract
+before v0.5.0: the creature ABI, Envelope, and three-job Kernel remain unchanged. It is `Met`: every
+acceptance item is Green through the explicitly suite-compositional local, store, surface,
+same-process, and real-process proofs recorded in the TRD.
 
 ## The convergence bar
 
@@ -27,6 +32,7 @@ fabric**, and v0.5.0 lands as *composition* (swap reference agents for LLM-backe
 | [TRD-003](TRD-003-app-surface-coherence.md) | App-surface coherence | Convergence | 0045 | Met (v0.4.3) |
 | [TRD-004](TRD-004-reserved-seam-discipline.md) | Reserved-seam & embryo discipline | Anti-churn | 0043 | Met (v0.4.3) |
 | [TRD-005](TRD-005-hygiene-and-complexity.md) | Hygiene & complexity reduction | Hygiene | 0044 | Met (v0.4.3) |
+| [TRD-006](TRD-006-typed-functions-and-durable-jobs.md) | Typed functions, durable Jobs, and portable home custody | Function foundation | 0046, 0047, 0048 | Met (v0.4.4) |
 
 ## How to read a TRD here
 
@@ -39,5 +45,6 @@ fabric**, and v0.5.0 lands as *composition* (swap reference agents for LLM-backe
 ## Status lifecycle
 
 `Draft` → `Accepted` (the requirements are agreed) → `Met` (implementation lands and acceptance passes).
-The implementation happens in a separate `/goal` pass against this corpus; these TRDs are `Draft` until
-that pass marks each requirement `Met`.
+The index above is authoritative per document: TRD-001–005 are Met for v0.4.3 and TRD-006 is Met for
+v0.4.4. A TRD can be Met before its release heading is cut; release/version state is tracked in the
+workspace manifests and changelog rather than inferred from this lifecycle.

@@ -13,10 +13,12 @@ is **not** hardened for hostile production deployment. Treat it accordingly:
 - The native `daemon` tier is **trusted-by-admission**: in-process native code cannot be fully
   contained, so you load only native creatures you vouch for. This is a stated limit, not a bug.
 - The `critter` (script) tier is a **sandboxed Rhai interpreter**: contained by
-  construction (no filesystem/network/clock/rand; one capability-gated `emit`) and metered by a
-  per-envelope **operation budget** (`cpu_ms`). One honest limit: `mem_bytes` is **best-effort**
-  (Rhai structural caps), not the byte-exact memory limiter the `beast` tier has — a critter that
-  must be memory-capped exactly should run as a beast.
+  construction (no filesystem/network/script-visible clock/rand; one capability-gated outward
+  `emit`) and metered by a per-envelope **operation budget** (`cpu_ms`) plus an optional live
+  progress-hook deadline (`wall_ms`). Its bounded JSON, Function-proof, and instance-local memory
+  helpers add no ambient authority. One honest limit: `mem_bytes` is **best-effort** (Rhai structural
+  caps fixed at load), not the byte-exact memory limiter the `beast` tier has — a critter that must be
+  memory-capped exactly should run as a beast.
 
 ## The control plane (HTTP/WS + MCP surfaces)
 
@@ -40,9 +42,59 @@ hot-load and drive). This surface **can author and hot-load native code**, so tr
   still require the Bearer key; read-only MCP tools require access to the spawned hub and, in remote
   mode, its mesh identity. Neither read path is blocked by the allow-AI gate; the local REPL is never
   gated; the gate is node-level, not per-creature.
+- **Bus replies are request-bound.** `corr` is predictable correlation, not authentication. HTTP and
+  MCP attach a fresh 256-bit OS-random reply capability to each `control_verb`; `ControlCore` echoes
+  it through the existing envelope `commitment`, including across authenticated transport, and the
+  surface accepts a `control_result` only on the exact `(corr, capability)` pair. A local creature
+  cannot complete another caller's pending surface request merely by guessing its correlation id.
+  This is an anti-spoof bearer challenge within trusted authenticated Realm relays, not end-to-end
+  responder authentication against a relay that can read the capability.
+- **Internal control replies are not reused across worker jobs.** The persistent orchestration worker
+  carries one monotone internal `corr` cursor across queued verbs; a timeout does not reset it, and
+  exhaustion fails closed permanently instead of wrapping. A late inner Function/Job reply therefore
+  cannot satisfy the next worker job by colliding with a fresh per-command context.
 - **DEV posture is disclosed, not assumed away.** The boot banner, the MCP `serverInfo`/instructions,
-  and this file all state that the bundled dev policy admits everything and the bus signer is a stub.
-  This is a single-node developer surface, not a hardened multi-tenant deployment.
+  and this file all state that the bundled dev policy admits everything. A non-clustered local-dev
+  Sanctum uses a stub bus signer; a clustered node, remote MCP hub, or Omega gateway signs with the
+  same real ed25519 identity its transport authenticates. Verified node attribution does not turn the
+  permissive dev admission policy into a hardened multi-tenant deployment.
+
+## Opt-in Function/Job state and private reads
+
+Typed Functions and durable Jobs are a v0.4.4 opt-in composition. Ordinary `alpha node`
+and `omega serve` bind none of their roles. `alpha node --functions <config>` accepts public Home
+authority proof plus paths to separately protected operational seed files; it has no Abode-root-key
+field and refuses root/operational key reuse, signer mismatches, weak Unix permissions, corrupt store
+recovery, and node/config mismatch.
+
+Before opening any operational seed or Function store, the composition canonicalizes its private
+state directory and takes a nonblocking exclusive advisory lock on a protected inode for the process
+lifetime. That prevents two local runtimes from accidentally writing the exact same tree. It is not a
+distributed lease: copying the directory creates another inode, so root/HSM/quorum custody and signed
+Home epochs remain the non-equivocation boundary.
+
+Job `get` and `events` are private proof-bearing reads, distinct from the control-result bearer
+challenge above. An authorized caller signs the Job handle plus a nonce; an admitted relay signs that
+complete request and exact Aether return route. The Home requires the live `reply_to` to match and
+signs the snapshot/page over the canonical hash of the complete relay record; Omni verifies both
+signatures and that exact response/request binding. This prevents route substitution and response
+reuse for another nonce or route. Relay admission is still injected trust, and a relay authorized to
+perform the read can observe the returned state; this is not end-to-end encryption from that relay.
+
+Attempt recovery addresses the current executor role after its numeric CreatureId changes, while a
+stable-executor-signed dispatch binds a typed call to that current route and exact target. Across a
+node boundary, this is an explicitly exposed `NodeRole`: only the boot-attested transport resolves it
+after authenticating the peer, and the executor must still prove the receipt-pinned stable key and
+deployment. TRD-006's real-process proof runs two child PIDs over that TCP/Omega path, loads and
+independently measures the signed checked-in typed critter through `Kernel::load`, durably registers
+it, and recovers a changed-id executor. A separate blocking daemon parent supplies authenticated
+progress and the exact `TooLate` Steer result; its progress anchors the typed-critter causal child.
+Fenced Home movement verifies the signed lease, real GX frames retry one dropped and one corrupted
+chunk as an exact in-memory gap set, and a hard restart of both processes recovers the foreign
+terminal facts without another invocation. The complementary in-process custody proof verifies the
+optional root-declared KMS rewrap chain; the process harness deliberately uses the legacy no-rewrap
+branch. This is not a claim of crash-resume inside an unfinished GX transfer, nor of ambient
+remote-role trust: hard cuts occur at durable boundaries and the application proofs remain mandatory.
 
 ## Cross-node origin & relay integrity (clustered nodes)
 

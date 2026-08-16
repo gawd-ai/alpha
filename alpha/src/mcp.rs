@@ -11,15 +11,16 @@
 //!
 //! ## Two profiles
 //! - **Local (default):** the hub boots its own organs + `ControlCore` and the MCP surface drives
-//!   `Role::CONTROL` on this node. A fully self-contained MCP server that authors/loads/runs on
-//!   itself. `--minimal` boots a bare control plane (no AUTHORING/BUILD organs).
-//! - **Remote (`--target <node-id@control-id>` + `--seed …`):** the hub joins the mesh and the MCP
-//!   surface routes verbs to a **peer** node's `Role::CONTROL` over the authenticated transport
-//!   One control point fronting another node — the sctl-fronts-a-device model. The
-//!   target node's allow-AI / admission still gate; the mesh only delivers the envelope.
+//!   `Role::CONTROL` on this node. It is self-contained and headless: pass `--allow-ai` at startup to
+//!   author/load/run, or omit it for read-only tools. There is no REPL or remote gate-flip tool.
+//!   `--minimal` boots a bare control plane (no AUTHORING/BUILD organs).
+//! - **Remote (`--target <node-id@control-id>` + `--node-id <id>` + `--listen <addr>` + at least one
+//!   `--seed …`):** the hub joins the mesh and routes verbs to a **peer** node's `Role::CONTROL` over
+//!   authenticated transport. The target node owns the allow-AI/admission decision; `--allow-ai` on
+//!   the hub has no effect on that remote gate.
 //!
 //! ## Flags
-//! `--allow-ai` open the gate on the hub's own node (local mode) · `--minimal` no local organs ·
+//! `--allow-ai` open the headless hub's own gate at boot (local mode only) · `--minimal` no local organs ·
 //! `--target <node-id@control-id>` remote mode · `--node-id <id>` `--listen <addr>` `--seed
 //! <id@host:port#pubkey>` `--cluster-key <64-hex>` the hub's mesh identity (remote mode).
 //!
@@ -177,6 +178,9 @@ pub fn run(args: &[String]) {
                 std::process::exit(1);
             }
             eprintln!("alpha mcp: remote mode — fronting node `{node}` control id {control_id} over the mesh.");
+            eprintln!(
+                "alpha mcp: the target node owns allow-ai; grant at its REPL or boot that target with --allow-ai (this hub's --allow-ai does not alter it)."
+            );
             ControlTarget::Node { node: node.clone(), control_id: *control_id }
         }
         // Local mode: this hub IS the node it controls.
@@ -199,7 +203,7 @@ pub fn run(args: &[String]) {
                 std::process::exit(1);
             }
             eprintln!(
-                "alpha mcp: local mode — self-contained sanctum; allow-ai is {} (grant more at a REPL on this node).",
+                "alpha mcp: local mode — self-contained headless sanctum; allow-ai is {} (set only at startup with --allow-ai; there is no REPL or remote gate-flip tool).",
                 if ai.allowed() { "ON" } else { "OFF" }
             );
             ControlTarget::Local

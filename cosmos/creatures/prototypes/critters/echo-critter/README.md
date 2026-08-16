@@ -26,7 +26,8 @@ Or author one live (no cargo) through `Role::BUILD` with the `build-critter` cre
 ## The contract
 
 `fn handle(env)` receives a map (`env.payload` Blob, `env.text` a bounded lossy UTF-8 preview,
-`env.text_truncated` when that preview clipped the body, `env.schema`, `env.from`, `env.corr`) and:
+`env.text_truncated` when that preview clipped the body, `env.schema`, `env.from`, `env.to`,
+`env.corr`) and:
 
 - **returns a Blob or string** (or any other non-unit value, best-effort stringified) → the engine
   replies to the envelope's reply target;
@@ -40,9 +41,13 @@ Or author one live (no cargo) through `Role::BUILD` with the `build-critter` cre
 [the substrate design note](../../../../../docs/design/substrate.md) and
 [CONCEPTS](../../../../../docs/CONCEPTS.md).)
 
-The engine is **bare by construction**: no filesystem, network, clock (`no_time`), process, or rand —
-the only host function is `emit`, and its dispatches still pass the router's `calls` gate. The script
+The engine is **bare by construction**: no filesystem, network, script-visible clock (`no_time`),
+process, or rand. Its only outward host function is `emit`, and those dispatches still pass the
+router's `calls` gate; bounded `mem_*` functions retain only instance-local values. The script
 is **metered**: `capabilities.cpu_ms` becomes an operation budget (the critter analog of wasm fuel),
-refilled per envelope from a live ceiling a `KernelControl::ExtendBudget` grant can lift; a breach is
-a structured `Hard`/`Fuel` budget signal, never a hang or a panic. `mem_bytes` maps to best-effort
-structural caps (string/array/map size), **not** the byte-exact limiter the beast tier has.
+refilled per envelope from a live ceiling a `KernelControl::ExtendBudget` grant can lift. Optional
+`wall_ms` is a live per-envelope deadline sampled by Rhai's progress hook and can likewise be lifted;
+a breach is a structured `Hard`/`Fuel` or `Hard`/`Wall` budget signal, never a panic. `mem_bytes` maps
+to best-effort structural caps (string/array/map size), **not** the byte-exact limiter the beast tier
+has. Pure bounded JSON, Function-call verification, and instance-local `mem_*` helpers add no ambient
+I/O, clock, random, bus, or key authority.

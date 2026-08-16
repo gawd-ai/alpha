@@ -23,11 +23,11 @@ builder), an in-memory registry (`REGISTRY`), and a `monitor` watching the sense
 probe id, the command list, and drops you at a prompt:
 
 ```
-alpha node — Alpha Sanctum daemon (v0.4.3)
+alpha node — Alpha Sanctum daemon (v0.4.4)
 posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.
 boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.
 probe endpoint id = 1
-commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm] | bestiary prove <artifact-hash> <realm> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit
+commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm] | bestiary prove <artifact-hash> <realm> | function resolve <signed-request-json> | function deploy <request+resolution+paths-json> | function undeploy <request+deployment-receipt-json> | function deployments <query-json> | job submit <request+receipts-json> | job get <signed-request-json> | job events <signed-request-json> | job control <signed-request-json> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit
 alpha>
 ```
 
@@ -108,7 +108,8 @@ scrolled past (the `┊` marks a sense event):
 ```
 
 `watch` reminds you where the tape is and how to get the live stream over the API; `journal` is the
-durable bus history if you want to scroll back.
+bounded, in-memory, drop-oldest diagnostic window if you want to scroll back. Durable application
+facts live in their owning organs, not in the Router journal.
 
 ## 5. Roles, binding, and retiring creatures
 
@@ -132,14 +133,17 @@ authenticated HTTP-REST + WebSocket control plane for web clients; MCP is a sepa
 control-hub (`alpha mcp`) that drives the same `Role::CONTROL` bus surface:
 
 ```sh
-cargo run -p alpha -- node --listen 127.0.0.1:7777     # prints a Bearer key; add --headless for no REPL
+cargo run -p alpha -- node --listen 127.0.0.1:7777     # prints a Bearer key
+# For API-only mutation, add both --headless and --allow-ai (there is then no REPL).
 curl -s localhost:7777/api/health                                  # public liveness
 curl -s -H "Authorization: Bearer $KEY" localhost:7777/api/status  # auth'd; shows the allow-AI gate
 ```
 
-A remote AI's *mutating* tools are blocked by the **allow-AI gate** (off by default) until a human flips
-`allow-ai on` at the REPL — and the AI's activity shows on your sense-tape so you can `allow-ai off` to
-revoke mid-flight. Full MCP setup (the `.mcp.json`, the gate, the security posture) is in the
+A remote AI's *mutating* tools are blocked by the **allow-AI gate** (off by default). On an
+interactive node, a human flips `allow-ai on|off` at that node's REPL and watches activity on the
+sense-tape. A headless target has no REPL: opt in with `--allow-ai` at boot and restart without it to
+revoke. In MCP remote mode the target owns this gate; the hub cannot grant itself permission. Full
+MCP setup (the `.mcp.json`, required remote-profile flags, gate, and security posture) is in the
 README's [*Drive it over MCP*](../../README.md#4-drive-it-over-mcp) rung.
 
 ## 7. Cluster real nodes into a mesh (a Realm of alphas)
@@ -185,6 +189,19 @@ pokes the federator's anti-entropy on that cadence, so cross-Realm pulls no long
 (without the flag the gateway stays poke-driven — the substrate ships no clock). See the
 [cross-Realm quickstart rung in the README](../../README.md#3-mesh-more-omegas-across-realms)
 and run the whole cross-Realm story in-process with `cargo run -p federation`.
+
+To run the real two-process Function/Job acceptance lifecycle—signed typed-critter deployment,
+changed-id executor recovery, blocking-parent progress/Steer, signed Home migration, faulted GX gap
+retry, typed causal child, dual hard restart, and terminal reconciliation—use:
+
+```sh
+cargo test -p sanctum --test function_jobs_cross_realm_process -- --test-threads=1
+```
+
+The test retries dropped/corrupted transfer gaps in memory and hard-cuts only at durable protocol
+boundaries; it does not claim crash-resume inside an unfinished GX transfer.
+The complementary in-process custody suite proves the optional root-declared KMS rewrap chain; the
+process harness deliberately exercises the legacy no-rewrap branch.
 
 ## 8. Narrated demos (in one process)
 

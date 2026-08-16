@@ -17,6 +17,7 @@ so this directory doubles as the proof that the Rhai builtins they use actually 
 | [`contains`](./contains) | a stateless predicate over `env.text` + `env.schema` | `"yes"` / `"no"` |
 | [`kv-extract`](./kv-extract) | `split` + an object map + the `in` operator | one value by key |
 | [`route-by-prefix`](./route-by-prefix) | `emit` — the one outward authority — + the `calls` gate | `()` (re-routes instead) |
+| [`typed-add-one`](./typed-add-one) | bounded JSON + a typed FunctionResultV1 that preserves AttemptId | `{ "answer": n + 1 }` |
 
 The reference echo critter is [`echo-critter`](./echo-critter) above; start there.
 
@@ -31,25 +32,30 @@ The reference echo critter is [`echo-critter`](./echo-critter) above; start ther
   or the 1 MiB text ceiling.
 - `env.schema` — the request's schema tag (a string).
 - `env.from` — the sender as an address string (e.g. `"creature:7"`), echo-able straight back to `emit`.
+- `env.to` — this envelope's local destination, used with `env.from` by proof-bound adapters.
 - `env.corr` — an int correlation id, present only on correlated requests.
 
 Return a **Blob or string** to reply; return **`()`** for no reply; call **`emit(addr, blob)`** to send
 an extra, capability-gated dispatch (`addr` is `creature:N` / `role:R` / `topic:T` / `intent:X` / `kernel`).
+`json_parse(text)` and `json_stringify(value)` provide deterministic, value-only JSON conversion for
+typed protocols without adding an authority-bearing host service.
+`function_call_verify(text, env.from, env.to)` verifies the Home grant, executor dispatch signature,
+and exact local executor/target route before a critter accepts a typed Function call.
 
-## Three gotchas (learned the hard way)
+## Four gotchas (learned the hard way)
 
-1. **Stateless per envelope.** Each `handle` call gets a fresh scope — a critter cannot accumulate
-   state across messages. Need memory? That's a `daemon`/`beast` concern. (`contains` leans into this.)
+1. **Fresh scope, explicit memory.** Each `handle` call gets fresh local variables. Bounded
+   `mem_get` / `mem_set` / `mem_del` state survives for the loaded instance and is dropped on unload;
+   `contains` simply chooses to remain stateless.
 2. **`emit` payloads must be Blobs**, and every `emit` still passes the kernel's `calls` gate — a
    critter never holds bus authority itself, it parks dispatches the kernel chooses to route.
    (`route-by-prefix` is the demonstration.)
 3. **`env.text` is not the full payload contract.** It is capped before the script runs; string
    critters should check `env.text_truncated` when a partial body would be wrong.
-4. **No in-script JSON.** There's no JSON parser in the sandbox — use `split` + a map (`kv-extract`
-   shows this). The interpreter *does* cap expression-nesting depth, but the cap is high and **pinned
-   identically in debug and release** so a critter that compiles in one profile compiles in the other;
-   `rot13` splits its arithmetic into single-op statements for readability and metering granularity,
-   not because the one-liner would be rejected.
+4. **JSON is deliberately finite.** `json_parse` / `json_stringify` reject non-JSON Rhai types and
+   conversions beyond the effective structural/message cap, 64 nesting levels, or 65,536 values.
+   The author gate and runtime register the same helpers. (`kv-extract` still demonstrates when a
+   tiny text grammar is cheaper than JSON.)
 
 ## Run them
 

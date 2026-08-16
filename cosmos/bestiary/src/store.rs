@@ -36,11 +36,26 @@
 //! integrity hardening: a forged at-rest `Put` is still gated at creature LOAD by the
 //! manifest-signature/calls admission gate before any `dlopen`. The journal proves "my durable record
 //! is intact," nothing about peer trust.
+//!
+//! ## Resource bounds
+//!
+//! The default store admits at most [`DEFAULT_MAX_BESTIARY_ENTRIES`] distinct retained keys across
+//! live entries **and permanent tombstones**, retains at most
+//! [`DEFAULT_MAX_BESTIARY_BLOB_BYTES`] aggregate content-addressed blob bytes, and retains at most
+//! [`DEFAULT_MAX_BESTIARY_LOG_BYTES`] aggregate JSONL bytes across all Realms. All three limits use
+//! `0` as an explicit operator opt-out. Recovery enforces the same limits before admitting on-disk
+//! state, including orphan blobs; the retained-key cap also bounds the number of physical blob
+//! files so tiny artifacts cannot turn the byte budget into inode exhaustion. Compaction budgets
+//! each replacement chain before growing its buffer. Atomic replacement can temporarily require
+//! one additional artifact blob plus one additional rewritten Realm chain beyond the steady-state
+//! aggregate caps.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -55,10 +70,25 @@ use crate::wire::{
 };
 use crate::{registry_artifact_too_large_message, MAX_REGISTRY_ARTIFACT_BYTES};
 
-/// Default maximum number of live `(realm, artifact_hash)` entries retained by [`FsBestiaryStore`].
+/// Default maximum number of distinct `(realm, artifact_hash)` keys retained by
+/// [`FsBestiaryStore`], counting both live entries and permanent tombstones.
 ///
 /// `0` is reserved as an explicit opt-out via [`FsBestiaryStore::with_max_entries`].
 pub const DEFAULT_MAX_BESTIARY_ENTRIES: usize = 1_024;
+
+/// Default aggregate bytes retained by unique physical content-addressed artifact blobs.
+///
+/// Atomic creation/replacement can transiently need one additional artifact blob while its temp
+/// file is prepared. `0` is reserved as an explicit opt-out via
+/// [`FsBestiaryStore::with_max_blob_bytes`].
+pub const DEFAULT_MAX_BESTIARY_BLOB_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Default aggregate durable JSONL bytes retained across every Realm journal.
+///
+/// A compaction rewrite can transiently need one additional Realm chain while its atomic temp file
+/// is prepared. `0` is reserved as an explicit opt-out via
+/// [`FsBestiaryStore::with_max_log_bytes`].
+pub const DEFAULT_MAX_BESTIARY_LOG_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum serialized bytes for one durable Bestiary log record line.
 ///
@@ -174,6 +204,93 @@ fn read_head_tip_bounded(path: &Path, realm_hash: &str) -> Option<String> {
     text.split_whitespace().nth(1).map(str::to_string)
 }
 
+#[derive(Clone, Copy)]
+enum TempDirectory {
+    Blobs,
+    Log,
+}
+
+/// Recognize only the exact temp basename emitted by [`FsBestiaryStore::unique_tmp`]. Keeping this
+/// parser strict prevents startup cleanup from treating an arbitrary operator dotfile as ours.
+fn is_owned_temp_name(name: &str, directory: TempDirectory) -> bool {
+    let Some(body) = name.strip_prefix('.').and_then(|name| name.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let Some((stem_and_pid, sequence)) = body.rsplit_once('.') else { return false };
+    let Some((stem, pid)) = stem_and_pid.rsplit_once('.') else { return false };
+    if pid.is_empty()
+        || sequence.is_empty()
+        || pid.parse::<u32>().is_err()
+        || sequence.parse::<u64>().is_err()
+    {
+        return false;
+    }
+
+    match directory {
+        TempDirectory::Blobs => is_artifact_hash(stem),
+        TempDirectory::Log => stem
+            .strip_suffix(".jsonl")
+            .or_else(|| stem.strip_suffix(".head"))
+            .is_some_and(is_artifact_hash),
+    }
+}
+
+/// Removes an atomic-write temp on every early return. Rename moves the inode away from `path`, so
+/// disarming after a successful rename avoids an unnecessary remove attempt.
+struct TempFileGuard {
+    path: PathBuf,
+    file: Option<File>,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf, file: File) -> Self {
+        Self { path, file: Some(file), armed: true }
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("atomic temp file is open")
+    }
+
+    fn close(&mut self) {
+        self.file.take();
+    }
+
+    fn disarm(&mut self) {
+        self.close();
+        self.armed = false;
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        self.close();
+        if !self.armed {
+            return Ok(());
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!(
+                "bestiary: could not remove failed atomic temp {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 /// Structured failure modes for the durable store. Distinct from a creature's admission/policy
 /// errors: these refuse *before* any restore-into-catalog work — the bytes don't hash, a signature
 /// doesn't verify, the chain is broken, a record is foreign-authored.
@@ -195,12 +312,16 @@ pub enum StoreError {
     /// realm hash, …).
     #[error("bestiary corrupt on-disk state: {0}")]
     Corrupt(String),
-    /// The catalog is at its `max_entries` cap and a new key was refused.
+    /// The catalog is at its live-plus-tombstone `max_entries` cap and a new key was refused.
     #[error("bestiary at capacity: {0}")]
     Capacity(String),
     /// A caller asked the store to retain bytes beyond its configured bounds.
     #[error("bestiary limit exceeded: {0}")]
     Limit(String),
+    /// A prior persistence result was uncertain. No catalog state is served or changed until a
+    /// complete recovery re-establishes one authoritative chain view.
+    #[error("bestiary store unhealthy; recover before use: {0}")]
+    Unhealthy(String),
     /// A manifest failed structural validation (`Manifest::validate`) — a malformed shape or an
     /// over-cap metadata field, distinct from a *byte-retention* [`StoreError::Limit`].
     #[error("bestiary invalid manifest: {0}")]
@@ -460,7 +581,8 @@ pub trait BestiaryStore: Send + Sync {
     /// absent or not quarantined.
     fn unquarantine(&self, realm: &RealmId, artifact_hash: &str) -> Result<bool, StoreError>;
     /// Permanently evict an entry. Federates; never silently resurrected by a later `Put`. `false` if
-    /// already tombstoned.
+    /// already tombstoned. Tombstoning a live key is cardinality-neutral; a previously absent key
+    /// returns [`StoreError::Capacity`] when the retained-key cap is full.
     fn tombstone(&self, realm: &RealmId, artifact_hash: &str) -> Result<bool, StoreError>;
     /// Merge a pushed, self-verifying entry from a peer. Verifies content hash + the foreign record's
     /// signature, then merges (membership union, verified-greater reputation, sticky-union quarantine,
@@ -478,7 +600,9 @@ pub trait BestiaryStore: Send + Sync {
         max_artifact_bytes: usize,
         max_entries: usize,
     ) -> Result<Vec<SignedSyncEntry>, StoreError>;
-    /// Replay + verify the on-disk log at bind; returns the number of records replayed.
+    /// Replay + verify the on-disk log at bind; returns the number of records replayed. Fails closed
+    /// before retaining state beyond the configured distinct-key, physical-blob, or
+    /// aggregate-journal cap.
     fn recover(&self) -> Result<usize, StoreError>;
     /// Flush durable state (fsync) at shutdown.
     fn flush(&self) -> Result<(), StoreError>;
@@ -526,7 +650,7 @@ impl Default for Head {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Inner {
     /// (realm, artifact_hash) → live entry.
     entries: HashMap<(RealmId, String), Live>,
@@ -538,6 +662,70 @@ struct Inner {
     heads: HashMap<String, Head>,
     /// The next birth order to assign at a first `Put`. Monotonic; continues across restart.
     next_first_seen: u64,
+    /// Aggregate bytes currently retained by every authoritative `<realm_hash>.jsonl` file.
+    journal_bytes: u64,
+    /// Aggregate bytes currently retained by unique physical content-addressed blob files,
+    /// including unreferenced orphans.
+    blob_bytes: u64,
+    /// Number of unique physical content-addressed blob files, including unreferenced orphans.
+    /// The retained-key cap also bounds this count so tiny files cannot bypass the byte budget.
+    blob_count: usize,
+    /// Set after a persistence result whose durable outcome cannot be inferred in-process, or when
+    /// a newly opened non-empty root has not yet been recovered. Successful recovery is the only
+    /// operation that clears it.
+    unhealthy_reason: Option<String>,
+}
+
+/// Internal append certainty classification. Only `BeforeWrite` proves that no journal bytes were
+/// attempted; callers may then roll back a blob that they know they created for this append.
+enum AppendFailure {
+    BeforeWrite(StoreError),
+    Uncertain(StoreError),
+}
+
+impl From<StoreError> for AppendFailure {
+    fn from(error: StoreError) -> Self {
+        Self::BeforeWrite(error)
+    }
+}
+
+impl From<AppendFailure> for StoreError {
+    fn from(error: AppendFailure) -> Self {
+        match error {
+            AppendFailure::BeforeWrite(error) | AppendFailure::Uncertain(error) => error,
+        }
+    }
+}
+
+/// Atomic temp failure classification. `Cleanup` means the destination operation failed and the
+/// Bestiary could not prove its newly-created temp was removed; callers must latch the store so
+/// repeated requests cannot accumulate unaccounted files/inodes.
+enum AtomicWriteFailure {
+    Operation(StoreError),
+    Cleanup { operation: String, cleanup: String },
+}
+
+impl From<StoreError> for AtomicWriteFailure {
+    fn from(error: StoreError) -> Self {
+        Self::Operation(error)
+    }
+}
+
+impl AtomicWriteFailure {
+    fn cleanup_failed(&self) -> bool {
+        matches!(self, Self::Cleanup { .. })
+    }
+}
+
+impl From<AtomicWriteFailure> for StoreError {
+    fn from(error: AtomicWriteFailure) -> Self {
+        match error {
+            AtomicWriteFailure::Operation(error) => error,
+            AtomicWriteFailure::Cleanup { operation, cleanup } => StoreError::Io(format!(
+                "atomic write failed ({operation}) and its temp cleanup also failed ({cleanup})"
+            )),
+        }
+    }
 }
 
 /// The reference filling: a realm-hashed, signed-log, content-addressed on-disk Bestiary.
@@ -545,12 +733,22 @@ pub struct FsBestiaryStore {
     root: PathBuf,
     abode_key: Ed25519KeyMaterial,
     pubkey: String,
-    /// Live-entry cap. A new key past it is refused; `0` means unbounded.
+    /// Retained distinct-key cap across live entries + permanent tombstones; `0` is unbounded.
     max_entries: usize,
+    /// Aggregate durable JSONL byte cap across all Realms; `0` is unbounded.
+    max_log_bytes: u64,
+    /// Aggregate unique physical content-addressed blob byte cap; `0` is unbounded.
+    max_blob_bytes: u64,
     /// `0` = unbounded; otherwise the largest artifact blob this store will retain.
     max_artifact_bytes: usize,
     /// Per-process unique suffix source for atomic temp files (no clock/rng needed).
     tmp_seq: AtomicU64,
+    /// Deterministically model a full write followed by an uncertain append result.
+    #[cfg(test)]
+    fail_append_after_write: AtomicBool,
+    /// Deterministically fail after curation has been staged but before its first replacement.
+    #[cfg(test)]
+    fail_compaction_after_stage: AtomicBool,
     inner: Mutex<Inner>,
 }
 
@@ -568,22 +766,61 @@ impl FsBestiaryStore {
             abode_key,
             pubkey,
             max_entries: DEFAULT_MAX_BESTIARY_ENTRIES,
+            max_log_bytes: DEFAULT_MAX_BESTIARY_LOG_BYTES,
+            max_blob_bytes: DEFAULT_MAX_BESTIARY_BLOB_BYTES,
             max_artifact_bytes: MAX_REGISTRY_ARTIFACT_BYTES,
             tmp_seq: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_append_after_write: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_compaction_after_stage: AtomicBool::new(false),
             inner: Mutex::new(Inner::default()),
         };
         fs::create_dir_all(store.blobs_dir()).map_err(|e| StoreError::Io(e.to_string()))?;
         fs::create_dir_all(store.log_dir()).map_err(|e| StoreError::Io(e.to_string()))?;
+        store.cleanup_stale_temps(&store.blobs_dir(), TempDirectory::Blobs)?;
+        store.cleanup_stale_temps(&store.log_dir(), TempDirectory::Log)?;
+        if Self::directory_has_entries(&store.blobs_dir())?
+            || Self::directory_has_entries(&store.log_dir())?
+        {
+            store.inner.lock().unwrap_or_else(|p| p.into_inner()).unhealthy_reason = Some(
+                "an existing Bestiary root must complete recovery before serving requests".into(),
+            );
+        }
         Ok(store)
     }
 
     /// Cap the number of distinct catalog entries.
     ///
-    /// The default is [`DEFAULT_MAX_BESTIARY_ENTRIES`]. At capacity a `Put` of a *new* key is
-    /// refused; re-publishing an existing key always succeeds. Pass `0` to opt out and make the
-    /// live-entry catalog unbounded.
+    /// The default is [`DEFAULT_MAX_BESTIARY_ENTRIES`]. Live entries and permanent tombstones both
+    /// consume one slot. A live-to-tombstone transition is cardinality-neutral; a `Put` or
+    /// tombstone for a previously absent key is refused at capacity. The same finite value bounds
+    /// unique physical blob files (including orphans) so tiny artifacts cannot exhaust inodes.
+    /// Recovery enforces both bounds. Pass `0` to opt out of both counts.
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries;
+        self
+    }
+
+    /// Cap aggregate durable JSONL bytes across all Realm journals.
+    ///
+    /// The default is [`DEFAULT_MAX_BESTIARY_LOG_BYTES`]. Append and recovery both fail closed
+    /// before admitting state beyond this bound. A compaction replacement is budgeted against the
+    /// other Realm logs before its buffer grows. Pass `0` to opt out.
+    pub fn with_max_log_bytes(mut self, max_log_bytes: u64) -> Self {
+        self.max_log_bytes = max_log_bytes;
+        self
+    }
+
+    /// Cap aggregate bytes retained by unique physical content-addressed blob files.
+    ///
+    /// The default is [`DEFAULT_MAX_BESTIARY_BLOB_BYTES`]. Dedupe references an existing blob
+    /// without charging it again. Append preflight proves the journal first, then blob growth is
+    /// proved before the atomic temp is written. Recovery counts every accountable blob, including
+    /// unreferenced orphans. Physical file count remains bounded by `max_entries` when it is
+    /// nonzero. Pass `0` to opt out of the byte cap.
+    pub fn with_max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
+        self.max_blob_bytes = max_blob_bytes;
         self
     }
 
@@ -624,29 +861,263 @@ impl FsBestiaryStore {
         dir.join(format!(".{stem}.{}.{n}.tmp", std::process::id()))
     }
 
-    /// Write `bytes` atomically to `dest` (temp file in the same dir + rename), fsyncing both.
-    fn atomic_write(&self, dest: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-        let dir = dest.parent().ok_or_else(|| StoreError::Io("no parent dir".into()))?;
-        let stem = dest.file_name().and_then(|s| s.to_str()).unwrap_or("f");
-        let tmp = self.unique_tmp(dir, stem);
-        {
-            let mut f = File::create(&tmp).map_err(|e| StoreError::Io(e.to_string()))?;
-            f.write_all(bytes).map_err(|e| StoreError::Io(e.to_string()))?;
-            f.sync_all().map_err(|e| StoreError::Io(e.to_string()))?;
+    fn retained_key_count(inner: &Inner) -> usize {
+        inner.entries.len().saturating_add(inner.tombstones.len())
+    }
+
+    fn op_adds_retained_key(inner: &Inner, op: &LogOp) -> bool {
+        match op {
+            LogOp::Put { realm, artifact_hash, .. } | LogOp::Tombstone { realm, artifact_hash } => {
+                let key = (realm.clone(), artifact_hash.clone());
+                !inner.entries.contains_key(&key) && !inner.tombstones.contains(&key)
+            }
+            LogOp::Attest { .. } | LogOp::Quarantine { .. } | LogOp::Unquarantine { .. } => false,
         }
-        fs::rename(&tmp, dest).map_err(|e| StoreError::Io(e.to_string()))?;
+    }
+
+    fn ensure_entry_capacity(&self, inner: &Inner, op: &LogOp) -> Result<(), StoreError> {
+        if self.max_entries != 0
+            && Self::op_adds_retained_key(inner, op)
+            && Self::retained_key_count(inner) >= self.max_entries
+        {
+            return Err(StoreError::Capacity(format!(
+                "catalog at retained-key capacity ({}); refused new {} in realm {}",
+                self.max_entries,
+                op.artifact_hash(),
+                op.realm().0
+            )));
+        }
+        Ok(())
+    }
+
+    fn checked_journal_growth(&self, current: u64, adding: u64) -> Result<u64, StoreError> {
+        let prospective = current.checked_add(adding).ok_or_else(|| {
+            StoreError::Limit("aggregate Bestiary journal byte count overflow".into())
+        })?;
+        if self.max_log_bytes != 0 && prospective > self.max_log_bytes {
+            return Err(StoreError::Limit(format!(
+                "aggregate Bestiary journal would retain {prospective} bytes, exceeding {} byte limit",
+                self.max_log_bytes
+            )));
+        }
+        Ok(prospective)
+    }
+
+    fn checked_blob_growth(&self, current: u64, adding: u64) -> Result<u64, StoreError> {
+        let prospective = current.checked_add(adding).ok_or_else(|| {
+            StoreError::Limit("aggregate Bestiary blob byte count overflow".into())
+        })?;
+        if self.max_blob_bytes != 0 && prospective > self.max_blob_bytes {
+            return Err(StoreError::Limit(format!(
+                "aggregate Bestiary blobs would retain {prospective} bytes, exceeding {} byte limit",
+                self.max_blob_bytes
+            )));
+        }
+        Ok(prospective)
+    }
+
+    fn ensure_healthy(inner: &Inner) -> Result<(), StoreError> {
+        match &inner.unhealthy_reason {
+            Some(reason) => Err(StoreError::Unhealthy(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn mark_unhealthy(inner: &mut Inner, reason: impl Into<String>) {
+        if inner.unhealthy_reason.is_none() {
+            inner.unhealthy_reason = Some(reason.into());
+        }
+    }
+
+    fn directory_has_entries(dir: &Path) -> Result<bool, StoreError> {
+        fs::read_dir(dir)
+            .map_err(|error| {
+                StoreError::Io(format!("read Bestiary directory {}: {error}", dir.display()))
+            })?
+            .next()
+            .transpose()
+            .map(|entry| entry.is_some())
+            .map_err(|error| {
+                StoreError::Io(format!("read Bestiary directory {}: {error}", dir.display()))
+            })
+    }
+
+    /// Account every physical blob file without reading artifact contents. Blob names are content
+    /// addresses and therefore unique within the directory; all other names/inode types are
+    /// unaccountable disk use and fail closed. Exact Bestiary temps were safely removed at startup.
+    fn scan_blob_usage(&self) -> Result<(u64, usize), StoreError> {
+        let dir = self.blobs_dir();
+        let read = fs::read_dir(&dir).map_err(|error| {
+            StoreError::Io(format!("read Bestiary blob directory {}: {error}", dir.display()))
+        })?;
+        let mut blob_bytes = 0u64;
+        let mut blob_count = 0usize;
+        for entry in read {
+            let entry = entry.map_err(|error| {
+                StoreError::Io(format!("read Bestiary blob directory {}: {error}", dir.display()))
+            })?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                StoreError::Corrupt(format!(
+                    "unaccountable non-UTF-8 entry in Bestiary blob directory {}",
+                    dir.display()
+                ))
+            })?;
+            if !is_artifact_hash(&name) {
+                return Err(StoreError::Corrupt(format!(
+                    "unaccountable Bestiary blob-directory entry {}",
+                    entry.path().display()
+                )));
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                StoreError::Io(format!("blob {} metadata: {error}", entry.path().display()))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(StoreError::Corrupt(format!(
+                    "blob {} is not a regular non-symlink file",
+                    entry.path().display()
+                )));
+            }
+            blob_bytes = self.checked_blob_growth(blob_bytes, metadata.len())?;
+            blob_count = blob_count
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Limit("Bestiary physical blob count overflow".into()))?;
+            if self.max_entries != 0 && blob_count > self.max_entries {
+                return Err(StoreError::Limit(format!(
+                    "Bestiary physical blobs retain {blob_count} files, exceeding the {} file limit",
+                    self.max_entries
+                )));
+            }
+        }
+        Ok((blob_bytes, blob_count))
+    }
+
+    fn regular_file_len_or_zero(path: &Path) -> Result<u64, StoreError> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink() && metadata.file_type().is_file() =>
+            {
+                Ok(metadata.len())
+            }
+            Ok(_) => Err(StoreError::Corrupt(format!(
+                "journal path {} is not a regular non-symlink file",
+                path.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => {
+                Err(StoreError::Io(format!("journal path {} metadata: {error}", path.display())))
+            }
+        }
+    }
+
+    fn cleanup_stale_temps(&self, dir: &Path, directory: TempDirectory) -> Result<(), StoreError> {
+        let mut removed_any = false;
+        for entry in fs::read_dir(dir).map_err(|error| StoreError::Io(error.to_string()))? {
+            let entry = entry.map_err(|error| StoreError::Io(error.to_string()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            if !is_owned_temp_name(&name, directory) {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                StoreError::Io(format!("stale temp {} metadata: {error}", path.display()))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(StoreError::Corrupt(format!(
+                    "owned stale temp {} is not a regular non-symlink file",
+                    path.display()
+                )));
+            }
+            fs::remove_file(&path).map_err(|error| {
+                StoreError::Io(format!("remove stale temp {}: {error}", path.display()))
+            })?;
+            removed_any = true;
+        }
+        if removed_any {
+            fsync_dir(dir);
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` atomically to `dest` (temp file in the same dir + rename), fsyncing both.
+    fn atomic_write(&self, dest: &Path, bytes: &[u8]) -> Result<(), AtomicWriteFailure> {
+        let dir = dest.parent().ok_or_else(|| StoreError::Io("no parent dir".into()))?;
+        let stem = dest
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| StoreError::Io("atomic destination has no UTF-8 filename".into()))?;
+        let tmp = self.unique_tmp(dir, stem);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| StoreError::Io(e.to_string()))?;
+        let mut guard = TempFileGuard::new(tmp.clone(), file);
+        if let Err(error) = guard.file_mut().write_all(bytes) {
+            let operation = error.to_string();
+            return Err(match guard.cleanup() {
+                Ok(()) => AtomicWriteFailure::Operation(StoreError::Io(operation)),
+                Err(cleanup) => {
+                    AtomicWriteFailure::Cleanup { operation, cleanup: cleanup.to_string() }
+                }
+            });
+        }
+        if let Err(error) = guard.file_mut().sync_all() {
+            let operation = error.to_string();
+            return Err(match guard.cleanup() {
+                Ok(()) => AtomicWriteFailure::Operation(StoreError::Io(operation)),
+                Err(cleanup) => {
+                    AtomicWriteFailure::Cleanup { operation, cleanup: cleanup.to_string() }
+                }
+            });
+        }
+        guard.close();
+        if let Err(error) = fs::rename(&tmp, dest) {
+            let operation = error.to_string();
+            return Err(match guard.cleanup() {
+                Ok(()) => AtomicWriteFailure::Operation(StoreError::Io(operation)),
+                Err(cleanup) => {
+                    AtomicWriteFailure::Cleanup { operation, cleanup: cleanup.to_string() }
+                }
+            });
+        }
+        guard.disarm();
         fsync_dir(dir);
         Ok(())
     }
 
-    fn write_blob(&self, artifact_hash: &str, artifact: &[u8]) -> Result<(), StoreError> {
+    fn write_blob(
+        &self,
+        inner: &mut Inner,
+        artifact_hash: &str,
+        artifact: &[u8],
+    ) -> Result<bool, StoreError> {
         if !is_artifact_hash(artifact_hash) {
             return Err(invalid_artifact_hash(artifact_hash));
         }
         let path = self.blob_path(artifact_hash);
-        if path.exists() {
+        let existing_len = match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink() && metadata.file_type().is_file() =>
+            {
+                Some(metadata.len())
+            }
+            Ok(_) => {
+                return Err(StoreError::Corrupt(format!(
+                    "blob {artifact_hash} is not a regular non-symlink file"
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(StoreError::Io(format!(
+                    "blob {artifact_hash} metadata failed: {error}"
+                )))
+            }
+        };
+        if existing_len.is_some() {
             match self.read_blob(artifact_hash) {
-                Ok(_) => return Ok(()), // content-addressed dedupe: identical bytes already on disk
+                // Content-addressed dedupe: identical bytes already on disk. `false` means an
+                // append failure must never remove this pre-existing file.
+                Ok(_) => return Ok(false),
                 Err(err) => {
                     eprintln!(
                         "bestiary: rewriting corrupt or unreadable blob {artifact_hash}: {err}"
@@ -654,7 +1125,86 @@ impl FsBestiaryStore {
                 }
             }
         }
-        self.atomic_write(&path, artifact)
+        let artifact_len = u64::try_from(artifact.len())
+            .map_err(|_| StoreError::Limit("artifact length does not fit u64".into()))?;
+        let repairs_live_reference =
+            existing_len.is_none() && inner.entries.keys().any(|(_, hash)| hash == artifact_hash);
+        // A corrupt existing blob may have been externally resized. Re-scan the physical directory
+        // before replacement so final accounting subtracts the actual old file rather than a stale
+        // assumption. A missing blob referenced by an already-durable live row is likewise repaired
+        // from a physical re-scan. These are rare repair paths; ordinary CAS dedupe never scans.
+        let (current_blob_bytes, current_blob_count) =
+            if existing_len.is_some() || repairs_live_reference {
+                self.scan_blob_usage()?
+            } else {
+                (inner.blob_bytes, inner.blob_count)
+            };
+        let prospective_blob_count = if existing_len.is_some() {
+            current_blob_count
+        } else {
+            current_blob_count
+                .checked_add(1)
+                .ok_or_else(|| StoreError::Limit("Bestiary physical blob count overflow".into()))?
+        };
+        if self.max_entries != 0 && prospective_blob_count > self.max_entries {
+            return Err(StoreError::Limit(format!(
+                "Bestiary physical blobs would retain {prospective_blob_count} files, exceeding the {} file limit",
+                self.max_entries
+            )));
+        }
+        let without_existing = current_blob_bytes
+            .checked_sub(existing_len.unwrap_or(0))
+            .ok_or_else(|| StoreError::Corrupt("Bestiary blob accounting underflow".into()))?;
+        let prospective_blob_bytes = self.checked_blob_growth(without_existing, artifact_len)?;
+        if let Err(failure) = self.atomic_write(&path, artifact) {
+            let cleanup_failed = failure.cleanup_failed();
+            let error = StoreError::from(failure);
+            if cleanup_failed {
+                Self::mark_unhealthy(inner, format!("blob atomic temp cleanup failed: {error}"));
+            }
+            return Err(error);
+        }
+        inner.blob_bytes = prospective_blob_bytes;
+        inner.blob_count = prospective_blob_count;
+        // A repaired blob is required by an older durable Put and must survive even if this
+        // re-publication's new append later fails before writing.
+        Ok(existing_len.is_none() && !repairs_live_reference)
+    }
+
+    fn rollback_new_blob(&self, inner: &mut Inner, artifact_hash: &str) -> Result<(), StoreError> {
+        let path = self.blob_path(artifact_hash);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            StoreError::Io(format!("new blob {artifact_hash} rollback metadata: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(StoreError::Corrupt(format!(
+                "new blob {artifact_hash} changed inode type before rollback"
+            )));
+        }
+        fs::remove_file(&path).map_err(|error| {
+            StoreError::Io(format!("rollback new blob {artifact_hash}: {error}"))
+        })?;
+        inner.blob_bytes = inner.blob_bytes.checked_sub(metadata.len()).ok_or_else(|| {
+            StoreError::Corrupt("Bestiary blob accounting underflow during rollback".into())
+        })?;
+        inner.blob_count = inner.blob_count.checked_sub(1).ok_or_else(|| {
+            StoreError::Corrupt("Bestiary blob count underflow during rollback".into())
+        })?;
+        fsync_dir(&self.blobs_dir());
+        Ok(())
+    }
+
+    fn regular_blob_metadata(&self, artifact_hash: &str) -> Result<fs::Metadata, StoreError> {
+        let path = self.blob_path(artifact_hash);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(StoreError::Corrupt(format!(
+                "blob {artifact_hash} is not a regular non-symlink file"
+            )));
+        }
+        Ok(metadata)
     }
 
     fn read_blob(&self, artifact_hash: &str) -> Result<Vec<u8>, StoreError> {
@@ -670,6 +1220,7 @@ impl FsBestiaryStore {
             return Err(invalid_artifact_hash(artifact_hash));
         }
         let path = self.blob_path(artifact_hash);
+        self.regular_blob_metadata(artifact_hash)?;
         let mut file = File::open(&path)
             .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
         let mut bytes = Vec::new();
@@ -704,8 +1255,7 @@ impl FsBestiaryStore {
         if !is_artifact_hash(artifact_hash) {
             return Err(invalid_artifact_hash(artifact_hash));
         }
-        let meta = fs::metadata(self.blob_path(artifact_hash))
-            .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
+        let meta = self.regular_blob_metadata(artifact_hash)?;
         usize::try_from(meta.len()).map_err(|_| {
             StoreError::Corrupt(format!("blob {artifact_hash} length does not fit usize"))
         })
@@ -749,6 +1299,7 @@ impl FsBestiaryStore {
         if len == 0 {
             return Ok(bytes);
         }
+        self.regular_blob_metadata(artifact_hash)?;
         let mut file = File::open(self.blob_path(artifact_hash))
             .map_err(|e| StoreError::Corrupt(format!("blob {artifact_hash} unreadable: {e}")))?;
         file.seek(SeekFrom::Start(offset))
@@ -758,11 +1309,36 @@ impl FsBestiaryStore {
         Ok(bytes)
     }
 
+    /// Prove the next append fits both the per-record and aggregate journal byte limits without
+    /// mutating disk or chain state. Used before retaining a new artifact blob.
+    fn preflight_append(
+        &self,
+        inner: &Inner,
+        op: &LogOp,
+        first_seen: u64,
+    ) -> Result<(), StoreError> {
+        let realm_hash = Self::realm_hash(op.realm());
+        let head = inner.heads.get(&realm_hash).cloned().unwrap_or_default();
+        head.next_seq
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Limit("journal sequence exhausted".into()))?;
+        let record = self.build_record(head.next_seq, head.tip_hash, op.clone(), first_seen);
+        let line = encode_log_record_line(&record)?;
+        let line_len = u64::try_from(line.len())
+            .map_err(|_| StoreError::Limit("journal record length does not fit u64".into()))?;
+        self.checked_journal_growth(inner.journal_bytes, line_len).map(|_| ())
+    }
+
     /// Append a record for `op`/`first_seen` to its realm chain (sign, write, advance the head).
-    /// Caller holds the inner lock and has already updated the in-memory state.
-    fn append(&self, inner: &mut Inner, op: LogOp, first_seen: u64) -> Result<(), StoreError> {
+    /// Caller holds the inner lock.
+    fn append(&self, inner: &mut Inner, op: LogOp, first_seen: u64) -> Result<(), AppendFailure> {
+        Self::ensure_healthy(inner)?;
         let realm_hash = Self::realm_hash(op.realm());
         let head = inner.heads.entry(realm_hash.clone()).or_default().clone();
+        let next_seq = head
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Limit("journal sequence exhausted".into()))?;
         let mut rec = LogRecord {
             seq: head.next_seq,
             prev_hash: head.tip_hash,
@@ -775,6 +1351,9 @@ impl FsBestiaryStore {
         let rec_hash = rec.hash();
 
         let line = encode_log_record_line(&rec)?;
+        let line_len = u64::try_from(line.len())
+            .map_err(|_| StoreError::Limit("journal record length does not fit u64".into()))?;
+        let new_journal_bytes = self.checked_journal_growth(inner.journal_bytes, line_len)?;
         let log_path = self.log_path(&realm_hash);
         {
             let mut f = OpenOptions::new()
@@ -782,17 +1361,159 @@ impl FsBestiaryStore {
                 .append(true)
                 .open(&log_path)
                 .map_err(|e| StoreError::Io(e.to_string()))?;
-            f.write_all(&line).map_err(|e| StoreError::Io(e.to_string()))?;
-            f.sync_all().map_err(|e| StoreError::Io(e.to_string()))?;
+            if let Err(error) = f.write_all(&line) {
+                let reason = format!(
+                    "append of Realm {realm_hash} seq {} may be partially durable after write error: {error}",
+                    rec.seq
+                );
+                Self::mark_unhealthy(inner, reason);
+                return Err(AppendFailure::Uncertain(StoreError::Io(error.to_string())));
+            }
+            #[cfg(test)]
+            if self.fail_append_after_write.swap(false, Ordering::Relaxed) {
+                let reason = format!(
+                    "append of Realm {realm_hash} seq {} has injected post-write uncertainty",
+                    rec.seq
+                );
+                Self::mark_unhealthy(inner, reason.clone());
+                return Err(AppendFailure::Uncertain(StoreError::Io(reason)));
+            }
+            if let Err(error) = f.sync_all() {
+                let reason = format!(
+                    "append of Realm {realm_hash} seq {} may be durable after sync error: {error}",
+                    rec.seq
+                );
+                Self::mark_unhealthy(inner, reason);
+                return Err(AppendFailure::Uncertain(StoreError::Io(error.to_string())));
+            }
         }
-        let new_head = Head { next_seq: head.next_seq + 1, tip_hash: rec_hash };
+        let new_head = Head { next_seq, tip_hash: rec_hash };
         // Advisory tip hint (truncation detector) — best-effort, the jsonl is authoritative.
-        let _ = self.atomic_write(
+        if let Err(failure) = self.atomic_write(
             &self.head_path(&realm_hash),
             format!("{} {}", new_head.next_seq, new_head.tip_hash).as_bytes(),
-        );
+        ) {
+            if failure.cleanup_failed() {
+                let error = StoreError::from(failure);
+                Self::mark_unhealthy(
+                    inner,
+                    format!("advisory-head atomic temp cleanup failed: {error}"),
+                );
+                return Err(AppendFailure::Uncertain(error));
+            }
+        }
         inner.heads.insert(realm_hash, new_head);
+        inner.journal_bytes = new_journal_bytes;
         Ok(())
+    }
+
+    /// Encode one genesis-rewrite record directly into the bounded replacement buffer. This avoids
+    /// retaining a second vector of manifest-bearing `LogRecord`s during compaction.
+    fn push_compaction_record(
+        &self,
+        buffer: &mut Vec<u8>,
+        replacement_budget: Option<u64>,
+        next_seq: &mut u64,
+        tip: &mut String,
+        op: LogOp,
+        first_seen: u64,
+    ) -> Result<(), StoreError> {
+        let record = self.build_record(*next_seq, tip.clone(), op, first_seen);
+        let line = encode_log_record_line(&record)?;
+        let line_len = u64::try_from(line.len())
+            .map_err(|_| StoreError::Limit("compacted journal line does not fit u64".into()))?;
+        let current = u64::try_from(buffer.len())
+            .map_err(|_| StoreError::Limit("compacted journal buffer does not fit u64".into()))?;
+        let prospective = current
+            .checked_add(line_len)
+            .ok_or_else(|| StoreError::Limit("compacted journal byte count overflow".into()))?;
+        if let Some(replacement_budget) = replacement_budget {
+            if prospective > replacement_budget {
+                return Err(StoreError::Limit(format!(
+                    "compacted Realm journal would retain {prospective} bytes, exceeding its {replacement_budget} byte aggregate-budget share"
+                )));
+            }
+        }
+        // Geometric growth avoids reallocate+copy of the full chain for every record. The logical
+        // bytes are checked against the exact replacement budget before allocation; Vec may retain
+        // a bounded geometric spare-capacity envelope while this one-Realm buffer is alive.
+        buffer.try_reserve(line.len()).map_err(|error| {
+            StoreError::Limit(format!("could not reserve compacted journal buffer: {error}"))
+        })?;
+        buffer.extend_from_slice(&line);
+        *tip = record.hash();
+        *next_seq = next_seq
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Limit("compacted journal sequence overflow".into()))?;
+        Ok(())
+    }
+
+    /// Build one Realm's canonical replacement chain under its exact share of the aggregate log
+    /// budget. Callers can run this as a discardable dry pass before any durable replacement, then
+    /// rebuild one Realm at a time to keep peak allocation bounded to a single chain.
+    fn build_compaction_buffer(
+        &self,
+        inner: &Inner,
+        realm: &RealmId,
+        replacement_budget: Option<u64>,
+    ) -> Result<(Vec<u8>, u64, String), StoreError> {
+        let mut buffer = Vec::new();
+        let mut next_seq = 0u64;
+        let mut tip = genesis_prev();
+
+        let mut live_keys: Vec<(RealmId, String)> =
+            inner.entries.keys().filter(|(r, _)| *r == realm).cloned().collect();
+        live_keys
+            .sort_by(|a, b| (a.0 .0.as_str(), a.1.as_str()).cmp(&(b.0 .0.as_str(), b.1.as_str())));
+        for key in live_keys {
+            let live = inner.entries.get(&key).cloned().expect("just listed");
+            let mut ops = vec![LogOp::Put {
+                realm: realm.clone(),
+                artifact_hash: key.1.clone(),
+                manifest: Box::new(live.manifest.clone()),
+            }];
+            if let Some(q) = &live.quarantine {
+                ops.push(LogOp::Quarantine {
+                    realm: realm.clone(),
+                    artifact_hash: key.1.clone(),
+                    notice: q.clone(),
+                });
+            }
+            if let Some(rep) = &live.reputation {
+                ops.push(LogOp::Attest {
+                    realm: realm.clone(),
+                    artifact_hash: key.1.clone(),
+                    score: rep.clone(),
+                });
+            }
+            for op in ops {
+                self.push_compaction_record(
+                    &mut buffer,
+                    replacement_budget,
+                    &mut next_seq,
+                    &mut tip,
+                    op,
+                    live.first_seen,
+                )?;
+            }
+        }
+
+        let mut tomb_keys: Vec<(RealmId, String)> =
+            inner.tombstones.iter().filter(|(r, _)| *r == realm).cloned().collect();
+        tomb_keys
+            .sort_by(|a, b| (a.0 .0.as_str(), a.1.as_str()).cmp(&(b.0 .0.as_str(), b.1.as_str())));
+        for key in tomb_keys {
+            self.push_compaction_record(
+                &mut buffer,
+                replacement_budget,
+                &mut next_seq,
+                &mut tip,
+                LogOp::Tombstone { realm: realm.clone(), artifact_hash: key.1 },
+                0,
+            )?;
+        }
+
+        Ok((buffer, next_seq, tip))
     }
 
     /// Apply one op to the in-memory state (no log write). Shared by `recover` (replay) and, after a
@@ -876,36 +1597,68 @@ impl BestiaryStore for FsBestiaryStore {
         let hash = sha256_hex(&artifact);
         let key = (realm.clone(), hash.clone());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::ensure_healthy(&inner)?;
 
         if inner.tombstones.contains(&key) {
             eprintln!("bestiary: refusing Put of tombstoned {hash} in realm {}", realm.0);
             return Ok(hash);
         }
         let is_new = !inner.entries.contains_key(&key);
-        if is_new && self.max_entries != 0 && inner.entries.len() >= self.max_entries {
+        if is_new && self.max_entries != 0 && Self::retained_key_count(&inner) >= self.max_entries {
             // Refuse-new with a wire-honest error (matches `registry-mem`, which returns
             // `RegistryReply::Error`): the daemon maps this to a structured failure rather than a
             // false `Published`. A re-publish of an existing key never reaches here (it is not new).
             return Err(StoreError::Capacity(format!(
-                "catalog at capacity ({}); refused new artifact {hash} in realm {}",
+                "catalog at retained-key capacity ({}); refused new artifact {hash} in realm {}",
                 self.max_entries, realm.0
             )));
         }
 
-        self.write_blob(&hash, &artifact)?;
-        let first_seen = if is_new {
-            let fs = inner.next_first_seen;
-            inner.next_first_seen += 1;
-            fs
+        let (first_seen, next_first_seen) = if is_new {
+            let next = inner.next_first_seen.checked_add(1).ok_or_else(|| {
+                StoreError::Limit("Bestiary first_seen sequence exhausted".into())
+            })?;
+            (inner.next_first_seen, Some(next))
         } else {
-            inner.entries.get(&key).map(|l| l.first_seen).unwrap_or(0)
+            (inner.entries.get(&key).map(|l| l.first_seen).unwrap_or(0), None)
         };
         let op = LogOp::Put {
             realm: realm.clone(),
             artifact_hash: hash.clone(),
             manifest: Box::new(manifest),
         };
-        self.append(&mut inner, op.clone(), first_seen)?;
+        // Prove the journal can retain this record before writing a potentially large blob. The
+        // lock makes the preflight exact for this store process; append repeats the check as the
+        // authoritative guard.
+        self.preflight_append(&inner, &op, first_seen)?;
+        let created_new_blob = self.write_blob(&mut inner, &hash, &artifact)?;
+        match self.append(&mut inner, op.clone(), first_seen) {
+            Ok(()) => {}
+            Err(AppendFailure::BeforeWrite(error)) => {
+                // This classification proves no journal write was attempted. Only a blob newly
+                // created for this operation is safe to remove; deduped or repaired blobs predate
+                // the failed append and remain owned by the CAS.
+                if created_new_blob {
+                    if let Err(cleanup_error) = self.rollback_new_blob(&mut inner, &hash) {
+                        Self::mark_unhealthy(
+                            &mut inner,
+                            format!(
+                                "append failed before write and its new blob could not be rolled back: {cleanup_error}"
+                            ),
+                        );
+                        return Err(cleanup_error);
+                    }
+                }
+                return Err(error);
+            }
+            // The record may be durable despite the reported error. Keep the blob so recovery can
+            // never find a durable Put whose content was optimistically deleted; append already
+            // latched the store unhealthy.
+            Err(AppendFailure::Uncertain(error)) => return Err(error),
+        }
+        if let Some(next) = next_first_seen {
+            inner.next_first_seen = next;
+        }
         Self::apply(&mut inner, &op, first_seen);
         Ok(hash)
     }
@@ -917,6 +1670,7 @@ impl BestiaryStore for FsBestiaryStore {
         let key = (realm.clone(), artifact_hash.to_string());
         let live = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
             Self::live_entry(&inner, &key)
         };
         match live {
@@ -944,6 +1698,7 @@ impl BestiaryStore for FsBestiaryStore {
         let key = (realm.clone(), artifact_hash.to_string());
         let live = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
             Self::live_entry(&inner, &key)
         };
         let Some(live) = live else {
@@ -989,6 +1744,7 @@ impl BestiaryStore for FsBestiaryStore {
         let key = (realm.clone(), artifact_hash.to_string());
         let is_live = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
             Self::live_entry(&inner, &key).is_some()
         };
         if !is_live {
@@ -1008,6 +1764,7 @@ impl BestiaryStore for FsBestiaryStore {
     ) -> Result<Vec<SyncEntry>, StoreError> {
         let rows: Vec<((RealmId, String), Live)> = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
             inner
                 .entries
                 .iter()
@@ -1053,6 +1810,7 @@ impl BestiaryStore for FsBestiaryStore {
 
     fn list_metadata(&self, realm: Option<&RealmId>) -> Result<Vec<CatalogEntry>, StoreError> {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::ensure_healthy(&inner)?;
         Ok(inner
             .entries
             .iter()
@@ -1085,6 +1843,7 @@ impl BestiaryStore for FsBestiaryStore {
         }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::ensure_healthy(&inner)?;
         if !inner.entries.contains_key(&key) {
             return Ok(false);
         }
@@ -1115,6 +1874,7 @@ impl BestiaryStore for FsBestiaryStore {
         }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::ensure_healthy(&inner)?;
         let Some(live) = inner.entries.get(&key) else {
             return Ok(false);
         };
@@ -1154,6 +1914,7 @@ impl BestiaryStore for FsBestiaryStore {
         }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::ensure_healthy(&inner)?;
         match inner.entries.get(&key) {
             Some(live) if live.quarantine.is_some() => {
                 let first_seen = live.first_seen;
@@ -1175,17 +1936,23 @@ impl BestiaryStore for FsBestiaryStore {
         }
         let key = (realm.clone(), artifact_hash.to_string());
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        Self::ensure_healthy(&inner)?;
         if inner.tombstones.contains(&key) {
             return Ok(false);
         }
         let op =
             LogOp::Tombstone { realm: realm.clone(), artifact_hash: artifact_hash.to_string() };
+        self.ensure_entry_capacity(&inner, &op)?;
         self.append(&mut inner, op.clone(), 0)?;
         Self::apply(&mut inner, &op, 0);
         Ok(true)
     }
 
     fn merge_push(&self, entry: SignedSyncEntry) -> Result<MergeOutcome, StoreError> {
+        {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
+        }
         let verifier = Ed25519Verifier;
         let record = &entry.record;
         // 1. The foreign record must be self-verifying under its declared author.
@@ -1305,6 +2072,7 @@ impl BestiaryStore for FsBestiaryStore {
     ) -> Result<Vec<SignedSyncEntry>, StoreError> {
         let (live_rows, tombstones): (Vec<LiveRow>, Vec<(RealmId, String)>) = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
             let live = inner
                 .entries
                 .iter()
@@ -1372,18 +2140,34 @@ impl BestiaryStore for FsBestiaryStore {
 
     fn recover(&self) -> Result<usize, StoreError> {
         let verifier = Ed25519Verifier;
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        *inner = Inner::default();
+        let mut current = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Enter recovery fail-closed even when an operator invokes it on a currently healthy
+        // handle. Every early `?` leaves this latch in place; only the final transactional candidate
+        // assignment below restores a healthy state.
+        Self::mark_unhealthy(&mut current, "recovery has not completed successfully");
+        // Same-instance recovery is allowed after an atomic temp cleanup failure. Re-run the exact
+        // owned-name cleanup while the store lock excludes all of our writers; otherwise recovery
+        // could ignore a log `.tmp`, clear the health latch, and let repeated failures accumulate
+        // unaccounted files. A failed unlink returns while the latch remains set.
+        self.cleanup_stale_temps(&self.blobs_dir(), TempDirectory::Blobs)?;
+        self.cleanup_stale_temps(&self.log_dir(), TempDirectory::Log)?;
+        // Replay into a private candidate. A late signature/chain/cap failure must not expose a
+        // verified prefix through a daemon that correctly treats `recover()` as failed.
+        let mut recovered = Inner::default();
         let mut count = 0usize;
         let mut max_first_seen = 0u64;
+        // Count every physical content-addressed blob, not only those currently referenced by a
+        // live row. Orphans can be left by an append whose durable result was uncertain and must
+        // continue consuming the aggregate disk budget until compaction removes them.
+        let (blob_bytes, blob_count) = self.scan_blob_usage()?;
 
         let dir = self.log_dir();
-        let read = match fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(_) => return Ok(0), // no log dir yet → empty store
-        };
+        let read = fs::read_dir(&dir).map_err(|error| {
+            StoreError::Io(format!("read Bestiary log directory {}: {error}", dir.display()))
+        })?;
         // Collect+sort the jsonl files for deterministic replay order across realms.
         let mut files: Vec<(String, PathBuf)> = Vec::new();
+        let mut journal_bytes = 0u64;
         for ent in read {
             let ent = ent.map_err(|e| StoreError::Io(e.to_string()))?;
             let path = ent.path();
@@ -1395,6 +2179,24 @@ impl BestiaryStore for FsBestiaryStore {
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| StoreError::Corrupt("bad log filename".into()))?
                 .to_string();
+            if !is_artifact_hash(&stem) {
+                return Err(StoreError::Corrupt(format!(
+                    "bad Bestiary log filename {}",
+                    path.display()
+                )));
+            }
+            let file_len = Self::regular_file_len_or_zero(&path)?;
+            journal_bytes = self.checked_journal_growth(journal_bytes, file_len)?;
+            // In a valid journal every Realm file contains at least one retained live/tombstone
+            // key (tombstones are permanent), so a bounded catalog cannot legitimately have more
+            // Realm files than retained-key slots. Enforce this while collecting paths so empty or
+            // newline-only files cannot turn a byte cap into an unbounded recovery allocation.
+            if self.max_entries != 0 && files.len() >= self.max_entries {
+                return Err(StoreError::Capacity(format!(
+                    "Bestiary journal has more Realm files than the {} retained-key limit",
+                    self.max_entries
+                )));
+            }
             files.push((stem, path));
         }
         files.sort();
@@ -1443,10 +2245,15 @@ impl BestiaryStore for FsBestiaryStore {
                     )));
                 }
                 tip = rec.hash();
-                expect_seq += 1;
-                count += 1;
+                expect_seq = expect_seq.checked_add(1).ok_or_else(|| {
+                    StoreError::Corrupt(format!("{realm_hash}.jsonl sequence overflow"))
+                })?;
+                count = count.checked_add(1).ok_or_else(|| {
+                    StoreError::Limit("Bestiary recovery record count overflow".into())
+                })?;
                 max_first_seen = max_first_seen.max(rec.first_seen);
-                Self::apply(&mut inner, &rec.op, rec.first_seen);
+                self.ensure_entry_capacity(&recovered, &rec.op)?;
+                Self::apply(&mut recovered, &rec.op, rec.first_seen);
             }
             // Advisory head cross-check — a mismatch means a crash between append and head-write, or a
             // truncated tail. The jsonl chain is authoritative; warn, don't fail.
@@ -1457,9 +2264,13 @@ impl BestiaryStore for FsBestiaryStore {
                     );
                 }
             }
-            inner.heads.insert(realm_hash, Head { next_seq: expect_seq, tip_hash: tip });
+            recovered.heads.insert(realm_hash, Head { next_seq: expect_seq, tip_hash: tip });
         }
-        inner.next_first_seen = max_first_seen.saturating_add(1);
+        recovered.next_first_seen = max_first_seen.saturating_add(1);
+        recovered.journal_bytes = journal_bytes;
+        recovered.blob_bytes = blob_bytes;
+        recovered.blob_count = blob_count;
+        *current = recovered;
         Ok(count)
     }
 
@@ -1482,6 +2293,7 @@ impl BestiaryStore for FsBestiaryStore {
         let key = (realm.clone(), artifact_hash.to_string());
         let live = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
             Self::live_entry(&inner, &key)
         };
         let Some(live) = live else {
@@ -1512,6 +2324,7 @@ impl BestiaryStore for FsBestiaryStore {
     ) -> Result<Vec<CurationSnapshot>, StoreError> {
         let rows: Vec<((RealmId, String), Live)> = {
             let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Self::ensure_healthy(&inner)?;
             inner.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
         let head_first_seen = rows.iter().map(|(_, l)| l.first_seen).max().unwrap_or(0);
@@ -1557,136 +2370,239 @@ impl BestiaryStore for FsBestiaryStore {
 
     fn compact(&self, curator: &dyn Curator) -> Result<CompactStats, StoreError> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stats = CompactStats::default();
+        Self::ensure_healthy(&inner)?;
+        let mut durability_at_risk = false;
+        let result = (|| -> Result<CompactStats, StoreError> {
+            let mut stats = CompactStats::default();
+            // Curate a private candidate first. A predictable cap/serialization/allocation failure
+            // must leave both the live catalog and every Realm chain untouched.
+            let mut candidate = inner.clone();
+            let head_first_seen =
+                candidate.entries.values().map(|l| l.first_seen).max().unwrap_or(0);
+            // Fast metadata-only decide() pass (the byte-needing model call already ran in observe()).
+            let keys: Vec<(RealmId, String)> = candidate.entries.keys().cloned().collect();
+            for key in keys {
+                let Some(live) = candidate.entries.get(&key).cloned() else { continue };
+                stats.scanned += 1;
+                let meta_entry = Entry {
+                    manifest: live.manifest.clone(),
+                    artifact: Vec::new(), // decide() must not need bytes (it is lock-held + fast)
+                    reputation: live.reputation.clone(),
+                    quarantine: live.quarantine.clone(),
+                };
+                let ctx = CurationContext {
+                    realm: &key.0,
+                    artifact_hash: &key.1,
+                    entry: &meta_entry,
+                    first_seen: live.first_seen,
+                    head_first_seen,
+                };
+                match curator.decide(&ctx) {
+                    CurationDecision::Keep => {}
+                    CurationDecision::Promote { score } | CurationDecision::Demote { score } => {
+                        if let Some(l) = candidate.entries.get_mut(&key) {
+                            l.reputation = Some(ReputationScore::unsigned(score, None));
+                        }
+                    }
+                    CurationDecision::Quarantine { reason } => {
+                        if let Some(l) = candidate.entries.get_mut(&key) {
+                            let mut notice = l.quarantine.clone().unwrap_or(QuarantineNotice {
+                                reason: reason.clone(),
+                                attesting_peers: Vec::new(),
+                            });
+                            notice.reason = reason;
+                            l.quarantine = Some(notice);
+                            stats.quarantined += 1;
+                        }
+                    }
+                    CurationDecision::Gc { .. } => {
+                        candidate.entries.remove(&key);
+                        candidate.tombstones.insert(key);
+                        stats.gc += 1;
+                    }
+                }
+            }
 
-        let head_first_seen = inner.entries.values().map(|l| l.first_seen).max().unwrap_or(0);
-        // Fast metadata-only decide() pass (the byte-needing model call already ran in observe()).
-        let keys: Vec<(RealmId, String)> = inner.entries.keys().cloned().collect();
-        for key in keys {
-            let Some(live) = inner.entries.get(&key).cloned() else { continue };
-            stats.scanned += 1;
-            let meta_entry = Entry {
-                manifest: live.manifest.clone(),
-                artifact: Vec::new(), // decide() must not need bytes (it is lock-held + fast)
-                reputation: live.reputation.clone(),
-                quarantine: live.quarantine.clone(),
-            };
-            let ctx = CurationContext {
-                realm: &key.0,
-                artifact_hash: &key.1,
-                entry: &meta_entry,
-                first_seen: live.first_seen,
-                head_first_seen,
-            };
-            match curator.decide(&ctx) {
-                CurationDecision::Keep => {}
-                CurationDecision::Promote { score } | CurationDecision::Demote { score } => {
-                    if let Some(l) = inner.entries.get_mut(&key) {
-                        l.reputation = Some(ReputationScore::unsigned(score, None));
+            let mut realm_hashes: Vec<String> = candidate.realms.keys().cloned().collect();
+            realm_hashes.sort();
+
+            // Discardable dry pass across every Realm. Track the planned aggregate sequentially so
+            // a growth in an earlier replacement tightens every later Realm's exact budget. Peak
+            // memory remains one replacement chain; no durable file or live catalog changes yet.
+            let mut planned_journal_bytes = inner.journal_bytes;
+            for realm_hash in &realm_hashes {
+                let realm = candidate.realms.get(realm_hash).cloned();
+                let Some(realm) = realm else { continue };
+                let log_path = self.log_path(realm_hash);
+                let old_log_bytes = Self::regular_file_len_or_zero(&log_path)?;
+                let other_log_bytes = planned_journal_bytes.checked_sub(old_log_bytes).ok_or_else(
+                    || {
+                        StoreError::Corrupt(format!(
+                            "planned journal accounting {planned_journal_bytes} bytes is smaller than {old_log_bytes} byte Realm log {realm_hash}"
+                        ))
+                    },
+                )?;
+                let replacement_budget = if self.max_log_bytes == 0 {
+                    None
+                } else {
+                    Some(self.max_log_bytes.checked_sub(other_log_bytes).ok_or_else(|| {
+                        StoreError::Limit(format!(
+                            "other Realm journals retain {other_log_bytes} bytes, exceeding {} byte aggregate limit",
+                            self.max_log_bytes
+                        ))
+                    })?)
+                };
+                let (buffer, _, _) =
+                    self.build_compaction_buffer(&candidate, &realm, replacement_budget)?;
+                let replacement_bytes = u64::try_from(buffer.len()).map_err(|_| {
+                    StoreError::Limit("compacted journal buffer length does not fit u64".into())
+                })?;
+                planned_journal_bytes =
+                    self.checked_journal_growth(other_log_bytes, replacement_bytes)?;
+            }
+
+            // All predictable work validated. From here an allocation or I/O error can leave the
+            // candidate catalog ahead of disk or some Realm replacements ahead of others, so any
+            // error must poison the store until recovery.
+            inner.entries = candidate.entries;
+            inner.tombstones = candidate.tombstones;
+            durability_at_risk = true;
+            #[cfg(test)]
+            if self.fail_compaction_after_stage.swap(false, Ordering::Relaxed) {
+                return Err(StoreError::Io(
+                    "injected compaction failure after candidate staging".into(),
+                ));
+            }
+
+            // Rewrite one fresh genesis chain per Realm. first_seen is preserved verbatim;
+            // seq/prev_hash are renumbered. Only one replacement buffer is retained at a time.
+            for realm_hash in realm_hashes {
+                let realm = inner.realms.get(&realm_hash).cloned();
+                let Some(realm) = realm else { continue };
+                let log_path = self.log_path(&realm_hash);
+                let old_log_bytes = Self::regular_file_len_or_zero(&log_path)?;
+                let other_log_bytes =
+                    inner.journal_bytes.checked_sub(old_log_bytes).ok_or_else(|| {
+                        StoreError::Corrupt(format!(
+                            "journal accounting {} bytes is smaller than {} byte Realm log {}",
+                            inner.journal_bytes, old_log_bytes, realm_hash
+                        ))
+                    })?;
+                let replacement_budget = if self.max_log_bytes == 0 {
+                    None
+                } else {
+                    Some(self.max_log_bytes.checked_sub(other_log_bytes).ok_or_else(|| {
+                        StoreError::Limit(format!(
+                            "other Realm journals retain {other_log_bytes} bytes, exceeding {} byte aggregate limit",
+                            self.max_log_bytes
+                        ))
+                    })?)
+                };
+                let (buffer, next_seq, tip) =
+                    self.build_compaction_buffer(&inner, &realm, replacement_budget)?;
+                let replacement_bytes = u64::try_from(buffer.len()).map_err(|_| {
+                    StoreError::Limit("compacted journal buffer length does not fit u64".into())
+                })?;
+                let new_journal_bytes =
+                    self.checked_journal_growth(other_log_bytes, replacement_bytes)?;
+                self.atomic_write(&log_path, &buffer)?;
+                if let Err(failure) = self.atomic_write(
+                    &self.head_path(&realm_hash),
+                    format!("{next_seq} {tip}").as_bytes(),
+                ) {
+                    if failure.cleanup_failed() {
+                        return Err(StoreError::from(failure));
                     }
                 }
-                CurationDecision::Quarantine { reason } => {
-                    if let Some(l) = inner.entries.get_mut(&key) {
-                        let mut notice = l.quarantine.clone().unwrap_or(QuarantineNotice {
-                            reason: reason.clone(),
-                            attesting_peers: Vec::new(),
-                        });
-                        notice.reason = reason;
-                        l.quarantine = Some(notice);
-                        stats.quarantined += 1;
-                    }
+                inner.heads.insert(realm_hash, Head { next_seq, tip_hash: tip });
+                inner.journal_bytes = new_journal_bytes;
+            }
+
+            // Global-union blob GC: keep only blobs referenced by some LIVE entry in ANY realm.
+            // Validate aggregate accounting before deleting so every decrement is exact. There can
+            // be no in-flight Bestiary blob temp while this same process holds `inner`.
+            let (physical_blob_bytes, physical_blob_count) = self.scan_blob_usage()?;
+            if physical_blob_bytes != inner.blob_bytes || physical_blob_count != inner.blob_count {
+                return Err(StoreError::Corrupt(format!(
+                    "physical Bestiary blobs retain {physical_blob_count} files / {physical_blob_bytes} bytes but in-memory accounting tracks {} files / {} bytes",
+                    inner.blob_count, inner.blob_bytes
+                )));
+            }
+            let live_hashes: HashSet<String> =
+                inner.entries.keys().map(|(_, h)| h.clone()).collect();
+            let blob_dir = self.blobs_dir();
+            let read = fs::read_dir(&blob_dir).map_err(|error| {
+                StoreError::Io(format!(
+                    "read Bestiary blob directory {} during GC: {error}",
+                    blob_dir.display()
+                ))
+            })?;
+            let mut removed_any = false;
+            for entry in read {
+                let entry = entry.map_err(|error| {
+                    StoreError::Io(format!(
+                        "read Bestiary blob directory {} during GC: {error}",
+                        blob_dir.display()
+                    ))
+                })?;
+                let path = entry.path();
+                let name = entry.file_name().into_string().map_err(|_| {
+                    StoreError::Corrupt(format!(
+                        "unaccountable non-UTF-8 entry in Bestiary blob directory {}",
+                        blob_dir.display()
+                    ))
+                })?;
+                if !is_artifact_hash(&name) {
+                    return Err(StoreError::Corrupt(format!(
+                        "unaccountable Bestiary blob-directory entry {}",
+                        path.display()
+                    )));
                 }
-                CurationDecision::Gc { .. } => {
-                    inner.entries.remove(&key);
-                    inner.tombstones.insert(key);
-                    stats.gc += 1;
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    StoreError::Io(format!("blob {} metadata during GC: {error}", path.display()))
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Err(StoreError::Corrupt(format!(
+                        "blob {} is not a regular non-symlink file",
+                        path.display()
+                    )));
                 }
+                if !live_hashes.contains(&name) {
+                    fs::remove_file(&path).map_err(|error| {
+                        StoreError::Io(format!("remove orphan blob {}: {error}", path.display()))
+                    })?;
+                    inner.blob_bytes =
+                        inner.blob_bytes.checked_sub(metadata.len()).ok_or_else(|| {
+                            StoreError::Corrupt(
+                                "Bestiary blob accounting underflow during GC".into(),
+                            )
+                        })?;
+                    inner.blob_count = inner.blob_count.checked_sub(1).ok_or_else(|| {
+                        StoreError::Corrupt("Bestiary blob count underflow during GC".into())
+                    })?;
+                    stats.blobs_removed += 1;
+                    removed_any = true;
+                }
+            }
+            if removed_any {
+                fsync_dir(&blob_dir);
+            }
+            Ok(stats)
+        })();
+        if let Err(error) = &result {
+            if durability_at_risk || matches!(error, StoreError::Corrupt(_)) {
+                // Curation mutates the candidate catalog before Realm logs are replaced, and a
+                // multi-Realm rewrite/GC can fail after some durable changes landed. Never continue
+                // serving or append from a possibly divergent head. A pre-stage accounting
+                // corruption is equally unsafe even though predictable Limit/allocation refusals
+                // leave the old state operational. Only recovery may re-establish corrupt state.
+                Self::mark_unhealthy(
+                    &mut inner,
+                    format!("compaction did not complete atomically: {error}"),
+                );
             }
         }
-
-        // Rewrite a fresh genesis chain per realm: a Put (+ Attest/Quarantine) per live entry and a
-        // Tombstone per evicted key. first_seen is preserved verbatim; seq/prev_hash are renumbered.
-        let realm_hashes: Vec<String> = inner.realms.keys().cloned().collect();
-        for realm_hash in realm_hashes {
-            let realm = inner.realms.get(&realm_hash).cloned();
-            let Some(realm) = realm else { continue };
-            let mut records: Vec<LogRecord> = Vec::new();
-            let mut next_seq = 0u64;
-            let mut tip = genesis_prev();
-
-            // Live entries.
-            let mut live_keys: Vec<(RealmId, String)> =
-                inner.entries.keys().filter(|(r, _)| *r == realm).cloned().collect();
-            live_keys.sort_by(|a, b| {
-                (a.0 .0.as_str(), a.1.as_str()).cmp(&(b.0 .0.as_str(), b.1.as_str()))
-            });
-            for key in live_keys {
-                let live = inner.entries.get(&key).cloned().expect("just listed");
-                let mut ops = vec![LogOp::Put {
-                    realm: realm.clone(),
-                    artifact_hash: key.1.clone(),
-                    manifest: Box::new(live.manifest.clone()),
-                }];
-                if let Some(q) = &live.quarantine {
-                    ops.push(LogOp::Quarantine {
-                        realm: realm.clone(),
-                        artifact_hash: key.1.clone(),
-                        notice: q.clone(),
-                    });
-                }
-                if let Some(rep) = &live.reputation {
-                    ops.push(LogOp::Attest {
-                        realm: realm.clone(),
-                        artifact_hash: key.1.clone(),
-                        score: rep.clone(),
-                    });
-                }
-                for op in ops {
-                    records.push(self.build_record(next_seq, tip.clone(), op, live.first_seen));
-                    tip = records.last().unwrap().hash();
-                    next_seq += 1;
-                }
-            }
-            // Tombstones (permanent — preserved across compaction so a recover keeps them dead).
-            let mut tomb_keys: Vec<(RealmId, String)> =
-                inner.tombstones.iter().filter(|(r, _)| *r == realm).cloned().collect();
-            tomb_keys.sort_by(|a, b| {
-                (a.0 .0.as_str(), a.1.as_str()).cmp(&(b.0 .0.as_str(), b.1.as_str()))
-            });
-            for key in tomb_keys {
-                let op = LogOp::Tombstone { realm: realm.clone(), artifact_hash: key.1 };
-                records.push(self.build_record(next_seq, tip.clone(), op, 0));
-                tip = records.last().unwrap().hash();
-                next_seq += 1;
-            }
-
-            // Atomically replace the realm chain.
-            let mut buf = Vec::new();
-            for rec in &records {
-                buf.extend_from_slice(&encode_log_record_line(rec)?);
-            }
-            self.atomic_write(&self.log_path(&realm_hash), &buf)?;
-            let _ = self
-                .atomic_write(&self.head_path(&realm_hash), format!("{next_seq} {tip}").as_bytes());
-            inner.heads.insert(realm_hash, Head { next_seq, tip_hash: tip });
-        }
-
-        // Global-union blob GC: keep only blobs referenced by some LIVE entry in ANY realm.
-        let live_hashes: HashSet<String> = inner.entries.keys().map(|(_, h)| h.clone()).collect();
-        if let Ok(rd) = fs::read_dir(self.blobs_dir()) {
-            for ent in rd.flatten() {
-                let path = ent.path();
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name.starts_with('.') {
-                        continue; // skip in-flight temp files
-                    }
-                    if !live_hashes.contains(name) && fs::remove_file(&path).is_ok() {
-                        stats.blobs_removed += 1;
-                    }
-                }
-            }
-        }
-        Ok(stats)
+        result
     }
 }
 
@@ -1748,6 +2664,78 @@ mod tests {
     }
     fn store(root: &TempRoot) -> FsBestiaryStore {
         FsBestiaryStore::new(&root.0, key()).unwrap()
+    }
+
+    #[test]
+    fn startup_removes_only_exact_regular_owned_temps() {
+        let root = TempRoot::new("stale-temps");
+        let blobs = root.0.join("blobs");
+        let log = root.0.join("log");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(&log).unwrap();
+        let hash = "a".repeat(64);
+        let blob_temp = blobs.join(format!(".{hash}.123.7.tmp"));
+        let log_temp = log.join(format!(".{hash}.jsonl.123.8.tmp"));
+        let unrelated = blobs.join(".operator-note");
+        fs::write(&blob_temp, b"stale").unwrap();
+        fs::write(&log_temp, b"stale").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+
+        let _store = store(&root);
+        assert!(!blob_temp.exists(), "owned stale blob temp removed");
+        assert!(!log_temp.exists(), "owned stale log temp removed");
+        assert!(unrelated.exists(), "non-Bestiary dotfile left untouched");
+    }
+
+    #[test]
+    fn startup_fails_closed_on_non_regular_owned_temp() {
+        let root = TempRoot::new("stale-temp-type");
+        let log = root.0.join("log");
+        fs::create_dir_all(root.0.join("blobs")).unwrap();
+        fs::create_dir_all(&log).unwrap();
+        let owned_name = format!(".{}.head.123.9.tmp", "b".repeat(64));
+        fs::create_dir(log.join(owned_name)).unwrap();
+
+        let opened = FsBestiaryStore::new(&root.0, key());
+        assert!(
+            matches!(opened, Err(StoreError::Corrupt(_))),
+            "an owned temp with an unexpected inode type fails closed"
+        );
+    }
+
+    #[test]
+    fn same_instance_recovery_cleans_exact_owned_temps_before_clearing_health() {
+        let root = TempRoot::new("recover-temp-cleanup");
+        let store = store(&root);
+        let hash = "d".repeat(64);
+        let blob_temp = store.blobs_dir().join(format!(".{hash}.123.10.tmp"));
+        let log_temp = store.log_dir().join(format!(".{hash}.head.123.11.tmp"));
+        fs::write(&blob_temp, b"failed blob temp").unwrap();
+        fs::write(&log_temp, b"failed head temp").unwrap();
+        {
+            let mut inner = store.inner.lock().unwrap();
+            FsBestiaryStore::mark_unhealthy(&mut inner, "injected atomic temp cleanup uncertainty");
+        }
+
+        assert_eq!(store.recover().unwrap(), 0);
+
+        assert!(!blob_temp.exists());
+        assert!(!log_temp.exists());
+        assert!(store.inner.lock().unwrap().unhealthy_reason.is_none());
+    }
+
+    #[test]
+    fn failed_atomic_rename_removes_its_temp() {
+        let root = TempRoot::new("atomic-temp-guard");
+        let store = store(&root);
+        let hash = "c".repeat(64);
+        let destination = store.blob_path(&hash);
+        fs::create_dir(&destination).unwrap();
+        let expected_temp = store.blobs_dir().join(format!(".{hash}.{}.0.tmp", std::process::id()));
+
+        let result = store.atomic_write(&destination, b"cannot replace a directory");
+        assert!(matches!(result, Err(AtomicWriteFailure::Operation(StoreError::Io(_)))));
+        assert!(!expected_temp.exists(), "RAII guard removed the failed atomic temp");
     }
 
     #[test]
@@ -1923,6 +2911,25 @@ mod tests {
         assert_eq!(healed, hash);
         let entry = s.get(&realm, &hash).unwrap().expect("republished entry is readable");
         assert_eq!(entry.artifact, bytes);
+    }
+
+    #[test]
+    fn republish_recreates_a_missing_live_blob_and_rebases_physical_accounting() {
+        let root = TempRoot::new("blob-missing-heal");
+        let s = store(&root);
+        let realm = RealmId::new("crew");
+        let bytes = b"artifact-bytes".to_vec();
+        let hash = s.put(&realm, manifest("c"), bytes.clone()).unwrap();
+        fs::remove_file(s.blob_path(&hash)).unwrap();
+
+        let healed = s.put(&realm, manifest("c"), bytes.clone()).unwrap();
+
+        assert_eq!(healed, hash);
+        let inner = s.inner.lock().unwrap();
+        assert_eq!(inner.blob_bytes, bytes.len() as u64, "repair does not double-charge bytes");
+        assert_eq!(inner.blob_count, 1, "repair restores exactly one physical file");
+        drop(inner);
+        assert_eq!(s.get(&realm, &hash).unwrap().unwrap().artifact, bytes);
     }
 
     #[test]
@@ -2503,44 +3510,366 @@ mod tests {
     }
 
     #[test]
+    fn capacity_counts_permanent_tombstones_and_live_to_tombstone_is_neutral() {
+        let root = TempRoot::new("tombstone-cap");
+        let s = store(&root).with_max_entries(1);
+        let realm = RealmId::local();
+        let live_hash = s.put(&realm, manifest("a"), b"one".to_vec()).unwrap();
+
+        assert!(s.tombstone(&realm, &live_hash).unwrap(), "live key becomes a tombstone at cap");
+        assert_eq!(
+            FsBestiaryStore::retained_key_count(&s.inner.lock().unwrap()),
+            1,
+            "the live-to-tombstone transition consumes no new slot"
+        );
+
+        let absent_hash = sha256_hex(b"never-published");
+        let refused_tombstone = s.tombstone(&realm, &absent_hash);
+        assert!(
+            matches!(refused_tombstone, Err(StoreError::Capacity(_))),
+            "an absent key cannot create a second retained tombstone at cap: {refused_tombstone:?}"
+        );
+        let refused_put = s.put(&realm, manifest("b"), b"two".to_vec());
+        assert!(
+            matches!(refused_put, Err(StoreError::Capacity(_))),
+            "the permanent tombstone continues to occupy the only retained-key slot"
+        );
+        assert!(!s.tombstone(&realm, &live_hash).unwrap(), "the tombstone remains idempotent");
+    }
+
+    #[test]
     fn default_entry_cap_is_bounded_and_zero_opt_out_is_explicit() {
         let root = TempRoot::new("default-cap");
         let s = store(&root);
         assert_eq!(s.max_entries, DEFAULT_MAX_BESTIARY_ENTRIES);
+        assert_eq!(s.max_blob_bytes, DEFAULT_MAX_BESTIARY_BLOB_BYTES);
+        assert_eq!(s.max_log_bytes, DEFAULT_MAX_BESTIARY_LOG_BYTES);
 
         let unbounded_root = TempRoot::new("default-cap-unbounded");
-        let unbounded = store(&unbounded_root).with_max_entries(0);
+        let unbounded =
+            store(&unbounded_root).with_max_entries(0).with_max_blob_bytes(0).with_max_log_bytes(0);
         assert_eq!(unbounded.max_entries, 0, "0 is the explicit unbounded opt-out");
+        assert_eq!(unbounded.max_blob_bytes, 0, "blob bytes have the same explicit opt-out");
+        assert_eq!(unbounded.max_log_bytes, 0, "journal bytes have the same explicit opt-out");
     }
 
     #[test]
-    fn recover_replays_existing_catalog_even_when_current_cap_is_lower() {
+    fn aggregate_blob_cap_counts_physical_content_once_across_realms() {
+        let root = TempRoot::new("blob-cap-dedupe");
+        let s = store(&root).with_max_blob_bytes(4);
+        let realm_a = RealmId::new("a");
+        let realm_b = RealmId::new("b");
+        let bytes = b"same".to_vec();
+
+        let hash = s.put(&realm_a, manifest("a"), bytes.clone()).unwrap();
+        assert_eq!(s.put(&realm_b, manifest("b"), bytes).unwrap(), hash);
+        {
+            let inner = s.inner.lock().unwrap();
+            assert_eq!(inner.blob_bytes, 4, "cross-Realm dedupe charges physical bytes once");
+            assert_eq!(inner.blob_count, 1, "cross-Realm dedupe retains one physical file");
+        }
+
+        let refused_hash = sha256_hex(b"x");
+        let error = s
+            .put(&RealmId::new("c"), manifest("c"), b"x".to_vec())
+            .expect_err("a fifth aggregate blob byte is refused before its atomic write");
+        assert!(matches!(error, StoreError::Limit(_)), "aggregate blob cap is explicit: {error:?}");
+        assert!(!s.blob_path(&refused_hash).exists(), "over-cap blob was never written");
+    }
+
+    #[test]
+    fn recovery_counts_orphan_blob_bytes_and_reconstructs_exact_usage() {
+        let root = TempRoot::new("blob-recovery-cap");
+        let realm = RealmId::local();
+        {
+            let writer = store(&root).with_max_blob_bytes(0);
+            writer.put(&realm, manifest("live"), b"four".to_vec()).unwrap();
+        }
+        let orphan = b"xyz";
+        let orphan_hash = sha256_hex(orphan);
+        fs::write(root.0.join("blobs").join(&orphan_hash), orphan).unwrap();
+
+        let too_small = store(&root).with_max_blob_bytes(6);
+        let error = too_small
+            .recover()
+            .expect_err("the unreferenced physical blob still consumes aggregate capacity");
+        assert!(matches!(error, StoreError::Limit(_)), "orphan bytes fail closed: {error:?}");
+        assert!(
+            matches!(too_small.list_metadata(None), Err(StoreError::Unhealthy(_))),
+            "failed recovery never enables the catalog"
+        );
+        drop(too_small);
+
+        let exact = store(&root).with_max_blob_bytes(7);
+        assert_eq!(exact.recover().unwrap(), 1);
+        let inner = exact.inner.lock().unwrap();
+        assert_eq!(inner.blob_bytes, 7);
+        assert_eq!(inner.blob_count, 2);
+    }
+
+    #[test]
+    fn recovery_rejects_unaccountable_or_non_regular_blob_entries() {
+        let unknown_root = TempRoot::new("blob-recovery-unknown");
+        fs::create_dir_all(unknown_root.0.join("blobs")).unwrap();
+        fs::create_dir_all(unknown_root.0.join("log")).unwrap();
+        fs::write(unknown_root.0.join("blobs").join(".operator-note"), b"not a blob").unwrap();
+        let unknown = store(&unknown_root);
+        assert!(
+            matches!(unknown.recover(), Err(StoreError::Corrupt(_))),
+            "unaccountable physical disk use fails closed"
+        );
+
+        let special_root = TempRoot::new("blob-recovery-special");
+        fs::create_dir_all(special_root.0.join("blobs")).unwrap();
+        fs::create_dir_all(special_root.0.join("log")).unwrap();
+        fs::create_dir(special_root.0.join("blobs").join("a".repeat(64))).unwrap();
+        let special = store(&special_root);
+        assert!(
+            matches!(special.recover(), Err(StoreError::Corrupt(_))),
+            "a digest-named special inode fails closed"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_root = TempRoot::new("blob-recovery-symlink");
+            fs::create_dir_all(symlink_root.0.join("blobs")).unwrap();
+            fs::create_dir_all(symlink_root.0.join("log")).unwrap();
+            symlink(
+                symlink_root.0.join("outside"),
+                symlink_root.0.join("blobs").join("b".repeat(64)),
+            )
+            .unwrap();
+            let linked = store(&symlink_root);
+            assert!(
+                matches!(linked.recover(), Err(StoreError::Corrupt(_))),
+                "a digest-named symlink fails closed"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_blob_count_is_bounded_with_retained_keys() {
+        let root = TempRoot::new("blob-file-count");
+        let realm = RealmId::local();
+        {
+            let writer = store(&root).with_max_entries(0).with_max_blob_bytes(0);
+            writer.put(&realm, manifest("live"), b"one".to_vec()).unwrap();
+        }
+        let orphan = b"two";
+        fs::write(root.0.join("blobs").join(sha256_hex(orphan)), orphan).unwrap();
+
+        let capped = store(&root).with_max_entries(1);
+        let error = capped
+            .recover()
+            .expect_err("tiny orphan files cannot bypass the finite default inode bound");
+        assert!(matches!(error, StoreError::Limit(_)), "physical file cap is explicit: {error:?}");
+    }
+
+    #[test]
+    fn gc_decrements_aggregate_blob_bytes_and_count() {
+        let root = TempRoot::new("blob-gc-accounting");
+        let s = store(&root).with_max_blob_bytes(7);
+        let realm = RealmId::local();
+        s.put(&realm, manifest("keep"), b"one".to_vec()).unwrap();
+        let removed_hash = s.put(&realm, manifest("remove"), b"four".to_vec()).unwrap();
+        s.tombstone(&realm, &removed_hash).unwrap();
+        assert_eq!(s.inner.lock().unwrap().blob_bytes, 7);
+
+        let stats = s.compact(&DeterministicCurator::default()).unwrap();
+
+        assert_eq!(stats.blobs_removed, 1);
+        let inner = s.inner.lock().unwrap();
+        assert_eq!(inner.blob_bytes, 3);
+        assert_eq!(inner.blob_count, 1);
+    }
+
+    #[test]
+    fn definitely_prewrite_append_failure_rolls_back_only_its_new_blob() {
+        let root = TempRoot::new("append-prewrite-failure");
+        let s = store(&root);
+        let realm = RealmId::local();
+        let log_path = s.log_path(&FsBestiaryStore::realm_hash(&realm));
+        fs::create_dir(&log_path).unwrap();
+        let bytes = b"new-blob";
+        let hash = sha256_hex(bytes);
+
+        let error = s
+            .put(&realm, manifest("new"), bytes.to_vec())
+            .expect_err("opening a directory as an append log fails before any write");
+
+        assert!(matches!(error, StoreError::Io(_)), "pre-write open error is reported: {error:?}");
+        assert!(!s.blob_path(&hash).exists(), "only the provably new blob was rolled back");
+        let inner = s.inner.lock().unwrap();
+        assert_eq!(inner.blob_bytes, 0);
+        assert_eq!(inner.blob_count, 0);
+        assert!(inner.unhealthy_reason.is_none(), "a proven pre-write failure is retryable");
+    }
+
+    #[test]
+    fn uncertain_append_keeps_blob_and_gates_store_until_reopen_recovery() {
+        let root = TempRoot::new("append-uncertain-latch");
+        let realm = RealmId::local();
+        let bytes = b"possibly-durable";
+        let hash = sha256_hex(bytes);
+        {
+            let s = store(&root);
+            s.fail_append_after_write.store(true, Ordering::Relaxed);
+            let error = s
+                .put(&realm, manifest("uncertain"), bytes.to_vec())
+                .expect_err("fault is injected after the complete line write");
+            assert!(matches!(error, StoreError::Io(_)));
+            assert!(s.blob_path(&hash).exists(), "uncertain append never deletes its blob");
+            assert!(matches!(s.get(&realm, &hash), Err(StoreError::Unhealthy(_))));
+            assert!(matches!(s.signed_entries(None), Err(StoreError::Unhealthy(_))));
+            assert!(matches!(
+                s.compact(&DeterministicCurator::default()),
+                Err(StoreError::Unhealthy(_))
+            ));
+            assert!(matches!(
+                s.put(&realm, manifest("blocked"), b"another".to_vec()),
+                Err(StoreError::Unhealthy(_))
+            ));
+        }
+
+        let reopened = store(&root);
+        assert!(matches!(reopened.get(&realm, &hash), Err(StoreError::Unhealthy(_))));
+        assert_eq!(reopened.recover().unwrap(), 1);
+        assert_eq!(reopened.get(&realm, &hash).unwrap().unwrap().artifact, bytes);
+    }
+
+    #[test]
+    fn compaction_failure_after_staging_poison_latches_but_dry_run_limit_does_not() {
+        let staged_root = TempRoot::new("compact-staged-latch");
+        let staged = store(&staged_root);
+        let realm = RealmId::local();
+        let hash = staged.put(&realm, manifest("a"), b"one".to_vec()).unwrap();
+        staged.fail_compaction_after_stage.store(true, Ordering::Relaxed);
+        let error = staged
+            .compact(&DeterministicCurator::default())
+            .expect_err("fault after candidate staging is durability-uncertain");
+        assert!(matches!(error, StoreError::Io(_)));
+        assert!(matches!(staged.get(&realm, &hash), Err(StoreError::Unhealthy(_))));
+
+        let dry_root = TempRoot::new("compact-dry-limit");
+        let mut dry = store(&dry_root);
+        let dry_hash = dry.put(&realm, manifest("b"), b"two".to_vec()).unwrap();
+        dry.max_log_bytes = 1;
+        let error = dry
+            .compact(&DeterministicCurator::default())
+            .expect_err("the dry pass proves this replacement cannot fit");
+        assert!(matches!(error, StoreError::Limit(_)));
+        assert!(dry.get(&realm, &dry_hash).unwrap().is_some(), "dry failure changes no state");
+        assert!(dry.inner.lock().unwrap().unhealthy_reason.is_none());
+    }
+
+    #[test]
+    fn recovery_rejects_a_shrunk_retained_key_cap_and_reopens_with_sufficient_capacity() {
         let root = TempRoot::new("recover-over-cap");
         let realm = RealmId::local();
-        let h1;
-        let h2;
+        let live_then_tombstoned;
+        let absent_tombstone = sha256_hex(b"never-published");
         {
             let writer = store(&root).with_max_entries(0);
-            h1 = writer.put(&realm, manifest("a"), b"one".to_vec()).unwrap();
-            h2 = writer.put(&realm, manifest("b"), b"two".to_vec()).unwrap();
+            live_then_tombstoned = writer.put(&realm, manifest("a"), b"one".to_vec()).unwrap();
+            writer.tombstone(&realm, &live_then_tombstoned).unwrap();
+            writer.tombstone(&realm, &absent_tombstone).unwrap();
         }
 
         let capped = store(&root).with_max_entries(1);
-        capped.recover().unwrap();
-        assert!(capped.get(&realm, &h1).unwrap().is_some(), "first entry recovered");
+        let error =
+            capped.recover().expect_err("two permanent keys cannot recover through a one-key cap");
         assert!(
-            capped.get(&realm, &h2).unwrap().is_some(),
-            "recovery replays existing entries even above the current live cap"
+            matches!(error, StoreError::Capacity(_)),
+            "entry-cap recovery failure is explicit: {error:?}"
         );
+        assert_eq!(
+            FsBestiaryStore::retained_key_count(&capped.inner.lock().unwrap()),
+            0,
+            "failed replay exposes no verified prefix"
+        );
+        drop(capped);
 
-        let refused = capped.put(&realm, manifest("c"), b"three".to_vec());
+        let sufficient = store(&root).with_max_entries(2);
+        sufficient.recover().unwrap();
+        assert!(sufficient.get(&realm, &live_then_tombstoned).unwrap().is_none());
+        assert!(sufficient.get(&realm, &absent_tombstone).unwrap().is_none());
+        assert_eq!(FsBestiaryStore::retained_key_count(&sufficient.inner.lock().unwrap()), 2);
+    }
+
+    #[test]
+    fn journal_cap_preflights_before_retaining_an_orphan_blob() {
+        let root = TempRoot::new("journal-append-cap");
+        let s = store(&root).with_max_log_bytes(1);
+        let realm = RealmId::local();
+        let bytes = b"artifact-that-must-not-be-orphaned";
+        let hash = sha256_hex(bytes);
+
+        let error = s
+            .put(&realm, manifest("a"), bytes.to_vec())
+            .expect_err("one byte cannot hold a signed journal record");
+        assert!(matches!(error, StoreError::Limit(_)), "journal cap is explicit: {error:?}");
+        assert!(!s.blob_path(&hash).exists(), "failed journal admission retained no orphan blob");
         assert!(
-            matches!(refused, Err(StoreError::Capacity(_))),
-            "a new entry past the cap is a wire-honest Capacity error, not a false success: {refused:?}"
+            !s.log_path(&FsBestiaryStore::realm_hash(&realm)).exists(),
+            "failed preflight wrote no journal"
         );
+    }
+
+    #[test]
+    fn recovery_enforces_the_aggregate_journal_cap_across_realms() {
+        let root = TempRoot::new("journal-recovery-cap");
+        let realm_a = RealmId::new("a");
+        let realm_b = RealmId::new("b");
+        {
+            let writer = store(&root).with_max_log_bytes(0);
+            writer.put(&realm_a, manifest("a"), b"one".to_vec()).unwrap();
+            writer.put(&realm_b, manifest("b"), b"two".to_vec()).unwrap();
+        }
+        let total = [realm_a.clone(), realm_b.clone()]
+            .iter()
+            .map(|realm| {
+                fs::metadata(
+                    root.0
+                        .join("log")
+                        .join(format!("{}.jsonl", FsBestiaryStore::realm_hash(realm))),
+                )
+                .unwrap()
+                .len()
+            })
+            .sum::<u64>();
+
+        let too_small = store(&root).with_max_log_bytes(total - 1);
+        let error = too_small
+            .recover()
+            .expect_err("the cap is global rather than repeated independently per Realm");
         assert!(
-            capped.get(&realm, &sha256_hex(b"three")).unwrap().is_none(),
-            "new entries are still refused after over-cap recovery"
+            matches!(error, StoreError::Limit(_)),
+            "aggregate cap rejected recovery: {error:?}"
         );
+        drop(too_small);
+
+        let exact = store(&root).with_max_log_bytes(total);
+        assert_eq!(exact.recover().unwrap(), 2);
+        assert_eq!(exact.inner.lock().unwrap().journal_bytes, total);
+    }
+
+    #[test]
+    fn compaction_rewrites_with_bounded_current_journal_accounting() {
+        let root = TempRoot::new("journal-compaction-accounting");
+        let s = store(&root);
+        let realm = RealmId::local();
+        let bytes = b"same-artifact".to_vec();
+        s.put(&realm, manifest("first"), bytes.clone()).unwrap();
+        s.put(&realm, manifest("replacement"), bytes).unwrap();
+        let log_path = s.log_path(&FsBestiaryStore::realm_hash(&realm));
+        let before = fs::metadata(&log_path).unwrap().len();
+
+        s.compact(&DeterministicCurator::default()).unwrap();
+
+        let after = fs::metadata(&log_path).unwrap().len();
+        assert!(after < before, "genesis rewrite removed superseded history");
+        assert_eq!(s.inner.lock().unwrap().journal_bytes, after);
     }
 }

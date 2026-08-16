@@ -34,6 +34,7 @@ USAGE:
 COMMANDS:
     node [flags]     Boot a sanctum node daemon (REPL + optional HTTP/WS + cluster).
                      All node flags pass through: --listen --cluster-listen --exec …
+                     Opt-in Function/Job organs: --functions <config.json>
                      Model author (needs `--features openai`): --author-model <id>
                      [--author-base-url <url>] [--author-api-key-file <path> | --author-api-key <key>]
                      [--author-timeout-secs <n>]. Selected per node instance — never from the env.

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLoc
 
 use sigil::{Capabilities, Verifier};
 
-use crate::address::{Address, CreatureId, Role, Topic};
+use crate::address::{node_role_capability_key, Address, CreatureId, Role, Topic};
 use crate::envelope::{address_depth_error, header_size_error, Envelope};
 
 /// The kernel's reserved routing handle. [`Address::Kernel`] resolves here.
@@ -61,6 +61,13 @@ struct Registration {
     caps: Capabilities,
 }
 
+#[derive(Clone, Copy)]
+struct RoleBinding {
+    creature: CreatureId,
+    /// Host-selected remote exposure. Local role binding alone never grants this.
+    remote: bool,
+}
+
 /// One row of the history primitive — the ordered header log (registry lineage is the same idea at
 /// artifact grain).
 #[derive(Clone, Debug)]
@@ -90,7 +97,9 @@ pub enum RouteError {
 
 pub struct Router {
     table: RwLock<HashMap<CreatureId, Registration>>,
-    roles: RwLock<HashMap<Role, CreatureId>>,
+    /// Host-only IoC bindings. Remote exposure is one bit on the same row, so the new seam adds no
+    /// remotely growable table and an ordinary rebind clears exposure by default.
+    roles: RwLock<HashMap<Role, RoleBinding>>,
     /// Topic fan-out table. `subscribe` is **host-only** — the `Bus`/`BusHandle` handed to a creature
     /// exposes no `subscribe`, only `send`/`id`/`may_attest`/backpressure (`bus.rs`) — so a creature
     /// cannot grow this map. It is bounded by [`Router::max_topics`] anyway, as defense-in-depth
@@ -191,7 +200,7 @@ impl Router {
     /// thread's `recv` returns and it can exit (then the kernel joins it, then frees the library).
     pub fn deregister(&self, id: CreatureId) {
         wlock(&self.table).remove(&id);
-        wlock(&self.roles).retain(|_, v| *v != id);
+        wlock(&self.roles).retain(|_, binding| binding.creature != id);
         for subs in wlock(&self.topics).values_mut() {
             subs.retain(|v| *v != id);
         }
@@ -199,14 +208,28 @@ impl Router {
 
     /// Bind a creature into an IoC socket (the `bind_role` hook). Plugging a strategy creature into
     /// e.g. [`Role::DISTRIBUTOR`] is how a *model* enters the fabric — the fabric supplies none.
+    /// This local-only form deliberately clears any prior remote exposure for the role.
     pub fn bind_role(&self, role: Role, id: CreatureId) {
-        wlock(&self.roles).insert(role, id);
+        wlock(&self.roles).insert(role, RoleBinding { creature: id, remote: false });
+    }
+    /// Bind a role locally and explicitly expose that exact binding to an attesting transport's
+    /// [`Address::NodeRole`] resolution. This is host-only; no creature or manifest can self-expose.
+    pub fn bind_remote_role(&self, role: Role, id: CreatureId) {
+        wlock(&self.roles).insert(role, RoleBinding { creature: id, remote: true });
     }
     pub fn unbind_role(&self, role: &Role) {
         wlock(&self.roles).remove(role);
     }
     pub fn role_binding(&self, role: &Role) -> Option<CreatureId> {
-        rlock(&self.roles).get(role).copied()
+        rlock(&self.roles).get(role).map(|binding| binding.creature)
+    }
+    /// Resolve an explicitly remote-exposed role. The boot-granted transport reaches this only
+    /// through [`crate::Bus::remote_role_target`]; ordinary creature buses fail closed.
+    pub fn remote_role_binding(&self, role: &Role) -> Option<CreatureId> {
+        rlock(&self.roles)
+            .get(role)
+            .filter(|binding| binding.remote)
+            .map(|binding| binding.creature)
     }
 
     /// Whether a creature is currently routable (registered and not yet deregistered) — the
@@ -252,7 +275,7 @@ impl Router {
     /// Every current IoC role binding (for a node-status / introspection surface). Order is
     /// unspecified (it's a snapshot of a `HashMap`); callers that want a stable view sort it.
     pub fn bound_roles(&self) -> Vec<(Role, CreatureId)> {
-        rlock(&self.roles).iter().map(|(r, id)| (r.clone(), *id)).collect()
+        rlock(&self.roles).iter().map(|(role, binding)| (role.clone(), binding.creature)).collect()
     }
 
     /// The one delivery method — every interaction flows through here, the single choke point for
@@ -320,7 +343,7 @@ impl Router {
                     .ok_or_else(|| RouteError::NoProvider(Role::DISTRIBUTOR.to_string()))?;
                 self.deliver(id, env)
             }
-            Address::Node(_, _) => {
+            Address::Node(_, _) | Address::NodeRole(_, _) => {
                 let id = self
                     .role_binding(&Role::new(Role::TRANSPORT))
                     .ok_or_else(|| RouteError::NoProvider(Role::TRANSPORT.to_string()))?;
@@ -381,9 +404,17 @@ fn caps_allow(calls: &[String], to: &Address) -> bool {
     if calls.iter().any(|c| c == "*") {
         return true;
     }
+    // `node:<id>` is the existing coarse authority to address any creature on the node, so it also
+    // dominates a NodeRole call. The exact key is length-prefixed because NodeId/Role are open strings;
+    // delimiter-only concatenation would make component boundaries ambiguous.
+    if let Address::NodeRole(node, role) = to {
+        return calls.contains(&format!("node:{}", node.0))
+            || calls.contains(&node_role_capability_key(node, role));
+    }
     let want = match to {
         Address::Creature(id) => format!("creature:{}", id.0),
         Address::Node(n, _) => format!("node:{}", n.0),
+        Address::NodeRole(..) => unreachable!("handled above"),
         Address::Kernel => "kernel".to_string(),
         Address::Topic(t) => format!("topic:{}", t.0),
         Address::Role(r) => format!("role:{}", r.0),

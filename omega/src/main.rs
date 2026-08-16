@@ -24,8 +24,9 @@ COMMANDS:
                      Optional: --realm <id> (this gateway's Realm; default `global`)
                                --seed <node-id@host:port#pubkey-hex>   (repeatable)
                                --peer-realm <realm>=<node-id>          (repeatable; Omega routes)
+                               --pull-interval <seconds>               (optional anti-entropy cadence)
                                --cluster-key <64-hex seed>  --listen <http-addr>
-                               --api-key <key>  --allow-ai
+                               --api-key <key>  --allow-ai (boot-only; omega has no REPL)
     version          Print the version.
     help             Print this help.
 ";

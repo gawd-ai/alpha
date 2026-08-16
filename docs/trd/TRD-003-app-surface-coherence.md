@@ -1,6 +1,6 @@
 # TRD-003 — App-surface coherence
 
-- **Status:** Met (v0.4.3)
+- **Status:** Met (v0.4.3), extended for typed functions/jobs (v0.4.4)
 - **Theme:** Convergence
 - **Spawns:** [ADR-0045](../adr/ADR-0045-demo-registry-coherence.md) (demo-registry coherence) — *only if the
   cluster-demo disposition is a genuine fork; otherwise folded as R7 below.*
@@ -41,6 +41,14 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 | `RegistryList` | RO | ✅ | `alpha_registry_list` | `GET /api/registry/list` | uniform |
 | `FetchLoad` | Gated | ✅ | `alpha_registry_fetch_load` | `POST /api/registry/fetch-load` | loads code → gated |
 | `BestiaryProve` | RO | ✅ | `alpha_bestiary_prove` | `GET /api/bestiary/prove` | uniform |
+| `FunctionResolve` | Gated | ✅ (`function resolve <json>`) | `alpha_function_resolve` | `POST /api/functions/resolve` | signed request; exact signed resolution receipt |
+| `FunctionDeploy` | Gated | ✅ (`function deploy <json>`) | `alpha_function_deploy` | `POST /api/functions/deploy` | signed authorization + resolution; manifest/artifact paths are node-local |
+| `FunctionUndeploy` | Gated | ✅ (`function undeploy <json>`) | `alpha_function_undeploy` | `POST /api/functions/undeploy` | executor tombstone precedes exact-identity Kernel unload; signed deployment receipt required |
+| `FunctionDeployments` | RO | ✅ (`function deployments <json>`) | `alpha_function_deployments` | `POST /api/functions/deployments` | POST carries the structured bounded query; operation remains an ungated read |
+| `JobSubmit` | Gated | ✅ (`job submit <json>`) | `alpha_job_submit` | `POST /api/jobs/submit` | returns durable `Accepted` only; never waits for terminal execution |
+| `JobGet` | RO | ✅ (`job get <json>`) | `alpha_job_get` | `POST /api/jobs/get` | POST carries the attributable signed read request |
+| `JobEvents` | RO | ✅ (`job events <json>`) | `alpha_job_events` | `POST /api/jobs/events` | bounded signed event-page read |
+| `JobControl` | Gated | ✅ (`job control <json>`) | `alpha_job_control` | `POST /api/jobs/control` | signed steer/cancel/access mutation |
 | `Send` | Gated | ✅ | `alpha_send` | `POST /api/send` | uniform |
 | `Intent` | Gated | ✅ | `alpha_intent` | `POST /api/intent` | uniform |
 | `Bind` | Gated | ✅ | `alpha_bind` | `POST /api/bind` | uniform |
@@ -50,7 +58,7 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 | `Help` | RO | ✅ (`help`) | — | — | REPL parser-internal (`COMMANDS`) |
 | `Quit` | — | ✅ (`quit`/`exit`) | — | — | REPL lifecycle only |
 
-**Counts:** MCP `tool_list` = **19** tools; HTTP = **18** verb endpoints (the 19 minus `alpha_watch`)
+**Counts:** MCP `tool_list` = **27** tools; HTTP = **26** verb endpoints (the 27 minus `alpha_watch`)
 \+ `/api/health` + `/api/ws` (public). REPL covers all verbs plus `help`/`quit`. The asymmetries are
 **three, all intentional** and must be made *discoverable* rather than removed: `Watch` has no HTTP route
 (use `/api/ws`), `AllowAi` is REPL-only, `AiStatus` is mutating-but-ungated.
@@ -62,20 +70,18 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
   test MUST assert (a) `tool_list` ≡ `known_tool` (`surface-mcp/src/lib.rs:451,709` — already in
   lock-step via the `unreachable!` at `:598`), (b) the HTTP route set equals the MCP tool set **minus
   `alpha_watch`** (`surface-http/src/lib.rs:420`), and (c) every `Verb::is_gated` verb is rejected over a
-  gated surface without the allow-AI grant. The existing `alpha/tests/mcp.rs:98` (`tools.len() == 19`)
+  gated surface without the allow-AI grant. `alpha/tests/mcp.rs` (`tools.len() == 27`)
   locks the MCP count; extend it to lock the cross-surface set, not just MCP.
-  *Met (v0.4.3):* (a) `alpha/tests/mcp.rs` now pins the **exact** 19-name catalog (not just the count)
+  *Met (v0.4.3; extended v0.4.4):* (a) `alpha/tests/mcp.rs` pins the **exact** 27-name catalog (not just the count)
   and asserts no phantom `alpha_allow_ai`; (b) `alpha/tests/node_api.rs`
-  `http_route_set_is_the_mcp_verb_set_minus_watch` behaviourally pins the 18 HTTP verb routes (non-404)
+  `http_route_set_is_the_mcp_verb_set_minus_watch` behaviourally pins the 26 HTTP verb routes (non-404)
   + `/api/watch` absent (404) against the live router; (c) `node_api.rs`
   `health_is_public_auth_required_and_gate_blocks_mutation` asserts a mutating verb is refused
   (`403 ai-not-allowed`) over the gated HTTP surface while a read-only verb succeeds.
-- **R2 — The MCP catalog is exactly 19, and docs that enumerate it match.** `tool_list`
-  (`surface-mcp/src/lib.rs:451-472`) MUST list the 19 named in the matrix — no `alpha_allow_ai` (it does
+- **R2 — The MCP catalog is exactly 27, and docs that enumerate it match.** `tool_list`
+  MUST list the 27 named in the matrix — no `alpha_allow_ai` (it does
   not exist; the earlier "20" audit miscounted a phantom verb). Any doc that *enumerates* the tools MUST
-  list all 19. **Drift to fix:** `docs/design/bus-and-control.md:386-392` enumerates the catalog but omits
-  **`alpha_registry_fetch_load`** (lists 18 of 19). README (`README.md:135`) uses "and the rest", so it
-  does not drift. The fix is doc-only and additive.
+  list all 27. README uses "and the rest", so it does not drift.
 - **R3 — `allow-ai`'s REPL-only nature is discoverable on the gated surfaces.** `AllowAi` is correctly
   refused when `ctx.gated` (`cosmos/omni/src/lib.rs:761-766`) with `{"error":"repl-only", ...}`, and is
   correctly *absent* from `tool_list`/`/api/*`. But a host operator reading the MCP/HTTP capability set
@@ -114,18 +120,17 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 
 | Finding | Status | Evidence |
 |---|---|---|
-| MCP `tool_list` exposes exactly **19** `alpha_*` tools | **Verified** | `surface-mcp/src/lib.rs:451-472` (19 enumerated); test `alpha/tests/mcp.rs:98` |
+| MCP `tool_list` exposes exactly **27** `alpha_*` tools | **Verified** | `surface-mcp::tool_list`; test `alpha/tests/mcp.rs` |
 | Earlier "20 tools incl. `alpha_allow_ai`" was a miscount | **Verified** → corrected | no `alpha_allow_ai` token exists anywhere in tree |
 | `tool_list` ≡ `known_tool` (catalog/dispatch lock-step) | **Verified** | `surface-mcp/src/lib.rs:451` vs `:709`; `unreachable!` guard `:598` |
 | `allow-ai` is REPL-only; refused when `ctx.gated`, not a tool/route | **Verified** | `cosmos/omni/src/lib.rs:761-766`; absent from `tool_list` & `/api/*` |
 | `allow-ai` absence is correct-by-design but **undiscoverable** to a host | **Verified** | nothing in MCP `instructions`/HTTP caps explains the missing gate-flip |
 | No verb returns stub/canned data | **Verified** | all `run_verb` arms `lib.rs:736-838` dispatch live |
 | `Verb::Watch` returns a pointer, not a stream | **Verified** → intentional | `lib.rs:757-759`; streaming is `/api/ws` (`surface-http`) |
-| HTTP mirrors MCP **minus** `alpha_watch` (no `/api/watch`) | **Verified** | `surface-http/src/lib.rs:420-444` (18 verb routes + health + ws) |
+| HTTP mirrors MCP **minus** `alpha_watch` (no `/api/watch`) | **Verified** | `surface-http::router` (26 verb routes + health + ws) |
 | Tool `alpha_list` ↔ route `/api/creatures` name skew (both → `Verb::List`) | **Verified** → cosmetic | `surface-mcp:454` vs `surface-http:423` |
 | `cluster` demo on disk but **not** in `demos.json` (5 registered, not 6) | **Verified** | `demos/demos.json` (5); `demos/cluster/*.sh` exist; `alpha/src/demo.rs:111` lists only json |
 | Docs reference `cluster` as a manual `cd demos/cluster && ./*.sh` runbook | **Verified** | `demos/README.md:15,43-49`; not claimed as `alpha demo run cluster` |
-| `docs/design/bus-and-control.md` tool enumeration omits `alpha_registry_fetch_load` | **Verified** (new) | `bus-and-control.md:386-392` lists 18/19 |
 | HTTP auth: Bearer key + constant-time compare + body cap | **Verified** | `surface-http/src/lib.rs:443,449,472,55-57` |
 | `omega serve` has no half-wired flag | **Verified** | `omega/src/serve.rs:132-136,94-100,234,245-284` |
 
@@ -134,7 +139,7 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 - ✅ A test pins the parity matrix: MCP tool set pinned exactly (`alpha/tests/mcp.rs`); HTTP `/api/*`
   verb set == MCP set minus `alpha_watch` (`alpha/tests/node_api.rs`); every `is_gated` verb is refused
   over a gated surface absent the allow-AI grant (`node_api.rs`).
-- `docs/design/bus-and-control.md` enumerates all **19** tools (adds `alpha_registry_fetch_load`); a
+- `docs/design/bus-and-control.md` enumerates all **27** tools; a
   grep-level check (or the matrix here) confirms no doc enumerates a phantom `alpha_allow_ai`.
 - `allow-ai`'s REPL-only posture is discoverable from a gated surface (MCP `instructions`/HTTP caps note,
   or documented `repl-only` capability) — verified by reading the surface's own self-description.

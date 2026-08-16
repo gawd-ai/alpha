@@ -4,9 +4,10 @@
 //! listed in an external manifest (`demos/demos.json`), compiled separately, and added or removed by
 //! editing that manifest with **no `alpha` recompile** — the same "added/removed by manifest" rule the
 //! rest of the substrate applies to creatures. The front door is a *managed runner*: it resolves the
-//! named demo and **spawns** it (its cargo `package` in a source checkout, or a prebuilt `bin` for an
-//! installed alpha), streaming the child's output and forwarding its exit code. Running a demo crate
-//! directly (`cargo run -p walkthrough`) is unchanged.
+//! named demo and launches it (its cargo `package` in a source checkout, or a prebuilt `bin` for an
+//! installed alpha). On Unix the selected command replaces Alpha, so signals and process ownership
+//! stay direct; other platforms wait for it and forward its exit code. Running a demo crate directly
+//! (`cargo run -p walkthrough`) is unchanged.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -168,14 +169,28 @@ fn spawn(entry: &DemoEntry, manifest_path: &Path, rest: &[String]) -> ExitCode {
         // Build + run the demo crate from the workspace root (manifest is <root>/demos/demos.json).
         let root = manifest_dir.parent().unwrap_or_else(|| Path::new("."));
         let mut c = Command::new("cargo");
-        c.current_dir(root).args(["run", "-p", pkg, "--"]).args(rest);
+        c.current_dir(root).args(["run", "--locked", "-p", pkg, "--"]).args(rest);
         c
     } else {
         eprintln!("alpha demo: `{}` has neither `package` nor `bin` set.", entry.name);
         return ExitCode::from(2);
     };
 
-    // `status()` inherits the parent's stdio, so the demo's narration streams to the terminal.
+    // Replacing Alpha on Unix keeps one process tree: a supervisor stopping `alpha demo` signals the
+    // selected Cargo/prebuilt command directly instead of leaving it orphaned behind a waiting Alpha
+    // launcher. `exec()` also inherits stdio, so narration continues to stream to the terminal.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let error = cmd.exec();
+        eprintln!("alpha demo: failed to launch `{}`: {error}", entry.name);
+        ExitCode::FAILURE
+    }
+
+    // Windows has no `exec(2)` equivalent. Waiting still preserves the documented exit-code and
+    // inherited-stdio behavior there.
+    #[cfg(not(unix))]
     match cmd.status() {
         Ok(st) => st.code().map(|c| ExitCode::from(c as u8)).unwrap_or(ExitCode::FAILURE),
         Err(e) => {

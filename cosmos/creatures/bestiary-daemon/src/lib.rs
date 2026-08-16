@@ -18,10 +18,11 @@
 //!
 //! `bind` calls [`BestiaryStore::recover`] and spawns **one** maintenance worker: it owns an
 //! `AtomicBool` stop flag + a joined `JoinHandle`, captures the `Arc<dyn Bus>`, and on its own cadence
-//! (a) consults the curator **off the drain thread** (the model call never blocks `handle`) then
-//! compacts, and (b) PUSHes the local catalog to configured peers. `shutdown` sets stop, flushes the
-//! store, and joins the worker. `handle` itself stays synchronous and fast — it touches only the store
-//! (no model calls, no blocking I/O beyond the local fs the store already owns).
+//! (a) when the catalog is dirty, consults the curator **off the drain thread** (the model call never
+//! blocks `handle`) then compacts, and (b) PUSHes the local catalog to configured peers. Quiet
+//! compaction cadences do no artifact snapshot/read or journal rewrite. `shutdown` sets stop, flushes
+//! the store, and joins the worker. `handle` itself stays synchronous and fast — it touches only the
+//! store (no model calls, no blocking I/O beyond the local fs the store already owns).
 //!
 //! ## Scoping notes (deliberate, recorded)
 //!
@@ -60,10 +61,10 @@ use bestiary::{
 use serde::{Deserialize, Serialize};
 use sigil::RealmId;
 
-/// Default maximum number of self-verifying entries accepted in one `PushEntries` batch. A normal
-/// full push can include live entries plus tombstones, so allow twice the default live catalog cap.
-/// `0` in [`BestiaryConfig::max_push_entries`] means unbounded.
-pub const DEFAULT_MAX_PUSH_ENTRIES: usize = DEFAULT_MAX_BESTIARY_ENTRIES * 2;
+/// Default maximum number of self-verifying entries accepted in one `PushEntries` batch. The
+/// durable store's default retained-key cap already counts live entries plus tombstones, so one
+/// default full snapshot fits exactly. `0` in [`BestiaryConfig::max_push_entries`] means unbounded.
+pub const DEFAULT_MAX_PUSH_ENTRIES: usize = DEFAULT_MAX_BESTIARY_ENTRIES;
 
 /// Default total artifact bytes read into one anti-entropy snapshot.
 ///
@@ -124,7 +125,8 @@ pub struct ReplicationPeer {
 pub struct BestiaryConfig {
     /// PUSH cadence. `Duration::ZERO` disables autonomous replication (no peers / a single node).
     pub anti_entropy_interval: Duration,
-    /// Curation+compaction cadence. `Duration::ZERO` disables autonomous compaction.
+    /// Curation+compaction cadence. Clean cadences skip snapshot/rewrite work; a failed dirty pass
+    /// stays dirty for the next cadence. `Duration::ZERO` disables autonomous compaction.
     pub compaction_interval: Duration,
     /// Peers to replicate to.
     pub replication_peers: Vec<ReplicationPeer>,
@@ -240,6 +242,9 @@ struct Shared {
     bus: Arc<dyn Bus>,
     me: CreatureId,
     stop: Arc<AtomicBool>,
+    /// Set after a mutation attempt that may have changed durable state. A maintenance pass claims
+    /// it with `swap(false)`; mutations racing the pass set it for the next cadence.
+    dirty: Arc<AtomicBool>,
 }
 
 struct GxChunkPull {
@@ -255,6 +260,7 @@ pub struct BestiaryDaemon {
     curator: Arc<dyn Curator>,
     cfg: BestiaryConfig,
     stop: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -283,6 +289,7 @@ impl BestiaryDaemon {
             curator,
             cfg,
             stop: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
         }
     }
@@ -290,6 +297,10 @@ impl BestiaryDaemon {
     /// Number of retained replication peers after constructor sanitization.
     pub fn replication_peer_count(&self) -> usize {
         self.cfg.replication_peers.len()
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
     }
 
     // ---- registry.op (byte-identical to registry-mem) ----
@@ -312,7 +323,12 @@ impl BestiaryDaemon {
                     if let Some(message) = self.artifact_too_large(artifact.len()) {
                         RegistryReply::Error { message }
                     } else {
-                        match self.store.put(&realm, manifest, artifact) {
+                        let result = self.store.put(&realm, manifest, artifact);
+                        // Even an error can be an uncertain append/fsync outcome. A false-positive
+                        // dirty bit costs at most one bounded maintenance pass; a false negative can
+                        // leave durable history growing forever.
+                        self.mark_dirty();
+                        match result {
                             Ok(artifact_hash) => RegistryReply::Published { artifact_hash, realm },
                             Err(e) => RegistryReply::Error { message: e.to_string() },
                         }
@@ -398,7 +414,11 @@ impl BestiaryDaemon {
                     signature,
                 }) => {
                     let rep = ReputationScore { score, attesting_realm, signed_by, signature };
-                    match self.store.attest(&realm, &artifact_hash, rep) {
+                    let result = self.store.attest(&realm, &artifact_hash, rep);
+                    if !matches!(&result, Ok(false)) {
+                        self.mark_dirty();
+                    }
+                    match result {
                         Ok(true) => RegistryReply::Attested { artifact_hash, realm },
                         Ok(false) => {
                             eprintln!(
@@ -435,7 +455,11 @@ impl BestiaryDaemon {
                         );
                     }
                     let notice = QuarantineNotice { reason, attesting_peers };
-                    match self.store.quarantine(&realm, &artifact_hash, notice) {
+                    let result = self.store.quarantine(&realm, &artifact_hash, notice);
+                    if !matches!(&result, Ok(false)) {
+                        self.mark_dirty();
+                    }
+                    match result {
                         Ok(true) => RegistryReply::Quarantined { artifact_hash, realm },
                         Ok(false) => {
                             eprintln!(
@@ -794,6 +818,7 @@ impl BestiaryDaemon {
                 Ok(BestiaryOp::Compact) => {
                     // Uses the curator's `decide` (fast / cache / deterministic) — the model-call
                     // `observe` pass runs only on the off-drain worker, never here on the drain thread.
+                    self.dirty.swap(false, Ordering::AcqRel);
                     match self.store.compact(&*self.curator) {
                         Ok(s) => BestiaryReply::Compacted {
                             scanned: s.scanned,
@@ -801,7 +826,12 @@ impl BestiaryDaemon {
                             quarantined: s.quarantined,
                             blobs_removed: s.blobs_removed,
                         },
-                        Err(e) => BestiaryReply::Error { message: e.to_string() },
+                        Err(e) => {
+                            // `compact` can have an uncertain/partial filesystem outcome. Restore
+                            // the bit without clearing a mutation that raced this pass.
+                            self.mark_dirty();
+                            BestiaryReply::Error { message: e.to_string() }
+                        }
                     }
                 }
                 Ok(BestiaryOp::PushEntries { entries }) => {
@@ -825,7 +855,11 @@ impl BestiaryDaemon {
                                     continue;
                                 }
                             }
-                            match self.store.merge_push(entry) {
+                            let result = self.store.merge_push(entry);
+                            // A merge can persist membership/reputation before a later signal fails,
+                            // so every attempted store merge conservatively dirties maintenance.
+                            self.mark_dirty();
+                            match result {
                                 Ok(_) => accepted += 1,
                                 Err(e) => {
                                     rejected += 1;
@@ -852,8 +886,16 @@ fn bestiary_push_too_many_entries_message(len: usize, limit: usize) -> String {
 impl Creature for BestiaryDaemon {
     fn bind(&mut self, ctx: CreatureCtx) {
         match self.store.recover() {
-            Ok(n) => eprintln!("bestiary-daemon: recovered {n} log record(s) at bind"),
-            Err(e) => eprintln!("bestiary-daemon: recover failed at bind ({e}); serving empty"),
+            Ok(n) => {
+                // The dirty bit is intentionally not persisted, and a zero-record journal can
+                // still have physical orphan blobs after a pre-record crash. One successful
+                // post-recovery pass canonicalizes/GCs the root; subsequent quiet cadences skip.
+                self.mark_dirty();
+                eprintln!("bestiary-daemon: recovered {n} log record(s) at bind");
+            }
+            Err(e) => eprintln!(
+                "bestiary-daemon: recover failed at bind ({e}); store remains unavailable until successful recovery"
+            ),
         }
         let shared = Shared {
             store: self.store.clone(),
@@ -862,6 +904,7 @@ impl Creature for BestiaryDaemon {
             bus: ctx.bus,
             me: ctx.me,
             stop: self.stop.clone(),
+            dirty: self.dirty.clone(),
         };
         match Builder::new()
             .name("bestiary-maintenance".into())
@@ -914,7 +957,7 @@ fn maintenance_loop(shared: Shared) {
         if shared.cfg.compaction_interval > Duration::ZERO
             && now.duration_since(last_compact) >= shared.cfg.compaction_interval
         {
-            curate_and_compact(&shared);
+            compact_if_dirty(&shared);
             last_compact = Instant::now();
         }
         if shared.cfg.anti_entropy_interval > Duration::ZERO
@@ -926,9 +969,21 @@ fn maintenance_loop(shared: Shared) {
     }
 }
 
+/// Claim one dirty generation and run its bounded curation+compaction pass. A mutation that races
+/// after the swap sets the bit for the next cadence. Any failed stage restores it without ever
+/// clearing such a racing mutation.
+fn compact_if_dirty(shared: &Shared) {
+    if !shared.dirty.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if !curate_and_compact(shared) {
+        shared.dirty.store(true, Ordering::Release);
+    }
+}
+
 /// Off-drain curation: consult the curator (its blocking model call runs here, never in `handle`),
 /// then compact.
-fn curate_and_compact(shared: &Shared) {
+fn curate_and_compact(shared: &Shared) -> bool {
     match shared.store.snapshot_for_curation_bounded(shared.cfg.max_snapshot_artifact_bytes) {
         Ok(snaps) => {
             for snap in &snaps {
@@ -946,12 +1001,17 @@ fn curate_and_compact(shared: &Shared) {
             let reason = e.to_string();
             eprintln!("bestiary-daemon: curation snapshot failed: {reason}");
             publish_maintenance_stall(shared, "curation", &reason, None);
+            return false;
         }
     }
-    if let Err(e) = shared.store.compact(&*shared.curator) {
-        let reason = e.to_string();
-        eprintln!("bestiary-daemon: compaction failed: {reason}");
-        publish_maintenance_stall(shared, "compaction", &reason, None);
+    match shared.store.compact(&*shared.curator) {
+        Ok(_) => true,
+        Err(e) => {
+            let reason = e.to_string();
+            eprintln!("bestiary-daemon: compaction failed: {reason}");
+            publish_maintenance_stall(shared, "compaction", &reason, None);
+            false
+        }
     }
 }
 
@@ -1145,6 +1205,27 @@ mod tests {
             },
             payload: op.to_bytes(),
         }
+    }
+
+    #[test]
+    fn successful_registry_mutation_marks_maintenance_dirty() {
+        let root = TempRoot::new("dirty-publish");
+        let key = Ed25519KeyMaterial::from_seed([0x41; 32]).unwrap();
+        let store = Arc::new(FsBestiaryStore::new(&root.0, key).unwrap());
+        let mut daemon = BestiaryDaemon::new(
+            store,
+            Arc::new(DeterministicCurator::default()),
+            BestiaryConfig::local(),
+        );
+        assert!(!daemon.dirty.load(Ordering::Acquire));
+
+        daemon.serve_registry(&registry_env(RegistryOp::Publish {
+            manifest: manifest("dirty"),
+            artifact: b"dirty".to_vec(),
+            realm: None,
+        }));
+
+        assert!(daemon.dirty.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1591,6 +1672,7 @@ mod tests {
             bus: bus.clone(),
             me: CreatureId(7),
             stop: Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(false)),
         };
         (shared, bus)
     }
@@ -1627,12 +1709,51 @@ mod tests {
         let root = TempRoot::new("curation-stall");
         let (shared, bus) = over_cap_shared(&root, Vec::new());
 
-        curate_and_compact(&shared);
+        assert!(!curate_and_compact(&shared));
 
         let events = stall_events(&bus);
         assert!(
             events.iter().any(|e| e.stage == "curation" && e.peer.is_none()),
             "the refused curation snapshot is surfaced on the proprioception topic, got {events:?}"
         );
+    }
+
+    #[test]
+    fn quiet_compaction_cadence_skips_snapshot_and_rewrite() {
+        let root = TempRoot::new("quiet-compaction");
+        let (shared, bus) = over_cap_shared(&root, Vec::new());
+
+        compact_if_dirty(&shared);
+
+        assert!(!shared.dirty.load(Ordering::Acquire));
+        assert!(
+            stall_events(&bus).is_empty(),
+            "a clean cadence never attempted the deliberately over-cap snapshot"
+        );
+    }
+
+    #[test]
+    fn failed_dirty_compaction_restores_the_generation_for_retry() {
+        let root = TempRoot::new("dirty-compaction-retry");
+        let (shared, bus) = over_cap_shared(&root, Vec::new());
+        shared.dirty.store(true, Ordering::Release);
+
+        compact_if_dirty(&shared);
+
+        assert!(shared.dirty.load(Ordering::Acquire), "failed pass remains dirty");
+        assert!(stall_events(&bus).iter().any(|event| event.stage == "curation"));
+    }
+
+    #[test]
+    fn successful_dirty_compaction_consumes_the_claimed_generation() {
+        let root = TempRoot::new("dirty-compaction-success");
+        let (mut shared, bus) = over_cap_shared(&root, Vec::new());
+        shared.cfg.max_snapshot_artifact_bytes = 16;
+        shared.dirty.store(true, Ordering::Release);
+
+        compact_if_dirty(&shared);
+
+        assert!(!shared.dirty.load(Ordering::Acquire), "successful quiet pass is clean");
+        assert!(stall_events(&bus).is_empty());
     }
 }

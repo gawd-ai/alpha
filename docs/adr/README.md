@@ -9,6 +9,10 @@ opens at **ADR-0037** (the prior series runs through the cosmology/cohesion base
 records predate this public tree's `docs/` and live in project history). Each ADR below is paired with
 the [TRD](../trd/README.md) whose requirements motivate it.
 
+The v0.4.4 function foundation continues at ADR-0046. Those decisions are **Implemented**, and their
+suite-compositional acceptance evidence is indexed by
+[TRD-006](../trd/TRD-006-typed-functions-and-durable-jobs.md).
+
 ## Index
 
 | ADR | Title | Decision in one line | Drives | Status |
@@ -22,11 +26,15 @@ the [TRD](../trd/README.md) whose requirements motivate it.
 | [ADR-0043](ADR-0043-reserved-seam-register.md) | Reserved-seam disposition register | Classify every reserved seam: keep-reserved / realize-now / realize-v0.5.0, each with its consumer | TRD-004 | Accepted |
 | [ADR-0044](ADR-0044-omni-control-plane-dry.md) | `omni` shared control-plane composition | Hoist the duplicated alpha/omega control-plane boot into one `omni` recipe | TRD-005 | Implemented |
 | [ADR-0045](ADR-0045-demo-registry-coherence.md) | Demo-registry coherence (the `cluster` demo) | Teach `demos.json`/`alpha demo` about manual runbooks so `alpha demo list` is authoritative | TRD-003 | Implemented |
+| [ADR-0046](ADR-0046-functions-are-typed-creature-entrypoints.md) | Functions are typed creature entrypoints | Add an optional structured entrypoint contract and dispatch over existing `handle`; no fourth tier/ABI | TRD-006 | Implemented |
+| [ADR-0047](ADR-0047-jobs-have-home-and-execution-ledgers.md) | Jobs have home and execution ledgers | Abode home owns intent/control; Realm executor owns durable claim/facts; delivery mode is explicit | TRD-006 | Implemented |
+| [ADR-0048](ADR-0048-home-authority-moves-by-fenced-handoff.md) | Home authority moves by fenced handoff | Freeze+fsync source before destination activation; separate root, epoch, and data keys | TRD-006 | Implemented |
 
 ## Status lifecycle
 
 `Proposed` → `Accepted` (decision agreed) → `Implemented` (lands in code, with the test from its sketch).
-The v0.4.3 implementation `/goal` pass moves these from `Accepted` to `Implemented`.
+TRD acceptance may compose several such tests; an ADR's `Implemented` status does not imply one test
+alone proves an entire TRD.
 
 ## ADR shape used here
 

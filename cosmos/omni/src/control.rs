@@ -30,6 +30,7 @@ use std::thread::JoinHandle;
 use aether::{
     Address, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, Outcome, Topic,
 };
+use gawdfn::AuthoritySigner;
 use sanctum::Kernel;
 use sigil::Capabilities;
 
@@ -82,6 +83,9 @@ struct Job {
     verb: Verb,
     reply_to: Address,
     corr: Option<u64>,
+    /// Opaque request capability echoed on the reply. Correlation selects a waiter; this value
+    /// proves the reply came from an organ that received the exact addressed request.
+    reply_capability: Option<String>,
 }
 
 /// The control translator creature. Bound to [`Role::CONTROL`](aether::Role::CONTROL) at boot.
@@ -94,6 +98,9 @@ pub struct ControlCore {
     ai: Arc<AiControl>,
     critter_builder: Option<CreatureId>,
     transport: Option<CreatureId>,
+    /// Separate node-local operational key for post-load deployment attestations. It is never an
+    /// Abode root key and is optional on control planes that do not expose function deployment.
+    function_deployer: Option<Arc<dyn AuthoritySigner>>,
     /// Set in [`bind`](ControlCore::bind): the channel feeding the orchestration worker. Dropping it
     /// (on `shutdown`) closes the worker's `recv` so the thread exits.
     job_tx: Option<SyncSender<Job>>,
@@ -117,10 +124,18 @@ impl ControlCore {
             ai,
             critter_builder,
             transport,
+            function_deployer: None,
             job_tx: None,
             worker: None,
             stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Enable explicit function deployment on this control plane with an injected operational
+    /// signer. The signer implementation retains custody of its private material.
+    pub fn with_function_deployer(mut self, signer: Arc<dyn AuthoritySigner>) -> Self {
+        self.function_deployer = Some(signer);
+        self
     }
 }
 
@@ -138,6 +153,16 @@ fn needs_probe(verb: &Verb) -> bool {
             | Verb::RegistryList { .. }
             | Verb::FetchLoad { .. }
             | Verb::BestiaryProve { .. }
+            // Typed function/job verbs are bounded request/reply calls to injected runtime roles.
+            // Submit returns durable `Accepted`; it does not wait for terminal execution.
+            | Verb::FunctionResolve { .. }
+            | Verb::FunctionDeploy { .. }
+            | Verb::FunctionUndeploy { .. }
+            | Verb::FunctionDeployments { .. }
+            | Verb::JobSubmit { .. }
+            | Verb::JobGet { .. }
+            | Verb::JobEvents { .. }
+            | Verb::JobControl { .. }
             | Verb::Send { .. }
             | Verb::Intent { .. }
             | Verb::Cluster
@@ -149,7 +174,11 @@ fn needs_probe(verb: &Verb) -> bool {
 /// `reply_target` (preserving `corr`), tagged so the surface can tell a result from a sense frame.
 fn reply(env: &Envelope, res: VerbResult) -> Outcome {
     let payload = control_result_payload(res);
-    Outcome::send(Dispatch::reply_to_env(env, payload).with_schema(CONTROL_RESULT_SCHEMA))
+    let mut dispatch = Dispatch::reply_to_env(env, payload).with_schema(CONTROL_RESULT_SCHEMA);
+    if let Some(capability) = &env.header.commitment {
+        dispatch = dispatch.with_commitment(capability.clone());
+    }
+    Outcome::send(dispatch)
 }
 
 impl Creature for ControlCore {
@@ -169,15 +198,20 @@ impl Creature for ControlCore {
         let ai = self.ai.clone();
         let cb = self.critter_builder;
         let tr = self.transport;
+        let deployer = self.function_deployer.clone();
         let stop = self.stop.clone();
         let spawned = std::thread::Builder::new().name("omni-worker".into()).spawn(move || {
-            // One verb at a time, sharing one corr space (no cross-talk) — exactly the daemon
-            // API's probe-worker discipline, now driven by envelopes instead of HTTP.
+            // One verb at a time, sharing one monotonic internal corr space for the lifetime of
+            // this persistent probe. A fresh VerbCtx per queued command must not reset it: a late
+            // reply from a timed-out command would otherwise be eligible to satisfy the next one.
+            // `None` is permanent checked-overflow exhaustion; VerbCtx then refuses every request
+            // before sending rather than wrapping and reusing an id.
+            let mut next_internal_corr = Some(1_u64);
             while let Ok(job) = rx.recv() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let Job { verb, reply_to, corr } = job;
+                let Job { verb, reply_to, corr, reply_capability } = job;
                 // Upgrade per job: hold a strong ref only for the duration of `run_verb`, so a
                 // dropped node lets the worker exit. If the kernel is already gone, stop.
                 let Some(kernel) = weak.upgrade() else { break };
@@ -194,8 +228,13 @@ impl Creature for ControlCore {
                     );
                 };
                 let mut ctx = VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, cb, &ai, true);
+                ctx.set_corr_cursor(next_internal_corr);
                 ctx.transport = tr;
+                if let Some(deployer) = deployer.as_deref() {
+                    ctx.set_function_deployer(deployer);
+                }
                 let res = run_verb(verb, &mut ctx, &mut progress);
+                next_internal_corr = ctx.corr_cursor();
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -203,6 +242,9 @@ impl Creature for ControlCore {
                 let mut d = Dispatch::to(reply_to, payload).with_schema(CONTROL_RESULT_SCHEMA);
                 if let Some(c) = corr {
                     d = d.with_corr(c);
+                }
+                if let Some(capability) = reply_capability {
+                    d = d.with_commitment(capability);
                 }
                 let _ = probe_bus.send(d);
             }
@@ -255,7 +297,12 @@ impl Creature for ControlCore {
         if needs_probe(&verb) {
             // Hand the request/reply verb to the worker; it emits the reply when done. `handle`
             // returns immediately, so a cold `author` never stalls the kernel's drain thread.
-            let job = Job { verb, reply_to: env.reply_target(), corr: env.header.corr };
+            let job = Job {
+                verb,
+                reply_to: env.reply_target(),
+                corr: env.header.corr,
+                reply_capability: env.header.commitment.clone(),
+            };
             match &self.job_tx {
                 Some(tx) => match tx.try_send(job) {
                     Ok(()) => Outcome::none(),
@@ -293,6 +340,9 @@ impl Creature for ControlCore {
             let mut noop = |_: &str| {};
             let mut ctx = VerbCtx::no_probe(&kernel, self.critter_builder, &self.ai, true);
             ctx.transport = self.transport;
+            if let Some(deployer) = self.function_deployer.as_deref() {
+                ctx.set_function_deployer(deployer);
+            }
             let res = run_verb(verb, &mut ctx, &mut noop);
             reply(&env, res)
         }

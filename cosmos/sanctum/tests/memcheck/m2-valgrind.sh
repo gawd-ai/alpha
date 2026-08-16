@@ -29,16 +29,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../../../.."
 
-# Ensure the cdylibs are freshly built — stale `.so`s would test old code while the host runs
-# new code (a failure mode we've seen during development).
-echo "[M2/valgrind] cargo build --workspace"
-cargo build --workspace
-
-# Locate the m2_two_node test binary. `cargo test --no-run` builds it without running and tells
-# us the path; we then re-invoke under valgrind so the test's setup/teardown runs in the
-# instrumented context. `--quiet` suppresses the "compiling" lines so the path is parsable.
-echo "[M2/valgrind] cargo test --no-run -p sanctum --test m2_two_node"
-TEST_BIN=$(cargo test --no-run -p sanctum --test m2_two_node --message-format=json 2>/dev/null \
+# Locate the m2_two_node test binary. `cargo test --no-run` builds the test and its fixture
+# cdylib dev-dependencies from the same source graph, so a preceding `cargo build --workspace`
+# would only duplicate a much broader compile and another set of artifacts. We then re-invoke the
+# exact binary under valgrind so the test's setup/teardown runs in the instrumented context.
+# `--quiet` suppresses the "compiling" lines so the path is parsable. Root Cargo configuration
+# keeps this forgotten/manual invocation to one build job with incremental output disabled.
+echo "[M2/valgrind] cargo test --locked --no-run -p sanctum --test m2_two_node"
+TEST_BIN=$(cargo test --locked --no-run -p sanctum --test m2_two_node --message-format=json 2>/dev/null \
     | jq -r 'select(.profile.test == true and (.target.name == "m2_two_node")) | .executable' \
     | tail -n1)
 

@@ -31,20 +31,23 @@ The pronunciation ("god") and the temple/pantheon naming are a joke we're keepin
 cleanly onto the engineering (below), which is why it's worth keeping.
 
 **Distribution** stays a governing mechanism: Alpha moves not just *code* but *work* — the
-Distributor places the daemons that do it onto whatever machine best fits, anywhere in the mesh.
+Distributor places the creatures that do it onto whatever machine best fits, anywhere in the mesh.
 
 ## One-paragraph mental model
 
-A **daemon** is a unit of capability — a chunk of code that does one thing. It runs inside a
-**Sanctum**, a single node whose whole job is to load, supervise, place, and unload daemons at
+A **creature** is a unit of capability — code that does one thing, in a native `daemon`, WASM `beast`,
+or script `critter` tier. It runs inside a **Sanctum**, a single node whose whole job is to load,
+supervise, place, and unload creatures at
 runtime. A Sanctum need not be a server: it is *any* compute host — a datacenter box, a robot, a
 satellite, an edge device — and it advertises its **embodiment** (the hardware, sensors, links, and
 location it has) so that work can be matched to it. A Sanctum hosts **Abodes** — portable
-identity/state contexts, the seat of "whose work this is," its memory, and its goals. Sanctums
+identity/state contexts, the seat of "whose work this is," its memory, goals, and durable Job home.
+Creatures advertise typed **Functions**; invoking one creates an asynchronous **Job** whose immutable
+identity/control history follows that Abode while its attempts may execute elsewhere. Sanctums
 federate into a **Realm** (a trust domain — a mesh of peers, which might be a server cluster, a
 robot fleet, or an orbital constellation), and Realms federate into the **Omega** (the global
-graph, plus the registry where daemons are published, discovered, and fetched). Work — and the
-daemons that do it — is **distributed** across this graph by AI, placed where it best runs rather
+graph, plus the registry where creatures are published, discovered, and fetched). Work — and the
+creatures that do it — is **distributed** across this graph by AI, placed where it best runs rather
 than by a human clicking buttons.
 
 ## The cosmology
@@ -56,6 +59,10 @@ Each term has a precise engineering meaning and a build status. Status legend:
 |---|---|---|
 | **creature** | An autonomous, dynamically-loadable unit of capability — the substrate's only kind of loadable unit. Loaded through one `Kernel::load` path; the same path runs *infrastructure* (transport, registry, the authoring agent, the admission policy, the placement distributor) and *workloads* alike, which is what makes the substrate **self-hosting**. | ✅ |
 | **daemon / beast / critter** | The three execution **tiers** of a creature, chosen by `abi.backend`: native in-process (`daemon`, a Rust `.so` exposing the `gawd_creature_v1` entry), sandboxed WASM (`beast`), sandboxed script (`critter`, a metered Rhai interpreter). | ✅ daemon + beast + critter |
+| **Function** | A named, typed entrypoint advertised inside a creature's signed Manifest. Canonical identity is the Manifest content address + entrypoint; it is not another loadable unit or execution tier. | ✅ v0.4.4 |
+| **deployment** | An explicit, signed fact that an immutable Function's creature was fetched/verified/admitted/loaded at an executor. Call follows deploy; it never silently loads code. | ✅ v0.4.4 |
+| **Job / attempt** | A Job is the durable asynchronous record/handle for one Function invocation. An attempt is one separately identified execution authorization under it. | ✅ v0.4.4 |
+| **Job home** | The single active, Abode-bound authority over Jobs, causal children, grants, commands, and verified observations. It can move while remote attempts remain at executors. | ✅ v0.4.4 |
 | **Sanctum** | A **node**: *any* compute host (server, robot, satellite, edge device) whose runtime loads, supervises, places, and unloads creatures. Advertises its **embodiment**. | ✅ |
 | **Abode** | A portable **identity + state context** — whose work this is, plus the memory, goals, and creatures acting on its behalf. Migrates / forks / merges / re-instantiates across Sanctums: the seat of a **distributed self**. | ✅ |
 | **Realm** | A **federated mesh of Sanctums** under one trust/control domain (a cluster, a robot fleet, an orbital constellation). Peer-to-peer, no central master. | ✅ |
@@ -77,10 +84,40 @@ Each term has a precise engineering meaning and a build status. Status legend:
           Sanctum ─── Sanctum ─── …        a node: any compute host, hosts creatures ✅
        (server·robot·satellite·edge)
           /  |  \
-     Abode Abode Abode                     portable identity/state: a distributed self  ✅
-        |
-     [ creatures: daemon · beast · critter ]   dynamically loaded units of capability  ✅
+     Abode Abode Abode                     portable identity/state + Job home       ✅
+        |       \
+      Jobs    [ creatures: daemon · beast · critter ]   only loadable units      ✅
+                         |
+                    Functions               typed signed entrypoints               ✅
 ```
+
+## Functions and Jobs
+
+A Function system adds two useful grains without adding a second substrate:
+
+- **Function** — the exact signed capability: `FunctionId { manifest_content_address, entrypoint }`.
+  The Manifest's optional structured entrypoint contract describes input/output and behavioral
+  declarations. An alias is only a friendly resolver name; a Job pins the immutable resolution at
+  submit.
+- **Deployment** — an explicit receipt that the Function's containing creature is active at a named
+  executor. Artifact hash (which bytes were fetched) and Manifest content address (which signed
+  definition ran) remain distinct and both are proved.
+- **Invocation** — the act of submitting input to a deployed Function.
+- **Job** — the durable asynchronous identity/state returned as soon as submission is committed.
+  `corr` may match one live exchange; it is never the Job identity.
+- **Attempt** — one durable grant to execute the Job. At-most-once and at-least-once describe how
+  grants/runs may repeat after ambiguity; neither means exactly-once external effects.
+- **Causal child Job** — a Job whose submission binds a parent Job, parent attempt, stable spawn id,
+  and parent event hash. The fabric records lineage; an authored creature decides joins, branches,
+  compensation, and workflows.
+- **Progress / steer** — signed, sequenced observations and durable commands. A cooperative Function
+  may act on `abort`, `amend`, or `info`; a non-cooperative one honestly reports `unsupported` rather
+  than pretending generic `handle` can be preempted.
+
+The Job's **home** belongs to an Abode; execution may occur in another Realm. The home owns intent and
+control, while the executor owns durable claim/dedup and execution receipts. Moving the home moves
+custody/history, not arbitrary running process memory. See
+[`design/functions-and-jobs.md`](design/functions-and-jobs.md).
 
 ## Why "daemon"
 
@@ -116,14 +153,18 @@ elsewhere in the docs run straight through this table:
 
 ## Core engineering terms
 
-- **Creature manifest / contract** — the metadata + ABI a daemon must carry to be loadable. It
+- **Creature manifest / contract** — the metadata + ABI a creature must carry to be loadable. It
   includes **version** (safe reload), **provenance/signature** (trust for authoring &
   transport), an **execution tier** (daemon/beast/critter — see the creatures above), **declared capabilities** (for *optional, self-imposed* sandboxing), **requirements** (the embodiment and
-  resources a host must offer to run it — for placement), and a **portable, content-addressed shape**
-  (movement between nodes).
-- **Hot-load / unload / reload** — bringing a daemon into a running Sanctum, removing it, or
+  resources a host must offer to run it — for placement), typed **entrypoints**, and a **portable,
+  content-addressed shape** (movement between nodes).
+- **Hot-load / unload / reload** — bringing a creature into a running Sanctum, removing it, or
   replacing it with a new version, all *without restarting the node*. Safe **unload** is the hard one
   (see ARCHITECTURE → "The hard problems").
+- **Function alias / resolver** — a friendly mutable name and the injected organ that resolves it to
+  an immutable Function/deployment. A signed resolution is pinned in each accepted Job.
+- **Home lease / locator** — a signed statement of the current Home epoch/location and the organ that
+  indexes the highest verified epoch. Stable Job identity never depends on the locator hint.
 - **Capability** — a permission a creature *declares*, and that a Sanctum *can* enforce **when asked to**.
   Enforcement is not imposed by default: an operator chooses what to contain (often by choosing a
   sandboxed tier — a *beast* or *critter*). See *Freedom by default* in [`VISION.md`](VISION.md).
@@ -316,7 +357,7 @@ resolved differently (the integration risk the substrate was designed around; se
 | the bus | `aether` — one `Envelope`, one `Router`, the `Creature` seam, the journal |
 | creature load mechanism | one `Kernel::load` over `anima` — `libloading` for native `daemon`s, `wasmtime` for `beast`s, Rhai for `critter`s — selected by `abi.backend` |
 | self-hosting | transport, registry, the authoring agent, the admission policy, and the placement distributor are all ordinary creatures (`cosmos/creatures/*`, `cosmos/creatures/prototypes/*`) |
-| Abode (portable self) | `aether::abode` snapshot + `cosmos/creatures/abode-migrator` (hand-off) + `cosmos/creatures/abode-reconciler` (fork/merge) |
+| Abode (portable self) | `abode::AbodeSnapshot` + `cosmos/creatures/abode-migrator` (hand-off) + `cosmos/creatures/abode-reconciler` (fork/merge) |
 | Realm / Omega (federation) | the `Realm` / `Omega` address grain + `cosmos/creatures/prototypes/gateways/realm-gateway` & `omega-gateway` + `cosmos/creatures/omega-federator` |
 | embodiment / placement | `cosmos/creatures/distributor-requirements` + `embodiment-advertiser`, over the `placement` SEER topic |
 

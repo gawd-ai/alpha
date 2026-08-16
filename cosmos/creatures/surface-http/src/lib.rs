@@ -43,6 +43,11 @@ use aether::{
     Address, Bus, Creature, CreatureCtx, CreatureId, Deadline, Dispatch, Envelope, InboxReceiver,
     Outcome, RealmId,
 };
+use gawdfn::{
+    DeploymentQueryV1, DeploymentReceiptV1, DeploymentRequestV1, EventQueryV1, JobControlV1,
+    JobGetV1, JobSubmitV1, ResolutionReceiptV1, ResolveRequestV1, SignedRecordV1,
+    UndeployRequestV1,
+};
 pub use omni::ControlTarget;
 use omni::{Verb, VerbResult, CONTROL_PROGRESS_SCHEMA, CONTROL_RESULT_SCHEMA, CONTROL_SCHEMA};
 
@@ -100,8 +105,9 @@ struct SurfaceState {
     /// The corr space for this surface's control round-trips. Each request takes the next value;
     /// the reply carries it back and `handle` matches it to the waiting handler.
     corr: AtomicU64,
-    /// In-flight control requests: corr → the oneshot that wakes the awaiting HTTP handler.
-    pending: Mutex<HashMap<u64, oneshot::Sender<VerbResult>>>,
+    /// In-flight control requests. `corr` selects a waiter but is predictable; the independently
+    /// random reply capability proves knowledge of the request before a response may consume it.
+    pending: Mutex<HashMap<u64, PendingReply>>,
     /// The live sense stream: `handle` republishes each subscribed sense/progress frame here; every
     /// `/api/ws` connection subscribes.
     stream_tx: broadcast::Sender<String>,
@@ -111,6 +117,11 @@ struct SurfaceState {
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     /// Set by `shutdown` so the sense-reader thread exits its `recv_timeout` loop and joins.
     stop: AtomicBool,
+}
+
+struct PendingReply {
+    capability: String,
+    tx: oneshot::Sender<VerbResult>,
 }
 
 impl SurfaceState {
@@ -123,17 +134,26 @@ impl SurfaceState {
     fn register_pending(
         &self,
         corr: u64,
+        capability: String,
         tx: oneshot::Sender<VerbResult>,
     ) -> Result<(), VerbResult> {
         let mut pending = self.pending.lock().unwrap();
         if pending.len() >= MAX_PENDING_CONTROL_REQUESTS {
             return Err(surface_busy(pending.len()));
         }
-        pending.insert(corr, tx);
+        pending.insert(corr, PendingReply { capability, tx });
         Ok(())
     }
-    fn take_pending(&self, corr: u64) -> Option<oneshot::Sender<VerbResult>> {
-        self.pending.lock().unwrap().remove(&corr)
+    fn take_pending(
+        &self,
+        corr: u64,
+        capability: Option<&str>,
+    ) -> Option<oneshot::Sender<VerbResult>> {
+        let mut pending = self.pending.lock().unwrap();
+        let matches = pending
+            .get(&corr)
+            .is_some_and(|expected| capability == Some(expected.capability.as_str()));
+        matches.then(|| pending.remove(&corr).expect("matched pending reply").tx)
     }
     fn remove_pending(&self, corr: u64) {
         self.pending.lock().unwrap().remove(&corr);
@@ -268,7 +288,7 @@ impl Creature for SurfaceHttp {
         // — sense frames go to the dedicated endpoint). A reply wakes the HTTP handler on its corr.
         if env.header.schema == CONTROL_RESULT_SCHEMA {
             if let Some(corr) = env.header.corr {
-                if let Some(tx) = self.state.take_pending(corr) {
+                if let Some(tx) = self.state.take_pending(corr, env.header.commitment.as_deref()) {
                     let res = omni::parse_control_result(&env.payload)
                         .unwrap_or_else(omni::control_result_decode_failure);
                     let _ = tx.send(res);
@@ -314,15 +334,25 @@ async fn request_control(st: &Arc<SurfaceState>, verb: Verb, timeout: Duration) 
         Ok(payload) => payload,
         Err(res) => return res,
     };
+    let reply_capability = match omni::fresh_control_reply_capability() {
+        Ok(capability) => capability,
+        Err(detail) => {
+            return VerbResult::err(
+                json!({ "error": "control-reply-capability-unavailable", "detail": detail }),
+                "control reply capability could not be generated; request was not sent",
+            )
+        }
+    };
     let corr = st.corr.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = oneshot::channel::<VerbResult>();
-    if let Err(res) = st.register_pending(corr, tx) {
+    if let Err(res) = st.register_pending(corr, reply_capability.clone(), tx) {
         return res;
     };
     let d = Dispatch::to(st.target.address(), payload)
         .with_schema(CONTROL_SCHEMA)
         .with_reply_to(Address::Creature(me))
-        .with_corr(corr);
+        .with_corr(corr)
+        .with_commitment(reply_capability);
     if let Err(e) = bus.emit(d) {
         st.remove_pending(corr);
         return VerbResult::err(
@@ -432,6 +462,16 @@ fn router(state: Arc<SurfaceState>) -> Router {
         .route("/api/registry/list", get(h_registry_list))
         .route("/api/registry/fetch-load", post(h_registry_fetch_load))
         .route("/api/bestiary/prove", get(h_bestiary_prove))
+        // Typed function/job operations carry signed structured records, so even reads use POST
+        // bodies. The shared control core still classifies deployments/get/events as ungated reads.
+        .route("/api/functions/resolve", post(h_function_resolve))
+        .route("/api/functions/deploy", post(h_function_deploy))
+        .route("/api/functions/undeploy", post(h_function_undeploy))
+        .route("/api/functions/deployments", post(h_function_deployments))
+        .route("/api/jobs/submit", post(h_job_submit))
+        .route("/api/jobs/get", post(h_job_get))
+        .route("/api/jobs/events", post(h_job_events))
+        .route("/api/jobs/control", post(h_job_control))
         .route("/api/send", post(h_send))
         .route("/api/intent", post(h_intent))
         .route("/api/bind", post(h_bind))
@@ -529,6 +569,44 @@ struct RegistryFetchLoadReq {
 struct BestiaryProveQ {
     artifact_hash: String,
     realm: String,
+}
+#[derive(Deserialize)]
+struct FunctionResolveReq {
+    request: SignedRecordV1<ResolveRequestV1>,
+}
+#[derive(Deserialize)]
+struct FunctionDeployReq {
+    request: SignedRecordV1<DeploymentRequestV1>,
+    resolution: SignedRecordV1<ResolutionReceiptV1>,
+    manifest_path: String,
+    artifact_path: String,
+}
+#[derive(Deserialize)]
+struct FunctionDeploymentsReq {
+    query: DeploymentQueryV1,
+}
+#[derive(Deserialize)]
+struct FunctionUndeployReq {
+    request: SignedRecordV1<UndeployRequestV1>,
+    deployment: SignedRecordV1<DeploymentReceiptV1>,
+}
+#[derive(Deserialize)]
+struct JobSubmitReq {
+    request: SignedRecordV1<JobSubmitV1>,
+    resolution: SignedRecordV1<ResolutionReceiptV1>,
+    deployment: SignedRecordV1<DeploymentReceiptV1>,
+}
+#[derive(Deserialize)]
+struct JobGetReq {
+    request: SignedRecordV1<JobGetV1>,
+}
+#[derive(Deserialize)]
+struct JobEventsReq {
+    request: SignedRecordV1<EventQueryV1>,
+}
+#[derive(Deserialize)]
+struct JobControlReq {
+    request: SignedRecordV1<JobControlV1>,
 }
 #[derive(Deserialize)]
 struct SendReq {
@@ -759,6 +837,107 @@ async fn h_bestiary_prove(
             READ_TIMEOUT,
         )
         .await,
+    )
+}
+
+async fn h_function_resolve(
+    State(st): State<Arc<SurfaceState>>,
+    Json(body): Json<FunctionResolveReq>,
+) -> Response {
+    into_response(
+        request_control(&st, Verb::FunctionResolve { request: body.request }, READ_TIMEOUT).await,
+    )
+}
+
+async fn h_function_deploy(
+    State(st): State<Arc<SurfaceState>>,
+    Json(body): Json<FunctionDeployReq>,
+) -> Response {
+    reject_bad_http_arg!(validate_http_arg(
+        "manifest_path",
+        &body.manifest_path,
+        MAX_HTTP_PATH_ARG_BYTES
+    ));
+    reject_bad_http_arg!(validate_http_arg(
+        "artifact_path",
+        &body.artifact_path,
+        MAX_HTTP_PATH_ARG_BYTES
+    ));
+    into_response(
+        request_control(
+            &st,
+            Verb::FunctionDeploy {
+                request: body.request,
+                resolution: body.resolution,
+                manifest_path: body.manifest_path,
+                artifact_path: body.artifact_path,
+            },
+            READ_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+async fn h_function_deployments(
+    State(st): State<Arc<SurfaceState>>,
+    Json(body): Json<FunctionDeploymentsReq>,
+) -> Response {
+    into_response(
+        request_control(&st, Verb::FunctionDeployments { query: body.query }, READ_TIMEOUT).await,
+    )
+}
+
+async fn h_function_undeploy(
+    State(st): State<Arc<SurfaceState>>,
+    Json(body): Json<FunctionUndeployReq>,
+) -> Response {
+    into_response(
+        request_control(
+            &st,
+            Verb::FunctionUndeploy { request: body.request, deployment: body.deployment },
+            READ_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+async fn h_job_submit(
+    State(st): State<Arc<SurfaceState>>,
+    Json(body): Json<JobSubmitReq>,
+) -> Response {
+    into_response(
+        request_control(
+            &st,
+            Verb::JobSubmit {
+                request: Box::new(body.request),
+                resolution: body.resolution,
+                deployment: body.deployment,
+            },
+            READ_TIMEOUT,
+        )
+        .await,
+    )
+}
+
+async fn h_job_get(State(st): State<Arc<SurfaceState>>, Json(body): Json<JobGetReq>) -> Response {
+    into_response(request_control(&st, Verb::JobGet { request: body.request }, READ_TIMEOUT).await)
+}
+
+async fn h_job_events(
+    State(st): State<Arc<SurfaceState>>,
+    Json(body): Json<JobEventsReq>,
+) -> Response {
+    into_response(
+        request_control(&st, Verb::JobEvents { request: body.request }, READ_TIMEOUT).await,
+    )
+}
+
+async fn h_job_control(
+    State(st): State<Arc<SurfaceState>>,
+    Json(body): Json<JobControlReq>,
+) -> Response {
+    into_response(
+        request_control(&st, Verb::JobControl { request: body.request }, READ_TIMEOUT).await,
     )
 }
 
@@ -998,12 +1177,12 @@ mod tests {
 
         for corr in 0..MAX_PENDING_CONTROL_REQUESTS as u64 {
             let (tx, rx) = oneshot::channel();
-            st.register_pending(corr, tx).expect("under cap");
+            st.register_pending(corr, format!("cap-{corr}"), tx).expect("under cap");
             receivers.push(rx);
         }
 
         let (tx, _rx) = oneshot::channel();
-        let err = st.register_pending(999_999, tx).expect_err("at cap refuses");
+        let err = st.register_pending(999_999, "cap-new".into(), tx).expect_err("at cap refuses");
         assert_eq!(err.json["error"].as_str(), Some("surface-busy"));
         assert_eq!(err.json["limit"].as_u64(), Some(MAX_PENDING_CONTROL_REQUESTS as u64));
         assert_eq!(
@@ -1012,11 +1191,34 @@ mod tests {
             "refused request is not inserted"
         );
 
-        let removed = st.take_pending(0).expect("existing corr is present");
+        let removed =
+            st.take_pending(0, Some("cap-0")).expect("existing corr and capability are present");
         drop(removed);
         let (tx, rx) = oneshot::channel();
-        st.register_pending(999_999, tx).expect("space reopens after a reply/timeout removes one");
+        st.register_pending(999_999, "cap-new".into(), tx)
+            .expect("space reopens after a reply/timeout removes one");
         receivers.push(rx);
+    }
+
+    #[test]
+    fn forged_control_reply_cannot_consume_a_pending_http_request() {
+        let st = test_state();
+        let (tx, _rx) = oneshot::channel();
+        st.register_pending(41, "unguessable-request-capability".into(), tx).unwrap();
+
+        assert!(
+            st.take_pending(41, Some("attacker-guessed-corr-only")).is_none(),
+            "a matching predictable corr with the wrong capability is inert"
+        );
+        assert_eq!(st.pending.lock().unwrap().len(), 1, "the legitimate waiter remains parked");
+        assert!(
+            st.take_pending(41, None).is_none(),
+            "a legacy corr-only reply cannot consume the waiter"
+        );
+        assert!(
+            st.take_pending(41, Some("unguessable-request-capability")).is_some(),
+            "only the exact echoed request capability completes the request"
+        );
     }
 
     #[tokio::test]

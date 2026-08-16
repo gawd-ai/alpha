@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use crate::address::{Address, CreatureId};
+use crate::address::{Address, CreatureId, Role};
 use crate::envelope::{address_depth_error, header_size_error, Envelope, Header};
 use crate::instance::Dispatch;
 use crate::origin::Origin;
@@ -181,6 +181,12 @@ pub trait Bus: Send + Sync {
     fn may_attest(&self) -> bool {
         false
     }
+    /// Resolve one host-selected remote role to its current local creature. Defaults to `None` for
+    /// every ordinary/FFI/test bus; only the kernel's boot-granted attesting handle implements it.
+    /// This is discovery mechanism, not application authority.
+    fn remote_role_target(&self, _role: &Role) -> Option<CreatureId> {
+        None
+    }
 }
 
 /// A failure putting a dispatch on the bus. The in-process bus preserves the full router detail via
@@ -251,5 +257,12 @@ impl Bus for BusHandle {
     }
     fn may_attest(&self) -> bool {
         self.may_attest
+    }
+    fn remote_role_target(&self, role: &Role) -> Option<CreatureId> {
+        if self.may_attest {
+            self.router.remote_role_binding(role)
+        } else {
+            None
+        }
     }
 }

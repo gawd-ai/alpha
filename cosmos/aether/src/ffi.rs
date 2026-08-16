@@ -67,4 +67,6 @@ pub struct CreatureVTableV1 {
 }
 
 /// The constructor signature the host looks up: `extern "C" fn() -> *mut CreatureVTableV1`.
+/// It must never unwind across this non-unwinding ABI; the Forge-generated constructor catches a
+/// panicking `Default` internally and returns null, which the host rejects as a load failure.
 pub type NativeCtor = extern "C" fn() -> *mut CreatureVTableV1;

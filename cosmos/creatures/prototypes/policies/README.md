@@ -14,6 +14,7 @@ Each is the minimal readable reference; real deployments ship their own (`my-org
 | `policy-abode-allowlist` | `RestorePolicy` (abode-migrator) | admit an incoming Abode snapshot only when its `abode_key` is allow-listed |
 | `policy-quarantine-trust-all` | `QuarantineTrust` (immune-response) | honor *every* inbound quarantine notice — reference only, never production |
 | `policy-quarantine-trust-realm` | `QuarantineTrust` (immune-response) | honor a notice only from a peer in the per-Realm trusted set (the realistic reference) |
+| `policy-job-basic` | `function-policy` role | verify a Home-signed exact question, then choose one bounded placement/retry result and hash-bind the signed answer |
 
 The substrate ships none of these decisions — it ships the sockets. See each crate's `lib.rs` header
 and [`CONTRIBUTING.md`](../../../../CONTRIBUTING.md).

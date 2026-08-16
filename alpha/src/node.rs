@@ -12,6 +12,9 @@
 //! `--minimal` boots the bare kernel; `--headless` runs the API with no REPL. With `--features openai`,
 //! `--author-model <id>` (+ optional `--author-base-url` / `--author-api-key-file` or `--author-api-key`
 //! / `--author-timeout-secs`) binds the model-backed author per node instance — see [`crate::AuthorFlags`].
+//! `--functions <config.json>` explicitly composes the durable reference Function/Job organs and a
+//! durable Bestiary. Its config references protected operational-key files; it never accepts an
+//! Abode root private key.
 //!
 //! **Dev posture (disclosed at boot):** the dev policy admits everything. A non-clustered node's bus
 //! signer is a stub; a clustered node (`--cluster-listen`) signs with its real ed25519 node identity
@@ -29,7 +32,10 @@ use anima::{NativeEngine, ScriptEngine, WasmEngine};
 use policy_dev::DevPolicy;
 use sanctum::Kernel;
 
-use omni::{boot_control, boot_organs_with, parse_verb, run_verb, AiControl, VerbCtx, COMMANDS};
+use omni::{
+    boot_control_with_function_deployer, boot_organs_with, parse_verb, run_verb, AiControl,
+    VerbCtx, COMMANDS,
+};
 
 /// Parsed command-line options.
 struct Opts {
@@ -41,6 +47,8 @@ struct Opts {
     api_key: Option<String>,
     exec: Option<String>,
     script: Option<String>,
+    // Explicit, root-private-key-free reference Function/Job composition.
+    functions: Option<String>,
     // Clustering: present `cluster_listen` boots the transport organ + joins a mesh.
     node_id: Option<String>,
     cluster_listen: Option<String>,
@@ -60,6 +68,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         api_key: None,
         exec: None,
         script: None,
+        functions: None,
         node_id: None,
         cluster_listen: None,
         seeds: Vec::new(),
@@ -79,6 +88,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--api-key" => o.api_key = Some(args.next().ok_or("--api-key needs <key>")?),
             "--exec" => o.exec = Some(args.next().ok_or("--exec needs <verb>")?),
             "--script" => o.script = Some(args.next().ok_or("--script needs <file>")?),
+            "--functions" => {
+                o.functions = Some(args.next().ok_or("--functions needs <config.json>")?)
+            }
             "--node-id" => o.node_id = Some(args.next().ok_or("--node-id needs <id>")?),
             "--cluster-listen" => {
                 o.cluster_listen =
@@ -123,6 +135,22 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             eprintln!("alpha node: {e}");
             std::process::exit(2);
         }
+    };
+    if opts.minimal && opts.functions.is_some() {
+        eprintln!(
+            "alpha node: --minimal and --functions are mutually exclusive; the Function runtime requires the normal authoring/registry composition"
+        );
+        std::process::exit(2);
+    }
+    let function_config = match opts.functions.as_deref() {
+        Some(path) => match crate::functions::load_config(path) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!("alpha node: {error}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
     };
 
     // One identity: when this node will cluster, derive its ed25519 node key *up front* so the bus
@@ -212,6 +240,13 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 }
             }
             Err(e) => {
+                if function_config.is_some() {
+                    eprintln!(
+                        "alpha node: base organ wiring failed before the requested Function runtime could start: {e}"
+                    );
+                    kernel.shutdown_all(Deadline::default());
+                    std::process::exit(1);
+                }
                 note!("boot: organ wiring incomplete ({e}); some organs may already be loaded/bound — run `list` / `status` to see what actually came up.");
             }
         }
@@ -252,6 +287,36 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         }
     }
 
+    // Compose Functions only after transport is available. A recovering Home may immediately
+    // re-emit policy questions or exact executor queries; booting it earlier would drop remote
+    // recovery work on a clustered node before Role::TRANSPORT existed.
+    let function_runtime = match function_config {
+        Some(config) => match crate::functions::boot(&kernel, config, opts.node_id.as_deref()) {
+            Ok(runtime) => {
+                note!(
+                    "functions: opt-in reference runtime for Home {} — durable Bestiary(id={}), resolver(id={}), executor(id={}), locator(id={}), policy(id={}), home(id={}).",
+                    runtime.home,
+                    runtime.catalog.0,
+                    runtime.resolver.0,
+                    runtime.executor.0,
+                    runtime.locator.0,
+                    runtime.policy.0,
+                    runtime.home_creature.0
+                );
+                note!(
+                    "functions: Abode root private key is not loaded; callers/root service must sign requests and custody grants externally."
+                );
+                Some(runtime)
+            }
+            Err(error) => {
+                eprintln!("alpha node: Function runtime refused startup: {error}");
+                kernel.shutdown_all(Deadline::default());
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // Optionally start the daemon HTTP/WS control plane. This is two
     // creatures on the bus: the `ControlCore` translator on `Role::CONTROL`, and the loadable
     // `surface-http` creature that drives it. The REPL (this file) keeps driving `run_verb` directly
@@ -280,7 +345,13 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         // Bind the control plane so the surface has something to talk to. Bound on the
         // `--listen` path specifically, so a `--minimal --exec` run still loads nothing (and a bare
         // node that wants no remote control simply never opens a surface).
-        let control_id = match boot_control(&kernel, &ai, critter_builder, cluster_transport) {
+        let control_id = match boot_control_with_function_deployer(
+            &kernel,
+            &ai,
+            critter_builder,
+            cluster_transport,
+            function_runtime.as_ref().map(|runtime| runtime.function_deployer.clone()),
+        ) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("alpha node: could not bind the control plane: {e}");
@@ -303,11 +374,19 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
             Ok(surface_id) => {
                 note!("control: ControlCore on Role::CONTROL (id={}), surface-http (id={}) — control rides the bus.", control_id.0, surface_id.0);
                 note!("api: HTTP/WS control plane on http://{listen}  (Bearer key: {key})");
-                note!(
-                    "api: allow-ai is {} — a remote AI may{} author/load/mutate (flip with `allow-ai on|off` here).",
-                    if ai.allowed() { "ON" } else { "OFF" },
-                    if ai.allowed() { "" } else { " NOT" }
-                );
+                if opts.headless {
+                    note!(
+                        "api: allow-ai is {} — a remote AI may{} author/load/mutate (headless: configure with --allow-ai at boot; restart without it to close the gate).",
+                        if ai.allowed() { "ON" } else { "OFF" },
+                        if ai.allowed() { "" } else { " NOT" }
+                    );
+                } else {
+                    note!(
+                        "api: allow-ai is {} — a remote AI may{} author/load/mutate (flip with `allow-ai on|off` here).",
+                        if ai.allowed() { "ON" } else { "OFF" },
+                        if ai.allowed() { "" } else { " NOT" }
+                    );
+                }
             }
             Err(e) => {
                 eprintln!("alpha node: could not start the API on {listen}: {e}");
@@ -321,6 +400,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         let mut ctx =
             VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, critter_builder, &ai, false);
         ctx.transport = cluster_transport;
+        if let Some(runtime) = &function_runtime {
+            ctx.set_function_deployer(runtime.function_deployer.as_ref());
+        }
         run_line(&verbs, &mut ctx, opts.json, &mut out)?;
         kernel.shutdown_all(Deadline::default());
         return Ok(());
@@ -340,6 +422,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         let mut ctx =
             VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, critter_builder, &ai, false);
         ctx.transport = cluster_transport;
+        if let Some(runtime) = &function_runtime {
+            ctx.set_function_deployer(runtime.function_deployer.as_ref());
+        }
         for line in body.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -372,6 +457,9 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
 
     let mut ctx = VerbCtx::with_probe(&kernel, &probe_bus, &probe_rx, critter_builder, &ai, false);
     ctx.transport = cluster_transport;
+    if let Some(runtime) = &function_runtime {
+        ctx.set_function_deployer(runtime.function_deployer.as_ref());
+    }
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     loop {

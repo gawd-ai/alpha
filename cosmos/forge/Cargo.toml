@@ -12,5 +12,6 @@ description = "Creature-authoring surface. `declare_creature!` emits one extern 
 aether = { path = "../aether" }
 seer = { path = "../seer" }
 sigil = { path = "../sigil" }
+gawdfn = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

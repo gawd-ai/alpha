@@ -11,30 +11,49 @@ description = "Per-tier loaders: the Engine trait + native (libloading, extern \
 [dependencies]
 aether = { path = "../aether" }
 sigil = { path = "../sigil" }
+gawdfn = { workspace = true }
 libloading = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # Trimmed to the minimal core-wasm runtime + compiler we actually use (`Module::new` compile,
-# `Store`, fuel metering, a custom `ResourceLimiter`). Dropping wasmtime's default features removes
-# the component-model, gc, async, threads, coredump, and profiling stacks we never touch — and with
-# `profiling` goes the transitive GPL-2.0/BSD `ittapi` dep (supply-chain + license hygiene; the
-# workspace is GPL-3.0-or-later). The dev-only `wat` crate (below) compiles test modules, so
-# wasmtime's own `wat` feature isn't needed either.
-wasmtime = { version = "45.0.0", default-features = false, features = ["cranelift", "runtime"] }
-# Native-from-bytes spills to a content-addressed tempfile; the short hash makes the file
-# debuggable next to other gawd tempfiles.
+# `Store`, fuel metering, a custom `ResourceLimiter`). Dropping Wasmtime's default features disables
+# the top-level component, GC, async, threads, coredump, and profiling APIs/dependency stacks we do
+# not use. It also excludes `parallel-compilation` and its Rayon worker pool: beast module builds stay
+# serial instead of bypassing Cargo/libtest CPU limits. Keep that feature absent; `wasm.rs` both
+# spells `parallel_compilation(false)` at the config seam and guards this dependency declaration.
+# Some internal compiler crates still share component/GC/thread representation code; the concrete
+# dependency win is that profiling—and its transitive GPL-2.0/BSD `ittapi` crate—is absent
+# (supply-chain + license hygiene; the workspace is GPL-3.0-or-later). The dev-only `wat` crate
+# (below) compiles test modules, so Wasmtime's own `wat` feature is not needed either.
+# 46.0.2 is the first patched 46.x release for RUSTSEC-2026-0222
+# (GHSA-hgjw-h833-99q9). Keep the minor explicit: Wasmtime's monthly major cadence can carry
+# embedding API changes, while Cargo may still take compatible 46.x security/bugfix releases.
+wasmtime = { version = "46.0.2", default-features = false, features = ["cranelift", "runtime"] }
+# Native staging hashes the exact bytes streamed into the retained load capability.
 sha2 = { workspace = true }
-# The critter (script) tier. Pure-Rust, MIT/Apache — no C toolchain, no
-# GPL-2.0 transitive (mirrors the wasmtime trim above), clears the deny.toml allow-list unchanged.
+# The critter (script) tier uses pure-Rust Rhai (MIT/Apache), so it needs no C toolchain. Its reviewed
+# transitive graph includes the MPL-2.0/CC0 licenses and narrow smartstring advisory exception
+# documented in deny.toml, but no GPL-2.0 dependency.
 # `sync` is REQUIRED, not optional: a `ScriptInstance` is moved onto its creature's drain thread, so
 # the `Engine`/`AST`/`Scope` it holds must be `Send` — which Rhai only is under `sync` (Arc/RwLock
 # instead of Rc/RefCell). `no_time` removes Rhai's `timestamp()`/time builtins — the only ambient,
 # non-deterministic function in the standard package; dropping it makes the bare engine both IoC-pure
 # (no ambient clock) and deterministic (same source + envelope ⇒ same op count) at the dependency
 # level, not just by convention. `no_module` removes `import` support entirely, so a critter is one
-# signed, static source file. Default features stay on for `std`; we deliberately do NOT enable
-# `unchecked` — `set_max_operations` is the critter's fuel analog and must keep its teeth.
-rhai = { version = "1", features = ["sync", "no_time", "no_module"] }
+# signed, static source file. Default features stay on for `std`; `serde` is deliberately enabled only
+# for the bounded in-memory JSON bridge registered by ScriptEngine and adds no host authority.
+# `unchecked` stays off — `set_max_operations` is the critter's fuel analog and must keep its teeth.
+rhai = { version = "1", features = ["sync", "no_time", "no_module", "serde"] }
+
+# Linux/Android can make the admission→dlopen identity kernel-enforced: the staged bytes live in
+# one retained memfd sealed against write/grow/shrink before they are admitted and loaded through
+# `/proc/self/fd`. Other targets use an OS-random private tempfile fallback (with an explicitly
+# narrower same-UID tamper guarantee).
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+memfd = "0.6.5"
+
+[target.'cfg(not(any(target_os = "android", target_os = "linux")))'.dependencies]
+getrandom = "0.3"
 
 [dev-dependencies]
 wat = "1"

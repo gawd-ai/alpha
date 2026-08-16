@@ -8,6 +8,166 @@ Semantic-versioning guarantees begin at 1.0.
 For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the design notes under [`docs/design/`](docs/design/).
 
+## 0.4.4 - 2026-08-16
+
+v0.4.4 establishes **typed Functions and durable Jobs** without adding a
+fourth creature tier, a Function-specific address, or changing `Creature::handle` or any engine ABI.
+It does add the generic `Address::NodeRole` variant for explicitly exposed, node-scoped role routing;
+all pre-v0.4.4 address variants retain their existing signed encoding. The requirements are **Met**:
+the complete suite-compositional acceptance evidence is recorded in
+[`TRD-006`](docs/trd/TRD-006-typed-functions-and-durable-jobs.md).
+
+- **Shared Function/Job contract.** New `foundation/gawdfn` owns bounded v1 identities, schemas,
+  signed records, typed entrypoint contracts, deployment pins, Job/attempt/control records, delivery
+  semantics, causal lineage, Home authority/custody proofs, leases, sealed/blob references, and the
+  role names their Alpha fillings bind. `sigil::Entrypoint` appends an optional structured contract;
+  omission preserves the v0.4.3 manifest signing bytes. The contract has eight signed application
+  domains: seven top-level Function message schemas plus the nested
+  `gawd.function.custody.rewrap.v1` KMS request/receipt domain.
+- **Two proof-bearing ledgers.** `function-home` durably owns Job identity, acceptance, causal graph,
+  commands, and verified foreign observations; `function-executor` durably owns deployment
+  registration, attempt claim/dedup, progress, controls, and terminal execution facts. Callers choose
+  at-most-once or bounded at-least-once; neither is mislabeled exactly-once. Same-Sanctum recovery
+  sends the exact durable grant to the current executor role instead of a stale process-local id,
+  while the typed call binds that current route to the stable executor key, grant, deployment, and
+  target with a signed dispatch proof. Progress/checkpoint retention is capped at 256 observations per
+  Attempt and unique controls at 256 per Job/Home and Attempt/executor, with exact dedup and terminal/
+  acknowledgement capacity preserved at saturation.
+- **Fail-closed, bounded recovery.** Home and executor recovery capture finite durable high-water
+  sweeps, emit at most 64 work dispatches per batch, and continue only through exact local
+  self-addressed pokes; remote origin cannot exploit a reused numeric creature id. Executor reopen
+  may advance a `Claimed`-only attempt to its first `Started`/call, but an already-`Started` attempt
+  becomes an honest delivery-mode-specific ambiguity terminal even when controls were queued. Those
+  commands are never forwarded to a new target incarnation and remain bounded audit evidence with
+  reserved capacity for a genuine late acknowledgement. Durable receipts replay in sequence order.
+  Home/executor journals maintain recovered dynamic reservations for terminal and control-ack facts,
+  while the custody journal reserves every mandatory fence/install transition. Frozen Homes refuse
+  Job duplicate/read/recovery/checkpoint paths while retaining proof-bearing custody reconciliation;
+  uncertain Homes also refuse stale-prefix handoff, and an uncertain locator returns bounded
+  unavailability instead of cached authority.
+- **Fenced Home custody.** Source `Prepared`, destination `Staged`, activation, status, and locator
+  facts are application-signed and hash-linked. The source fsyncs its irreversible freeze before a
+  destination can activate; the same destination creature becomes the stable active Home endpoint.
+  Genesis and moved Homes durably advance a monotone same-epoch route sequence. Signed queries persist
+  that route at executors so later target and restart receipts follow the current Home without
+  weakening the older attempt grant. A newer route is never treated as current unless that fence
+  appends durably: an exhausted journal returns `Capacity`, retains its terminal/ack facts, and can be
+  reopened with a larger finite cap before the current Home pulls them. Reopen also refuses an
+  operator cap reduction that would discard recovered terminal/control-ack or custody-phase safety
+  reservations.
+  The Abode root private key never enters a checkpoint or node runtime: root-signed grants delegate
+  narrowly scoped epoch keys, while application sealing keys remain a separate plane. An optional
+  root-declared custody rewrap binds distinct source/destination recipient identities, a bounded
+  source-frozen inventory, the destination epoch's exact request, and complete proof-key-signed KMS
+  coverage into Staged before activation. The injected adapter retains all private encryption/proof
+  keys; missing, mismatched, incomplete, or forged proof fails closed. Legacy grants omit the fields
+  byte-for-byte and do not imply destination decryption authority. Proof-of-trust evidence is policy
+  input and never grants authority merely by being present.
+- **Injected fillings, not fixed orchestration.** `function-resolver`, `function-locator`,
+  `job-blob-fs`, and the reference `policy-job-basic` fill the catalog/location/storage/placement and
+  retry seams. Scheduling, alternate placement, trust, retention, workflow joins, compensation, and
+  migration choice remain replaceable creatures or adapters an AI can author.
+- **Explicit deployment and coherent surfaces.** Omni, REPL, MCP, and HTTP add bounded
+  resolve/deploy/undeploy/deployments and submit/get/events/control operations. Explicit retirement first
+  confirms the executor's durable tombstone through a stable executor-signed acknowledgement bound
+  to the current authenticated role responder, then unloads only an exact live manifest plus
+  independently measured artifact identity; refusal or ambiguity retains the target, stale numeric
+  ids are untouched, and bounded teardown failure is reported as a safe orphan rather than a false
+  success. Every path load now becomes one representation before admission: beast/critter paths are
+  bounded bytes, while native path and byte loads share a retained stage. Linux/Android native stages
+  are sealed memfds re-hashed after sealing and loaded through process-unique `/proc/self/fd`
+  spellings; other platforms use OS-random private/read-only fallbacks with no same-UID immutability
+  claim. This closes source/hash/load reopen races and loader-cache aliasing while preserving O(1)
+  memory for uncapped local native paths. The compatibility tradeoff is explicit: ELF `$ORIGIN`
+  becomes the descriptor pseudo-directory or fallback stage, so adjacent private dependencies must
+  be linked in or available through another reviewed loader path. The public, pre-1.0 `Artifact`
+  enum gains the internal-transport `StagedNative` variant; downstream exhaustive matches must
+  handle it (the `Engine` method signature and creature ABI do not change). The Forge-generated
+  native constructor catches a panicking `Default` inside the guest and returns the ABI's null
+  failure result, so construction faults cannot abort while crossing non-unwinding `extern "C"`.
+  HTTP/MCP control replies
+  are bound to a one-use 256-bit request capability echoed through
+  the existing `commitment` slot, so a creature that guesses a live `corr` cannot win a forged-reply
+  race. Submit returns only after durable acceptance and never occupies the control worker until
+  completion. Private `get` / `events` nest a caller-signed handle/nonce in a trusted-relay signature
+  over the exact return route; the Home checks the live route and signs its response over that complete
+  relay hash, and Omni verifies both layers without duplicating a near-limit snapshot/page into the
+  bounded control result. Job-control acceptance likewise binds the complete signed command hash to
+  its exact Home-signed durable event. The persistent worker's internal correlations are monotone
+  across queued verbs and fail closed at exhaustion, preventing a timed-out reply from satisfying a
+  later operation. Deployment liveness compares
+  the exact loaded manifest content address and artifact hash, so a stale process-local CreatureId
+  cannot call a different creature after restart.
+- **Typed critter Functions.** The Rhai tier adds pure `json_parse` / `json_stringify` helpers with
+  structural, byte, depth, and node ceilings registered identically at the author gate and runtime;
+  they add no I/O, clock, random, or key authority. The reference `typed-add-one` source is loaded by
+  the real `ScriptEngine` in the composed Job proof, preserves the executor-issued AttemptId in its
+  `FunctionResultV1`, and remains protected by the same durable grant dedup across restart.
+- **Engine supply-chain refresh.** The beast tier moves to Wasmtime 46.0.2, the first 46.x release
+  patched for RUSTSEC-2026-0222. `cargo deny --all-features check` remains the release gate. Its one
+  narrow advisory exception is RUSTSEC-2026-0249: Rhai's non-optional `smartstring` backing crate is
+  unmaintained but has no reported vulnerability or unsoundness; replacing it requires an upstream
+  Rhai migration or a maintained fork, so every other vulnerability/unmaintained/unsound advisory
+  still fails closed.
+- **Resource-courteous build defaults.** Development and test profiles retain line tables for useful
+  backtraces while disabling full debug/incremental artifact graphs and limiting code generation to
+  one unit. Workspace Cargo config defaults to one build job and one test thread. The heavyweight
+  gate runs once only in CI: every heavyweight command and its child tree is pinned to one allowed
+  CPU; superseded runs cancel; timeouts are finite; incremental output and clean-runner debug
+  sections are disabled; `target/` is never cached; and rendered rustdoc output is removed after its
+  gate without discarding compiled dependencies. Wasmtime's optional `parallel-compilation`/Rayon
+  pool is excluded and guarded before compilation, while the engine's compatibility seam disables
+  it if dependency feature unification ever makes the setter available. This keeps the
+  Wasmtime-heavy matrix from monopolizing contributor CPUs or accumulating hundreds of GiB across
+  repeated builds.
+
+  The live `build-cargo` organ independently defaults its standalone authored workspace to one
+  Cargo job/one codegen unit/no incremental graph (with explicit operator overrides), and all
+  authoring demos/tests reuse one canonical `target/gawd-build-cache` rather than compiling four
+  duplicate SDK caches. That generated cache—including an isolated authored `.cargo-home` for
+  registry downloads/sources—has a finite 4 GiB default checked before, during, and after Cargo;
+  unsafe/unaccountable trees fail as `Capacity` with exact cleanup guidance. A retained cache lock
+  serializes the full authored-build interval across local Alpha processes; bounded, non-busy lock
+  contention consumes the same build timeout. On Unix, timeout, accounting, or wait failure kills
+  the private Cargo process group and reaps its leader, and every ordinary success or compiler
+  failure also sweeps residual group members before cache accounting or artifact acceptance.
+  OS-random build identities prevent stale Cargo fingerprints after PID reuse, and cleanup refuses
+  symlinked or special cache shapes instead of following them.
+- **Resource-bounded live organs and runbooks.** TCP admits at most 64 aggregate unauthenticated
+  inbound handshakes per transport instance, gives each candidate socket a five-second timeout, and
+  closes excess sockets before creating a worker thread. The durable Bestiary defaults to 1,024
+  live-plus-tombstone keys and physical blob files, 4 GiB aggregate blobs, 256 MiB aggregate JSONL,
+  and 128 MiB per artifact; strict recovery accounts orphans, and uncertain append/compaction latches
+  the store unhealthy until recovery. The opt-in Function composition compacts only a dirty local
+  catalogue, at most hourly, with replication still disabled. Cluster boot/teardown serialize PID
+  lifecycle under `flock`, bind records to Linux boot id plus process start time, roll back partial
+  boots, and use bounded TERM-then-KILL waits. The ASan lane uses a private per-run target with
+  marker-validated exact cleanup rather than polluting the ordinary workspace graph.
+- **Bounded checkpoint construction.** Home checkpoint creation borrows the verified journal prefix
+  and incrementally writes the canonical archive into a cap-aware buffer. It no longer clones the
+  complete chain or materializes one archive-sized JSON value before enforcing the 64 MiB default;
+  reopening the Home and custody journals likewise replays borrowed records.
+- **Opt-in reference composition.** `alpha node --functions <config.json>` binds a durable Bestiary
+  plus the Function roles using public authority proofs and protected, explicitly pinned operational
+  key-file references. Ordinary Alpha and `omega serve` leave the sockets unbound. The composition
+  refuses root-key reuse, signer mismatch, weak key/state permissions, corrupt recovery, and node
+  identity mismatch rather than inventing trust defaults. It canonicalizes the private state tree and
+  holds a nonblocking exclusive lock for the runtime lifetime; this prevents local concurrent writers,
+  not cloned-directory or distributed equivocation.
+- **Real two-Realm process acceptance.** Two child PIDs communicate over boot-attested TCP/Omega. B
+  loads the signed checked-in `typed-add-one` artifact through `Kernel::load`, independently measures
+  its bytes, durably registers it, and hard-restarts with a changed executor id reached through the
+  explicitly exposed `NodeRole`. A separate blocking daemon parent emits authenticated progress and
+  returns the exact cross-Realm Steer outcome `TooLate`; its progress anchors a deduplicated typed
+  critter causal child. Signed Stage/Activate migration carries the lease, whose coordinator is parsed
+  into the moved-Home route; this process path deliberately uses the legacy no-rewrap branch, while the
+  in-process custody suite proves the optional root-declared KMS chain. Real GX frames transfer
+  checkpoint/dependency bytes; one drop and
+  one corruption yield the exact in-memory gap set retried before CAS commit. A hard restart of both
+  sides recovers byte-identical progress, Steer, child, and terminal proofs without another invocation.
+  Dedicated suites complete R3 undeploy and R8 unacknowledged-control recovery. The bounded claim is
+  explicit: hard cuts occur at durable protocol boundaries, not inside an unfinished GX transfer.
+
 ## 0.4.3 - 2026-06-17
 
 The **convergence release**: no new features — make the current surface genuinely *work and make

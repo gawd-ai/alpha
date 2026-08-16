@@ -197,6 +197,13 @@ struct Loaded {
     name: String,
     /// Surfaced by [`Kernel::roster`].
     backend: Backend,
+    /// Immutable manifest identity retained for model-free deployment liveness checks.
+    manifest_content_address: Option<String>,
+    /// Artifact-byte pin declared by the admitted manifest.
+    artifact_build_hash: Option<String>,
+    /// SHA-256 recomputed from the artifact bytes actually passed to [`Kernel::load`]. `None` for
+    /// in-process boot creatures because they have no artifact boundary.
+    artifact_sha256: Option<String>,
     drain: JoinHandle<()>,
     deadline_ms: Arc<AtomicU64>,
     /// Sent once by the drain thread as the last thing it does (after the safe-unload drop sequence).
@@ -207,6 +214,22 @@ struct Loaded {
     /// here (not on the drain thread that owns the instance) so [`Kernel::extend_budget`] can lift a
     /// budget on a `KernelControl::ExtendBudget` grant without reaching across the thread boundary.
     budget: Option<BudgetControl>,
+}
+
+/// Model-free identity of one currently routable creature.
+///
+/// This exposes only immutable admission facts needed to compare a durable deployment pin with the
+/// process-local `CreatureId` that currently occupies it. Trust and placement decisions remain in
+/// injected creatures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedManifestIdentity {
+    pub creature: CreatureId,
+    pub manifest_content_address: Option<String>,
+    /// Author-declared `Manifest.provenance.build_hash`.
+    pub artifact_build_hash: Option<String>,
+    /// Hash of the bytes actually admitted and loaded, independent of admission policy. Function
+    /// deployment liveness must use this fact rather than trusting the manifest declaration.
+    pub artifact_sha256: Option<String>,
 }
 
 pub struct Kernel {
@@ -359,7 +382,11 @@ impl Kernel {
     /// `artifact` is `None` on `load_instance` (in-process boot creature — no bytes to hash) and
     /// `Some(&art)` on `load`. The mechanism never decides on the evidence; it just gathers and
     /// hands it to the policy. The policy decides what counts as enough.
-    fn admit(&self, manifest: &Manifest, artifact: Option<&Artifact>) -> Result<(), KernelError> {
+    fn admit(
+        &self,
+        manifest: &Manifest,
+        artifact: Option<&Artifact>,
+    ) -> Result<Option<String>, KernelError> {
         manifest.validate()?;
         let sig = manifest.provenance.signature.clone();
         let signature_present = sig.is_some();
@@ -372,24 +399,26 @@ impl Kernel {
         // **Artifact integrity gate.** Hash the actual bytes (file or in-memory) and compare to
         // the manifest's declared `provenance.build_hash`. A bit-flip anywhere in flight produces
         // a mismatch; the policy then rejects. We do this BEFORE engine `load` — the artifact
-        // bytes never reach `dlopen` if the hash doesn't match. The hash STREAMS a path-backed
-        // artifact (O(1) memory) rather than reading it whole, so the integrity gate neither
-        // materializes an attacker-sized file nor refuses a large-but-legit native `.so` that
-        // `anima::MAX_ARTIFACT_BYTES` would bound on a byte-materializing load.
+        // bytes never reach `dlopen` if the hash doesn't match. For native sources `Kernel::load`
+        // has already streamed the one opened source descriptor into a retained stage (sealed
+        // memfd on Linux/Android, random/read-only without a same-UID claim elsewhere);
+        // this reads that stage's construction hash, and NativeEngine later dlopens the same stage.
+        // The path source remains O(1) memory and uncapped while byte-materializing tiers retain
+        // `anima::MAX_ARTIFACT_BYTES`.
         let artifact_hash_declared = manifest.provenance.build_hash.is_some();
-        let artifact_hash_matches = match (artifact, &manifest.provenance.build_hash) {
-            (Some(art), Some(expected)) => match art.sha256_hex() {
-                Ok(actual) => Some(&actual == expected),
-                // Read failure surfaces as a structural admission failure ("can't compute the
-                // hash → can't admit"), not as "policy decided." The policy never sees half-truths.
-                Err(e) => {
-                    return Err(KernelError::AdmissionRejected(format!(
-                        "artifact unreadable for integrity check: {e}"
-                    )))
-                }
-            },
-            _ => None,
-        };
+        let actual_artifact_hash = artifact
+            .map(|artifact| {
+                artifact.sha256_hex().map_err(|error| {
+                    KernelError::AdmissionRejected(format!(
+                        "artifact unreadable for integrity check: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        let artifact_hash_matches = actual_artifact_hash
+            .as_ref()
+            .zip(manifest.provenance.build_hash.as_ref())
+            .map(|(actual, expected)| actual == expected);
         let evidence = Admission {
             signature_present,
             signature_valid,
@@ -399,20 +428,30 @@ impl Kernel {
             artifact_hash_matches,
             had_artifact: artifact.is_some(),
         };
-        self.policy.admit(manifest, &evidence).map_err(KernelError::AdmissionRejected)
+        self.policy.admit(manifest, &evidence).map_err(KernelError::AdmissionRejected)?;
+        Ok(actual_artifact_hash)
     }
 
     /// Load a creature from an artifact through its tier engine — the dynamic path (native `.so` /
     /// wasm). One path for both tiers, differing only by `abi.backend` (**R1**, **R3**).
     pub fn load(&self, manifest: Manifest, artifact: Artifact) -> Result<CreatureId, KernelError> {
-        self.admit(&manifest, Some(&artifact))?;
         let engine = self
             .engines
             .get(&manifest.abi.backend)
             .ok_or(KernelError::NoEngine(manifest.abi.backend))?
             .clone();
+        // Resolve the mechanism before touching artifact bytes. A Sanctum without this tier must
+        // report `NoEngine` deterministically even when the supplied path is not locally readable;
+        // admission and byte hashing still happen before the selected engine sees the artifact.
+        // Validate before staging so a structurally invalid manifest cannot make us copy a large
+        // native source. Preparation then produces one representation shared by admission and the
+        // engine: native streams into a retained sealed/best-effort stage; beast/critter paths are
+        // opened once into bounded bytes.
+        manifest.validate()?;
+        let artifact = artifact.prepare_for_load(&manifest)?;
+        let artifact_sha256 = self.admit(&manifest, Some(&artifact))?;
         let loaded = engine.load(&artifact, &manifest)?;
-        Ok(self.install(manifest, loaded, false))
+        Ok(self.install(manifest, loaded, false, artifact_sha256))
     }
 
     /// Install an already-constructed **in-process** creature (a boot creature: the transport
@@ -424,7 +463,7 @@ impl Kernel {
         instance: Box<dyn Creature>,
     ) -> Result<CreatureId, KernelError> {
         self.admit(&manifest, None)?;
-        Ok(self.install(manifest, LoadedModule::new(instance, Box::new(())), false))
+        Ok(self.install(manifest, LoadedModule::new(instance, Box::new(())), false, None))
     }
 
     /// Like [`load_instance`](Kernel::load_instance), but grants this creature the **boot-only
@@ -438,7 +477,7 @@ impl Kernel {
         instance: Box<dyn Creature>,
     ) -> Result<CreatureId, KernelError> {
         self.admit(&manifest, None)?;
-        Ok(self.install(manifest, LoadedModule::new(instance, Box::new(())), true))
+        Ok(self.install(manifest, LoadedModule::new(instance, Box::new(())), true, None))
     }
 
     /// Record this node's bus-signing public key — its ed25519 node identity, the same key the
@@ -455,7 +494,13 @@ impl Kernel {
     /// `BusHandle` (see [`BusHandle::new_attesting`]). It is `true` only for the transport, loaded
     /// through [`load_transport_instance`](Kernel::load_transport_instance) — never for a dynamic
     /// artifact — so a loaded creature can never seal a cross-node origin.
-    fn install(&self, manifest: Manifest, mut loaded: LoadedModule, attesting: bool) -> CreatureId {
+    fn install(
+        &self,
+        manifest: Manifest,
+        mut loaded: LoadedModule,
+        attesting: bool,
+        artifact_sha256: Option<String>,
+    ) -> CreatureId {
         // Lift the live fuel-ceiling control out BEFORE the LoadedModule moves into the
         // drain thread — the kernel keeps it (keyed by CreatureId) so a later ExtendBudget reaches the
         // creature; the drain only needs instance + resources for unload.
@@ -482,6 +527,9 @@ impl Kernel {
             Loaded {
                 name: manifest.name,
                 backend: manifest.abi.backend,
+                manifest_content_address: manifest.content_address,
+                artifact_build_hash: manifest.provenance.build_hash,
+                artifact_sha256,
                 drain,
                 deadline_ms,
                 done_signal,
@@ -605,6 +653,14 @@ impl Kernel {
         self.router.bind_role(role, id);
     }
 
+    /// Bind a local IoC socket and explicitly expose that exact binding to authenticated remote
+    /// [`Address::NodeRole`] delivery. Ordinary [`bind_role`](Self::bind_role)
+    /// remains local-only and overwrites any prior exposure, so remote reachability is opt-in at the
+    /// trusted composition root rather than a manifest capability a creature can self-assert.
+    pub fn bind_remote_role(&self, role: Role, id: CreatureId) {
+        self.router.bind_remote_role(role, id);
+    }
+
     /// The creature currently bound to `role`, if any. A composition root uses this to check that a
     /// recommended baseline (e.g. an `IMMUNE_RESPONSE` reacting to `OriginVerdict::BadSig`) is present
     /// — see ADR-0041's clustered-boot posture warning.
@@ -633,6 +689,23 @@ impl Kernel {
     /// Whether a creature is currently routable.
     pub fn is_loaded(&self, id: CreatureId) -> bool {
         self.router.is_registered(id)
+    }
+
+    /// Return the immutable manifest/artifact identity currently occupying an exact local id.
+    ///
+    /// `None` means the target is absent (or has already self-deregistered after a fault). Callers
+    /// must compare both pins they rely on; numeric `CreatureId`s are process-local and may be reused
+    /// after restart.
+    pub fn loaded_manifest_identity(&self, id: CreatureId) -> Option<LoadedManifestIdentity> {
+        if !self.router.is_registered(id) {
+            return None;
+        }
+        mlock(&self.loaded).get(&id).map(|loaded| LoadedManifestIdentity {
+            creature: id,
+            manifest_content_address: loaded.manifest_content_address.clone(),
+            artifact_build_hash: loaded.artifact_build_hash.clone(),
+            artifact_sha256: loaded.artifact_sha256.clone(),
+        })
     }
 
     /// How many creatures the kernel still has installed (including ghost entries from
@@ -1186,10 +1259,62 @@ mod tests {
     }
 
     #[test]
+    fn composition_explicitly_selects_remote_role_exposure() {
+        struct Noop;
+        impl Creature for Noop {
+            fn bind(&mut self, _ctx: CreatureCtx) {}
+            fn handle(&mut self, _env: Envelope) -> Outcome {
+                Outcome::none()
+            }
+        }
+
+        let kernel = kernel(Arc::new(AllowAll));
+        let id = kernel
+            .load_instance(
+                Manifest::new("remote-role", "0.1.0", Backend::Daemon, "gawd_creature_v1"),
+                Box::new(Noop),
+            )
+            .unwrap();
+        let role = Role::new("executor");
+
+        kernel.bind_role(role.clone(), id);
+        assert_eq!(kernel.router().remote_role_binding(&role), None);
+        kernel.bind_remote_role(role.clone(), id);
+        assert_eq!(kernel.router().remote_role_binding(&role), Some(id));
+        kernel.bind_role(role.clone(), id);
+        assert_eq!(
+            kernel.router().remote_role_binding(&role),
+            None,
+            "ordinary rebind returns the socket to local-only"
+        );
+
+        kernel.unload(id, Deadline::default()).unwrap();
+        assert_eq!(kernel.router().remote_role_binding(&role), None);
+    }
+
+    #[test]
     fn admission_policy_can_reject_a_load() {
         let k = kernel(Arc::new(DenyAll));
         let (m, a) = beast();
         assert!(matches!(k.load(m, a), Err(KernelError::AdmissionRejected(_))));
+    }
+
+    #[test]
+    fn loaded_identity_retains_actual_artifact_hash_under_permissive_admission() {
+        let k = kernel(Arc::new(AllowAll));
+        let (mut manifest, artifact) = beast();
+        let actual = artifact.sha256_hex().expect("fixture artifact hashes");
+        let declared = "0".repeat(64);
+        assert_ne!(actual, declared);
+        manifest.provenance.build_hash = Some(declared.clone());
+
+        let id =
+            k.load(manifest, artifact).expect("permissive policy admits mismatched declaration");
+        let identity = k.loaded_manifest_identity(id).expect("loaded identity exists");
+        assert_eq!(identity.artifact_build_hash.as_deref(), Some(declared.as_str()));
+        assert_eq!(identity.artifact_sha256.as_deref(), Some(actual.as_str()));
+
+        k.shutdown_all(Deadline::default());
     }
 
     #[test]

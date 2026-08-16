@@ -20,10 +20,10 @@
 //!   `loop_e_sandbox_seam_is_invoked_when_operator_opts_in`.
 //!
 //! ## Wall-clock honesty
-//! Cargo invocations dominate. The first build in a fresh `target/m3-build-cargo-cache/` compiles
+//! Cargo invocations dominate. The first build in a fresh `target/gawd-build-cache/` compiles
 //! forge + aether + sigil + sha2 + serde_json + serde + libloading + ring + thiserror —
 //! 30–60s cold. Subsequent builds reuse those artifacts and finish in <5s. The tests run safely
-//! in the default `cargo test` parallel mode: each test gets its own `LoopWorld` (kernel + agent +
+//! under the repository's serial test default: each test gets its own `LoopWorld` (kernel + agent +
 //! build creature), and `BuildCargo` materializes a process-unique `work_dir` per invocation so
 //! two parallel builds for the same `crate_name` (multiple tests build `reverse-daemon`) can't
 //! collide and fingerprint-poison each other. They share a single cargo target dir so
@@ -69,13 +69,11 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Single shared cargo target directory across every authoring-loop test in this process. Lives under the
-/// workspace's `target/` so it's already gitignored, and survives across runs (the second test of
-/// any given crate name resolves dependencies from a warm cache). **Separate from the workspace's
-/// own `target/`** so neither `cargo test` itself nor a build-cargo invocation collides on the
-/// cargo lockfile.
+/// Canonical Cargo target directory shared by every authoring test/demo. It is separate from the
+/// workspace's own `target/debug` graph, while process-unique authored crate names and serial
+/// repository defaults make cross-harness reuse collision-safe.
 fn shared_build_cache() -> PathBuf {
-    workspace_root().join("target").join("m3-build-cargo-cache")
+    workspace_root().join("target").join("gawd-build-cache")
 }
 
 /// The world for an authoring loop: kernel, agent endpoint id, build endpoint id, and the Abode signing
@@ -461,8 +459,8 @@ fn loop_d_inadmissible_manifest_rejected_at_load_with_structured_reason() {
     // ---- (i) the validation-mechanism level: duplicate entrypoint names ----
     let mut tampered = Manifest::new("rogue", "0.1.0", Backend::Daemon, "gawd_creature_v1");
     tampered.entrypoints = vec![
-        Entrypoint { name: "handle".into(), signature: "(Envelope) -> Outcome".into() },
-        Entrypoint { name: "handle".into(), signature: "(Envelope) -> Outcome".into() },
+        Entrypoint::new("handle", "(Envelope) -> Outcome"),
+        Entrypoint::new("handle", "(Envelope) -> Outcome"),
     ];
     let err = tampered.validate().unwrap_err();
     match err {

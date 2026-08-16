@@ -1,0 +1,19 @@
+[package]
+name = "function-resolver"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Exact Bestiary-backed function alias resolver with immutable FunctionId pinning and ambiguity refusal."
+
+[dependencies]
+aether = { path = "../../aether" }
+bestiary = { path = "../../bestiary" }
+gawdfn = { path = "../../../foundation/gawdfn" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+sigil = { path = "../../sigil" }

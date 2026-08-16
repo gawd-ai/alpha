@@ -27,8 +27,10 @@ members = [
     # ---- shared GAWD foundations: cross-system contracts/tools Alpha CONSUMES but does not own,
     #      destined to externalize into their own repos. They sit BESIDE the cosmology (alpha + cosmos),
     #      not within it, because they are not part of it — `gawd`-prefixed per the naming rule
-    #      (a name "stable across GAWD systems"). gawdxfer is the GX bulk-transfer contract sctl shares. ----
+    #      (a name "stable across GAWD systems"). gawdxfer is the GX bulk-transfer contract sctl shares;
+    #      gawdfn is the typed function + durable-job wire contract shared across GAWD systems. ----
     "foundation/gawdxfer",
+    "foundation/gawdfn",
 
     # ---- the cosmology between the α and Ω poles — their common library — lives under cosmos/ ----
 
@@ -80,6 +82,11 @@ members = [
     "cosmos/creatures/abode-migrator",
     "cosmos/creatures/abode-reconciler",
     "cosmos/creatures/verifiable-die",
+    "cosmos/creatures/function-home",
+    "cosmos/creatures/function-executor",
+    "cosmos/creatures/function-locator",
+    "cosmos/creatures/function-resolver",
+    "cosmos/creatures/job-blob-fs",
 
     # ---- prototypes: operator-replaceable injected models (policies, scorers, weighers, …) — the
     #      reference strategy fillings for the IoC sockets. Nested under
@@ -95,6 +102,7 @@ members = [
     "cosmos/creatures/prototypes/policies/policy-quarantine-trust-all",
     "cosmos/creatures/prototypes/policies/policy-quarantine-trust-realm",
     "cosmos/creatures/prototypes/policies/policy-origin",
+    "cosmos/creatures/prototypes/policies/policy-job-basic",
     "cosmos/creatures/prototypes/scorers/scorer-success-rate",
     "cosmos/creatures/prototypes/scorers/scorer-latency",
     "cosmos/creatures/prototypes/scorers/scorer-roundrobin",
@@ -130,7 +138,7 @@ members = [
     "cosmos/creatures/prototypes/fixtures/welbehaved-thread-daemon",
 ]
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 authors = ["Alex Grenier <alex@gawd.ai>"]
 license = "GPL-3.0-or-later"
@@ -139,7 +147,7 @@ repository = "https://github.com/gawd-ai/alpha"
 # Source-only workspace: every member sets `publish.workspace = true`, so nothing is
 # published to crates.io. Distribution is clone-and-build; on Alpha the distributable
 # unit is the creature (a signed gawd_creature_v1 artifact), fetched by content address
-# over the bus (the registry role; a durable Bestiary is on the roadmap).
+# over the bus (the registry role; `bestiary-daemon` is the durable reference filling).
 publish = false
 
 # WORKSPACE INVARIANT: no member may set a custom `#[global_allocator]`.
@@ -156,14 +164,34 @@ thiserror = "2"
 libloading = "0.8"
 ring = "0.17"
 sha2 = "0.10"
+gawdfn = { path = "foundation/gawdfn" }
 # wasmtime is a direct dependency of anima (the beast tier), not hoisted here.
 # ctrlc backs the `alpha` binary's clean SIGINT/SIGTERM shutdown only — it never enters a library
 # crate (the kernel spine stays dependency-light and signal-agnostic; time/signals are operator concerns).
 ctrlc = "3"
 
+[profile.dev]
+# Alpha's many integration binaries statically link large engine dependencies. Full debug info plus
+# incremental object graphs can grow `target/` by hundreds of GiB across repeated agent/test runs.
+# Line tables retain useful backtraces while keeping local builds materially smaller; one codegen
+# unit prevents a single rustc from bypassing Cargo's one-job CPU boundary with parallel LLVM work.
+debug = "line-tables-only"
+incremental = false
+codegen-units = 1
+
+[profile.test]
+# Tests need line-numbered failures, not full local-variable DWARF. Keep the same bounded posture as
+# development builds so `cargo test` cannot silently reintroduce the large incremental/debug graph.
+debug = "line-tables-only"
+incremental = false
+codegen-units = 1
+
 [profile.release]
 # Smaller shipped binaries (alpha / the demos). Symbol stripping is purely a size win.
 strip = true
+# Authored-creature tests invoke nested release builds. Keep those compiles within the same
+# one-rustc CPU posture; a single unit also gives the optimizer the whole crate at once.
+codegen-units = 1
 # DO NOT set `panic = "abort"`. The fabric-integrity floor (R9) relies on `std::panic::catch_unwind`
 # at every creature boundary — the drain loop (sanctum::run_drain) and the native FFI glue
 # (forge::glue) catch a panicking creature and route it to unload instead of crashing the node.

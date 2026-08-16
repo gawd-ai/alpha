@@ -80,6 +80,22 @@ alpha> cluster
 A lone `alpha node` already authors and runs creatures by itself; `omega` is what turns separate nodes
 into one fabric. With a single Realm the gateway is just a mesh anchor — it earns its keep in rung 3.
 
+Typed Functions and durable Jobs are an explicit composition because a node cannot guess an Abode
+root, operational keys, trust policy, or durable custody directory. Start the bounded reference
+fillings with `alpha node --functions /secure/alpha/function-runtime.json`; the file references
+separate protected operational-key files and contains only public proof material: the root-signed
+Home authority plus exact operational-identity pins. The Abode root private key is never accepted by
+this boot path. Ordinary `alpha node` and `omega serve` leave the Function sockets unbound. See
+[`docs/design/functions-and-jobs.md`](docs/design/functions-and-jobs.md#normal-boot-posture-and-the-reference-opt-in).
+The runtime canonicalizes and exclusively locks that state tree for its process lifetime before
+opening seeds or stores. TRD-006 is Met for v0.4.4 through a suite-compositional proof: the in-process
+custody suite proves the optional root-declared KMS rewrap chain, while the real two-process harness
+uses boot-attested TCP/Omega, explicit signed deployment of the checked-in typed critter, changed-id
+remote executor recovery through `NodeRole`, blocking-parent progress and Steer, typed causal-child
+execution, fenced Home migration on the legacy no-rewrap branch, faulted GX gap retry, dual hard
+restart, and terminal recovery. It deliberately does not claim crash-resume inside an unfinished GX
+transfer; hard cuts occur at durable protocol boundaries.
+
 ### 3. Mesh more omegas across Realms
 
 A **Realm** is one mesh of nodes. To federate *across* Realms — across servers, sites, organizations —
@@ -122,19 +138,23 @@ REST proxy: each tool call becomes a `Verb` envelope on `Role::CONTROL`. Registe
 ```json
 { "mcpServers": { "alpha": {
     "command": "/abs/path/to/target/release/alpha",
-    "args": ["mcp"] } } }
+    "args": ["mcp", "--allow-ai"] } } }
 ```
 
-That spawns a self-contained hub. To instead drive a node already running on a mesh, point the hub at a
-peer's control creature and seed it onto the mesh:
+That spawns a self-contained, **headless** hub with mutating tools enabled at boot. Omit `--allow-ai`
+for a read-only session; there is no REPL inside the MCP process and no MCP tool that can change its
+gate later. To instead drive a node already running on a mesh, point the hub at a peer's control
+creature and give the hub its own mesh identity, listener, and seed:
 
 ```sh
-alpha mcp --node-id hub --target op@<control-id> --seed op@127.0.0.1:9302#<op-pub>
+alpha mcp --node-id hub --listen 127.0.0.1:9190 \
+    --target op@<control-id> --seed op@127.0.0.1:9302#<op-pub>
 ```
 
 Tools: `alpha_author`, `alpha_author_critter`, `alpha_send`, `alpha_cluster`, `alpha_status`,
-`alpha_list`, `alpha_registry_*`, and the rest of the REPL surface. An AI's *mutating* tools stay
-blocked until a human opens the allow-AI gate (rung 5).
+`alpha_list`, `alpha_registry_*`, and the rest of the REPL surface. In remote mode the **target node**
+owns the allow-AI gate: grant it at that node's REPL, or boot a headless target with `--allow-ai`.
+Passing `--allow-ai` to the remote hub does not change the target's gate.
 
 ### 5. Drive it over HTTP
 
@@ -142,7 +162,8 @@ Any node can expose an authenticated HTTP-REST + WebSocket control plane — the
 surface, for web clients and scripts. (`omega serve` takes the same `--listen` / `--api-key`.)
 
 ```sh
-alpha node --listen 127.0.0.1:7777 --api-key secret    # add --headless for API-only, no REPL
+alpha node --listen 127.0.0.1:7777 --api-key secret
+# For API-only mutation, add both --headless and --allow-ai (there is then no REPL).
 
 curl -s localhost:7777/api/health                                          # public liveness
 curl -s -H "Authorization: Bearer secret" localhost:7777/api/cluster       # the mesh graph
@@ -153,9 +174,11 @@ curl -s -H "Authorization: Bearer secret" -X POST localhost:7777/api/send \
 ```
 
 `GET /api/health` is public; everything else needs the Bearer key. A remote caller's **mutating** verbs
-(author, send, cluster connect) stay blocked by the **allow-AI gate** — off by default — until a human
-flips `allow-ai on` at the REPL; the AI's activity shows on the sense-tape, so you can `allow-ai off` to
-revoke mid-flight. The REPL is the local human seat and is never gated.
+(author, send, cluster connect) stay blocked by the **allow-AI gate** — off by default. On an
+interactive `alpha node`, a human flips `allow-ai on|off` at the REPL and watches the AI on the
+sense-tape. A headless `alpha http`, `alpha node --headless`, or `omega serve` has no REPL: enable
+mutation explicitly with `--allow-ai` at boot, and restart without it to close the gate. The remote
+surface itself can never grant permission.
 
 ## Creatures — the unit of work
 
@@ -245,14 +268,15 @@ The root holds the two poles — the **α** door (`alpha/`) and the **Ω** serve
 |---|---|
 | `alpha/` | **α — the front door (client).** One binary: `alpha node \| mcp \| http \| demo`, dispatching in-process. |
 | `omega/` | **Ω — the federation/gateway server.** One binary: `omega serve` boots a headless gateway Sanctum (transport mesh + registry + `omega-federator` on `Role::OMEGA_GATEWAY`), the dual of `alpha node`. |
+| `foundation/{gawdxfer,gawdfn}/` | Shared GAWD contracts Alpha consumes: GX bulk transfer and typed Function/durable Job identities, wires, and proof verification. |
 | `cosmos/sigil/` | The at-rest contract — a creature's signed `Manifest` (identity / capabilities / provenance / content address). The sole metadata source. |
-| `cosmos/aether/` | The bus spine — typed `Envelope`, `Address`, the sharded `Router`, the journal, and the `seer` (Query/Answer) + `abode` (snapshot) primitives. |
+| `cosmos/aether/` | The bus spine — typed `Envelope`, `Address`, the sharded `Router`, and its bounded journal. `seer` and `abode` are separate first-class concept crates. |
 | `cosmos/anima/` | The per-tier loaders — `NativeEngine` (dlopen + safe-unload), `WasmEngine` (wasmtime), `ScriptEngine` (Rhai). |
 | `cosmos/sanctum/` | **The kernel** — model-free lifecycle, routing, and admission *mechanism*. Tier-blind. |
 | `cosmos/forge/` | The creature-authoring SDK — `declare_creature!`, the bus, managed spawn, the prelude. |
-| `cosmos/{abode,seer,realm,bestiary,omega-contract}/` | First-class concept crates: continuity, query/answer, the trust domain, the durable registry, and the lean **Ω** wire contract (`omega.deferred` + `GATEWAY_ROLE`; re-exported by the `omega` server). |
+| `cosmos/{abode,seer,realm,bestiary,mind,omega-contract}/` | First-class concept/leaf crates: continuity, query/answer, the trust domain, the durable registry, model injection, and the lean **Ω** wire contract (`omega.deferred` + `GATEWAY_ROLE`; re-exported by the `omega` server). |
 | `cosmos/omni/` | The spine-only control core every surface drives over `Role::CONTROL`. |
-| `cosmos/creatures/` | Production-capable reference organs: authoring, transport, registry, distributor, federation, immune response, … |
+| `cosmos/creatures/` | Production-capable reference organs: authoring, transport, registry, distributor, federation, Function/Job execution and custody, immune response, … |
 | `cosmos/creatures/prototypes/` | Injected, operator-replaceable strategy models (policies, scorers, distributors, gateways) — **not** substrate. |
 | `demos/` · `docs/` | Runnable narrated walkthroughs; the prose documentation. |
 
@@ -270,13 +294,32 @@ AI-curated** one (`bestiary-daemon`) — a realm-hashed signed-log store with ve
 monotonic-lattice replication. Both fill `Role::REGISTRY`; pick either.)
 
 ```sh
-cargo build --locked --workspace                                       # build everything
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo build --locked -p alpha -p omega
 cargo run   -p alpha -- node                                           # boot a node + REPL (--minimal = bare kernel)
-CARGO_BUILD_JOBS=2 cargo test --locked --workspace -- --test-threads=1 # the suite (CI uses the same caps)
-cargo doc   --workspace --no-deps --open                               # browse the per-crate API
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo test --locked -p sanctum --lib -- --test-threads=1
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo doc --locked -p sanctum --no-deps --open
 ```
 
-The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (stable, edition 2021). The
+Use focused package tests while iterating; the full workspace gate runs once on the exact candidate in
+constrained CI, not again locally. Workspace Cargo config defaults to one build job and one libtest
+thread. The development/test profiles keep only line-table debug information, disable incremental
+artifacts, and use one codegen unit to keep repeat builds responsive and reduce generated volume.
+Cargo does not garbage-collect stale target variants; inspect before cleaning, and use the exact
+authoring-cache command `cargo clean --target-dir target/gawd-build-cache` only while no authoring
+build is active. That generated cache also contains build-cargo's isolated `.cargo-home`, so authored
+registry downloads and unpacked dependency sources are covered by the same finite budget and cleanup.
+Every Alpha process using that directory takes its retained `.alpha-build-cargo.lock`; contention
+polls without spinning and consumes the build timeout, so two local nodes do not compile there at
+once. Cargo's own locks still protect cache integrity, but are not the concurrency/resource boundary.
+The isolation does not inherit `~/.cargo` configuration, credentials, or warmed registries:
+operators that require source replacement, offline builds, or authenticated/private registries must
+provision equivalent config/cache inside the budgeted home and inject credentials explicitly.
+After a candidate is frozen, an intentional workspace-wide reclaim of generated debug/test output is
+`cargo clean --locked --profile dev --dry-run`, followed by the same command without `--dry-run` only
+after confirming no Cargo process is active. It leaves `target/release` and all runtime state,
+journals, keys, fixtures, and source untouched.
+
+The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (Rust 1.97.1, edition 2021). The
 full REPL command reference (`author`, `load`, `send`, `intent`, `bind`, `unload`, `list / status /
 journal`, …) is in the [operator quickstart](docs/quickstart/operator.md).
 

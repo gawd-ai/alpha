@@ -53,7 +53,7 @@ Wire-lock classes used in the table:
 | 11 | **Signed dialogue provenance** | `cosmos/seer/src/lib.rs:987-1007` (the dialogue `AnswerBody`, `:1002-1006`) | additive-optional | **realize-v0.4.3** | LLM-backed dialogue agent (signs for real) | New per [ADR-0038](ADR-0038-origin-stays-hop-by-hop.md): optional `signer_pubkey` + `signature` over `(corr, prompt-or-turn, reply)`. v0.4.3 lands the *fields* + one verify/tamper test; signing the reference echo agent is optional. |
 | 12 | UDP/mDNS discovery beacon | `cosmos/creatures/transport-tcp/src/lib.rs:36` | not-wire (handshake unchanged) | **realize-v0.5.0** | meshed-Ω discovery | "Signed membership + a UDP/mDNS discovery beacon are the named next steps." TCP handshake stays as-is. |
 | 13 | Multi-entrypoint critter dispatch | `cosmos/anima/src/script.rs:52-54` | not-wire | **keep-reserved** | richer critters | Kernel drives `fn handle(env)` only; multi-entrypoint deferred. ABI tag `gawd_critter_v1` unchanged. |
-| 14 | Per-engine tuning knob (critter) | `cosmos/anima/src/script.rs:56-62, 64-72` | not-wire | **keep-reserved** | operator tuning | `cpu_ms` / `mem_bytes` are the per-creature dials today; a per-engine knob is deferred. |
+| 14 | Per-engine tuning knob (critter) | `cosmos/anima/src/script.rs:60-76` | not-wire | **keep-reserved** | operator tuning | `cpu_ms` / `mem_bytes` / `wall_ms` are per-creature dials today; the operation-rate/default-structure per-engine knob is deferred. |
 | 15 | `CreatureId`→Abode-pubkey router map | `cosmos/aether/src/lib.rs:599-607` | not-wire (stub verifier returns `""`) | **realize-v0.5.0** | cross-node membership | Router-side verify-on-route is present-but-stub; teaching the router to resolve each `CreatureId`→pubkey is "deferred to the cross-node membership work." Load-bearing trust gates (transport handshake, admission) are real. |
 | 16 | `OfferUpdate` schema | `cosmos/creatures/embodiment-advertiser/src/lib.rs:15-16` | additive (new schema) | **realize-v0.5.0** | dynamic embodiment advertisement | Offers are operator-supplied at construction today; a runtime-update schema is deferred. New schema = additive, never a retrofit. |
 | 17 | Advisory `deadline_ms` (placement Query) | `cosmos/creatures/embodiment-advertiser/src/lib.rs:21-22` | additive-optional | **keep-reserved** | a deadline-aware advertiser | "Currently unused; reserved" — time is injected policy, not fabric. |
@@ -64,7 +64,22 @@ Wire-lock classes used in the table:
 [ADR-0038](ADR-0038-origin-stays-hop-by-hop.md)'s implementation sketch cites `cosmos/seer/src/topics/`
 for the dialogue body. **No such directory exists.** The dialogue body lives in the `dialogue` module of
 `cosmos/seer/src/lib.rs:987-1007`; the signed-provenance fields (row 11) attach to its `AnswerBody`
-(`lib.rs:1002-1006`, currently just `reply: String`). The realize-in-v0.4.3 work targets that file.
+(`lib.rs:1002-1006`, which contained only `reply: String` when this decision was written). The
+realize-in-v0.4.3 work targeted that file and added the provenance fields recorded above.
+
+### v0.4.4 erratum and successor
+
+This register described itself as exhaustive, but missed a distinct reserved seam already documented
+in `sigil::Entrypoint`: its `signature` was free-form text with “a structured schema later.” Row 13
+tracks **direct multi-entrypoint critter engine dispatch**, which is not the same decision. The former
+is signed Manifest metadata and an application adapter; the latter would change how the Rhai engine
+calls exported functions.
+
+[ADR-0046](ADR-0046-functions-are-typed-creature-entrypoints.md) is the successor record. v0.4.4
+realizes the omitted metadata seam with an optional structured `gawdfn::EntrypointContractV1` and
+dispatches it through the existing `Creature::handle(Envelope)` ABI. Row 13 remains **keep-reserved**:
+the Kernel still drives `fn handle(env)` and `gawd_critter_v1` is unchanged. Recording the erratum here
+preserves this ADR as the historical v0.4.3 inventory instead of silently rewriting its table.
 
 ## Consequences
 

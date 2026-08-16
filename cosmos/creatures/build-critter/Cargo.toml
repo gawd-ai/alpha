@@ -11,6 +11,7 @@ description = "BUILD creature for the critter (script) tier: the no-cargo siblin
 [dependencies]
 aether = { path = "../../aether" }
 sigil = { path = "../../sigil" }
+gawdfn = { workspace = true }
 # Reuse build-cargo's wire vocabulary (ManifestStub / BuildReply / BuildErrorKind) so an authoring
 # agent and the node speak ONE reply shape across both builders — see lib.rs.
 build-cargo = { path = "../build-cargo" }
@@ -20,5 +21,6 @@ sha2 = { workspace = true }
 # Compile-validate the authored source (syntax + `fn handle` presence) before signing. `no_time` and
 # `no_module` mirror the runtime loader: no ambient clock and no imports, so the builder never signs
 # source the engine later refuses for using unavailable language surface. The validation engine is a
-# short-lived local, never stored across threads, so it does not need `sync`.
-rhai = { version = "1", features = ["no_time", "no_module"] }
+# short-lived local, never stored across threads, so it does not need `sync`. `serde` mirrors the
+# runtime's pure bounded JSON registrations; it does not add I/O or ambient authority.
+rhai = { version = "1", features = ["no_time", "no_module", "serde"] }

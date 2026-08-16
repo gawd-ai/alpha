@@ -47,6 +47,17 @@ use bestiary::{
 };
 use build_cargo::{BuildCargo, BuildConfig, BuildOp, BuildReply, Sandbox};
 use build_critter::{BuildCritter, BuildCritterOp};
+use gawdfn::{
+    derive_deployment_id, derive_job_id, verify_deployment_receipt, verify_event_page_response_for,
+    verify_job_acceptance, verify_job_control_acceptance, verify_job_event,
+    verify_job_snapshot_response_for, verify_undeploy_receipt, AuthoritySigner, DeploymentListV1,
+    DeploymentQueryV1, DeploymentReceiptV1, DeploymentRegistrationV1, DeploymentRequestV1,
+    EventQueryRelayV1, EventQueryV1, FunctionDeployMessageV1, JobControlV1, JobGetRelayV1,
+    JobGetV1, JobMessageV1, JobSubmitV1, ProtocolErrorV1, ResolutionReceiptV1, ResolveRequestV1,
+    SignedRecordV1, UndeployReceiptV1, UndeployRequestV1, Validate, FUNCTION_EXECUTOR_ROLE,
+    FUNCTION_HOME_ROLE, FUNCTION_RESOLVER_ROLE, MAX_JOB_MESSAGE_BYTES, SCHEMA_FUNCTION_DEPLOY_V1,
+    SCHEMA_JOB_V1,
+};
 use monitor::Monitor;
 use registry_mem::RegistryMem;
 use serde::de::DeserializeOwned;
@@ -60,7 +71,7 @@ pub use control::{
 };
 
 /// The one-line command summary printed by the REPL banner and the `help` verb.
-pub const COMMANDS: &str = "commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm] | bestiary prove <artifact-hash> <realm> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit";
+pub const COMMANDS: &str = "commands: author [--critter] <request> | load <manifest> <artifact> | registry publish <manifest> <artifact> [realm] | registry fetch <artifact-hash> [realm] | registry list [realm] | registry fetch-load <artifact-hash> [<node-id> <registry-id>] [realm] | bestiary prove <artifact-hash> <realm> | function resolve <signed-request-json> | function deploy <request+resolution+paths-json> | function undeploy <request+deployment-receipt-json> | function deployments <query-json> | job submit <request+receipts-json> | job get <signed-request-json> | job events <signed-request-json> | job control <signed-request-json> | send <[node-id:]id> <text> | intent <outcome> <text> | bind <role> <id> | unload <id> | allow-ai <on|off> | cluster [join <id@host:port#pubkey>] | list | status | journal | watch | help | quit";
 
 /// Control-surface manifests are JSON metadata, not artifacts. Keep the node-local path reader
 /// bounded so a granted surface caller cannot make the control plane slurp an arbitrary local file.
@@ -76,6 +87,14 @@ pub const MAX_CONTROL_VERB_BYTES: usize = 1024 * 1024;
 /// surface-side JSON parsing so a malformed or hostile control responder cannot force unbounded
 /// allocation in HTTP/MCP callers.
 pub const MAX_CONTROL_RESULT_BYTES: usize = MAX_CONTROL_VERB_BYTES;
+/// Bytes of operating-system randomness in the per-request control reply capability.
+///
+/// `corr` is intentionally predictable conversational bookkeeping, so it cannot bind a reply to a
+/// request by itself. HTTP/MCP surfaces attach a fresh capability in the envelope's existing opaque
+/// `commitment` slot and accept a `control_result` only when [`ControlCore`] echoes the exact value.
+/// Within trusted authenticated Realm relays, a creature that only guesses a correlation number
+/// therefore cannot win the reply race. This is not end-to-end responder identity authentication.
+pub const CONTROL_REPLY_CAPABILITY_BYTES: usize = 32;
 /// Maximum bytes shown when a control surface presents an arbitrary creature reply or sense payload.
 ///
 /// Control is an operator/API surface, not a bulk-data transport. Small replies stay exact; larger
@@ -269,6 +288,53 @@ pub enum Verb {
         artifact_hash: String,
         realm: RealmId,
     },
+    /// Resolve an exact signed function selector through the injected resolver. Resolution may
+    /// consult policy/catalogue state and produces a signed immutable pin, so remote callers must
+    /// pass the allow-AI gate.
+    FunctionResolve {
+        request: SignedRecordV1<ResolveRequestV1>,
+    },
+    /// Load one exact creature artifact from node-local paths and register the resulting live
+    /// deployment with the executor. Both the deployment authorization and immutable resolution
+    /// pin are signed; loading code and mutating deployment state are allow-AI gated.
+    FunctionDeploy {
+        request: SignedRecordV1<DeploymentRequestV1>,
+        resolution: SignedRecordV1<ResolutionReceiptV1>,
+        manifest_path: String,
+        artifact_path: String,
+    },
+    /// Durably tombstone one exact deployment at its executor, then retire the process-local target
+    /// only when the supplied signed receipt still matches the manifest and artifact occupying its
+    /// numeric creature id. The receipt is local control evidence; it is never forwarded as a new
+    /// source of authority. Mutating and allow-AI gated.
+    FunctionUndeploy {
+        request: SignedRecordV1<UndeployRequestV1>,
+        deployment: SignedRecordV1<DeploymentReceiptV1>,
+    },
+    /// Read the executor's bounded set of live deployment receipts. This is observation only and
+    /// is deliberately ungated.
+    FunctionDeployments {
+        query: DeploymentQueryV1,
+    },
+    /// Submit an already-authorized job plus the exact signed resolution/deployment pins. The home
+    /// replies only with durable acceptance; this control call never waits for terminal execution.
+    JobSubmit {
+        request: Box<SignedRecordV1<JobSubmitV1>>,
+        resolution: SignedRecordV1<ResolutionReceiptV1>,
+        deployment: SignedRecordV1<DeploymentReceiptV1>,
+    },
+    /// Read the home-authority snapshot for a job through an attributable signed request.
+    JobGet {
+        request: SignedRecordV1<JobGetV1>,
+    },
+    /// Read one bounded page of the durable job event stream.
+    JobEvents {
+        request: SignedRecordV1<EventQueryV1>,
+    },
+    /// Apply an already-signed cooperative steer/cancel/access command at the job home.
+    JobControl {
+        request: SignedRecordV1<JobControlV1>,
+    },
     /// Fetch a creature artifact over **GX** from a registry, assemble + integrity-check it, and
     /// **load** it into this node — the operator path that the `m2_two_node` test hand-scripted. Drives
     /// `FetchGxPlan` → a windowed `FetchGxChunk` pull (re-requesting only the gaps on a stall, so a
@@ -335,6 +401,11 @@ impl Verb {
                 | Verb::Load { .. }
                 | Verb::RegistryPublish { .. }
                 | Verb::FetchLoad { .. }
+                | Verb::FunctionResolve { .. }
+                | Verb::FunctionDeploy { .. }
+                | Verb::FunctionUndeploy { .. }
+                | Verb::JobSubmit { .. }
+                | Verb::JobControl { .. }
                 | Verb::Send { .. }
                 | Verb::Intent { .. }
                 | Verb::Bind { .. }
@@ -431,6 +502,17 @@ pub fn control_verb_payload(verb: &Verb) -> Result<Vec<u8>, VerbResult> {
     Ok(payload)
 }
 
+/// Mint an unguessable bearer capability binding one surface request to its control reply.
+///
+/// This is routing integrity mechanism, not trust policy: only the addressed ControlCore observes
+/// the request capability, and the surface consumes it exactly once with the pending correlation.
+/// Failure of the OS random source is fail-closed at the surface.
+pub fn fresh_control_reply_capability() -> Result<String, String> {
+    let seed = sigil::crypto::fresh_seed()?;
+    debug_assert_eq!(seed.len(), CONTROL_REPLY_CAPABILITY_BYTES);
+    Ok(sigil::crypto::hex_encode(&seed))
+}
+
 pub(crate) fn control_result_payload(res: VerbResult) -> Vec<u8> {
     let payload = serde_json::to_vec(&res).unwrap_or_else(|_| b"{}".to_vec());
     if payload.len() <= MAX_CONTROL_RESULT_BYTES {
@@ -516,7 +598,13 @@ pub struct VerbCtx<'a> {
     pub transport: Option<CreatureId>,
     pub ai: &'a AiControl,
     pub gated: bool,
-    corr: u64,
+    /// Operational deployer attestation used only after this privileged control core has admitted
+    /// and loaded an exact artifact. This is deliberately not the Abode root key; callers retain
+    /// their own nested signed deployment authorization.
+    function_deployer: Option<&'a dyn AuthoritySigner>,
+    /// Next request correlation in this probe's namespace. `None` is a permanent exhausted state:
+    /// correlations are never wrapped or reused after overflow.
+    corr: Option<u64>,
 }
 
 impl<'a> VerbCtx<'a> {
@@ -536,7 +624,8 @@ impl<'a> VerbCtx<'a> {
             transport: None,
             ai,
             gated,
-            corr: 1,
+            function_deployer: None,
+            corr: Some(1),
         }
     }
     /// A probe-free ctx — for verbs that only read/mutate kernel state (`list`/`status`/`journal`/
@@ -547,13 +636,49 @@ impl<'a> VerbCtx<'a> {
         ai: &'a AiControl,
         gated: bool,
     ) -> Self {
-        Self { kernel, probe: None, critter_builder, transport: None, ai, gated, corr: 1 }
+        Self {
+            kernel,
+            probe: None,
+            critter_builder,
+            transport: None,
+            ai,
+            gated,
+            function_deployer: None,
+            corr: Some(1),
+        }
     }
-    fn next_corr(&mut self) -> u64 {
-        let c = self.corr;
-        self.corr += 1;
-        c
+
+    /// Supply the node-local operational key that attests post-load deployment registration.
+    /// Private material remains in the injected signer implementation and never enters `gawdfn`.
+    pub fn set_function_deployer(&mut self, signer: &'a dyn AuthoritySigner) {
+        self.function_deployer = Some(signer);
     }
+    /// Replace the default direct-call correlation cursor with the persistent cursor owned by the
+    /// ControlCore worker. Direct REPL contexts keep their ordinary fresh `1`-based namespace.
+    pub(crate) fn set_corr_cursor(&mut self, next: Option<u64>) {
+        self.corr = next;
+    }
+
+    pub(crate) fn corr_cursor(&self) -> Option<u64> {
+        self.corr
+    }
+
+    fn next_corr(&mut self) -> Result<u64, VerbResult> {
+        let current = self.corr.ok_or_else(correlation_exhausted_err)?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            self.corr = None;
+            correlation_exhausted_err()
+        })?;
+        self.corr = Some(next);
+        Ok(current)
+    }
+}
+
+fn correlation_exhausted_err() -> VerbResult {
+    VerbResult::err(
+        json!({ "ok": false, "error": "control-internal-correlation-exhausted" }),
+        "control: internal request correlation space is exhausted; refusing to reuse an id",
+    )
 }
 
 fn no_probe_err() -> VerbResult {
@@ -595,6 +720,51 @@ fn read_node_file_bounded(path: &str, label: &str, max_bytes: u64) -> Result<Vec
 
 /// Parse one REPL line into a [`Verb`]. `Err` carries a usage string. A blank line is `Ok(None)`.
 pub fn parse_verb(line: &str) -> Result<Option<Verb>, String> {
+    let line = line.trim();
+    if let Some(json) = line.strip_prefix("function resolve ") {
+        return parse_repl_json::<SignedRecordV1<ResolveRequestV1>>(json, "function resolve")
+            .map(|request| Some(Verb::FunctionResolve { request }));
+    }
+    if let Some(json) = line.strip_prefix("function deploy ") {
+        let args = parse_repl_json::<FunctionDeployArgs>(json, "function deploy")?;
+        return Ok(Some(Verb::FunctionDeploy {
+            request: args.request,
+            resolution: args.resolution,
+            manifest_path: args.manifest_path,
+            artifact_path: args.artifact_path,
+        }));
+    }
+    if let Some(json) = line.strip_prefix("function undeploy ") {
+        let args = parse_repl_json::<FunctionUndeployArgs>(json, "function undeploy")?;
+        return Ok(Some(Verb::FunctionUndeploy {
+            request: args.request,
+            deployment: args.deployment,
+        }));
+    }
+    if let Some(json) = line.strip_prefix("function deployments ") {
+        return parse_repl_json::<DeploymentQueryV1>(json, "function deployments")
+            .map(|query| Some(Verb::FunctionDeployments { query }));
+    }
+    if let Some(json) = line.strip_prefix("job submit ") {
+        let args = parse_repl_json::<JobSubmitArgs>(json, "job submit")?;
+        return Ok(Some(Verb::JobSubmit {
+            request: Box::new(args.request),
+            resolution: args.resolution,
+            deployment: args.deployment,
+        }));
+    }
+    if let Some(json) = line.strip_prefix("job get ") {
+        return parse_repl_json::<SignedRecordV1<JobGetV1>>(json, "job get")
+            .map(|request| Some(Verb::JobGet { request }));
+    }
+    if let Some(json) = line.strip_prefix("job events ") {
+        return parse_repl_json::<SignedRecordV1<EventQueryV1>>(json, "job events")
+            .map(|request| Some(Verb::JobEvents { request }));
+    }
+    if let Some(json) = line.strip_prefix("job control ") {
+        return parse_repl_json::<SignedRecordV1<JobControlV1>>(json, "job control")
+            .map(|request| Some(Verb::JobControl { request }));
+    }
     let parts: Vec<&str> = line.split_whitespace().collect();
     let v = match parts.as_slice() {
         [] => return Ok(None),
@@ -718,6 +888,37 @@ pub fn parse_verb(line: &str) -> Result<Option<Verb>, String> {
     Ok(Some(v))
 }
 
+#[derive(serde::Deserialize)]
+struct JobSubmitArgs {
+    request: SignedRecordV1<JobSubmitV1>,
+    resolution: SignedRecordV1<ResolutionReceiptV1>,
+    deployment: SignedRecordV1<DeploymentReceiptV1>,
+}
+
+#[derive(serde::Deserialize)]
+struct FunctionDeployArgs {
+    request: SignedRecordV1<DeploymentRequestV1>,
+    resolution: SignedRecordV1<ResolutionReceiptV1>,
+    manifest_path: String,
+    artifact_path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FunctionUndeployArgs {
+    request: SignedRecordV1<UndeployRequestV1>,
+    deployment: SignedRecordV1<DeploymentReceiptV1>,
+}
+
+fn parse_repl_json<T: DeserializeOwned>(json: &str, operation: &str) -> Result<T, String> {
+    if json.len() > MAX_JOB_MESSAGE_BYTES {
+        return Err(format!(
+            "{operation}: JSON is {} bytes, exceeds {MAX_JOB_MESSAGE_BYTES}",
+            json.len()
+        ));
+    }
+    serde_json::from_str(json).map_err(|e| format!("{operation}: invalid JSON: {e}"))
+}
+
 // ---------------------------------------------------------------------------------------------
 // The command core
 // ---------------------------------------------------------------------------------------------
@@ -832,6 +1033,20 @@ pub fn run_verb(verb: Verb, ctx: &mut VerbCtx, progress: &mut dyn FnMut(&str)) -
         Verb::BestiaryProve { artifact_hash, realm } => {
             verb_bestiary_prove(ctx, &artifact_hash, realm)
         }
+        Verb::FunctionResolve { request } => verb_function_resolve(ctx, request),
+        Verb::FunctionDeploy { request, resolution, manifest_path, artifact_path } => {
+            verb_function_deploy(ctx, request, resolution, &manifest_path, &artifact_path)
+        }
+        Verb::FunctionUndeploy { request, deployment } => {
+            verb_function_undeploy(ctx, request, deployment)
+        }
+        Verb::FunctionDeployments { query } => verb_function_deployments(ctx, query),
+        Verb::JobSubmit { request, resolution, deployment } => {
+            verb_job_submit(ctx, *request, resolution, deployment)
+        }
+        Verb::JobGet { request } => verb_job_get(ctx, request),
+        Verb::JobEvents { request } => verb_job_events(ctx, request),
+        Verb::JobControl { request } => verb_job_control(ctx, request),
         Verb::Send { id, text, node } => verb_send(ctx, id, &text, node.as_deref()),
         Verb::Intent { outcome, text } => verb_intent(ctx, &outcome, &text),
         Verb::Author { request } => verb_author(ctx, &request, progress),
@@ -943,7 +1158,7 @@ fn registry_request(
             ))
         }
     };
-    let c = ctx.next_corr();
+    let c = ctx.next_corr()?;
     let d = Dispatch::to(Address::Role(Role::new(Role::REGISTRY)), payload)
         .with_schema(REGISTRY_OP_SCHEMA)
         .with_reply_to(Address::Creature(bus.id()))
@@ -971,7 +1186,7 @@ fn registry_request(
 /// Like [`registry_request`] but over the additive `bestiary.op` schema, decoding a [`BestiaryReply`].
 fn bestiary_request(ctx: &mut VerbCtx, op: BestiaryOp) -> Result<BestiaryReply, VerbResult> {
     let Some((bus, rx)) = ctx.probe else { return Err(no_probe_err()) };
-    let c = ctx.next_corr();
+    let c = ctx.next_corr()?;
     let d = Dispatch::to(Address::Role(Role::new(Role::REGISTRY)), op.to_bytes())
         .with_schema(BESTIARY_OP_SCHEMA)
         .with_reply_to(Address::Creature(bus.id()))
@@ -1059,6 +1274,9 @@ fn fetched_metadata_ok(entry: &CatalogEntry, artifact_len: usize) -> VerbResult 
         "name": manifest.name,
         "version": manifest.version,
         "content_address": manifest.content_address,
+        // Entrypoints are signed catalogue metadata. Keep them visible at the shared control
+        // layer so function discovery does not need a second registry or surface-specific scan.
+        "entrypoints": manifest.entrypoints,
         "artifact_len": artifact_len,
         "realm": realm_str,
     });
@@ -1115,6 +1333,8 @@ fn verb_registry_list(ctx: &mut VerbCtx, realm: Option<RealmId>) -> VerbResult {
                         "realm": e.realm.0,
                         "name": e.manifest.name,
                         "version": e.manifest.version,
+                        "content_address": e.manifest.content_address,
+                        "entrypoints": e.manifest.entrypoints,
                         "reputation": e.reputation.as_ref().map(|r| r.score),
                         "quarantined": e.quarantine.is_some(),
                     })
@@ -1263,7 +1483,10 @@ fn verb_fetch_load(
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
 
     // --- step 1: ask for a plan-only GX transfer (we pace the chunk pull ourselves) ---
-    let plan_corr = ctx.next_corr();
+    let plan_corr = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let plan_payload =
         match serde_json::to_vec(&gx_plan_op(artifact_hash, realm.as_ref(), chunk_size)) {
             Ok(p) => p,
@@ -1371,7 +1594,10 @@ fn verb_fetch_load(
             )
         }
     };
-    let chunk_corr = ctx.next_corr();
+    let chunk_corr = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let puller = GxChunkPuller {
         bus,
         target: &target,
@@ -1516,9 +1742,1223 @@ fn verb_bestiary_prove(ctx: &mut VerbCtx, artifact_hash: &str, realm: RealmId) -
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Typed functions + durable jobs — bounded adapters over the canonical gawdfn application wire.
+// These verbs do not implement policy or retain job state. They validate, route to an injected
+// role, and accept only the exact reply arm for the requested operation.
+// ---------------------------------------------------------------------------------------------
+
+const FUNCTION_JOB_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn function_read_reply_route(
+    ctx: &VerbCtx<'_>,
+    operation: &'static str,
+) -> Result<String, VerbResult> {
+    let Some((bus, _)) = ctx.probe else { return Err(no_probe_err()) };
+    serde_json::to_string(&Address::Creature(bus.id())).map_err(|error| {
+        VerbResult::err(
+            json!({ "ok": false, "error": "function-read-route", "detail": error.to_string() }),
+            format!("{operation}: could not encode the private reply route: {error}"),
+        )
+    })
+}
+
+fn function_read_signer<'a>(
+    ctx: &'a VerbCtx<'_>,
+    operation: &'static str,
+) -> Result<&'a dyn AuthoritySigner, VerbResult> {
+    ctx.function_deployer.ok_or_else(|| {
+        VerbResult::err(
+            json!({ "ok": false, "error": "function-read-relay-unconfigured" }),
+            format!("{operation}: no trusted Function control relay signer is configured"),
+        )
+    })
+}
+
+fn function_job_request<M: serde::Serialize, R: DeserializeOwned>(
+    ctx: &mut VerbCtx,
+    role: &'static str,
+    schema: &'static str,
+    operation: &'static str,
+    message: &M,
+) -> Result<R, VerbResult> {
+    function_job_request_authenticated(ctx, role, schema, operation, message)
+        .map(|(reply, _responder)| reply)
+}
+
+/// Send one local Function/Job role request and bind the reply to the exact creature that held the
+/// role when the request was emitted. `corr` prevents accidental cross-talk; it is not an authority
+/// proof. Without this sender check, another local creature that learned or guessed the correlation
+/// number could inject a syntactically valid reply into the control probe.
+fn function_job_request_authenticated<M: serde::Serialize, R: DeserializeOwned>(
+    ctx: &mut VerbCtx,
+    role_name: &'static str,
+    schema: &'static str,
+    operation: &'static str,
+    message: &M,
+) -> Result<(R, CreatureId), VerbResult> {
+    let Some((bus, rx)) = ctx.probe else { return Err(no_probe_err()) };
+    let role = Role::new(role_name);
+    let Some(expected_responder) = ctx.kernel.role_binding(&role) else {
+        return Err(VerbResult::err(
+            json!({
+                "ok": false,
+                "unrouted": true,
+                "error": "function-unrouted",
+                "operation": operation,
+                "detail": format!("no provider is bound to role `{}`", role.0)
+            }),
+            format!("{operation}: could not route to `{}`: no provider is bound", role.0),
+        ));
+    };
+    let payload = serde_json::to_vec(message).map_err(|e| {
+        VerbResult::err(
+            json!({ "ok": false, "error": "function-message-encode", "operation": operation, "detail": e.to_string() }),
+            format!("{operation}: could not encode the request: {e}"),
+        )
+    })?;
+    if payload.len() > MAX_JOB_MESSAGE_BYTES {
+        return Err(VerbResult::err(
+            json!({
+                "ok": false,
+                "error": "function-message-too-large",
+                "operation": operation,
+                "bytes": payload.len(),
+                "limit": MAX_JOB_MESSAGE_BYTES
+            }),
+            format!(
+                "{operation}: request is {} bytes, exceeds {MAX_JOB_MESSAGE_BYTES}",
+                payload.len()
+            ),
+        ));
+    }
+    let corr = ctx.next_corr()?;
+    let dispatch = Dispatch::to(Address::Role(role.clone()), payload)
+        .with_schema(schema)
+        .with_reply_to(Address::Creature(bus.id()))
+        .with_corr(corr);
+    match request_reply(bus, rx, dispatch, corr, FUNCTION_JOB_TIMEOUT) {
+        Ok(Some(env)) => {
+            let current_responder = ctx.kernel.role_binding(&role);
+            let expected_address = Address::Creature(expected_responder);
+            if env.header.from != expected_address || current_responder != Some(expected_responder)
+            {
+                let actual_address = format!("{:?}", env.header.from);
+                return Err(VerbResult::err(
+                    json!({
+                        "ok": false,
+                        "error": "function-reply-origin",
+                        "operation": operation,
+                        "role": role.0,
+                        "expected_creature": expected_responder.0,
+                        "actual_from": actual_address,
+                        "current_role_creature": current_responder.map(|id| id.0)
+                    }),
+                    format!(
+                        "{operation}: rejected reply from {actual_address}; `{}` was bound to {} when sent and is now bound to {}",
+                        role.0,
+                        expected_responder.0,
+                        current_responder
+                            .map(|id| id.0.to_string())
+                            .unwrap_or_else(|| "no creature".into())
+                    ),
+                ));
+            }
+            if env.header.schema != schema {
+                return Err(VerbResult::err(
+                    json!({
+                        "ok": false,
+                        "error": "unexpected-function-reply-schema",
+                        "operation": operation,
+                        "expected": schema,
+                        "received": env.header.schema
+                    }),
+                    format!(
+                        "{operation}: expected reply schema `{schema}`, received `{}`",
+                        env.header.schema
+                    ),
+                ));
+            }
+            parse_role_reply::<R>(&env.payload, MAX_JOB_MESSAGE_BYTES)
+                .map(|reply| (reply, expected_responder))
+                .map_err(|e| {
+                    VerbResult::err(
+                        json!({
+                            "ok": false,
+                            "error": "invalid-function-reply",
+                            "operation": operation,
+                            "detail": e.to_string(),
+                            "limit": MAX_JOB_MESSAGE_BYTES
+                        }),
+                        format!("{operation}: invalid reply: {e}"),
+                    )
+                })
+        }
+        Ok(None) => Err(VerbResult::err(
+            json!({ "ok": false, "error": "function-timeout", "operation": operation }),
+            format!("{operation}: `{}` did not reply in time", role.0),
+        )),
+        Err(e) => Err(VerbResult::err(
+            json!({
+                "ok": false,
+                "unrouted": true,
+                "error": "function-unrouted",
+                "operation": operation,
+                "detail": e.to_string()
+            }),
+            format!("{operation}: could not route to `{}`: {e}", role.0),
+        )),
+    }
+}
+
+fn validate_signed_record<T>(
+    record: &SignedRecordV1<T>,
+    expected_schema: &'static str,
+    operation: &'static str,
+    label: &'static str,
+) -> Result<(), VerbResult>
+where
+    T: Validate + serde::Serialize,
+{
+    if let Err(e) = record.validate() {
+        return Err(contract_input_error(operation, label, e.to_string()));
+    }
+    if record.schema != expected_schema {
+        return Err(contract_input_error(
+            operation,
+            label,
+            format!("signed record schema is `{}`, expected `{expected_schema}`", record.schema),
+        ));
+    }
+    if !record.verify() {
+        return Err(contract_input_error(
+            operation,
+            label,
+            "signed record signature does not verify".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn contract_input_error(
+    operation: &'static str,
+    field: &'static str,
+    detail: String,
+) -> VerbResult {
+    VerbResult::err(
+        json!({
+            "ok": false,
+            "error": "invalid-function-contract",
+            "operation": operation,
+            "field": field,
+            "detail": detail
+        }),
+        format!("{operation}: invalid {field}: {detail}"),
+    )
+}
+
+fn protocol_error(operation: &'static str, error: ProtocolErrorV1) -> VerbResult {
+    if let Err(detail) = error.validate() {
+        return VerbResult::err(
+            json!({ "ok": false, "error": "invalid-function-reply", "operation": operation, "detail": detail.to_string() }),
+            format!("{operation}: invalid protocol error reply: {detail}"),
+        );
+    }
+    let human = format!("{operation}: {}: {}", error.code, error.message);
+    VerbResult::err(
+        json!({
+            "ok": false,
+            "error": error.code,
+            "message": error.message,
+            "retryable": error.retryable
+        }),
+        human,
+    )
+}
+
+fn unexpected_function_reply(operation: &'static str) -> VerbResult {
+    VerbResult::err(
+        json!({ "ok": false, "error": "unexpected-function-reply", "operation": operation }),
+        format!("{operation}: the role returned a reply for a different operation"),
+    )
+}
+
+fn verb_function_resolve(
+    ctx: &mut VerbCtx,
+    request: SignedRecordV1<ResolveRequestV1>,
+) -> VerbResult {
+    const OP: &str = "function resolve";
+    if let Err(error) = validate_signed_record(&request, SCHEMA_FUNCTION_DEPLOY_V1, OP, "request") {
+        return error;
+    }
+    let selector = request.payload.selector.clone();
+    let message = FunctionDeployMessageV1::Resolve { request };
+    match function_job_request::<_, FunctionDeployMessageV1>(
+        ctx,
+        FUNCTION_RESOLVER_ROLE,
+        SCHEMA_FUNCTION_DEPLOY_V1,
+        OP,
+        &message,
+    ) {
+        Ok(FunctionDeployMessageV1::Resolved { receipt }) => {
+            if let Err(error) =
+                validate_signed_record(&receipt, SCHEMA_FUNCTION_DEPLOY_V1, OP, "receipt")
+            {
+                return error;
+            }
+            if receipt.payload.selector != selector {
+                return contract_input_error(
+                    OP,
+                    "receipt",
+                    "resolution receipt answers a different selector".into(),
+                );
+            }
+            let function = receipt.payload.function.clone();
+            VerbResult::ok(
+                json!({ "ok": true, "receipt": receipt }),
+                format!("resolved {}#{}", function.manifest_content_address, function.entrypoint),
+            )
+        }
+        Ok(FunctionDeployMessageV1::Error { error }) => protocol_error(OP, error),
+        Ok(_) => unexpected_function_reply(OP),
+        Err(error) => error,
+    }
+}
+
+fn verb_function_deploy(
+    ctx: &mut VerbCtx,
+    request: SignedRecordV1<DeploymentRequestV1>,
+    resolution: SignedRecordV1<ResolutionReceiptV1>,
+    manifest_path: &str,
+    artifact_path: &str,
+) -> VerbResult {
+    const OP: &str = "function deploy";
+
+    if let Err(error) =
+        validate_signed_record(&request, SCHEMA_FUNCTION_DEPLOY_V1, OP, "authorization")
+    {
+        return error;
+    }
+    if request.signer != request.payload.requested_by.as_str() {
+        return contract_input_error(
+            OP,
+            "authorization",
+            "deployment request is not signed by requested_by".into(),
+        );
+    }
+    if let Err(error) =
+        validate_signed_record(&resolution, SCHEMA_FUNCTION_DEPLOY_V1, OP, "resolution")
+    {
+        return error;
+    }
+    if request.payload.function != resolution.payload.selector {
+        return contract_input_error(
+            OP,
+            "resolution",
+            "resolution answers a different deployment selector".into(),
+        );
+    }
+    let Some(target_node) = request.payload.target_node.clone() else {
+        return contract_input_error(
+            OP,
+            "authorization",
+            "an explicit target_node is required for local post-load registration".into(),
+        );
+    };
+    let Some(deployer) = ctx.function_deployer else {
+        return VerbResult::err(
+            json!({
+                "ok": false,
+                "error": "function-deployer-unconfigured",
+                "hint": "compose ControlCore/VerbCtx with a node-local operational deployer signer"
+            }),
+            "function deploy: no operational deployer signer is configured on this control plane",
+        );
+    };
+    let target_realm = request.payload.target_realm.clone();
+    let registration_evidence = request.payload.evidence.clone();
+    let resolved_function = resolution.payload.function.clone();
+
+    let manifest_bytes =
+        match read_node_file_bounded(manifest_path, "manifest", MAX_CONTROL_MANIFEST_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return VerbResult::err(
+                    json!({ "ok": false, "error": error }),
+                    format!("function deploy: {error}"),
+                )
+            }
+        };
+    let manifest = match Manifest::parse(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return contract_input_error(OP, "manifest", error.to_string());
+        }
+    };
+    let computed_content_address = manifest.compute_content_address();
+    if manifest.content_address.as_deref() != Some(computed_content_address.as_str())
+        || resolved_function.manifest_content_address != computed_content_address
+    {
+        return contract_input_error(
+            OP,
+            "manifest",
+            "manifest content address does not match the immutable resolved FunctionId".into(),
+        );
+    }
+    let Some(entrypoint) = manifest
+        .entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.name == resolved_function.entrypoint)
+    else {
+        return contract_input_error(
+            OP,
+            "manifest",
+            "resolved entrypoint is absent from the signed manifest".into(),
+        );
+    };
+    if entrypoint.contract.is_none() {
+        return contract_input_error(
+            OP,
+            "manifest",
+            "function deployment requires a structured entrypoint contract".into(),
+        );
+    }
+
+    // Produce one representation before deriving the deployment pin. Native paths stream into the
+    // retained O(1)-memory stage; sandboxed artifacts use the existing bounded materialization path.
+    // Kernel::load verifies/reuses the sealed Linux stage (and defensively restages the fallback),
+    // so this digest and the loaded identity never depend on reopening the operator source path.
+    let artifact = match manifest.abi.backend {
+        Backend::Daemon => Artifact::Path(artifact_path.into()),
+        Backend::Beast | Backend::Critter => {
+            match read_node_file_bounded(artifact_path, "artifact", MAX_CONTROL_ARTIFACT_BYTES) {
+                Ok(bytes) => Artifact::Bytes(bytes),
+                Err(error) => {
+                    return VerbResult::err(
+                        json!({ "ok": false, "error": error }),
+                        format!("function deploy: {error}"),
+                    )
+                }
+            }
+        }
+    };
+    let artifact = match artifact.prepare_for_load(&manifest) {
+        Ok(artifact) => artifact,
+        Err(error) => return contract_input_error(OP, "artifact", error.to_string()),
+    };
+    let artifact_hash = match artifact.sha256_hex() {
+        Ok(hash) => format!("sha256:{hash}"),
+        Err(error) => {
+            return contract_input_error(OP, "artifact", error.to_string());
+        }
+    };
+    let artifact_hex = artifact_hash
+        .strip_prefix("sha256:")
+        .expect("locally computed artifact hash carries the scheme");
+    if manifest.provenance.build_hash.as_deref() != Some(artifact_hex) {
+        return contract_input_error(
+            OP,
+            "manifest",
+            "manifest provenance.build_hash does not bind the supplied artifact bytes".into(),
+        );
+    }
+    if artifact_hash != resolution.payload.artifact_hash {
+        return contract_input_error(
+            OP,
+            "artifact",
+            format!(
+                "artifact digest is `{artifact_hash}`, resolution pins `{}`",
+                resolution.payload.artifact_hash
+            ),
+        );
+    }
+
+    let target = match ctx.kernel.load(manifest, artifact) {
+        Ok(target) => target,
+        Err(error) => {
+            return VerbResult::err(
+                json!({ "ok": false, "error": error.to_string(), "stage": "load" }),
+                format!("function deploy: admission/load rejected the artifact: {error}"),
+            )
+        }
+    };
+    if let Err(rollback) = verify_loaded_function_artifact(ctx, target, artifact_hex) {
+        return rollback;
+    }
+    let target_creature = target.0.to_string();
+    let deployment = match derive_deployment_id(
+        &resolved_function,
+        &artifact_hash,
+        &target_realm,
+        &target_node,
+        &target_creature,
+    ) {
+        Ok(deployment) => deployment,
+        Err(error) => {
+            return rollback_function_load(
+                ctx,
+                target,
+                "identity",
+                format!("could not derive deployment identity: {error}"),
+            )
+        }
+    };
+    let registration = DeploymentRegistrationV1 {
+        authorization: request,
+        resolution,
+        deployment: deployment.clone(),
+        function: resolved_function.clone(),
+        artifact_hash: artifact_hash.clone(),
+        target_creature: target_creature.clone(),
+        evidence: registration_evidence,
+    };
+    let registration = match SignedRecordV1::sign(SCHEMA_FUNCTION_DEPLOY_V1, registration, deployer)
+    {
+        Ok(registration) => registration,
+        Err(error) => {
+            return rollback_function_load(
+                ctx,
+                target,
+                "registration-sign",
+                format!("could not attest post-load registration: {error}"),
+            )
+        }
+    };
+    let message = FunctionDeployMessageV1::Register { request: Box::new(registration) };
+    match function_job_request_authenticated::<_, FunctionDeployMessageV1>(
+        ctx,
+        FUNCTION_EXECUTOR_ROLE,
+        SCHEMA_FUNCTION_DEPLOY_V1,
+        OP,
+        &message,
+    ) {
+        Ok((FunctionDeployMessageV1::Registered { receipt }, responder)) => {
+            let expected = ExpectedDeploymentReceipt {
+                deployment: &deployment,
+                function: &resolved_function,
+                artifact_hash: &artifact_hash,
+                realm: &target_realm,
+                node: &target_node,
+                target,
+                responder,
+            };
+            if let Err(error) = validate_function_deployment_receipt(&receipt, &expected) {
+                return function_registration_indeterminate(target, deployment, error);
+            }
+            VerbResult::ok(
+                json!({
+                    "ok": true,
+                    "creature_id": target.0,
+                    "deployment": receipt
+                }),
+                format!("function deployed as {} (creature {})", deployment, target.0),
+            )
+        }
+        Ok((FunctionDeployMessageV1::Error { error }, _)) => rollback_function_load(
+            ctx,
+            target,
+            "register",
+            format!("{}: {}", error.code, error.message),
+        ),
+        Ok((_, _)) => function_registration_indeterminate(
+            target,
+            deployment,
+            "executor returned a reply for a different operation".into(),
+        ),
+        Err(error) => {
+            // A timeout or lost response cannot prove registration failed. Unloading here could
+            // leave a durable receipt pointing at a retired target, so preserve the loaded instance
+            // and return its identity for explicit reconciliation via `function deployments`.
+            function_registration_indeterminate(target, deployment, error.human)
+        }
+    }
+}
+
+fn verb_function_undeploy(
+    ctx: &mut VerbCtx,
+    request: SignedRecordV1<UndeployRequestV1>,
+    deployment: SignedRecordV1<DeploymentReceiptV1>,
+) -> VerbResult {
+    const OP: &str = "function undeploy";
+
+    if let Err(error) =
+        validate_signed_record(&request, SCHEMA_FUNCTION_DEPLOY_V1, OP, "authorization")
+    {
+        return error;
+    }
+    if request.signer != request.payload.requested_by.as_str() {
+        return contract_input_error(
+            OP,
+            "authorization",
+            "undeploy request is not signed by requested_by".into(),
+        );
+    }
+    if let Err(error) = verify_deployment_receipt(&deployment) {
+        return contract_input_error(OP, "deployment", error.to_string());
+    }
+    if request.payload.deployment != deployment.payload.deployment {
+        return contract_input_error(
+            OP,
+            "deployment",
+            "deployment receipt does not match the authorized DeploymentId".into(),
+        );
+    }
+    let target = match parse_receipt_creature_id(&deployment.payload.creature) {
+        Ok(target) => target,
+        Err(detail) => return contract_input_error(OP, "deployment", detail),
+    };
+    let deployment_id = deployment.payload.deployment.clone();
+    let message = FunctionDeployMessageV1::Undeploy { request };
+    let (reply, responder) = match function_job_request_authenticated::<_, FunctionDeployMessageV1>(
+        ctx,
+        FUNCTION_EXECUTOR_ROLE,
+        SCHEMA_FUNCTION_DEPLOY_V1,
+        OP,
+        &message,
+    ) {
+        Ok(answer) => answer,
+        Err(error) => {
+            return function_undeploy_indeterminate(
+                ctx,
+                target,
+                &deployment_id,
+                error.human,
+                "executor outcome was not authenticated",
+            )
+        }
+    };
+
+    match reply {
+        FunctionDeployMessageV1::Undeployed { receipt } => {
+            let acknowledgement = verify_undeploy_receipt(&receipt)
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    let route = parse_receipt_creature_id(&receipt.payload.executor_creature)?;
+                    if receipt.payload.deployment != deployment_id {
+                        return Err(format!(
+                            "executor acknowledged DeploymentId `{}`, expected `{deployment_id}`",
+                            receipt.payload.deployment
+                        ));
+                    }
+                    if receipt.payload.executor != deployment.payload.executor {
+                        return Err(
+                            "undeploy acknowledgement is signed by a different stable executor"
+                                .into(),
+                        );
+                    }
+                    if route != responder {
+                        return Err(format!(
+                            "undeploy acknowledgement pins current executor creature {}, but the authenticated role reply came from {}",
+                            route.0, responder.0
+                        ));
+                    }
+                    Ok(())
+                });
+            match acknowledgement {
+                Ok(()) => finish_function_undeploy(ctx, target, deployment, receipt),
+                Err(detail) => function_undeploy_indeterminate(
+                    ctx,
+                    target,
+                    &deployment_id,
+                    detail,
+                    "executor acknowledgement did not match the durable deployment",
+                ),
+            }
+        }
+        FunctionDeployMessageV1::Error { error } => {
+            function_undeploy_refused(ctx, target, &deployment_id, error)
+        }
+        _ => function_undeploy_indeterminate(
+            ctx,
+            target,
+            &deployment_id,
+            "executor returned a reply for a different operation".into(),
+            "unexpected executor reply",
+        ),
+    }
+}
+
+fn parse_receipt_creature_id(value: &str) -> Result<CreatureId, String> {
+    let id = value
+        .parse::<u64>()
+        .map_err(|_| format!("receipt creature `{value}` is not a numeric CreatureId"))?;
+    if id == 0 || id.to_string() != value {
+        return Err(format!("receipt creature `{value}` is not one canonical positive CreatureId"));
+    }
+    Ok(CreatureId(id))
+}
+
+fn function_undeploy_refused(
+    ctx: &VerbCtx<'_>,
+    target: CreatureId,
+    deployment: &gawdfn::DeploymentId,
+    error: ProtocolErrorV1,
+) -> VerbResult {
+    if let Err(detail) = error.validate() {
+        return function_undeploy_indeterminate(
+            ctx,
+            target,
+            deployment,
+            format!("invalid protocol error reply: {detail}"),
+            "executor refusal was malformed",
+        );
+    }
+    let retained = ctx.kernel.is_loaded(target);
+    let target_state = if retained {
+        format!("retained loaded creature {}", target.0)
+    } else {
+        format!("issued no Kernel unload; creature {} was already absent", target.0)
+    };
+    let human = format!(
+        "function undeploy: executor refused {}: {}; {target_state}",
+        error.code, error.message
+    );
+    VerbResult::err(
+        json!({
+            "ok": false,
+            "error": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+            "deployment_id": deployment,
+            "creature_id": target.0,
+            "durable_tombstone": false,
+            "kernel_unload_attempted": false,
+            "loaded_instance_retained": retained
+        }),
+        human,
+    )
+}
+
+fn function_undeploy_indeterminate(
+    ctx: &VerbCtx<'_>,
+    target: CreatureId,
+    deployment: &gawdfn::DeploymentId,
+    detail: String,
+    summary: &'static str,
+) -> VerbResult {
+    let retained = ctx.kernel.is_loaded(target);
+    let target_state = if retained {
+        format!("retained loaded creature {}", target.0)
+    } else {
+        format!("issued no Kernel unload; creature {} was already absent", target.0)
+    };
+    VerbResult::err(
+        json!({
+            "ok": false,
+            "error": "undeploy-outcome-indeterminate",
+            "detail": detail,
+            "summary": summary,
+            "deployment_id": deployment,
+            "creature_id": target.0,
+            "tombstone_confirmed": false,
+            "kernel_unload_attempted": false,
+            "loaded_instance_retained": retained
+        }),
+        format!("function undeploy: {summary}; {target_state} for reconciliation: {detail}"),
+    )
+}
+
+fn finish_function_undeploy(
+    ctx: &VerbCtx<'_>,
+    target: CreatureId,
+    deployment: SignedRecordV1<DeploymentReceiptV1>,
+    acknowledgement: SignedRecordV1<UndeployReceiptV1>,
+) -> VerbResult {
+    let id = &deployment.payload.deployment;
+    let Some(identity) = ctx.kernel.loaded_manifest_identity(target) else {
+        return VerbResult::ok(
+            json!({
+                "ok": true,
+                "deployment_id": id,
+                "creature_id": target.0,
+                "durable_tombstone": true,
+                "undeploy_receipt": &acknowledgement,
+                "kernel_unload_attempted": false,
+                "target_unloaded": false,
+                "target_status": "already_absent"
+            }),
+            format!(
+                "function undeployed as {id}; durable tombstone confirmed and creature {} was already absent",
+                target.0
+            ),
+        );
+    };
+
+    let expected_hash = deployment.payload.artifact_hash.strip_prefix("sha256:");
+    let live_hash = identity
+        .artifact_sha256
+        .as_deref()
+        .and_then(|hash| hash.strip_prefix("sha256:").or(Some(hash)));
+    let identity_matches = identity.manifest_content_address.as_deref()
+        == Some(deployment.payload.function.manifest_content_address.as_str())
+        && expected_hash.is_some()
+        && live_hash == expected_hash;
+    if !identity_matches {
+        return VerbResult::ok(
+            json!({
+                "ok": true,
+                "deployment_id": id,
+                "creature_id": target.0,
+                "durable_tombstone": true,
+                "undeploy_receipt": &acknowledgement,
+                "kernel_unload_attempted": false,
+                "target_unloaded": false,
+                "target_status": "identity_mismatch",
+                "unsafe_unload_prevented": true,
+                "loaded_identity": {
+                    "manifest_content_address": identity.manifest_content_address,
+                    "artifact_sha256": identity.artifact_sha256,
+                    "declared_artifact_build_hash": identity.artifact_build_hash
+                }
+            }),
+            format!(
+                "function undeployed as {id}; durable tombstone confirmed, but creature {} now holds a different identity and was safely retained",
+                target.0
+            ),
+        );
+    }
+
+    match ctx.kernel.unload(target, Deadline::default()) {
+        Ok(()) => VerbResult::ok(
+            json!({
+                "ok": true,
+                "deployment_id": id,
+                "creature_id": target.0,
+                "durable_tombstone": true,
+                "undeploy_receipt": &acknowledgement,
+                "kernel_unload_attempted": true,
+                "target_unloaded": true,
+                "target_status": "unloaded"
+            }),
+            format!("function undeployed as {id}; retired creature {}", target.0),
+        ),
+        // A fault can make the exact target disappear between the identity check and unload. The
+        // tombstone still prevents new work, and no different numeric occupant was touched.
+        Err(sanctum::KernelError::NoSuchModule(_)) => VerbResult::ok(
+            json!({
+                "ok": true,
+                "deployment_id": id,
+                "creature_id": target.0,
+                "durable_tombstone": true,
+                "undeploy_receipt": &acknowledgement,
+                "kernel_unload_attempted": true,
+                "target_unloaded": false,
+                "target_status": "disappeared_before_unload"
+            }),
+            format!(
+                "function undeployed as {id}; durable tombstone confirmed and creature {} disappeared before unload",
+                target.0
+            ),
+        ),
+        Err(error) => {
+            let routable = ctx.kernel.is_loaded(target);
+            VerbResult::err(
+                json!({
+                    "ok": false,
+                    "error": "function-unload-incomplete",
+                    "detail": error.to_string(),
+                    "deployment_id": id,
+                    "creature_id": target.0,
+                    "durable_tombstone": true,
+                    "undeploy_receipt": &acknowledgement,
+                    "kernel_unload_attempted": true,
+                    "target_unloaded": false,
+                    "target_routable": routable,
+                    "orphaned_instance": true,
+                    "retirement_state": "tombstoned_safe_orphan"
+                }),
+                format!(
+                    "function undeploy: durable tombstone confirmed for {id}, but creature {} did not complete teardown and is a safe orphan: {error}",
+                    target.0
+                ),
+            )
+        }
+    }
+}
+
+struct ExpectedDeploymentReceipt<'a> {
+    deployment: &'a gawdfn::DeploymentId,
+    function: &'a gawdfn::FunctionId,
+    artifact_hash: &'a str,
+    realm: &'a str,
+    node: &'a str,
+    target: CreatureId,
+    responder: CreatureId,
+}
+
+fn validate_function_deployment_receipt(
+    receipt: &SignedRecordV1<DeploymentReceiptV1>,
+    expected: &ExpectedDeploymentReceipt<'_>,
+) -> Result<(), String> {
+    verify_deployment_receipt(receipt).map_err(|error| error.to_string())?;
+    let payload = &receipt.payload;
+    if &payload.deployment != expected.deployment
+        || &payload.function != expected.function
+        || payload.artifact_hash != expected.artifact_hash
+        || payload.realm != expected.realm
+        || payload.node != expected.node
+        || payload.executor_creature != expected.responder.0.to_string()
+        || payload.creature != expected.target.0.to_string()
+    {
+        return Err("executor receipt does not match the loaded target and authorization".into());
+    }
+    Ok(())
+}
+
+fn rollback_function_load(
+    ctx: &VerbCtx,
+    target: CreatureId,
+    stage: &'static str,
+    reason: String,
+) -> VerbResult {
+    let rollback = ctx.kernel.unload(target, Deadline::default());
+    let rollback_error = rollback.err().map(|error| error.to_string());
+    VerbResult::err(
+        json!({
+            "ok": false,
+            "error": reason.clone(),
+            "stage": stage,
+            "creature_id": target.0,
+            "rolled_back": rollback_error.is_none(),
+            "rollback_error": rollback_error.clone()
+        }),
+        format!(
+            "function deploy failed during {stage}: {reason}{}",
+            rollback_error
+                .as_deref()
+                .map(|error| format!("; unload rollback also failed: {error}"))
+                .unwrap_or_default()
+        ),
+    )
+}
+
+fn verify_loaded_function_artifact(
+    ctx: &VerbCtx,
+    target: CreatureId,
+    expected_sha256: &str,
+) -> Result<(), VerbResult> {
+    let loaded_artifact_sha256 =
+        ctx.kernel.loaded_manifest_identity(target).and_then(|identity| identity.artifact_sha256);
+    if loaded_artifact_sha256.as_deref() == Some(expected_sha256) {
+        return Ok(());
+    }
+    Err(rollback_function_load(
+        ctx,
+        target,
+        "identity",
+        format!(
+            "loaded artifact identity {:?} differs from deployment pin `{expected_sha256}`",
+            loaded_artifact_sha256
+        ),
+    ))
+}
+
+fn function_registration_indeterminate(
+    target: CreatureId,
+    deployment: gawdfn::DeploymentId,
+    detail: String,
+) -> VerbResult {
+    VerbResult::err(
+        json!({
+            "ok": false,
+            "error": "deployment-registration-indeterminate",
+            "detail": detail,
+            "creature_id": target.0,
+            "deployment_id": deployment,
+            "loaded_instance_retained": true
+        }),
+        format!(
+            "function deploy: registration outcome is indeterminate; retained creature {} for reconciliation: {detail}",
+            target.0
+        ),
+    )
+}
+
+fn verb_function_deployments(ctx: &mut VerbCtx, query: DeploymentQueryV1) -> VerbResult {
+    const OP: &str = "function deployments";
+    if let Err(error) = query.validate() {
+        return contract_input_error(OP, "query", error.to_string());
+    }
+    let message = FunctionDeployMessageV1::Lookup { query: query.clone() };
+    match function_job_request::<_, FunctionDeployMessageV1>(
+        ctx,
+        FUNCTION_EXECUTOR_ROLE,
+        SCHEMA_FUNCTION_DEPLOY_V1,
+        OP,
+        &message,
+    ) {
+        Ok(FunctionDeployMessageV1::Deployments { list }) => {
+            if let Err(error) = validate_deployment_list(&list, &query) {
+                return contract_input_error(OP, "reply", error);
+            }
+            let count = list.deployments.len();
+            VerbResult::ok(
+                json!({ "ok": true, "deployments": list.deployments }),
+                format!("{count} deployment(s)"),
+            )
+        }
+        Ok(FunctionDeployMessageV1::Error { error }) => protocol_error(OP, error),
+        Ok(_) => unexpected_function_reply(OP),
+        Err(error) => error,
+    }
+}
+
+fn validate_deployment_list(
+    list: &DeploymentListV1,
+    query: &DeploymentQueryV1,
+) -> Result<(), String> {
+    list.validate().map_err(|e| e.to_string())?;
+    for receipt in &list.deployments {
+        verify_deployment_receipt(receipt).map_err(|error| error.to_string())?;
+        let deployment = &receipt.payload;
+        if query.function.as_ref().is_some_and(|function| function != &deployment.function)
+            || query.realm.as_ref().is_some_and(|realm| realm != &deployment.realm)
+            || query.node.as_ref().is_some_and(|node| node != &deployment.node)
+        {
+            return Err("deployment reply contains an item outside the requested filter".into());
+        }
+    }
+    Ok(())
+}
+
+fn verb_job_submit(
+    ctx: &mut VerbCtx,
+    request: SignedRecordV1<JobSubmitV1>,
+    resolution: SignedRecordV1<ResolutionReceiptV1>,
+    deployment: SignedRecordV1<DeploymentReceiptV1>,
+) -> VerbResult {
+    const OP: &str = "job submit";
+    for result in [
+        validate_signed_record(&request, SCHEMA_JOB_V1, OP, "request"),
+        validate_signed_record(&resolution, SCHEMA_FUNCTION_DEPLOY_V1, OP, "resolution"),
+        verify_deployment_receipt(&deployment)
+            .map_err(|error| contract_input_error(OP, "deployment", error.to_string())),
+    ] {
+        if let Err(error) = result {
+            return error;
+        }
+    }
+    let expected_hash = match request.payload.request_hash() {
+        Ok(hash) => hash,
+        Err(error) => return contract_input_error(OP, "request", error.to_string()),
+    };
+    let expected_job =
+        match derive_job_id(&request.payload.home, &request.payload.caller_idempotency_key) {
+            Ok(job) => job,
+            Err(error) => return contract_input_error(OP, "request", error.to_string()),
+        };
+    let expected_home = request.payload.home.clone();
+    let message = JobMessageV1::Submit {
+        request: Box::new(request),
+        resolution: Box::new(resolution),
+        deployment: Box::new(deployment),
+    };
+    match function_job_request::<_, JobMessageV1>(
+        ctx,
+        FUNCTION_HOME_ROLE,
+        SCHEMA_JOB_V1,
+        OP,
+        &message,
+    ) {
+        Ok(JobMessageV1::Accepted { handle, request_hash, submitted }) => {
+            if handle.home != expected_home
+                || handle.job != expected_job
+                || request_hash != expected_hash
+            {
+                return contract_input_error(
+                    OP,
+                    "accepted",
+                    "home returned an acceptance for a different request".into(),
+                );
+            }
+            if let Err(error) = verify_job_acceptance(&handle, &request_hash, &submitted) {
+                return contract_input_error(OP, "accepted", error.to_string());
+            }
+            VerbResult::ok(
+                json!({
+                    "ok": true,
+                    "accepted": true,
+                    "handle": handle,
+                    "request_hash": request_hash,
+                    "submitted": submitted
+                }),
+                format!("accepted job {}", expected_job),
+            )
+        }
+        Ok(JobMessageV1::Error { error }) => protocol_error(OP, error),
+        Ok(_) => unexpected_function_reply(OP),
+        Err(error) => error,
+    }
+}
+
+fn verb_job_get(ctx: &mut VerbCtx, request: SignedRecordV1<JobGetV1>) -> VerbResult {
+    const OP: &str = "job get";
+    if let Err(error) = validate_signed_record(&request, SCHEMA_JOB_V1, OP, "request") {
+        return error;
+    }
+    let expected_handle = request.payload.handle.clone();
+    let reply_to = match function_read_reply_route(ctx, OP) {
+        Ok(reply_to) => reply_to,
+        Err(error) => return error,
+    };
+    let signer = match function_read_signer(ctx, OP) {
+        Ok(signer) => signer,
+        Err(error) => return error,
+    };
+    let request = match SignedRecordV1::sign(
+        SCHEMA_JOB_V1,
+        JobGetRelayV1 { caller: request, reply_to },
+        signer,
+    ) {
+        Ok(request) => request,
+        Err(error) => return contract_input_error(OP, "relay", error.to_string()),
+    };
+    let relay_request = request.clone();
+    let message = JobMessageV1::Get { request: Box::new(request) };
+    match function_job_request::<_, JobMessageV1>(
+        ctx,
+        FUNCTION_HOME_ROLE,
+        SCHEMA_JOB_V1,
+        OP,
+        &message,
+    ) {
+        Ok(JobMessageV1::Snapshot { response }) => {
+            if let Err(error) = verify_job_snapshot_response_for(&response, &relay_request) {
+                return contract_input_error(OP, "snapshot response", error.to_string());
+            }
+            if response.payload.snapshot.payload.spec.handle != expected_handle {
+                return contract_input_error(
+                    OP,
+                    "snapshot",
+                    "home returned a different job".into(),
+                );
+            }
+            let state = &response.payload.snapshot.payload.state;
+            let human = format!("job {} is {state:?}", expected_handle.job);
+            proof_bearing_private_read_result(relay_request, response, human)
+        }
+        Ok(JobMessageV1::Error { error }) => protocol_error(OP, error),
+        Ok(_) => unexpected_function_reply(OP),
+        Err(error) => error,
+    }
+}
+
+fn verb_job_events(ctx: &mut VerbCtx, request: SignedRecordV1<EventQueryV1>) -> VerbResult {
+    const OP: &str = "job events";
+    if let Err(error) = validate_signed_record(&request, SCHEMA_JOB_V1, OP, "request") {
+        return error;
+    }
+    let expected_handle = request.payload.handle.clone();
+    let reply_to = match function_read_reply_route(ctx, OP) {
+        Ok(reply_to) => reply_to,
+        Err(error) => return error,
+    };
+    let signer = match function_read_signer(ctx, OP) {
+        Ok(signer) => signer,
+        Err(error) => return error,
+    };
+    let request = match SignedRecordV1::sign(
+        SCHEMA_JOB_V1,
+        EventQueryRelayV1 { caller: request, reply_to },
+        signer,
+    ) {
+        Ok(request) => request,
+        Err(error) => return contract_input_error(OP, "relay", error.to_string()),
+    };
+    let relay_request = request.clone();
+    let message = JobMessageV1::Events { request: Box::new(request) };
+    match function_job_request::<_, JobMessageV1>(
+        ctx,
+        FUNCTION_HOME_ROLE,
+        SCHEMA_JOB_V1,
+        OP,
+        &message,
+    ) {
+        Ok(JobMessageV1::EventPage { response }) => {
+            if let Err(error) = verify_event_page_response_for(&response, &relay_request) {
+                return contract_input_error(OP, "event page response", error.to_string());
+            }
+            if response.payload.page.handle != expected_handle
+                || response.payload.page.events.iter().any(|event| verify_job_event(event).is_err())
+            {
+                return contract_input_error(
+                    OP,
+                    "event page",
+                    "home returned a different job or an invalid event signature".into(),
+                );
+            }
+            let count = response.payload.page.events.len();
+            proof_bearing_private_read_result(
+                relay_request,
+                response,
+                format!("{count} event(s) for job {}", expected_handle.job),
+            )
+        }
+        Ok(JobMessageV1::Error { error }) => protocol_error(OP, error),
+        Ok(_) => unexpected_function_reply(OP),
+        Err(error) => error,
+    }
+}
+
+fn proof_bearing_private_read_result<R, S>(
+    relay_request: R,
+    response: S,
+    human: impl Into<String>,
+) -> VerbResult
+where
+    R: serde::Serialize,
+    S: serde::Serialize,
+{
+    VerbResult::ok(
+        json!({
+            "ok": true,
+            "relay_request": relay_request,
+            "response": response,
+        }),
+        human,
+    )
+}
+
+fn verb_job_control(ctx: &mut VerbCtx, request: SignedRecordV1<JobControlV1>) -> VerbResult {
+    const OP: &str = "job control";
+    if let Err(error) = validate_signed_record(&request, SCHEMA_JOB_V1, OP, "request") {
+        return error;
+    }
+    let expected_handle = request.payload.handle.clone();
+    let control = request.payload.control.clone();
+    let request_for_verification = request.clone();
+    let message = JobMessageV1::Control { request: Box::new(request) };
+    match function_job_request::<_, JobMessageV1>(
+        ctx,
+        FUNCTION_HOME_ROLE,
+        SCHEMA_JOB_V1,
+        OP,
+        &message,
+    ) {
+        Ok(JobMessageV1::ControlAccepted { request_hash, event }) => {
+            if let Err(error) =
+                verify_job_control_acceptance(&request_for_verification, &request_hash, &event)
+            {
+                return contract_input_error(OP, "control acceptance", error.to_string());
+            }
+            debug_assert_eq!(event.payload.handle, expected_handle);
+            VerbResult::ok(
+                json!({ "ok": true, "request_hash": request_hash, "event": event }),
+                format!("job control {} was durably recorded", control),
+            )
+        }
+        Ok(JobMessageV1::Error { error }) => protocol_error(OP, error),
+        Ok(_) => unexpected_function_reply(OP),
+        Err(error) => error,
+    }
+}
+
 fn verb_send(ctx: &mut VerbCtx, id: u64, text: &str, node: Option<&str>) -> VerbResult {
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
-    let c = ctx.next_corr();
+    let c = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     // A cross-node send (`Some(node)`) rides the cluster: the transport ships it to the peer and
     // rewrites our `reply_to` so the reply routes back here. A local send is `Module`.
     let to = match node {
@@ -1550,7 +2990,10 @@ fn verb_send(ctx: &mut VerbCtx, id: u64, text: &str, node: Option<&str>) -> Verb
 
 fn verb_intent(ctx: &mut VerbCtx, outcome: &str, text: &str) -> VerbResult {
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
-    let c = ctx.next_corr();
+    let c = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let d = Dispatch::to(
         Address::Intent(Intent { outcome: outcome.to_string(), requirements: vec![] }),
         text.as_bytes().to_vec(),
@@ -1592,7 +3035,10 @@ fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str))
             MAX_CONTROL_AUTHOR_REQUEST_BYTES
         ));
     }
-    let c1 = ctx.next_corr();
+    let c1 = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let payload = match serde_json::to_vec(&AuthoringRequest {
         request: request.into(),
         ..Default::default()
@@ -1627,7 +3073,10 @@ fn verb_author(ctx: &mut VerbCtx, request: &str, progress: &mut dyn FnMut(&str))
         resp.source.len()
     ));
 
-    let c2 = ctx.next_corr();
+    let c2 = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let op = BuildOp::Build {
         crate_name: resp.crate_name.clone(),
         crate_version: resp.crate_version.clone(),
@@ -1708,7 +3157,10 @@ fn verb_author_critter(
             MAX_CONTROL_AUTHOR_REQUEST_BYTES - (nudged.len() - request.len())
         ));
     }
-    let c1 = ctx.next_corr();
+    let c1 = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let payload =
         match serde_json::to_vec(&AuthoringRequest { request: nudged, ..Default::default() }) {
             Ok(p) => p,
@@ -1741,7 +3193,10 @@ fn verb_author_critter(
         resp.source.len()
     ));
 
-    let c2 = ctx.next_corr();
+    let c2 = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let op = BuildCritterOp::Author {
         source: resp.source.clone(),
         manifest_stub: resp.manifest_stub.clone(),
@@ -1821,7 +3276,10 @@ fn cluster_disabled() -> VerbResult {
 fn verb_cluster(ctx: &mut VerbCtx) -> VerbResult {
     let Some(tid) = ctx.transport else { return cluster_disabled() };
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
-    let c = ctx.next_corr();
+    let c = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let d = Dispatch::to(Address::Creature(tid), TransportCtl::Members.to_bytes())
         .with_schema(CTL_SCHEMA)
         .with_reply_to(Address::Creature(bus.id()))
@@ -1866,7 +3324,10 @@ fn verb_cluster(ctx: &mut VerbCtx) -> VerbResult {
 fn verb_cluster_join(ctx: &mut VerbCtx, node_id: &str, addr: &str, pubkey: &str) -> VerbResult {
     let Some(tid) = ctx.transport else { return cluster_disabled() };
     let Some((bus, rx)) = ctx.probe else { return no_probe_err() };
-    let c = ctx.next_corr();
+    let c = match ctx.next_corr() {
+        Ok(corr) => corr,
+        Err(error) => return error,
+    };
     let op = TransportCtl::Connect {
         node_id: node_id.to_string(),
         pubkey_hex: pubkey.to_string(),
@@ -2182,11 +3643,28 @@ pub fn boot_control(
     critter_builder: Option<CreatureId>,
     transport: Option<CreatureId>,
 ) -> Result<CreatureId, String> {
+    boot_control_with_function_deployer(kernel, ai, critter_builder, transport, None)
+}
+
+/// Boot the control organ with an optional, separately-custodied operational deployer key.
+///
+/// The ordinary [`boot_control`] path passes `None`, preserving its existing posture. A composition
+/// that boots the function executor supplies this signer so `FunctionDeploy` can attest the exact
+/// post-admission `CreatureId`; the caller's Abode authorization remains nested and independently
+/// signed, and the executor still applies its injected admission model.
+pub fn boot_control_with_function_deployer(
+    kernel: &std::sync::Arc<Kernel>,
+    ai: &std::sync::Arc<AiControl>,
+    critter_builder: Option<CreatureId>,
+    transport: Option<CreatureId>,
+    function_deployer: Option<std::sync::Arc<dyn AuthoritySigner>>,
+) -> Result<CreatureId, String> {
+    let mut control = ControlCore::new(kernel, ai.clone(), critter_builder, transport);
+    if let Some(signer) = function_deployer {
+        control = control.with_function_deployer(signer);
+    }
     let id = kernel
-        .load_instance(
-            boot_manifest("omni"),
-            Box::new(ControlCore::new(kernel, ai.clone(), critter_builder, transport)),
-        )
+        .load_instance(boot_manifest("omni"), Box::new(control))
         .map_err(|e| format!("omni: {e}"))?;
     kernel.bind_role(Role::new(Role::CONTROL), id);
     Ok(id)
@@ -2365,6 +3843,20 @@ pub fn open_probe(kernel: &Kernel) -> (CreatureId, BusHandle, InboxReceiver) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn unsigned_record<T>(schema: &str, payload: T) -> SignedRecordV1<T> {
+        SignedRecordV1 {
+            schema: schema.into(),
+            signer: String::new(),
+            payload,
+            signature: String::new(),
+        }
+    }
+
+    fn unsigned_job_record<T>(payload: T) -> SignedRecordV1<T> {
+        unsigned_record(SCHEMA_JOB_V1, payload)
+    }
 
     #[test]
     fn parse_control_result_accepts_bounded_result() {
@@ -2376,6 +3868,55 @@ mod tests {
         assert!(parsed.ok);
         assert_eq!(parsed.json, json!({ "ok": true }));
         assert_eq!(parsed.human, "ready");
+    }
+
+    #[test]
+    fn post_load_artifact_identity_mismatch_rolls_back_before_registration() {
+        let kernel = Kernel::new(
+            vec![Arc::new(anima::ScriptEngine)],
+            Arc::new(aether::StubSigner::new("test-node")),
+            Arc::new(aether::StubVerifier),
+            Arc::new(policy_dev::DevPolicy),
+            64,
+        );
+        let manifest =
+            Manifest::new("identity-rollback", "1.0.0", Backend::Critter, anima::CRITTER_ABI_TAG);
+        let target = kernel
+            .load(manifest, Artifact::Bytes(b"fn handle(env) { env.payload }".to_vec()))
+            .unwrap();
+        let ai = AiControl::new(true);
+        let ctx = VerbCtx::no_probe(&kernel, None, &ai, false);
+
+        let result = match verify_loaded_function_artifact(&ctx, target, &"0".repeat(64)) {
+            Ok(()) => panic!("a mismatched loaded identity must not reach registration"),
+            Err(result) => result,
+        };
+
+        assert!(!result.ok);
+        assert_eq!(result.json["stage"], "identity");
+        assert_eq!(result.json["rolled_back"], true);
+        assert_eq!(kernel.loaded_count(), 0, "mismatched target was unloaded");
+    }
+
+    #[test]
+    fn correlation_cursor_exhaustion_is_permanent_and_never_wraps() {
+        let kernel = Kernel::new(
+            Vec::new(),
+            std::sync::Arc::new(aether::StubSigner::new("corr-test")),
+            std::sync::Arc::new(aether::StubVerifier),
+            std::sync::Arc::new(policy_dev::DevPolicy),
+            8,
+        );
+        let ai = AiControl::new(true);
+        let mut ctx = VerbCtx::no_probe(&kernel, None, &ai, false);
+        ctx.set_corr_cursor(Some(u64::MAX));
+
+        let first = ctx.next_corr().unwrap_err();
+        assert_eq!(first.json["error"], "control-internal-correlation-exhausted");
+        assert_eq!(ctx.corr_cursor(), None);
+        let second = ctx.next_corr().unwrap_err();
+        assert_eq!(second.json["error"], "control-internal-correlation-exhausted");
+        assert_eq!(ctx.corr_cursor(), None, "exhaustion must not wrap back to zero or one");
     }
 
     #[test]
@@ -2436,6 +3977,179 @@ mod tests {
             chunk_size: None,
         };
         assert!(v.is_gated(), "fetch-load loads code, so it is gated by allow-AI");
+    }
+
+    #[test]
+    fn function_job_repl_operation_set_and_gate_posture_are_exact() {
+        let home = gawdfn::HomeId::new("home");
+        let function = gawdfn::FunctionId {
+            manifest_content_address: format!("sha256:{}", "a".repeat(64)),
+            entrypoint: "run".into(),
+        };
+        let selector = gawdfn::FunctionSelectorV1::Id { function: function.clone() };
+        let handle = gawdfn::JobHandleV1 { home: home.clone(), job: gawdfn::JobId::new("job") };
+        let resolve = unsigned_record(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            ResolveRequestV1 {
+                requested_by: home.clone(),
+                selector: selector.clone(),
+                evidence: Vec::new(),
+            },
+        );
+        let resolution = unsigned_record(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            ResolutionReceiptV1 {
+                selector: selector.clone(),
+                function: function.clone(),
+                artifact_hash: format!("sha256:{}", "b".repeat(64)),
+                resolved_at_unix_ms: None,
+                evidence: Vec::new(),
+            },
+        );
+        let deployment = unsigned_record(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            DeploymentReceiptV1 {
+                deployment: gawdfn::DeploymentId::new("deployment"),
+                function: function.clone(),
+                artifact_hash: format!("sha256:{}", "b".repeat(64)),
+                realm: "local".into(),
+                node: "node".into(),
+                executor: String::new(),
+                executor_creature: "1".into(),
+                creature: "2".into(),
+                evidence: Vec::new(),
+                registered_at_unix_ms: None,
+            },
+        );
+        let deploy = unsigned_record(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            DeploymentRequestV1 {
+                requested_by: home.clone(),
+                function: selector.clone(),
+                target_realm: "local".into(),
+                target_node: Some("node".into()),
+                evidence: Vec::new(),
+                requested_at_unix_ms: None,
+            },
+        );
+        let submit = unsigned_job_record(JobSubmitV1 {
+            home: home.clone(),
+            caller_idempotency_key: "caller-key".into(),
+            function: selector.clone(),
+            input: gawdfn::ValueRefV1::Inline { value: json!({}) },
+            delivery: gawdfn::DeliveryModeV1::AtMostOnce,
+            allow_duplicate_effects: false,
+            parent: None,
+            causal: Vec::new(),
+            access: gawdfn::JobAccessV1::default(),
+            evidence: Vec::new(),
+            result_recipients: Vec::new(),
+            submitted_at_unix_ms: None,
+        });
+        let get = unsigned_job_record(JobGetV1 { handle: handle.clone(), nonce: "nonce".into() });
+        let events = unsigned_job_record(EventQueryV1 {
+            handle: handle.clone(),
+            after_sequence: None,
+            limit: 1,
+            nonce: "events".into(),
+        });
+        let control = unsigned_job_record(JobControlV1 {
+            handle,
+            expected_home_epoch: 1,
+            control: gawdfn::ControlId::new("cancel-1"),
+            issued_at_unix_ms: None,
+            kind: gawdfn::JobControlKindV1::Cancel { reason: "operator request".into() },
+        });
+        let undeploy = unsigned_record(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            UndeployRequestV1 {
+                requested_by: home,
+                deployment: gawdfn::DeploymentId::new("deployment"),
+                reason: None,
+            },
+        );
+
+        let cases = vec![
+            ("function resolve", true, format!("function resolve {}", json!(resolve))),
+            (
+                "function deploy",
+                true,
+                format!(
+                    "function deploy {}",
+                    json!({
+                        "request": deploy,
+                        "resolution": resolution,
+                        "manifest_path": "/node/creature.json",
+                        "artifact_path": "/node/creature.wasm"
+                    })
+                ),
+            ),
+            (
+                "function undeploy",
+                true,
+                format!(
+                    "function undeploy {}",
+                    json!({ "request": undeploy, "deployment": deployment })
+                ),
+            ),
+            ("function deployments", false, r#"function deployments {"limit":7}"#.to_string()),
+            (
+                "job submit",
+                true,
+                format!(
+                    "job submit {}",
+                    json!({
+                        "request": submit,
+                        "resolution": resolution,
+                        "deployment": deployment
+                    })
+                ),
+            ),
+            ("job get", false, format!("job get {}", json!(get))),
+            ("job events", false, format!("job events {}", json!(events))),
+            ("job control", true, format!("job control {}", json!(control))),
+        ];
+        assert_eq!(
+            cases.iter().map(|(operation, _, _)| *operation).collect::<Vec<_>>(),
+            vec![
+                "function resolve",
+                "function deploy",
+                "function undeploy",
+                "function deployments",
+                "job submit",
+                "job get",
+                "job events",
+                "job control",
+            ],
+            "the REPL Function/Job operation set is an exact parity contract"
+        );
+
+        for (operation, gated, line) in cases {
+            let verb = parse_verb(&line)
+                .unwrap_or_else(|error| panic!("{operation} did not parse: {error}"))
+                .unwrap_or_else(|| panic!("{operation} parsed as a blank line"));
+            let parsed_operation = match &verb {
+                Verb::FunctionResolve { .. } => "function resolve",
+                Verb::FunctionDeploy { .. } => "function deploy",
+                Verb::FunctionUndeploy { .. } => "function undeploy",
+                Verb::FunctionDeployments { .. } => "function deployments",
+                Verb::JobSubmit { .. } => "job submit",
+                Verb::JobGet { .. } => "job get",
+                Verb::JobEvents { .. } => "job events",
+                Verb::JobControl { .. } => "job control",
+                other => panic!("{operation} mapped to the wrong verb: {other:?}"),
+            };
+            assert_eq!(parsed_operation, operation);
+            assert_eq!(verb.is_gated(), gated, "{operation} gate posture drifted");
+        }
+    }
+
+    #[test]
+    fn function_repl_json_honors_the_job_message_cap() {
+        let oversized = format!("function deployments {}", "x".repeat(MAX_JOB_MESSAGE_BYTES + 1));
+        let error = parse_verb(&oversized).unwrap_err();
+        assert!(error.contains("exceeds"));
+        assert!(error.contains(&MAX_JOB_MESSAGE_BYTES.to_string()));
     }
 
     #[test]
@@ -2509,6 +4223,38 @@ mod tests {
         assert!(!parsed.ok);
         assert_eq!(parsed.json["error"].as_str(), Some("control-result-too-large"));
         assert!(parsed.json["bytes"].as_u64().unwrap() > MAX_CONTROL_RESULT_BYTES as u64);
+    }
+
+    #[test]
+    fn near_cap_private_reads_keep_complete_proof_without_duplicate_projection() {
+        for response_kind in ["signed_snapshot_response", "signed_event_page_response"] {
+            let signed_response = json!({
+                (response_kind): "x".repeat(gawdfn::MAX_PRIVATE_READ_MESSAGE_BYTES - 1024),
+            });
+            let signed_relay = json!({
+                "signed_exact_reply_route": "r".repeat(48 * 1024),
+            });
+            let result = proof_bearing_private_read_result(
+                signed_relay.clone(),
+                signed_response.clone(),
+                "bounded private read",
+            );
+            let raw = serde_json::to_vec(&result).unwrap();
+            assert!(
+                raw.len() > MAX_CONTROL_RESULT_BYTES - 32 * 1024,
+                "fixture must exercise the control-result ceiling rather than a small response"
+            );
+            assert!(raw.len() <= MAX_CONTROL_RESULT_BYTES);
+
+            let emitted = control_result_payload(result);
+            assert_eq!(emitted, raw, "the proof-bearing result must not collapse to a size error");
+            let parsed = parse_control_result(&emitted).unwrap();
+            assert!(parsed.ok);
+            assert_eq!(parsed.json["relay_request"], signed_relay);
+            assert_eq!(parsed.json["response"], signed_response);
+            assert!(parsed.json.get("snapshot").is_none());
+            assert!(parsed.json.get("page").is_none());
+        }
     }
 
     #[test]

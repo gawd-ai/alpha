@@ -277,7 +277,7 @@ fn http_route_set_is_the_mcp_verb_set_minus_watch() {
     // us pin the set behaviourally against the real running router (no axum route introspection).
     let d = Daemon::spawn(free_port(), true, false); // --minimal: routes exist regardless of organs
 
-    // The 18 verb routes = the 19 MCP tools minus `alpha_watch`. Mirrors `surface-http::router()` and
+    // The 26 verb routes = the 27 MCP tools minus `alpha_watch`. Mirrors `surface-http::router()` and
     // the TRD-003 matrix; if a verb is added to one surface but not the other, this breaks.
     let verb_routes = [
         "/api/status",
@@ -291,6 +291,14 @@ fn http_route_set_is_the_mcp_verb_set_minus_watch() {
         "/api/registry/list",
         "/api/registry/fetch-load",
         "/api/bestiary/prove",
+        "/api/functions/resolve",
+        "/api/functions/deploy",
+        "/api/functions/undeploy",
+        "/api/functions/deployments",
+        "/api/jobs/submit",
+        "/api/jobs/get",
+        "/api/jobs/events",
+        "/api/jobs/control",
         "/api/send",
         "/api/intent",
         "/api/bind",
@@ -299,7 +307,7 @@ fn http_route_set_is_the_mcp_verb_set_minus_watch() {
         "/api/cluster",
         "/api/cluster/connect",
     ];
-    assert_eq!(verb_routes.len(), 18, "the 19 MCP tools minus alpha_watch");
+    assert_eq!(verb_routes.len(), 26, "the 27 MCP tools minus alpha_watch");
     for path in verb_routes {
         let (sc, _) = http(d.port, "GET", path, None, None);
         assert_ne!(sc, 404, "`{path}` must be a wired HTTP route (got 404)");

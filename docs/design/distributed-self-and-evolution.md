@@ -66,11 +66,12 @@ These three are the substrate's only judgment about a self in flight: the bytes 
 bounded, the signature verifies. Everything past them — does *this* key earn a restore on *this* body
 — is operator code.
 
-## Migration: single-active-fork hand-off
+## Migration reference: acknowledged hand-off, not durable authority
 
-Moving a self is a creature, `abode-migrator`, bound to `Role::ABODE_MIGRATOR` (one per Sanctum). It
+The shipped portable-state reference is `abode-migrator`, bound to `Role::ABODE_MIGRATOR` (one per
+Sanctum). It
 speaks one wire schema (`"abode.migrator"`) carrying a `kind`-tagged message enum, and holds at most
-one Abode through a three-state machine:
+one Abode through a three-state **in-memory** machine:
 
 ```
    Empty ──SetState / RestoreRequest{ok}──► Authoritative{payload} ──Migrate{ok}──► Migrated{to}
@@ -89,9 +90,12 @@ A `Migrate { destination_node, destination_migrator }` op orchestrates the hand-
 wrap it with the migrator's own version-magic (`b"v3.0"`) → sign with the Abode key → ship a
 `RestoreRequest` carrying an **unguessable per-migration challenge** → await the matching
 `RestoreResponse`. On `admitted: true` the source transitions `Authoritative → Migrated { to }` and is
-**sealed** — further `SetState` / `Migrate` / `SnapshotRequest` all reject. This is the
-**single-active invariant**: the instant the destination acks, the source ceases to be authoritative,
-so at most one body is ever the self. No two-active-fork window exists on this path.
+sealed against further mutation. This demonstrates cross-node snapshot validation and a signed
+witness, but it is deliberately **not** a crash-safe single-authority protocol: state and the pending
+handoff exist only in RAM; the destination installs `Authoritative` before emitting its response; and
+the source seals only after receiving and verifying that response. A lost response or crash can leave
+the destination active while the source still holds authoritative state. The pending flag blocks some
+source mutations while the process lives, but it is neither durable nor an epoch fence.
 
 The **responder** (the destination migrator) admits an inbound `RestoreRequest` only through, in order:
 
@@ -106,8 +110,8 @@ The **responder** (the destination migrator) admits an inbound `RestoreRequest` 
    migrator using another encoding ships its own prefix and the substrate's gates are unchanged).
 5. **injected `RestorePolicy`** — the operator's final say: `fn admit(&self, &AbodeSnapshot) ->
    Result<(), String>`. The substrate ships none; `policy-abode-allowlist` is the reference (admit
-   when `abode_key` is on an allowlist). The reason rides verbatim in the reply so the originator can
-   audit and reissue.
+   when `abode_key` is on an allowlist). A bounded prefix of the reason rides in the reply so the
+   originator can audit and reissue without turning policy prose into an unbounded wire field.
 
 Matching `corr` alone never seals a migration. Transport reseals the envelope's `from` to the local
 transport creature's id, so the origin node is not trustworthy there; the source instead requires the
@@ -133,9 +137,51 @@ operator pins the destination's key when it issues the migration), and the witne
 not *liveness or non-equivocation* — a destination cannot later disavow having admitted the self, but
 the path does not by itself prevent a trusted destination from misbehaving after admission.
 
+There is a second identity limitation: `AbodeSnapshot.abode_key` describes the stable self, but the
+reference destination retains the key with which its migrator was constructed; restore transfers only
+payload bytes. Identity continuity therefore requires both bodies to be provisioned with the same
+private key out of band. Some local demos do that; the cross-node reference test intentionally permits
+different keys. A durable portable home must not infer key continuity from this V1 snapshot shape.
+
+## Durable Job homes: the stricter v0.4.4 authority protocol
+
+A Job home uses Abode identity and portability vocabulary, but **does not reuse the current migrator
+state machine**. It needs a fail-closed, fsynced, signed, hash-chained ledger and monotone authority
+epochs. The implemented protocol is [`ADR-0048`](../adr/ADR-0048-home-authority-moves-by-fenced-handoff.md):
+
+1. The source takes its exclusive write gate, materializes the checkpoint and sealed-value
+   inventory, then appends and fsyncs `Frozen` with the exact grant and checkpoint. That `Frozen`
+   fsync is the irreversible fence: recovery after it is frozen, never active, and silence never
+   thaws it. Only after that fence succeeds does the source sign `CustodyPreparedV1` and append
+   `Prepared`; if that proof append is missing, recovery remains frozen and an exact retry completes
+   preparation.
+2. The destination verifies the grant, ledger tip, checkpoint, all referenced content-addressed
+   ciphertext, and every contract-declared inline recipient wrap; installs them durably; then appends
+   and fsyncs `CustodyActivated`/`HomeActivated` before serving writes.
+3. The destination returns a signed activation lease/receipt. If the acknowledgement is lost, it
+   returns the same proof on replay; the source stays frozen and redirects once it has verified proof.
+
+The Abode root authority signing key anchors `HomeId` and monotone epoch grants and stays in an
+HSM/KMS/offline trusted boundary. A per-home, per-epoch destination operational signer writes the
+ledger under that grant. Application sealing/DEK keys are separate: migration carries ciphertext
+hashes and contract-declared recipient wraps, never root material or plaintext. v1 does not infer a
+destination-local KMS/enclave rewrap merely because custody moved. When the root grant explicitly
+declares signed source and destination recipient bindings, source Prepared commits the exact bounded
+sealed-value inventory, the destination epoch signs its request, and Staged persists the adapter's
+complete proof-key-signed receipt before activation. An omitted declaration preserves the no-rewrap
+path and grants no destination decryption authority. Data custody may replicate read-only encrypted
+backups; only write authority must be exclusive.
+
+This ordering chooses safety over liveness. A signed, durably recorded refusal can permit an abort;
+timeout or partition cannot. Strict non-equivocation under partition ultimately requires an injected
+root/quorum/lease service that durably issues exactly one next epoch. Running attempts are not moved:
+their grants cross the checkpoint and their signed results are accepted or forwarded under the new
+home, while only new grants use the new epoch. Full details are in
+[`functions-and-jobs.md`](functions-and-jobs.md#the-abode-home-and-custody).
+
 ## Fork and merge: a CRDT reconciler on an injected lattice
 
-Hand-off covers the safe case. The hard case is **two bodies of the same self that both kept running
+Generic snapshot hand-off covers a useful reference case. The hard case is **two bodies of the same self that both kept running
 and diverged** — a healed partition, a returning offline fork, a deliberate parallel exploration that
 rejoined. Reconciling them needs a **conflict-free merge** (a CRDT), and the merge semantics depend on
 what the Abode's state *is* — which is opaque to the substrate. So the substrate cannot ship the merge;
@@ -176,8 +222,15 @@ cannot prove for arbitrary operator code. A non-CRDT merge bound here diverges �
 caught by the fabric-integrity floor (no panic) but not adjudicated (no model judgment), exactly like a
 hostile `FitnessScorer` or a non-commutative weigher.
 
-With hand-off and reconcile both shipped, the distributed self is **whole**: it can *move* and it can
-*rejoin after diverging*.
+This generic CRDT path must **not** reconcile an authoritative Job ledger. Two divergent
+`DispatchGranted` histories may merge as data after both side effects have already happened. A Job
+home fork is a safety incident: preserve the signed evidence for audit and resolve authority through a
+trusted epoch-recovery policy/quorum, never LWW.
+
+With snapshot hand-off and reconcile both shipped, Alpha demonstrates that a generic distributed
+self can *move* and can *rejoin after diverging*. The stricter durable-home acceptance proof is also
+Green for v0.4.4 through the Function/Job suite; it remains a distinct protocol and is not a property
+retroactively attributed to `abode-migrator`.
 
 ## Evolution as loops
 
@@ -312,9 +365,9 @@ The signal is `BudgetSignal { level, kind, vector }`:
 - **`level`** — `Warn` (advisory) or `Hard` (terminal). The wasm and script engines emit `Warn` after a
   *successful* handle that crosses the operator-declared `capabilities.budget_warn_at` percent; a budget
   trap emits `Hard`.
-- **`kind`** — the dimension: `Fuel` (cpu), `Memory`, `Wall` (per-envelope wall time —
-  engine-enforced on the **beast** tier via `wasmtime` epoch interruption, see the substrate note;
-  unenforced on the critter and native tiers).
+- **`kind`** — the dimension: `Fuel` (cpu), `Memory`, `Wall` (per-envelope wall time). Wall is
+  engine-enforced for **beasts** through Wasmtime epoch interruption and for **critters** through the
+  Rhai deadline; the trusted native tier has no fabric-enforced wall limit.
 - **`vector`** — the raw scalars (`consumed`, `limit`, `dispatches_this_envelope`, `wall_ms_elapsed`,
   `envelopes_since_load`). The fabric ships **numerator and denominator**; any tolerance / velocity /
   curve / abuse-detection model lives entirely in an injected policy. A "last 1% hides 1000% of the work"
@@ -328,10 +381,11 @@ outward for grace itself by publishing `BudgetRequest { module, …, justificati
 — the resource analog of an authoring query; an injected policy weighs the justification and either
 grants or ignores.
 
-`ExtendBudget` is **honored**: the wasm tier exposes a live per-handle **fuel** ceiling and the script
-tier a live per-handle **operation** ceiling (`anima::BudgetControl`, a shared atomic the running
-instance reads each handle, seeded to the declared budget at load). The kernel keys it by creature id
-and `Kernel::extend_budget` lifts it on a grant. The reference `policy-budget` (`BudgetGraceful`) is the
+`ExtendBudget` is **honored**: the wasm tier exposes live per-handle **fuel, memory, and wall**
+ceilings; the script tier exposes live **operation and wall** ceilings (its memory cap is structural
+and fixed at load). `anima::BudgetControl` carries the shared atomics each instance reads, seeded from
+the Manifest. The kernel keys it by creature id and `Kernel::extend_budget` lifts supported dimensions
+on a grant. The reference `policy-budget` (`BudgetGraceful`) is the
 first real consumer: it honors a creature's *first* fuel ask per creature (one-shot, so a creature
 can't loop-beg unbounded budget) and observes the rest; a `Hard` signal still becomes an apoptosis
 `Unload`.
@@ -339,14 +393,12 @@ Its per-module grace/decision tables are bounded by default (`DEFAULT_MAX_TRACKE
 module at capacity cannot receive untracked grace, while a `Hard` signal still unloads because the cap
 only limits retained policy state.
 
-This is **tier-honest**. The metering tiers expose budget control; the native tier — trusted by
-admission, with no fuel or operation metering — exposes none, so a grant to a native creature returns
-`false`: an explicit no-op, not a silent lie. A live *lift* of `mem_bytes` or `wall_ms` via
-`ExtendBudget` is accepted by the wire but not yet honored on any tier (the wasm limiter isn't
-live-mutable and script memory is a structural cap) — a documented limit, not a silent drop. (This is
-the live grant; the `wall_ms` *cap* itself does trap a beast today — enforcement and live-lift are
-separate, and only fuel is live-liftable so far.) The **wire is the commitment**: the framework admits
-gradient strategies without baking any, and richer engine behavior lands against the unchanged shape.
+This is **tier-honest**. The metering tiers expose only dimensions they actually control; the native
+tier — trusted by admission, with no fuel, memory, or wall metering — exposes none. A requested
+dimension that a tier cannot honor returns `Unenforceable`, never a silent lie: notably, critter
+memory is a load-time structural cap and cannot be live-lifted. WASM honors fuel/memory/wall lifts;
+Rhai honors operation/wall lifts. The **wire is the commitment**: the framework admits gradient
+strategies without baking any, and richer engine behavior lands against the unchanged shape.
 
 Anti-IoC discipline closes it: `Warn` is fire-and-forget and **never blocks on a policy reply**. A slow
 policy's grant may lose the race to the next handle and the creature traps anyway — and that is correct.

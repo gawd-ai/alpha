@@ -8,8 +8,9 @@
 
 ## Toolchain
 
-- Stable Rust, **edition 2021**.
-- Build: `cargo build` (workspace).
+- Rust **1.97.1** (pinned by `rust-toolchain.toml`), **edition 2021**.
+- Build the two entry points: `cargo build --locked -p alpha -p omega`; the complete workspace gate
+  runs once in constrained CI.
 - Run a node: `cargo run -p alpha -- node` (REPL — see [README](README.md)).
 - Native creatures are `cdylib` crates (`crate-type = ["cdylib"]`).
 - Beast (wasm) creatures target `wasm32-unknown-unknown` and are built explicitly
@@ -34,7 +35,8 @@
 `alpha/` (the α front door — `alpha node`/`mcp`/`http`/`demo`) · `cosmos/forge/` (authoring surface) ·
 `cosmos/creatures/*` (production-capable reference organs) · `cosmos/creatures/prototypes/*` (injected reference models +
 critter script references) · `cosmos/creatures/prototypes/fixtures/*` (test-only creatures) ·
-`foundation/gawdxfer/` (the shared GX bulk-transfer contract — beside the cosmology, not within it).
+`foundation/gawdxfer/` (the shared GX bulk-transfer contract) · `foundation/gawdfn/` (the shared
+typed-Function + durable-Job contract — both foundations sit beside the cosmology, not within it).
 Full detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For a fast machine-first map (and the
 load-bearing invariants), see [`AGENTS.md`](AGENTS.md). Before authoring a creature, read the two
 contracts it builds against: the pub/sub + consult surface in [`docs/TOPICS.md`](docs/TOPICS.md) and
@@ -51,8 +53,9 @@ be exercised by the kernel test suite (a fault specimen or a walking-skeleton st
 that another GAWD system would want *verbatim* — a cross-system contract or tool, `gawd`-prefixed, that
 will carry its own version (eventually its own repo, maybe its own binary) — lives in `foundation/`,
 beside the cosmology rather than inside it; filing shared infra under `cosmos/` would falsely claim
-Alpha owns it. `foundation/gawdxfer` (the GX bulk-transfer contract, shared with `sctl`) is the first.
-An Alpha-internal seam that is *not* cross-system — e.g. `cosmos/mind` (the injected-model seam) — stays
+Alpha owns it. `foundation/gawdxfer` is the GX bulk-transfer contract shared with `sctl`;
+`foundation/gawdfn` is the typed-Function + durable-Job contract shared across GAWD systems. An
+Alpha-internal seam that is *not* cross-system — e.g. `cosmos/mind` (the injected-model seam) — stays
 in `cosmos/`.
 
 ## Release packaging
@@ -151,13 +154,16 @@ A critter is the cheapest creature tier: one Rhai source file that defines
 
 1. Write a Rhai `handle` function. `env.payload` is a `Blob`; `env.text` is the payload as lossy
    UTF-8 (the engine has no Blob→String builtin, so string-oriented critters read this); `env.schema`,
-   `env.from`, and optional `env.corr` are also available. Return a `Blob` or string to reply, return
+   `env.from`, `env.to`, and optional `env.corr` are also available. Return a `Blob` or string to reply, return
    `()` for no reply, or call `emit("creature:N", bytes)` / `emit("role:R", bytes)` /
    `emit("topic:T", bytes)` / `emit("intent:X", bytes)` / `emit("kernel", bytes)` for extra
-   capability-gated dispatches. Three gotchas: critters are **stateless per envelope** (fresh scope
-   each call), `emit` payloads must be **Blobs** and still pass the `calls` gate, and there is **no
-   JSON** (use `split` + a map). The engine caps expression-nesting depth, but the cap is high and
-   pinned identically across debug/release builds, so it won't surprise you between profiles.
+   capability-gated dispatches. Local variables have a fresh scope per envelope; bounded
+   `mem_get` / `mem_set` / `mem_del` state survives for the loaded instance. `emit` payloads must be
+   **Blobs** and still pass the `calls` gate. Pure `json_parse` / `json_stringify` helpers support
+   value-only JSON under byte, depth, node, and structural caps; `function_call_verify` validates a
+   typed Function call's signed dispatch and its authenticated local `env.from` / `env.to` route.
+   These helpers add no I/O or key authority. The engine caps expression-nesting depth, pinned
+   identically across debug/release builds, so it won't surprise you between profiles.
 2. Author a manifest stub with the same fields the native authoring path uses. `build-critter`
    fills `abi`, `provenance`, `content_address`, and the ed25519 signature.
 3. Validate/sign through `cosmos/creatures/build-critter` or through `alpha> author --critter <request>`.
@@ -194,8 +200,19 @@ primitive); either way, call out in its README that it is an injected model, not
 ## Tests
 
 - **Unit tests** live next to the code they test; run a focused crate with `cargo test -p <crate>`.
-- **Full suite:** use `CARGO_BUILD_JOBS=2 cargo test --locked --workspace -- --test-threads=1`
-  (the same cap CI uses).
+- **Full suite:** do not duplicate it locally. It runs once on the exact release candidate in
+  constrained CI. Iterate with
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo test -p <crate> -- --test-threads=1`;
+  `.cargo/config.toml` also defaults forgotten invocations to one build job and one libtest thread.
+- **Disk courtesy:** CI runs the full suite once per candidate; focused package tests are the local
+  iteration loop. The workspace profiles retain line tables but disable full
+  debug/incremental artifact graphs. Cargo does not garbage-collect old target variants; inspect
+  `target/` and use `cargo clean -p <exact-package>` when generated package artifacts must be
+  reclaimed. Never clean runtime state, journals, keys, or fixtures as build output. Do not launch a
+  Cargo command while another agent or shell is compiling the same workspace; wait for and reuse the
+  existing result instead of repeating the gate.
+  Cargo-backed authoring tests and demos share `target/gawd-build-cache`; while no authoring build is
+  active, `cargo clean --target-dir target/gawd-build-cache` reclaims exactly that generated cache.
 - **CPU courtesy:** budget/fuel tests should prove the trap with the smallest useful cap and bounded
   work. If a test intentionally spins, keep the loop short, serialize it with a harness-local lock
   when nearby tests may also spin, and make long-lived thread specimens sleep/yield between polls.

@@ -44,6 +44,18 @@ alpha> send 5 hello
 reply: olleh
 ```
 
+Alpha opens that source `.so` once and streams/hashes it into a retained stage. Linux/Android use a
+memfd sealed against write/grow/shrink, re-hash after sealing, and `dlopen` its unique retained
+`/proc/self/fd` capability; other platforms use an OS-random private/read-only tempfile with the
+narrower caveat that the same OS identity can restore write permission. Admission and the engine
+therefore do not reopen the operator source path.
+
+This means ELF `$ORIGIN` is the descriptor pseudo-directory on Linux/Android or the fallback staging
+directory—not `target/debug` or the source directory. Adjacent private `.so` dependencies are not
+copied. Link them into the daemon or arrange a reviewed system/absolute rpath; a daemon that depends
+on `$ORIGIN` siblings will otherwise fail to load. Fallback temporary directories and hardened memfd
+execution policies must also permit executable mappings.
+
 The crate scaffolding (Cargo.toml, the manifest fields, the build invocation) is in
 [`CONTRIBUTING.md` → "Add a creature (native daemon)"](../../CONTRIBUTING.md). For the **live** path,
 `alpha> author <request>` has an agent write a daemon, then `cargo build` + sign + admit + hot-load

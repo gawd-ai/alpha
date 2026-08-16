@@ -63,8 +63,10 @@
 //! Static ports `19_950 / 19_951` so the test is trivially debuggable; explicitly distinct from
 //! `m2_two_node`'s `19_900/01`, `v01_end_to_end`'s `19_910/11`, `distributor_cross_node`'s
 //! `19_920/21`, `realm_local_route`'s `19_930/31`, and the `19_940/41` slot reserved for a future
-//! Omega test. The build creature's cargo cache lives at `<root>/target/v02-build-cargo-cache`
-//! so it doesn't fight `m3_authoring_loop`'s or `v01_end_to_end`'s cargo cache for the lockfile.
+//! Omega test. Cargo-backed authoring tests share `<root>/target/gawd-build-cache`, avoiding a
+//! duplicate SDK artifact graph for every test binary. build-cargo's retained cache lock serializes
+//! every instance and process using that directory; Cargo's own target/package locks remain
+//! integrity guards, not the resource-concurrency boundary.
 //!
 //! Cold first build takes 30–60s for the transitive deps; warm reuses sit under 15s.
 
@@ -126,11 +128,10 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Dedicated cargo cache so this test doesn't share a lockfile with `m3_authoring_loop` or
-/// `v01_end_to_end`. Cold first build is 30–60s for the transitive deps; warm reuses fit under
-/// 15s on the dev box.
+/// Canonical authoring cache shared across tests/demos. Process-unique authored crate names and the
+/// serial repository defaults make reuse safe while avoiding another cold SDK dependency graph.
 fn shared_build_cache() -> PathBuf {
-    workspace_root().join("target").join("v02-build-cargo-cache")
+    workspace_root().join("target").join("gawd-build-cache")
 }
 
 // ----- signed-manifest helpers ------------------------------------------------------------------

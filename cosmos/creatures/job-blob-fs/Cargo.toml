@@ -1,0 +1,14 @@
+[package]
+name = "job-blob-fs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "A finite filesystem content-addressed store for opaque function-job values. Bytes are SHA-256 addressed, written atomically with file and directory fsync, and re-hashed on every read; storage adapters and trust policy remain replaceable."
+
+[dependencies]
+gawdfn = { path = "../../../foundation/gawdfn" }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

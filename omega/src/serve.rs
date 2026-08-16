@@ -288,7 +288,7 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                 println!("control: ControlCore on Role::CONTROL (id={}), surface-http (id={}) — control rides the bus.", control_id.0, surface_id.0);
                 println!("api: HTTP/WS control plane on http://{listen}  (Bearer key: {key})");
                 println!(
-                    "api: allow-ai is {} — a remote AI may{} drive this gateway (flip with `allow-ai on|off`).",
+                    "api: allow-ai is {} — a remote AI may{} drive this gateway (headless: configure with --allow-ai at boot; restart without it to close the gate).",
                     if ai.allowed() { "ON" } else { "OFF" },
                     if ai.allowed() { "" } else { " NOT" }
                 );
