@@ -2624,14 +2624,18 @@ mod tests {
     fn unique_artifact_cleanup_refuses_special_files() {
         use std::os::unix::net::UnixListener;
 
-        let tree = TempTree::new("artifact-cleanup-special");
+        // Unix-domain socket paths are commonly capped at 108 bytes. Keep this fixture's label and
+        // matching Cargo stem deliberately short so the safety assertion is portable across CI
+        // checkout depths instead of failing while the socket itself is created.
+        let tree = TempTree::new("s");
         let target = tree.path().join("target");
         let deps = target.join("release/deps");
         std::fs::create_dir_all(&deps).unwrap();
-        let special = deps.join("libbounded_bP9c13-special.sock");
+        let cargo_name = "b";
+        let special = deps.join("libb-special.sock");
         let _listener = UnixListener::bind(&special).unwrap();
 
-        let error = reap_build_artifacts(&target, "bounded-bP9c13")
+        let error = reap_build_artifacts(&target, cargo_name)
             .expect_err("cleanup must not unlink a matching special file");
         assert!(error.contains("not a regular file"), "{error}");
         assert!(std::fs::symlink_metadata(&special).is_ok());
