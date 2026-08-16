@@ -2211,8 +2211,6 @@ fn drain_pipe_capped(
     cap: usize,
     cancel: &AtomicBool,
 ) -> String {
-    use std::os::fd::AsRawFd;
-
     const POLL_MILLIS: libc::c_int = 100;
     let Some(mut pipe) = pipe else { return String::new() };
     let mut kept = Vec::new();
