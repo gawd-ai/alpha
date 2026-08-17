@@ -173,20 +173,19 @@ right one.
 Live SEER consumers parse with `SeerEnvelope::parse_bounded`, capped by default at
 1 MiB (`seer::MAX_SEER_ENVELOPE_BYTES`), before decoding the opaque JSON body.
 That keeps high-volume consult/sense traffic inside the hostile-input floor
-without adding a router-level topic table.
+without adding a router-level SEER-topic discriminator.
 
 **Reserved topics.** `Authoring` (the curiosity seam), `Placement` (the
-distributor consult), and named-peer `Dialogue` have live consumers; `Consensus` carries signed reputation
-deltas for cross-Realm federation. `Policy`, `Budget`, `Fitness`, and `Curation`
-are reserved topics with draft typed bodies — their sockets exist, awaiting a
-concrete consumer to pin the exact payload. `Curation` is the durable Bestiary's
-seam for an *external* curator creature (an in-process curator already runs over
-the injected `mind::Model`; the topic reserves the off-process form). Reserving
-them means a new mechanism lands as a topic *consumer*, never as a widening of
-the wire.
+distributor consult), and named-peer `Dialogue` have live contracts; `Consensus` carries signed
+reputation deltas for cross-Realm federation. `Policy`, `Budget`, `Fitness`, and `Curation` have
+reserved/draft typed bodies plus shipped standing responders under
+`creatures/prototypes/responders/`. Those creatures prove the generic exchange without promoting
+the bodies to stable. The in-process Bestiary `AICurator` does not use SEER;
+`responder-curation` is the off-process reference seam. Reserving them means a new mechanism lands
+as a topic *consumer*, never as a widening of the wire.
 
-**Topic isolation is a consumer concern, by design.** The substrate has no
-router-level topic concept; SEER envelopes route by address like any envelope. A
+**Topic isolation is a consumer concern, by design.** The substrate has no router-level
+**SEER-topic** concept; SEER envelopes route by address like any envelope. A
 creature bound to topic A reads a `SeerEnvelope`, sees a foreign topic, and drops
 it *silently* — no Failed reply, because that would make the substrate
 adjudicate a cross-topic dispute through the creature. The router stays the
@@ -278,15 +277,16 @@ IoC win is at the *interface*: control is bus traffic, surfaces hold no kernel,
 and a peer cannot drive this node except by sending a `Verb` envelope this node's
 own `ControlCore` chooses to honor.
 
-### Two lanes, so reads never block a build
+### Two lanes, so probe-free inline reads never block a build
 
 A cold `author` is a real `cargo build` — tens of seconds. If every verb queued
 behind one responder, a build would head-of-line-block a `status`. So the
 control core runs on two lanes:
 
-- **Fast, probe-free verbs** (`status`, `list`, `journal`, `bind`, `unload`,
-  `load`, `allow-ai`, `ai-status`, `watch`) run **inline on the kernel's drain
-  thread** — microseconds — and reply directly.
+- **Probe-free verbs** (`status`, `list`, `journal`, `bind`, `unload`, `load`, `allow-ai`,
+  `ai-status`, `watch`) run **inline on the kernel's drain thread** and reply directly. Simple
+  introspection is fast; `load` may read and load an artifact, while `unload` may wait through its
+  bounded drain deadline, so the lane is not a blanket microsecond-latency promise.
 - **Request/reply orchestration** (`author`, `author --critter`, all four
   `registry` operations including `fetch-load`, `bestiary prove`, the four
   `function` operations, the four `job` operations, `send`, `intent`, `cluster`,
@@ -294,7 +294,8 @@ control core runs on two lanes:
   own probe endpoint and `corr` space and emits the reply itself. These verbs
   await a reply from an author/build organ, Registry/Bestiary, an injected
   Function/Job role, a target creature, or transport; a build in the worker
-  never stalls an inline `status`.
+  never stalls an inline `status`. Some worker verbs are read-only; they still require a correlated
+  bus probe and therefore can queue behind authoring.
 
 Long-running progress (an `author`'s "compiling…") rides a SEER topic, a
 `control_progress` frame correlated by the command `corr`, so any surface that
@@ -453,7 +454,8 @@ announcement. One binary, two profiles, one `ControlTarget`:
   mutations are refused. `--minimal` skips the organs for a bare control-only
   plane.
 - **Remote (`--target <node-id@control-id>` + `--node-id <id>` + `--listen
-  <addr>` + at least one `--seed …`)** — the hub joins the mesh and targets
+  <addr>` + `--cluster-key <seed>` + at least one `--seed …`)** — the hub's
+  stable public identity must first be admitted by an existing mesh member; it then joins the mesh and targets
   `ControlTarget::Node`; the verb crosses to the peer's own `ControlCore`, which
   resolves `authoring` and `build` *there*. No local organs. The target owns its
   allow-AI gate; `--allow-ai` on the hub has no effect in this profile.

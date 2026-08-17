@@ -1,5 +1,5 @@
-//! `walkthrough` — thin binary wrapper over [`walkthrough::run`]; the same demo `alpha demo
-//! walkthrough` runs in-process.
+//! `walkthrough` — thin binary wrapper over [`walkthrough::run`]. `alpha demo walkthrough` launches
+//! this binary as an external child.
 
 fn main() {
     walkthrough::run()

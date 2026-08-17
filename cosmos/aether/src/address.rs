@@ -83,8 +83,8 @@ impl Role {
     /// **Abode-migrator.** A consumer of the top-level `abode` crate's shape: a long-lived creature
     /// on every Sanctum that snapshots the local Abode state, ships `abode::AbodeRestore` envelopes to a peer migrator,
     /// and admits incoming snapshots via an injected restore policy. The substrate ships the
-    /// socket; the operator binds a model (single-active-fork hand-off; fork/merge is the
-    /// reconciler's job).
+    /// socket; the operator binds a model. The reference migrator is an acknowledged in-memory
+    /// hand-off with a possible authority-overlap window; fork/merge is the reconciler's job.
     pub const ABODE_MIGRATOR: &'static str = "abode-migrator";
     /// **Fitness-selector.** A consumer of
     /// operating-model Loop 2 (author → select → promote): a long-lived creature that aggregates the
@@ -107,7 +107,7 @@ impl Role {
     /// on a different role and a different sense stream — so reward and defense stay legible.
     pub const IMMUNE_RESPONSE: &'static str = "immune-response";
     /// **Abode-reconciler** — the fork+merge half of the distributed self. Where
-    /// [`Role::ABODE_MIGRATOR`] does single-active-fork *hand-off*, the reconciler *merges* two
+    /// [`Role::ABODE_MIGRATOR`] does acknowledged in-memory *hand-off*, the reconciler *merges* two
     /// divergent snapshots of the same Abode (a healed partition, a rejoined offline fork) into one
     /// authoritative snapshot via an **injected** CRDT merge model, re-signed by the Abode key. The
     /// substrate ships the socket + the snapshot verify/sign primitives; the conflict-free *lattice*

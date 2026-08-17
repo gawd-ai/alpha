@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 description = "Narrated, runnable demo of the GAWD federation fabric — several Sanctums in 2–3 Realms talk over real ed25519-authenticated TCP (loopback): within-Realm cross-node fetch, then cross-Realm pull anti-entropy, signed reputation, quarantine propagation, and Omega-addressed routing. The Acculturate loop, out of #[test] and into your terminal."
 
-# The demo body (`run`) lives in the lib so `alpha demo federation` can run it in-process;
-# the binary is a thin wrapper.
+# The demo body (`run`) lives in the lib for reuse and focused testing; the binary is a thin wrapper.
+# `alpha demo federation` launches that binary as an external child from the registry.
 [lib]
 name = "federation"
 path = "src/lib.rs"

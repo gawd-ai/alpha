@@ -1,7 +1,7 @@
 //! `alpha demo` — the managed runner for the external demo registry. The demos
 //! are NOT linked into alpha; `alpha demo` reads `demos/demos.json` and spawns the named demo. These
 //! tests exercise the *runner* (list + resolution + error paths) without launching a full demo — the
-//! demos themselves are gated standalone in CI (`cargo run -p walkthrough` / `-p federation`).
+//! runnable demos themselves are gated standalone in the one-CPU CI job.
 
 use std::process::Command;
 use std::{fs, process};
@@ -132,6 +132,181 @@ fn oversized_demo_manifest_is_rejected_before_json_parse() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("alpha demo manifest"), "should name the bounded file: {stderr:?}");
     assert!(stderr.contains("exceeds"), "should explain the byte cap: {stderr:?}");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn demo_manifest_rejects_cargo_feature_argument_shapes() {
+    let dir = std::env::temp_dir().join(format!(
+        "alpha-demo-manifest-test-{}-{}",
+        process::id(),
+        "bad-feature"
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("demos.json");
+    fs::write(
+        &manifest,
+        r#"{
+          "demos": [
+            {
+              "name": "unsafe-feature",
+              "package": "walkthrough",
+              "features": ["--release"]
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let out = alpha_demo()
+        .arg("list")
+        .env("ALPHA_DEMOS_MANIFEST", &manifest)
+        .output()
+        .expect("run alpha demo list with invalid feature metadata");
+    assert!(!out.status.success(), "invalid Cargo feature syntax must fail closed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("invalid Cargo feature"), "should explain the refusal: {stderr:?}");
+
+    let too_long = "x".repeat(65);
+    fs::write(
+        &manifest,
+        format!(
+            r#"{{
+              "demos": [
+                {{
+                  "name": "oversized-feature",
+                  "package": "walkthrough",
+                  "features": ["{too_long}"]
+                }}
+              ]
+            }}"#
+        ),
+    )
+    .unwrap();
+    let out = alpha_demo()
+        .arg("list")
+        .env("ALPHA_DEMOS_MANIFEST", &manifest)
+        .output()
+        .expect("run alpha demo list with an oversized feature name");
+    assert!(!out.status.success(), "an oversized feature name must fail closed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("at most 64 bytes"), "should explain the name cap: {stderr:?}");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn demo_manifest_bounds_cargo_feature_count() {
+    let dir = std::env::temp_dir().join(format!(
+        "alpha-demo-manifest-test-{}-{}",
+        process::id(),
+        "too-many-features"
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("demos.json");
+    let features =
+        (0..17).map(|index| format!(r#""feature-{index}""#)).collect::<Vec<_>>().join(",");
+    fs::write(
+        &manifest,
+        format!(
+            r#"{{
+              "demos": [
+                {{
+                  "name": "too-many-features",
+                  "package": "walkthrough",
+                  "features": [{features}]
+                }}
+              ]
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let out = alpha_demo()
+        .arg("list")
+        .env("ALPHA_DEMOS_MANIFEST", &manifest)
+        .output()
+        .expect("run alpha demo list with too many features");
+    assert!(!out.status.success(), "an oversized feature list must fail closed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("limit is 16"), "should explain the feature cap: {stderr:?}");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn package_demo_passes_validated_features_before_the_binary_argument_boundary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "alpha-demo-manifest-test-{}-{}",
+        process::id(),
+        "feature-argv"
+    ));
+    let bin_dir = dir.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let manifest = dir.join("demos.json");
+    fs::write(
+        &manifest,
+        r#"{
+          "demos": [
+            {
+              "name": "feature-demo",
+              "package": "demo-package",
+              "features": ["openai"]
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    // `alpha demo` execs `cargo` on Unix. Put a bounded local recorder first on PATH so this proves
+    // the exact argv without invoking Cargo or compiling a demo.
+    let fake_cargo = bin_dir.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$ALPHA_FAKE_CARGO_ARGS\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_cargo).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fake_cargo, permissions).unwrap();
+
+    let args_file = dir.join("argv");
+    let mut paths = vec![bin_dir];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let path = std::env::join_paths(paths).unwrap();
+    let out = alpha_demo()
+        .args(["run", "feature-demo", "--demo-flag", "value"])
+        .env("ALPHA_DEMOS_MANIFEST", &manifest)
+        .env("ALPHA_FAKE_CARGO_ARGS", &args_file)
+        .env("PATH", path)
+        .output()
+        .expect("run alpha demo through the fake Cargo recorder");
+    assert!(
+        out.status.success(),
+        "fake Cargo launch should succeed; stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let args = fs::read_to_string(&args_file).expect("fake Cargo recorded argv");
+    assert_eq!(
+        args.lines().collect::<Vec<_>>(),
+        [
+            "run",
+            "--locked",
+            "-p",
+            "demo-package",
+            "--features",
+            "openai",
+            "--",
+            "--demo-flag",
+            "value",
+        ]
+    );
 
     let _ = fs::remove_dir_all(dir);
 }

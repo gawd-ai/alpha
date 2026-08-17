@@ -119,7 +119,8 @@ pub struct Fitness {
 /// `level` is `"warn"` | `"hard"`; `kind` is `"fuel"` | `"memory"` | `"wall"`. The `vector` carries
 /// raw scalars from which any tolerance / velocity / curve model can be computed by the policy
 /// creature — the fabric ships numerator + denominator, never the curve. Wasm and script engines
-/// emit both `"warn"` and `"hard"` where the operator opts in; `Wall` remains reserved.
+/// emit fuel/memory warnings where supported and hard wall breaches; wall is hard-only because the
+/// deadline is detected when it expires rather than at a predictive warning threshold.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BudgetSignalEvent {
     pub creature: u64,
@@ -210,7 +211,7 @@ struct Loaded {
     /// `recv_timeout` is the kernel's join-with-timeout primitive — `JoinHandle::join` has no built-in
     /// timeout, and a misbehaving creature must not hang the kernel forever.
     done_signal: Receiver<()>,
-    /// The creature's live fuel-ceiling control, `Some` only for the wasm tier. Held
+    /// The creature's live resource-ceiling control, `Some` for metered wasm and script tiers. Held
     /// here (not on the drain thread that owns the instance) so [`Kernel::extend_budget`] can lift a
     /// budget on a `KernelControl::ExtendBudget` grant without reaching across the thread boundary.
     budget: Option<BudgetControl>,
@@ -251,8 +252,8 @@ pub struct Kernel {
 /// supervision creature) asks the kernel to act — IoC-pure: no creature ever holds an
 /// `Arc<Kernel>` directly.
 ///
-/// `ExtendBudget` is **honored** — the listener lifts
-/// the live wasm fuel ceiling on a grant (see [`Kernel::extend_budget`]). Future ops
+/// `ExtendBudget` is **honored** — the listener asks the selected tier's live budget control to lift
+/// each supported dimension (see [`Kernel::extend_budget`]). Future ops
 /// (Load, Reload, RotateRole, ProvisionEndpoint) can be added without changing the dispatcher's
 /// shape — that's why it's an enum.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -432,8 +433,8 @@ impl Kernel {
         Ok(actual_artifact_hash)
     }
 
-    /// Load a creature from an artifact through its tier engine — the dynamic path (native `.so` /
-    /// wasm). One path for both tiers, differing only by `abi.backend` (**R1**, **R3**).
+    /// Load a creature from an artifact through its tier engine — the dynamic path (native `.so`,
+    /// wasm, or Rhai). One path for all three tiers, differing only by `abi.backend` (**R1**, **R3**).
     pub fn load(&self, manifest: Manifest, artifact: Artifact) -> Result<CreatureId, KernelError> {
         let engine = self
             .engines
@@ -661,9 +662,10 @@ impl Kernel {
         self.router.bind_remote_role(role, id);
     }
 
-    /// The creature currently bound to `role`, if any. A composition root uses this to check that a
-    /// recommended baseline (e.g. an `IMMUNE_RESPONSE` reacting to `OriginVerdict::BadSig`) is present
-    /// — see ADR-0041's clustered-boot posture warning.
+    /// The creature currently bound to `role`, if any. This reports role sockets only; it cannot
+    /// prove that a particular decision model is subscribed to a topic. For example, ADR-0041's
+    /// `policy-origin` baseline is a `PROPRIOCEPTION` subscriber, not an `IMMUNE_RESPONSE` role
+    /// filling, so its composition root tracks that wiring explicitly.
     pub fn role_binding(&self, role: &Role) -> Option<CreatureId> {
         self.router.role_binding(role)
     }

@@ -169,6 +169,19 @@ fn signed_add_one_call(
 }
 
 #[test]
+fn echo_critter_returns_payload_verbatim() {
+    let k = kernel();
+    let id = load(
+        &k,
+        "echo-critter",
+        include_bytes!("../../creatures/prototypes/critters/echo-critter/echo.rhai"),
+    );
+    let payload = b"echo me exactly\0\xff";
+    assert_eq!(ask(&k, id, payload, "ignored"), payload);
+    k.shutdown_all(Deadline::default());
+}
+
+#[test]
 fn uppercase_critter_uppercases_text() {
     let k = kernel();
     let id = load(

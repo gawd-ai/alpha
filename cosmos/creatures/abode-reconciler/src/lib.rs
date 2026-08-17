@@ -1,11 +1,13 @@
 //! `abode-reconciler` — the **fork + merge** half of the distributed self (the
-//! `abode-migrator` does *single-active-fork* hand-off only).
+//! `abode-migrator` does acknowledged in-memory hand-off only).
 //!
 //! The `abode-migrator` moves an Abode between Sanctums with an explicit hand-off: the source marks
-//! itself `Migrated { to }` the moment the destination acks, so at most one body is ever
-//! authoritative. That deliberately sidesteps the hard case: **two bodies of the same self that both
-//! kept running and diverged** (a partition healed, an offline fork came back, a deliberate
-//! parallel exploration rejoined). Reconciling them needs a **conflict-free merge** — a CRDT — and
+//! itself `Migrated { to }` after it receives the destination's acknowledgement. Because the
+//! destination activates before sending that response, the hand-off has a transient overlap window
+//! and a lost response can leave both bodies active. It does not solve the hard case: **two bodies of
+//! the same self that both kept running and diverged** (a partition healed, an offline fork came
+//! back, a failed hand-off, or a deliberate parallel exploration rejoined). Reconciling them needs a
+//! **conflict-free merge** — a CRDT — and
 //! the merge *semantics* depend on what the Abode's state actually is, which is opaque to the
 //! substrate (T1). So the substrate ships the **reconciler socket + the snapshot
 //! verify/sign primitives**; the merge model is **injected** (IoC).

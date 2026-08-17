@@ -44,8 +44,10 @@ locally. CI pins every heavyweight command and its child process tree to one all
 Cargo job and one test thread, disables incremental output and clean-runner debug sections, never
 caches `target/`, removes only rendered rustdoc output after that gate, cancels superseded runs on
 the same ref, and has finite job timeouts. Its required phases are: workspace
-Clippy, build, strict rustdoc, serial tests, alpha/omega version smokes, walkthrough/federation
-demos, and the opt-in `openai` Clippy/tests. The separate `cargo-deny` job evaluates all features.
+Clippy, build, strict rustdoc, serial tests, alpha/omega version smokes, every runnable hermetic demo
+(`walkthrough`, `federation`, `distribute`, and `dialogue`), the credential-free `bestiary-live`
+startup path, cluster-runbook shell parsing, and the opt-in `openai` Clippy/tests. The separate
+`cargo-deny` job evaluates all features.
 `.github/workflows/ci.yml` is the executable source of truth for those commands.
 
 Cargo does not garbage-collect stale local build variants. Use focused package checks while

@@ -6,10 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Narrated, runnable Alpha walkthrough of the GAWD substrate — an AI authors → compiles → signs → admits → hot-loads → runs a creature, then a running self migrates between Sanctums. The proof, out of #[test] and into your terminal."
+description = "Narrated, runnable Alpha walkthrough of the GAWD substrate — an agent authors → compiles → signs → admits → hot-loads → runs a creature, then a running self performs a signed local hand-off between two bodies inside one live Sanctum. The cross-Sanctum transport variant remains integration-test-proven."
 
-# The demo body (`run`) lives in the lib so `alpha demo walkthrough` can run it in-process;
-# the binary is a thin wrapper.
+# The demo body (`run`) lives in the lib for reuse and focused testing; the binary is a thin wrapper.
+# `alpha demo walkthrough` launches that binary as an external child from the registry.
 [lib]
 name = "walkthrough"
 path = "src/lib.rs"

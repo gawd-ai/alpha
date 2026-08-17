@@ -2,7 +2,7 @@
 //! system)**.
 //!
 //! The substrate carries the *shape* of defense: the kernel senses a creature's health on
-//! [`Topic::PROPRIOCEPTION`](aether::Topic::PROPRIOCEPTION) (lifecycle + budget signals), the
+//! [`Topic::PROPRIOCEPTION`](aether::Topic::PROPRIOCEPTION) (including lifecycle + budget signals), the
 //! registry carries a reversible [`quarantine`](registry_mem::QuarantineNotice) marker, and the
 //! `omega-federator` carries the cross-Realm quarantine *path* (`FederateQuarantine` →
 //! `QuarantineNotice`). This creature closes the loop: it watches a set of creatures, senses
@@ -16,11 +16,13 @@
 //! [`Topic::FITNESS`](aether::Topic::FITNESS), because the kernel publishes a fitness event after
 //! **every** handle — so a drain-thread creature subscribed to FITNESS would feed on its own events
 //! (a 1-in-1-out livelock). The immune-response is the **dual**, and the dual is good news:
-//! [`Topic::PROPRIOCEPTION`](aether::Topic::PROPRIOCEPTION) carries only **lifecycle** events
-//! (`"loaded"` / `"unloaded"` / `"unload_leaked_resources"`) and **budget signals** — events tied
-//! to *load/unload/breach*, **never to a plain handle**. So when the immune-response handles a
-//! proprioception envelope, the kernel publishes a *fitness* event for it (on FITNESS, which it does
-//! not subscribe to) — and **no** new proprioception event. Handling one never produces another.
+//! [`Topic::PROPRIOCEPTION`](aether::Topic::PROPRIOCEPTION) also carries origin, peer, build, and
+//! maintenance observations, but this creature discriminates schemas and consumes only **lifecycle**
+//! events (`"loaded"` / `"unloaded"` / `"unload_leaked_resources"`) and **budget signals**. Those
+//! consumed events are tied to *load/unload/breach*, **never to a plain handle**. So when the
+//! immune-response handles a proprioception envelope, the kernel publishes a *fitness* event for it
+//! (on FITNESS, which it does not subscribe to) — and **no** new proprioception event. Handling one
+//! never produces another.
 //! The immune-response is therefore fed by a **direct topic subscription** — real automatic Loop-4
 //! sensing, no relay needed — unlike the selector. (As defense-in-depth it still drops events
 //! naming its own [`CreatureId`]: a creature is never its own immune trigger; self-apoptosis on

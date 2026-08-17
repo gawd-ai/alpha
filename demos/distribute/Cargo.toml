@@ -8,8 +8,8 @@ repository.workspace = true
 publish.workspace = true
 description = "Narrated, runnable demo of the GAWD distribution path: node A publishes a creature into its registry; node B issues a single `registry fetch-load` over real ed25519-authenticated TCP (loopback), which pulls the artifact in bounded GX chunks, integrity-checks it, and admits + loads it — then runs it. The m2 cross-node ship→admit→load, as one operator command instead of a hand-rolled pull loop."
 
-# The demo body (`run`) lives in the lib so `alpha demo distribute` can run it in-process; the binary
-# is a thin wrapper.
+# The demo body (`run`) lives in the lib for reuse and focused testing; the binary is a thin wrapper.
+# `alpha demo distribute` launches that binary as an external child from the registry.
 [lib]
 name = "distribute"
 path = "src/lib.rs"

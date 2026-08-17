@@ -1,9 +1,9 @@
 {
-  "about": "The demos `alpha demo` can launch. Alpha never links these — add or remove an entry here and Alpha needs no recompile. Each demo runs via its cargo `package` in a source checkout, or a prebuilt `bin` path for an installed alpha (bin wins over package if both are set; a relative bin resolves against this file's directory).",
+  "about": "The demos `alpha demo` can launch. Alpha never links these — add or remove an entry here and Alpha needs no recompile. Each demo runs via its cargo `package` in a source checkout, optionally with a bounded list of package `features`, or a prebuilt `bin` path for an installed alpha (bin wins over package if both are set; a relative bin resolves against this file's directory).",
   "demos": [
     {
       "name": "walkthrough",
-      "summary": "Onboarding loop: author -> build -> sign -> load -> run -> migrate, narrated.",
+      "summary": "Onboarding loop: a deterministic reference author -> build -> sign -> load -> run, then a signed local two-body hand-off, narrated.",
       "package": "walkthrough"
     },
     {
@@ -18,17 +18,18 @@
     },
     {
       "name": "bestiary-live",
-      "summary": "A REAL model authors a creature into a durable, replicated, AI-curated Bestiary (opt-in: needs ALPHA_LLM_MODEL + --features openai).",
-      "package": "bestiary-live"
+      "summary": "A REAL model authors a creature into a durable Bestiary with a verified proof, journal recovery, and store-level signed-entry convergence (opt-in: needs ALPHA_LLM_MODEL; the runner enables its openai feature).",
+      "package": "bestiary-live",
+      "features": ["openai"]
     },
     {
       "name": "dialogue",
-      "summary": "Two agents hold a multi-turn conversation ACROSS a Realm boundary over ed25519 TCP (loopback): an initiator on one Realm speaks to a stateful agent on another through the Omega gateway. The v0.5.0 cross-mesh interaction story.",
+      "summary": "Two reference agents hold a multi-turn conversation ACROSS a Realm boundary over ed25519 TCP (loopback): an initiator on one Realm speaks to a stateful responder on another through the Omega gateway.",
       "package": "dialogue"
     },
     {
       "name": "cluster",
-      "summary": "Three real Sanctum PROCESSES across both poles (omega serve + two alpha node operators) form a gossip mesh, cross-execute over it, and attach an AI to each — driven via shell + HTTP + MCP. The operator-facing counterpart to `federation`.",
+      "summary": "Three real Sanctum processes across both poles (omega serve + two alpha node operators) form a gossip mesh, cross-execute over it, and prove one pre-admitted remote MCP hub can read a chosen operator's live graph. Manual fail-closed shell/HTTP/MCP runbook.",
       "manual": true,
       "runbook": "cluster"
     }

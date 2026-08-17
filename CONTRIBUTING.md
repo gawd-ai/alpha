@@ -12,7 +12,8 @@
 - Build the two entry points: `cargo build --locked -p alpha -p omega`; the complete workspace gate
   runs once in constrained CI.
 - Run a node: `cargo run -p alpha -- node` (REPL — see [README](README.md)).
-- Native creatures are `cdylib` crates (`crate-type = ["cdylib"]`).
+- Artifact-backed native creatures are `cdylib` crates (`crate-type = ["cdylib"]`); trusted organs
+  compiled into a host may instead be installed as in-process creature instances.
 - Beast (wasm) creatures target `wasm32-unknown-unknown` and are built explicitly
   (excluded from the workspace). The beast tier is exercised by an inline WAT module in
   `cosmos/sanctum/tests/m0_integration.rs` (the `wat` crate compiles it for `WasmEngine`); no standalone
@@ -63,13 +64,14 @@ in `cosmos/`.
 The public release is **source-first**: every workspace crate sets `publish.workspace = true` and so
 inherits `publish = false` from the root manifest — nothing goes to a package registry; you clone and
 build from this repository. Keep that invariant when adding a crate (set `publish.workspace = true`):
-on Alpha the distributable unit is the **creature** (a signed `gawd_creature_v1` artifact), published
-and fetched by content address over the bus, not a Rust package. The release checklist lives in
+on Alpha the distributable unit is the **creature** (a signed artifact: daemon/beast use
+`gawd_creature_v1`, critter uses `gawd_critter_v1`), published and fetched by content address over
+the bus, not a Rust package. The release checklist lives in
 [`RELEASE.md`](RELEASE.md).
 
-## Add a creature (native daemon)
+## Add an artifact-backed creature (native daemon)
 
-A creature is a `cdylib` crate that exports one POD-only `extern "C"`
+An artifact-backed native creature is a `cdylib` crate that exports one POD-only `extern "C"`
 constructor via `forge::declare_creature!`. The kernel loads it via
 `NativeEngine`.
 
@@ -181,17 +183,21 @@ end-to-end pattern.
 Models — placement resolvers, admission policies, fitness scorers — are *not*
 substrate; they belong in `cosmos/creatures/prototypes/*` (or in `cosmos/creatures/*` when they're real
 shipped consumers of a substrate primitive, like the requirements-matching distributor and
-advertiser). The substrate ships the *socket* and the *mechanism*; a model fills
-the socket via `Role`-binding (`bind <role> <id>` at the REPL, or programmatically
-via `Router::bind_role`). **The substrate never substitutes a model of its own.**
+advertiser). The substrate ships the *seam* and the *mechanism*; the host injects a model through
+the seam it declares: a `Role` binding for addressable organs, a constructor-supplied trait for
+bootstrap/local strategies (`Policy`, `FitnessScorer`, `ReputationWeigher`, `MergeModel`), or a
+topic subscription for sense-driven policy. **The substrate never substitutes a model of its own.**
 
 - `cosmos/creatures/prototypes/distributors/distributor-roundrobin` — a minimal round-robin
   distributor reference, bound to `Role::DISTRIBUTOR`. The requirements-matching Distributor
   (`cosmos/creatures/distributor-requirements`) ships alongside; both are creatures, the
   operator picks one with `bind_role` (IoC composability).
-- `cosmos/creatures/prototypes/policies/policy-dev` — permissive admission policy (admits everything).
-- `cosmos/creatures/prototypes/policies/policy-signed` — admission policy requiring an Abode-signed manifest.
-- `cosmos/creatures/prototypes/policies/policy-budget` — admission policy consuming the `BudgetSignal`.
+- `cosmos/creatures/prototypes/policies/policy-dev` — permissive constructor-injected admission
+  policy (admits everything).
+- `cosmos/creatures/prototypes/policies/policy-signed` — constructor-injected admission policy
+  requiring an Abode-signed manifest.
+- `cosmos/creatures/prototypes/policies/policy-budget` — topic-subscribed budget-response policy
+  creature; it consumes `BudgetSignal` and may emit `KernelControl`, but does not decide admission.
 
 When you write a new model, decide between `cosmos/creatures/prototypes/`
 (operator-replaceable reference strategy) and `cosmos/creatures/` (real consumer of a substrate
@@ -241,8 +247,15 @@ primitive); either way, call out in its README that it is an injected model, not
   two migrator creatures — so it uses no ports);
   `omega_federation_cross_node` uses `19_960 / 19_961` (
   `omega_admission_gate_holds` is in-process — the T2 property is about the
-  admission gate, not the wire — so it uses no ports); `seer_steer_abort_cross_node`
-  uses `19_970 / 19_971`. Pick from the next free range and document the choice.
+  admission gate, not the wire — so it uses no ports);
+  `omega_app_routing_cross_node` uses `19_962 / 19_963`;
+  `distributor_cross_realm` uses `19_964 / 19_965`;
+  `function_jobs_cross_realm` uses `19_966 / 19_967`;
+  `seer_steer_abort_cross_node` uses `19_970 / 19_971`;
+  `bestiary_replication_cross_node` uses `19_980 / 19_981`;
+  `control_over_mesh` uses `19_982 / 19_983`; and
+  `omega_serve_federation` uses `19_990 / 19_991`. Pick an unused range and document the choice;
+  prefer ephemeral ports whenever the test can publish its selected address to its peers.
 
 ## Conventions
 

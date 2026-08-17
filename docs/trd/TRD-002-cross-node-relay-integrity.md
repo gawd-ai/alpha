@@ -54,10 +54,11 @@ final delivery and reply. Three properties: **attribution** (who really sent it)
   sessions; applications that need it use `corr` + idempotency. A reconnect-replay test MUST pin the
   chosen behavior. See ADR-0040.
 - **R4 — `BadSig` posture is explicit and operator-visible.** The router is correctly non-enforcing
-  (R5-style): a `BadSig` verdict is *published*, not *dropped* (`transport-tcp/src/lib.rs:1502-1512`).
-  v0.4.3 MUST make the consequence operator-visible — a recommended default immune-response binding
-  and/or a `SECURITY.md` warning that, absent a bound `Role::IMMUNE_RESPONSE` acting on
-  `OriginVerdict::BadSig`, forged-signature frames are admitted. See ADR-0041.
+  (R5-style): a `BadSig` verdict is *published*, not *dropped* (`dispatch_inbound` /
+  `publish_origin_verdict`). The consequence is operator-visible: `SECURITY.md` and the clustered
+  boot warning state that, absent an origin-defense topic consumer, forged-signature frames are
+  admitted. The shipped reference is `policy-origin`, subscribed to `PROPRIOCEPTION`; it sends the
+  reversible transport `Forget` operation after an injected threshold. See ADR-0041.
 - **R5 — Relay attribution is documented end-to-end.** Each in-fabric relay path
   (`omega-federator`, `realm-gateway`, `dialogue-initiator`) MUST have a one-paragraph doc stating what
   it preserves (`reply_to`, `corr`, `commitment`, payload bytes) and what it does *not* (origin —
@@ -67,12 +68,12 @@ final delivery and reply. Three properties: **attribution** (who really sent it)
 
 | Finding | Status | Evidence |
 |---|---|---|
-| Inbound frames are origin-attested at transport | **Verified** | `transport-tcp:1514` |
-| Creature can read but not set origin (anti-forgery by design) | **Verified** | `envelope.rs:74`, `instance.rs:16`, `bus.rs:83-91` |
+| Inbound frames are origin-attested at transport | **Verified** | `transport_tcp::dispatch_inbound` |
+| Creature can read but not set origin (anti-forgery by design) | **Verified** | sealed `Header.origin`; no `Dispatch.origin` field |
 | "Add `Dispatch.origin` to fix relay attribution" | **Down-ranked** | would be forgeable; replaced by R1 app-signing |
-| `reply_to` nested grain not rewritten | **Verified** | `transport-tcp:1463-1466` |
-| Replay watermark resets on reconnect | **Verified** | `transport-tcp:1525-1541` |
-| `BadSig` is published, not enforced | **Verified** | `transport-tcp:1502-1512` |
+| `reply_to` nested grain is recursively rewritten | **Verified** | `transport_tcp::rewrite_peer_reply_to` |
+| Replay watermark resets on reconnect | **Verified** | per-connection `recv_seq` state in `dispatch_inbound` |
+| `BadSig` is published, not enforced | **Verified** | `publish_origin_verdict`; delivery remains unconditional |
 
 ## Acceptance
 
@@ -81,6 +82,7 @@ final delivery and reply. Three properties: **attribution** (who really sent it)
 - A cross-node integration test sends a request with `reply_to = Realm{…, Creature(mid)}` and asserts the
   reply arrives at the right creature on the right node (ADR-0039).
 - A reconnect-replay test pins the ADR-0040 behavior.
-- `SECURITY.md` documents the `BadSig`-admission consequence; composition roots show the recommended
-  immune binding (ADR-0041).
+- `SECURITY.md` documents the `BadSig`-admission consequence; composition roots warn when no
+  origin-defense subscriber is wired, and integration proves `policy-origin` can close the loop
+  (ADR-0041).
 - Each relay creature's module doc states its preserve/not-preserve contract (R5).

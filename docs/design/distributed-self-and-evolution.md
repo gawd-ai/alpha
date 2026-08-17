@@ -306,18 +306,19 @@ nature resists a pathogen. The capability layer admits *multiple satisfying impl
 pinning one; the registry is a gene pool, not a static index. Some efficiency is traded for diversity
 and redundancy **on purpose** — that cost *is* the resilience.
 
-### The immune system — trust-gated, reversible quarantine
+### The immune system — reversible quarantine with an optional inbound trust gate
 
 `immune-response` (bound to `Role::IMMUNE_RESPONSE`, one per Sanctum) is selection's **dual**: it
 *quarantines*, never promotes. It closes the three immune mappings into running code — **innate**
 (self/non-self via signing at admission), **adaptive** (anomaly sensing), **herd** (mesh-wide rejection
 of a known-bad lineage).
 
-Unlike the selector, it **can** subscribe directly to its sense stream. `PROPRIOCEPTION` carries only
-**lifecycle** (`loaded` / `unloaded` / `unload_leaked_resources`) and **budget** events — tied to
-load/unload/breach, never to a plain handle — so handling one never produces another. The two streams
-are duals: per-handle `FITNESS` self-feeds (so the selector needs a relay), per-lifecycle
-`PROPRIOCEPTION` does not (so the immune-response subscribes directly). It quarantines a *watched*
+Unlike the selector, it **can** subscribe directly to its sense stream. `PROPRIOCEPTION` also carries
+origin, peer, build, and maintenance observations, but `immune-response` schema-filters and consumes
+only **lifecycle** (`loaded` / `unloaded` / `unload_leaked_resources`) and **budget** triggers. Those
+consumed events are tied to load/unload/breach, never to a plain handle, so handling one never
+produces another. The two streams are duals: per-handle `FITNESS` self-feeds (so the selector needs a
+relay), while the immune consumer's lifecycle/budget inputs do not. It quarantines a *watched*
 creature's artifact on three triggers:
 
 - a `budget_signal` event with `level == "hard"` (an apoptosis-level breach);
@@ -337,15 +338,16 @@ registry/federator path repeats the pressure guard: shared `QuarantineNotice` ca
 or malformed keys, reasons, and peer lists before a registry filling stores the marker or a federator
 forwards it.
 
-Two properties are load-bearing. **Decentralized and trust-gated:** there is no central authority that
-can quarantine your creatures. An inbound cross-Realm `QuarantineNotice` is honored only if an
-**injected** `QuarantineTrust { fn honors(&self, attesting_peers, realm) -> bool }` returns true, else
-dropped silently — so a peer you don't trust cannot flag your code. The substrate ships only the trait;
-references are `policy-quarantine-trust-all` (a non-production reference) and `policy-quarantine-trust-realm`
-(a per-Realm trusted set, fail-closed for unknown Realms). **Reversible:** the immune system only ever
-*marks* — a re-publish of the same `(realm, artifact_hash)` clears the marker. It flags; it does not
-execute, and it never permanently blacklists (that would be a policy decision the substrate refuses to
-make for you).
+Two receiving postures are explicit. A `QuarantineNotice` addressed to the peer
+`omega-federator` is shape-checked and written directly as a reversible registry marker; that path
+does **not** invoke `QuarantineTrust`. An operator that does not grant a peer that flagging power
+routes the notice to `immune-response` instead. That creature honors it only if the **injected**
+`QuarantineTrust { fn honors(&self, attesting_peers, realm) -> bool }` returns true, otherwise it
+drops the notice. References are `policy-quarantine-trust-all` (a non-production reference) and
+`policy-quarantine-trust-realm` (a per-Realm trusted set, fail-closed for unknown Realms).
+**Reversible:** both paths only ever *mark* — a re-publish of the same
+`(realm, artifact_hash)` clears the marker. A marker is an input to admission policy, not an unload
+or execution command, and the substrate never permanently blacklists.
 
 A quarantine marker is also just a **policy input**, not a gate. `policy-quarantine-aware` checks the
 quarantine slot *first* (reject if quarantined) and only then applies the promotion gate. So an entry

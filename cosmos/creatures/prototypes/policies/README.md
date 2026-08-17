@@ -9,6 +9,7 @@ Each is the minimal readable reference; real deployments ship their own (`my-org
 | `policy-dev` | admission `Policy` | admit everything (permissive dev policy) |
 | `policy-signed` | admission `Policy` | admit only an Abode-signed manifest with a matching artifact hash |
 | `policy-budget` | budget policy (PROPRIOCEPTION → `BudgetSignal`) | `BudgetApoptosis` (Hard→Unload) and `BudgetGraceful` (Warn→one-shot ExtendBudget) |
+| `policy-origin` | origin defense (PROPRIOCEPTION → `Role::TRANSPORT`) | count a peer's non-`Verified` origin verdicts and issue the reversible `Forget` lever after an injected threshold |
 | `policy-prefer-promoted` | admission `Policy` | admit only a creature with a verified at-threshold fitness promotion (selection-as-policy, T7) |
 | `policy-quarantine-aware` | admission `Policy` | reject a quarantined creature *before* the promotion gate — defense overrides selection |
 | `policy-abode-allowlist` | `RestorePolicy` (abode-migrator) | admit an incoming Abode snapshot only when its `abode_key` is allow-listed |

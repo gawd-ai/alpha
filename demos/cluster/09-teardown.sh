@@ -8,6 +8,10 @@ if [[ ! -d "$RUN" ]]; then
   echo "✓ cluster already down; no run directory exists"
   exit 0
 fi
+if [[ -L "$RUN" ]]; then
+  echo "✗ refusing teardown: run path $RUN is a symlink" >&2
+  exit 1
+fi
 acquire_cluster_lifecycle_lock || exit 1
 
 status=0
@@ -57,7 +61,8 @@ for name in A B C; do
 done
 
 if ((status == 0)); then
-  echo "✓ cluster down. Logs remain in $RUN (node pubkeys in *.pub). Re-run ./01-boot.sh to start again."
+  echo "✓ cluster down. Local logs remain in $RUN (pubkeys: *.pub; boot-local control ids: *.control)."
+  echo "  Re-run ./01-boot.sh to start again; Step 05's temporary MCP hub is already self-cleaning."
 else
   echo "✗ cluster teardown incomplete; retained PID files still need attention" >&2
 fi

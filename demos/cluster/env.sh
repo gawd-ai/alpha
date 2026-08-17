@@ -6,12 +6,13 @@
 # (setting that box's own *_HOST), then run 02–05 from anywhere that can reach all three. See the
 # "Run it across three real machines" section of README.md.
 #
-# Each node has two ports: a cluster transport port (peer mesh) and an HTTP control-plane
-# port (the operator + MCP drive it).
+# Each node has two ports: a cluster transport port (peer mesh) and an HTTP/WS control-plane
+# port (curl/browser clients drive this directly). MCP is stdio, not an HTTP listener: a remote
+# `alpha mcp` hub gets its own cluster-transport listener and reaches Role::CONTROL over the mesh.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 export ROOT="$(cd "$HERE/../.." && pwd)"
-export RUN="$HERE/run"     # pids / logs / captured pubkeys live here
+export RUN="$HERE/run"     # local pids / logs / captured pubkeys + boot-local control ids
 # Two poles, two binaries. `alpha` is the α front door — `alpha node` is an operator daemon,
 # `alpha mcp` the MCP hub; BIN/MCP both point at it (`"$BIN" node …` / `"$MCP" mcp …`). `omega` is
 # the Ω server — `omega serve` boots a federation/gateway Sanctum. This runbook makes node A an
@@ -30,6 +31,17 @@ export A_HOST="${A_HOST:-127.0.0.1}"; export A_CPORT="${A_CPORT:-9101}"; export 
 export B_HOST="${B_HOST:-127.0.0.1}"; export B_CPORT="${B_CPORT:-9102}"; export B_APORT="${B_APORT:-7102}"
 export C_HOST="${C_HOST:-127.0.0.1}"; export C_CPORT="${C_CPORT:-9103}"; export C_APORT="${C_APORT:-7103}"
 
+# Stable identity for the temporary/host-managed MCP hub used by Step 05. The hub's listen port is a
+# CLUSTER TRANSPORT port, not an HTTP or MCP port (MCP itself remains JSON-RPC on stdio). A pre-shared
+# identity is necessary because transport authentication is mutual and deliberately has no TOFU: an
+# existing member must admit this pubkey before the hub can join. Demo-only fixed key; when overriding
+# MCP_HUB_SEED, override MCP_HUB_PUB with the public key derived from that seed as one atomic choice.
+export MCP_HUB_ID="${MCP_HUB_ID:-mcp-hub-B}"
+export MCP_HUB_HOST="${MCP_HUB_HOST:-127.0.0.1}"
+export MCP_HUB_CPORT="${MCP_HUB_CPORT:-9190}"
+export MCP_HUB_SEED="${MCP_HUB_SEED:-d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4}"
+export MCP_HUB_PUB="${MCP_HUB_PUB:-ed3234b276d4ceda57d59bad14fbaf5a773c0f318c999de3a60d53c5a5b34c05}"
+
 # HTTP Bearer keys (one per node). With --allow-ai (how 01-boot.sh runs the nodes) this key is the
 # SOLE gate on POST /api/cluster/connect — and a join propagates by gossip to every node's allowlist,
 # so possession of any one node's key is effectively cluster-wide admission authority. Use strong,
@@ -37,6 +49,12 @@ export C_HOST="${C_HOST:-127.0.0.1}"; export C_CPORT="${C_CPORT:-9103}"; export 
 export A_KEY="${A_KEY:-demo-key-A}"
 export B_KEY="${B_KEY:-demo-key-B}"
 export C_KEY="${C_KEY:-demo-key-C}"
+
+# Bound every runbook HTTP request. Individual poll calls may lower --max-time further; curl applies
+# the last occurrence. These defaults keep a listener that accepts but never answers from hanging a
+# numbered step indefinitely.
+export CLUSTER_CURL_CONNECT_TIMEOUT="${CLUSTER_CURL_CONNECT_TIMEOUT:-2}"
+export CLUSTER_CURL_MAX_TIME="${CLUSTER_CURL_MAX_TIME:-30}"
 
 # Fixed node-identity seeds (32-byte ed25519 seeds, hex) so pubkeys are stable across runs.
 # DEMO ONLY — generate real keys (`alpha node` prints one when --cluster-key is omitted) for real use.
@@ -50,6 +68,76 @@ node_vars() {
   echo "HOST=\$${n}_HOST CPORT=\$${n}_CPORT APORT=\$${n}_APORT KEY=\$${n}_KEY SEED=\$${n}_SEED"
 }
 
+require_command() {
+  local command_name="$1"
+  command -v "$command_name" >/dev/null 2>&1 || {
+    echo "✗ required command not found: $command_name" >&2
+    return 1
+  }
+}
+
+# Open a fresh regular log file without ever following/truncating an existing destination symlink.
+# The random candidate is created with Bash noclobber while its descriptor stays open, then renamed
+# over the public log path. A prior symlink is replaced as a directory entry; child output goes to
+# the already-open inode. Caller redirects to `$CLUSTER_LOG_FD`, spawns, then closes it.
+CLUSTER_LOG_FD=""
+open_cluster_log() { # exact path directly under $RUN
+  local destination="$1" candidate="" old_umask attempt had_noclobber=0
+  [[ "$destination" == "$RUN/"* && "${destination#"$RUN/"}" != */* ]] || {
+    echo "✗ refusing log path outside the run directory: $destination" >&2
+    return 1
+  }
+  [[ -d "$RUN" && ! -L "$RUN" ]] || {
+    echo "✗ run path $RUN must be a real directory" >&2
+    return 1
+  }
+
+  [[ -o noclobber ]] && had_noclobber=1
+  old_umask="$(umask)"
+  umask 077
+  set -o noclobber
+  CLUSTER_LOG_FD=""
+  for ((attempt = 0; attempt < 32; attempt++)); do
+    candidate="$RUN/.cluster-log.$BASHPID.$RANDOM.$RANDOM.$attempt"
+    if exec {CLUSTER_LOG_FD}>"$candidate" 2>/dev/null; then
+      break
+    fi
+    candidate=""
+  done
+  ((had_noclobber == 1)) || set +o noclobber
+  umask "$old_umask"
+  [[ -n "$candidate" && -n "$CLUSTER_LOG_FD" ]] || {
+    echo "✗ could not create a fresh log inode under $RUN" >&2
+    return 1
+  }
+  if ! mv -fT -- "$candidate" "$destination"; then
+    exec {CLUSTER_LOG_FD}>&-
+    CLUSTER_LOG_FD=""
+    rm -f -- "$candidate"
+    return 1
+  fi
+}
+
+close_cluster_log() {
+  if [[ -n "$CLUSTER_LOG_FD" ]]; then
+    exec {CLUSTER_LOG_FD}>&-
+    CLUSTER_LOG_FD=""
+  fi
+}
+
+cluster_curl() {
+  [[ "$CLUSTER_CURL_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "✗ CLUSTER_CURL_CONNECT_TIMEOUT must be a positive integer" >&2
+    return 1
+  }
+  [[ "$CLUSTER_CURL_MAX_TIME" =~ ^[1-9][0-9]*$ ]] || {
+    echo "✗ CLUSTER_CURL_MAX_TIME must be a positive integer" >&2
+    return 1
+  }
+  curl -fsS --connect-timeout "$CLUSTER_CURL_CONNECT_TIMEOUT" \
+    --max-time "$CLUSTER_CURL_MAX_TIME" "$@"
+}
+
 # Poll a node's public /api/health until it answers (or time out).
 wait_health() {
   local host="$1" port="$2" tries="${3:-50}" watched_pid="${4:-}"
@@ -61,7 +149,7 @@ wait_health() {
     fi
     # Bound both connection establishment and the whole request. A listener that accepts but never
     # answers must not strand boot (or prevent its EXIT trap from rolling back nodes already started).
-    if curl -fsS --connect-timeout 1 --max-time 2 \
+    if cluster_curl --connect-timeout 1 --max-time 2 \
         "http://$host:$port/api/health" >/dev/null 2>&1; then
       return 0
     fi
@@ -300,5 +388,39 @@ remove_node_pid_if_matches() {
   rm -f -- "$pid_file"
 }
 
-# Read a node's captured pubkey (written by 01-boot.sh).
-node_pub() { cat "$RUN/$1.pub" 2>/dev/null; }
+# Read a node's pubkey. A locally launched node writes `run/<name>.pub`; a driver controlling nodes
+# on separate machines supplies A_PUB/B_PUB/C_PUB explicitly because those remote log files are not
+# magically present on the driver.
+node_pub() {
+  local name="$1" override_name="${1}_PUB" value=""
+  value="${!override_name:-}"
+  if [[ -z "$value" && -f "$RUN/$name.pub" ]]; then
+    IFS= read -r value <"$RUN/$name.pub" || return 1
+  fi
+  if [[ ! "$value" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "✗ no valid pubkey for node $name; run ./01-boot.sh locally or export ${name}_PUB from that node's boot log" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+# Resolve the process-local ControlCore creature id printed at boot. It is stable only for that
+# process incarnation, so remote drivers must copy it from the target's current boot log rather than
+# treating it as a permanent node identity.
+node_control_id() {
+  local name="$1" override_name="${1}_CONTROL_ID" value=""
+  value="${!override_name:-}"
+  if [[ -z "$value" && -f "$RUN/$name.control" ]]; then
+    IFS= read -r value <"$RUN/$name.control" || return 1
+  fi
+  if [[ -z "$value" && -f "$RUN/$name.log" ]]; then
+    value="$(awk '/Role::CONTROL \(id=[0-9]+\)/ {
+      line=$0; sub(/^.*Role::CONTROL \(id=/, "", line); sub(/\).*$/, "", line); print line; exit
+    }' "$RUN/$name.log")"
+  fi
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "✗ no valid control id for node $name; run ./01-boot.sh locally or export ${name}_CONTROL_ID from its current boot log" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
+}

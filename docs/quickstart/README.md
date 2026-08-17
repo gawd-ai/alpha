@@ -9,16 +9,18 @@ Short, task-oriented guides. Two kinds: **run the system** (drive a live node as
 |---|---|
 | [operator](./operator.md) | you want to **boot a node and play with it** — author code live, watch the sense-tape, then scale up to a small federation of Realms |
 
-The runnable, narrated demos it builds toward live in [`demos/`](../../demos/):
+The two fastest narrated demos it builds toward live in [`demos/`](../../demos/):
 `cargo run -p walkthrough` (one node's whole loop) and `cargo run -p federation`
-(many Sanctums across 2–3 Realms over real TCP). Driving a node *remotely* is in the README quickstart —
+(many Sanctums across 2–3 Realms over real TCP). `alpha demo list` shows the complete six-entry
+registry, including GX transfer, dialogue, the opt-in live-model demo, and the manual cluster runbook.
+Driving a node *remotely* is in the README quickstart —
 [*Drive it over MCP*](../../README.md#4-drive-it-over-mcp) and
 [*Drive it over HTTP*](../../README.md#5-drive-it-over-http).
 
 ## Write a creature
 
-All three tiers load through the *same* `Kernel::load` path and differ only by `abi.backend`; pick the
-tier by how much power vs. containment you need:
+Artifact-backed creatures in all three tiers load through the *same* `Kernel::load` path and differ
+only by `abi.backend`; pick the tier by how much power vs. containment you need:
 
 | Quickstart | Tier | Reach for it when… | Authoring cost |
 |---|---|---|---|

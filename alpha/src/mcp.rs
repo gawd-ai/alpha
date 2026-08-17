@@ -14,10 +14,11 @@
 //!   `Role::CONTROL` on this node. It is self-contained and headless: pass `--allow-ai` at startup to
 //!   author/load/run, or omit it for read-only tools. There is no REPL or remote gate-flip tool.
 //!   `--minimal` boots a bare control plane (no AUTHORING/BUILD organs).
-//! - **Remote (`--target <node-id@control-id>` + `--node-id <id>` + `--listen <addr>` + at least one
-//!   `--seed …`):** the hub joins the mesh and routes verbs to a **peer** node's `Role::CONTROL` over
-//!   authenticated transport. The target node owns the allow-AI/admission decision; `--allow-ai` on
-//!   the hub has no effect on that remote gate.
+//! - **Remote (`--target <node-id@control-id>` + `--node-id <id>` + `--listen <addr>` +
+//!   `--cluster-key <64-hex>` + at least one `--seed …`):** the hub joins the mesh and routes verbs
+//!   to a **peer** node's `Role::CONTROL` over authenticated transport. The stable hub identity must
+//!   be pre-admitted by the peer because transport has no TOFU. The target node owns the
+//!   allow-AI/admission decision; `--allow-ai` on the hub has no effect on that remote gate.
 //!
 //! ## Flags
 //! `--allow-ai` open the headless hub's own gate at boot (local mode only) · `--minimal` no local organs ·
@@ -110,6 +111,12 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             }
             other => return Err(format!("unknown flag `{other}`")),
         }
+    }
+    if o.target.is_some() && o.cluster_key.is_none() {
+        return Err(
+            "--target (remote mode) requires --cluster-key <64-hex> for a stable pre-admitted hub identity"
+                .into(),
+        );
     }
     Ok(o)
 }
@@ -240,4 +247,19 @@ fn join_mesh(
     }
     // Same cluster-transport boot the α/Ω composition roots use (ADR-0044) — single source of truth.
     omni::boot_cluster(kernel, &node_id, &listen, &opts.seeds, &nk.key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_opts;
+
+    #[test]
+    fn remote_mode_requires_a_stable_cluster_key() {
+        let args = vec!["--target".into(), "peer@7".into()];
+        let error = match parse_opts(&args) {
+            Err(error) => error,
+            Ok(_) => panic!("remote mode without a key must fail"),
+        };
+        assert!(error.contains("requires --cluster-key"));
+    }
 }

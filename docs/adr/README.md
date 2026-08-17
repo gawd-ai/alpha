@@ -21,7 +21,7 @@ suite-compositional acceptance evidence is indexed by
 | [ADR-0038](ADR-0038-origin-stays-hop-by-hop.md) | Origin stays hop-by-hop; agent identity is app-signed | Do **not** add a creature-settable origin (it would be forgeable); spec signed dialogue provenance instead | TRD-002 | Implemented |
 | [ADR-0039](ADR-0039-nested-reply-to-rewrite.md) | Nested `reply_to` rewrite for Realm/Omega grain | Recursively rewrite the boxed inner target at the transport boundary | TRD-002 | Implemented |
 | [ADR-0040](ADR-0040-replay-guard-reconnect.md) | Replay guard across reconnect | Accept session-scoped guard; document idempotency-via-`corr` as the cross-session contract | TRD-002 | Implemented |
-| [ADR-0041](ADR-0041-origin-verdict-posture.md) | Origin-verdict enforcement posture | Router stays non-enforcing (R5); ship a recommended immune-response default + SECURITY.md warning | TRD-002 | Implemented |
+| [ADR-0041](ADR-0041-origin-verdict-posture.md) | Origin-verdict enforcement posture | Router stays non-enforcing (R5); recommend a `policy-origin` subscriber and warn when no origin defense is wired | TRD-002 | Implemented |
 | [ADR-0042](ADR-0042-escape-hatch-policy.md) | Escape-hatch policy for `with_max_*(0)` | Keep the unbounded opt-out, but unify naming + a single documented "lab posture" | TRD-001 | Implemented |
 | [ADR-0043](ADR-0043-reserved-seam-register.md) | Reserved-seam disposition register | Classify every reserved seam: keep-reserved / realize-now / realize-v0.5.0, each with its consumer | TRD-004 | Accepted |
 | [ADR-0044](ADR-0044-omni-control-plane-dry.md) | `omni` shared control-plane composition | Hoist the duplicated alpha/omega control-plane boot into one `omni` recipe | TRD-005 | Implemented |

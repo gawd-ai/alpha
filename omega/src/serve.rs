@@ -219,9 +219,10 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
         "gateway: transport(id={}) → TRANSPORT, registry-mem(id={}) → REGISTRY, omega-federator(id={}) → OMEGA_GATEWAY",
         ids.transport.0, ids.registry.0, ids.federator.0
     );
-    // ADR-0041: a gateway is always a mesh node; warn loudly if no immune-response enforces the
-    // published OriginVerdict (BadSig frames are otherwise admitted).
-    omni::warn_if_no_immune_response(&kernel);
+    // ADR-0041: a gateway is always a mesh node. The reference composition subscribes no
+    // origin-defense policy by default, so warn loudly that published BadSig verdicts are not acted
+    // on until the operator wires `policy-origin` (or an equivalent consumer).
+    omni::warn_if_no_origin_defense(false);
 
     // Optional self-driving anti-entropy: the `federation-scheduler` companion. With `--pull-interval`,
     // the gateway pokes its own federator on a clock instead of waiting for an operator — Ω reconciles

@@ -7,14 +7,15 @@ invariants that constrain how it gets there. For what ships today, see
 
 ## The baseline
 
-An AI authors a creature and the substrate runs its whole life: it builds and signs the creature
-across three tiers (native `daemon`, WASM `beast`, Rhai `critter`); places it on a node whose
-embodiment satisfies the creature's declared requirements; quarantines it on a sensed fault and
-promotes a fit one; migrates its **Abode** — identity and state — to another node as a single active
-fork, reconciling divergent copies on an injected lattice; and federates, sanctums forming a **Realm**
-and Realms meeting at **Omega** to exchange signed reputation by pull anti-entropy. The five
-anti-entropy loops — sense→act, author→select→promote, distribute, defend, acculturate — are live end
-to end.
+The substrate loads and supervises three tiers: native `daemon`, WASM `beast`, and Rhai `critter`.
+Its managed author→build→sign surface covers daemon and critter today; beast artifacts are supplied
+externally and then enter the same admission/lifecycle path. Alpha places a creature on a node
+whose embodiment satisfies its declared requirements; quarantines it on a sensed fault and promotes
+a fit one; hands its **Abode** — identity and state — to another body with an acknowledged in-memory
+protocol whose overlap/crash limits are explicit, reconciling divergent copies on an injected
+lattice; and federates, sanctums forming a **Realm** and
+Realms meeting at **Omega** to exchange signed reputation by pull anti-entropy. The five anti-entropy
+loops — sense→act, author→select→promote, distribute, defend, acculturate — are live end to end.
 
 The operator surface is one binary, `alpha`: a node daemon, an MCP control-hub, and an HTTP/WS plane,
 each a thin host over the same `Role::CONTROL` bus contract. A node joins a gossip mesh from a seed,

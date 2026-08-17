@@ -24,8 +24,8 @@
 //! A successful handle that crosses `budget_warn_at` emits a `Warn` signal, and the
 //! live per-handle fuel ceiling is exposed through [`BudgetControl`] so an injected policy can grant
 //! `KernelControl::ExtendBudget`; the next handle reads the lifted ceiling. The [`BudgetVector`] is
-//! filled best-effort with the scalars wasmtime exposes cheaply (`consumed`, `limit`); fields a
-//! richer engine would measure (wall ms, dispatches-this-envelope) stay at zero.
+//! filled best-effort with the scalars available here (`consumed`, `limit`, and measured wall ms);
+//! `dispatches_this_envelope` stays zero because dispatch counting happens outside the engine.
 
 use aether::{
     ffi::ABI_TAG, BudgetSignal, BudgetVector, Creature, CreatureCtx, Envelope, LimitKind, Outcome,

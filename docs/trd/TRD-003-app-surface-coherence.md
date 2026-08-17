@@ -2,8 +2,8 @@
 
 - **Status:** Met (v0.4.3), extended for typed functions/jobs (v0.4.4)
 - **Theme:** Convergence
-- **Spawns:** [ADR-0045](../adr/ADR-0045-demo-registry-coherence.md) (demo-registry coherence) — *only if the
-  cluster-demo disposition is a genuine fork; otherwise folded as R7 below.*
+- **Resolution:** [ADR-0045](../adr/ADR-0045-demo-registry-coherence.md) records the implemented
+  manual-runbook registry shape for the `cluster` demo (R4/R7).
 - **Invariant in play:** one verb contract, uniform across surfaces — *the system makes sense AND works.*
 
 ## Scope
@@ -19,10 +19,8 @@ operator can reach is discoverable (including the *deliberate absences*). The ac
 
 ## The parity matrix (built from code)
 
-Sources: verb dispatch `omni::run_verb` (`cosmos/omni/src/lib.rs:729`) + gating set
-`Verb::is_gated` (`cosmos/omni/src/lib.rs:330`); MCP catalog `tool_list`
-(`cosmos/creatures/surface-mcp/src/lib.rs:451-472`); HTTP routes `router`
-(`cosmos/creatures/surface-http/src/lib.rs:420-444`). Gated = honors the allow-AI gate when the caller
+Sources: verb dispatch `omni::run_verb` + gating set `Verb::is_gated`; MCP catalog
+`surface_mcp::tool_list`; HTTP routes `surface_http::router`. Gated = honors the allow-AI gate when the caller
 is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 
 | Verb | RO/Mut | REPL | MCP tool | HTTP route | Notes |
@@ -54,7 +52,7 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 | `Bind` | Gated | ✅ | `alpha_bind` | `POST /api/bind` | uniform |
 | `Unload` | Gated | ✅ | `alpha_unload` | `POST /api/unload` | uniform |
 | `AiStatus` | Mut, **ungated** | ✅ | `alpha_ai_status` | `POST /api/ai/status` | transparency channel — never gated *by design* |
-| `AllowAi` | — | ✅ (`allow-ai on/off`) | **— (refused)** | **— (refused)** | **REPL-only by design**: refused when `ctx.gated` (`lib.rs:761-766`). Not a tool/route |
+| `AllowAi` | — | ✅ (`allow-ai on/off`) | **— (refused)** | **— (refused)** | **REPL-only by design**: refused when `ctx.gated`. Not a tool/route |
 | `Help` | RO | ✅ (`help`) | — | — | REPL parser-internal (`COMMANDS`) |
 | `Quit` | — | ✅ (`quit`/`exit`) | — | — | REPL lifecycle only |
 
@@ -67,9 +65,9 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 
 - **R1 — The parity matrix is the acceptance artifact and is pinned by a test.** The matrix above MUST
   hold: every verb reachable on each surface it should be, gating consistent, RO/mutating consistent. A
-  test MUST assert (a) `tool_list` ≡ `known_tool` (`surface-mcp/src/lib.rs:451,709` — already in
-  lock-step via the `unreachable!` at `:598`), (b) the HTTP route set equals the MCP tool set **minus
-  `alpha_watch`** (`surface-http/src/lib.rs:420`), and (c) every `Verb::is_gated` verb is rejected over a
+  test MUST assert (a) `tool_list` ≡ `known_tool` (already kept in lock-step by the dispatch guard),
+  (b) the HTTP route set equals the MCP tool set **minus `alpha_watch`**, and (c) every
+  `Verb::is_gated` verb is rejected over a
   gated surface without the allow-AI grant. `alpha/tests/mcp.rs` (`tools.len() == 27`)
   locks the MCP count; extend it to lock the cross-surface set, not just MCP.
   *Met (v0.4.3; extended v0.4.4):* (a) `alpha/tests/mcp.rs` pins the **exact** 27-name catalog (not just the count)
@@ -83,38 +81,39 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
   not exist; the earlier "20" audit miscounted a phantom verb). Any doc that *enumerates* the tools MUST
   list all 27. README uses "and the rest", so it does not drift.
 - **R3 — `allow-ai`'s REPL-only nature is discoverable on the gated surfaces.** `AllowAi` is correctly
-  refused when `ctx.gated` (`cosmos/omni/src/lib.rs:761-766`) with `{"error":"repl-only", ...}`, and is
+  refused when `ctx.gated` with `{"error":"repl-only", ...}`, and is
   correctly *absent* from `tool_list`/`/api/*`. But a host operator reading the MCP/HTTP capability set
   has nothing that explains *why* the gate-flip is missing. v0.4.3 MUST make the absence legible — e.g. a
   one-line note in the MCP `initialize`/`instructions` text or the HTTP capability doc, or surface the
   `repl-only` refusal as a documented capability. The `repl-only` error message text already exists and
-  is good; this requirement is about the *discovery* path, not the error.
-- **R4 — `demos.json` ↔ docs ↔ `alpha demo list` are consistent.** `alpha demo list`
-  (`alpha/src/demo.rs:111-122`) prints only `demos/demos.json` entries (walkthrough, federation,
-  distribute, bestiary-live, dialogue = **5**). The `cluster` demo exists on disk
-  (`demos/cluster/*.sh` + `README.md`) and is documented in the same demo table as the managed ones
-  (`demos/README.md:15`, plus `AGENTS.md:96`, `docs/quickstart/operator.md:172`, `README.md:114`,
-  `CHANGELOG.md:153`) but is **not** in `demos.json`, so `alpha demo list` never shows it and
-  `alpha demo run cluster` fails with "unknown demo". v0.4.3 MUST close the gap **one** of two ways
-  (see R7 / ADR-0045): register it, or have `alpha demo list` point at the manual runbook so the
-  managed-runner output is not silently incomplete.
+  is good; this requirement is about the *discovery* path, not the error. *Met (v0.4.3):* the MCP
+  initialize instructions explain self-contained startup gating, target-owned remote gating, and the
+  deliberate absence of any remote gate-flip tool.
+- **R4 — `demos.json` ↔ docs ↔ `alpha demo list` are consistent.** Before v0.4.3, the registry
+  contained only the five runner-launched demos while the documented `cluster` runbook existed only
+  on disk; consequently `alpha demo list` omitted it and `alpha demo run cluster` returned
+  "unknown demo." *Met (v0.4.3):* `demos/demos.json` now contains **six** entries: five external
+  Cargo-package demos (`walkthrough`, `federation`, `distribute`, `bestiary-live`, `dialogue`) and
+  `cluster` with `manual: true` plus `runbook: "cluster"`. `alpha demo list` tags that sixth entry
+  `(manual runbook)`, while `alpha demo run cluster` prints the numbered runbook pointer and exits
+  successfully rather than pretending the multi-process walkthrough is one launchable child.
 - **R5 — No verb returns stub/placeholder/canned data.** Every arm of `run_verb`
-  (`cosmos/omni/src/lib.rs:736-838`) MUST act on the live kernel/bus — verified: all ~22 arms dispatch to
-  a real handler. The **one** non-acting response, `Verb::Watch` (`lib.rs:757-759`), returns a *pointer*
+  MUST act on the live kernel/bus — verified: every arm dispatches to a real handler. The **one**
+  non-acting response, `Verb::Watch`, returns a *pointer*
   ("the monitor is tailing PROPRIOCEPTION + FITNESS … connect to `/api/ws` for the live stream"), which
   is **acceptable and intentional** (control replies are request/reply; streaming lives on `/api/ws`).
   This MUST be documented as deliberate so a future audit does not mistake it for a stub.
 - **R6 — `omega serve` exposes no half-wired flag.** `omega serve` (`omega/src/serve.rs`) MUST compose a
   complete node: transport + registry-mem + omega-federator (always), the `federation-scheduler`
-  companion only under `--pull-interval` (`serve.rs:94-100,226`), and the HTTP/WS control plane only under
-  `--listen` (`serve.rs:105,245-284`). Verified: `--cluster-listen` is required-and-checked
-  (`serve.rs:132-136`); `--pull-interval` without `--peer-realm` routes warns and stays poke-driven
-  (`serve.rs:234`) rather than silently no-op'ing. No flag advertises a capability it does not deliver.
-- **R7 — The cluster-demo disposition is recorded once.** If registering `cluster` in `demos.json` is
-  awkward (it is a multi-process shell runbook, not a single `cargo run -p`), the decision to keep it
-  *manual-only* MUST be recorded — as **ADR-0045** if it is a genuine fork in how demos are surfaced, or
-  folded as the R4 fix if it is a one-line registry/pointer change. Either way `alpha demo list` and the
-  `demos/README.md` table MUST stop disagreeing about whether `cluster` is a runner-managed demo.
+  companion only under `--pull-interval`, and the HTTP/WS control plane only under `--listen`.
+  Verified: `--cluster-listen` is required and checked; `--pull-interval` without `--peer-realm`
+  routes warns and stays poke-driven rather than silently no-op'ing. No flag advertises a capability
+  it does not deliver.
+- **R7 — The cluster-demo disposition is recorded once.** The multi-process shell walkthrough cannot
+  be represented honestly as one `cargo run -p` child. *Met (v0.4.3):* ADR-0045 records the
+  manual-runbook entry shape; the registry, runner, and `demos/README.md` all distinguish the five
+  externally launched demos from the listed-but-manual `cluster` runbook. Tests pin both the list tag
+  and the successful runbook-pointer behavior.
 
 ## Findings register
 
@@ -122,17 +121,18 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
 |---|---|---|
 | MCP `tool_list` exposes exactly **27** `alpha_*` tools | **Verified** | `surface-mcp::tool_list`; test `alpha/tests/mcp.rs` |
 | Earlier "20 tools incl. `alpha_allow_ai`" was a miscount | **Verified** → corrected | no `alpha_allow_ai` token exists anywhere in tree |
-| `tool_list` ≡ `known_tool` (catalog/dispatch lock-step) | **Verified** | `surface-mcp/src/lib.rs:451` vs `:709`; `unreachable!` guard `:598` |
-| `allow-ai` is REPL-only; refused when `ctx.gated`, not a tool/route | **Verified** | `cosmos/omni/src/lib.rs:761-766`; absent from `tool_list` & `/api/*` |
-| `allow-ai` absence is correct-by-design but **undiscoverable** to a host | **Verified** | nothing in MCP `instructions`/HTTP caps explains the missing gate-flip |
-| No verb returns stub/canned data | **Verified** | all `run_verb` arms `lib.rs:736-838` dispatch live |
-| `Verb::Watch` returns a pointer, not a stream | **Verified** → intentional | `lib.rs:757-759`; streaming is `/api/ws` (`surface-http`) |
+| `tool_list` ≡ `known_tool` (catalog/dispatch lock-step) | **Verified** | `surface_mcp::{tool_list,known_tool}` plus the dispatch guard |
+| `allow-ai` is REPL-only; refused when `ctx.gated`, not a tool/route | **Verified** | `omni::run_verb`; absent from `tool_list` and `/api/*` |
+| The deliberate absence of a remote gate-flip is discoverable | **Resolved / Verified** | MCP initialize instructions explain self-contained startup, target-owned remote gating, and that no remote tool flips it |
+| No verb returns stub/canned data | **Verified** | every `omni::run_verb` arm dispatches live |
+| `Verb::Watch` returns a pointer, not a stream | **Verified** → intentional | `omni::run_verb`; streaming is `/api/ws` (`surface-http`) |
 | HTTP mirrors MCP **minus** `alpha_watch` (no `/api/watch`) | **Verified** | `surface-http::router` (26 verb routes + health + ws) |
-| Tool `alpha_list` ↔ route `/api/creatures` name skew (both → `Verb::List`) | **Verified** → cosmetic | `surface-mcp:454` vs `surface-http:423` |
-| `cluster` demo on disk but **not** in `demos.json` (5 registered, not 6) | **Verified** | `demos/demos.json` (5); `demos/cluster/*.sh` exist; `alpha/src/demo.rs:111` lists only json |
-| Docs reference `cluster` as a manual `cd demos/cluster && ./*.sh` runbook | **Verified** | `demos/README.md:15,43-49`; not claimed as `alpha demo run cluster` |
-| HTTP auth: Bearer key + constant-time compare + body cap | **Verified** | `surface-http/src/lib.rs:443,449,472,55-57` |
-| `omega serve` has no half-wired flag | **Verified** | `omega/src/serve.rs:132-136,94-100,234,245-284` |
+| Tool `alpha_list` ↔ route `/api/creatures` name skew (both → `Verb::List`) | **Verified** → cosmetic | `surface_mcp::tool_list` vs `surface_http::router` |
+| Pre-v0.4.3: `cluster` existed on disk but was absent from the five-entry registry | **Resolved** | ADR-0045; retained here as historical problem context |
+| Current demo registry contains 6 entries: 5 external children + 1 manual runbook | **Verified** | `demos/demos.json`; `cluster` has `manual: true`, `runbook: "cluster"` |
+| `alpha demo list` tags `cluster`; `alpha demo run cluster` prints its runbook and exits 0 | **Verified** | `alpha/tests/demo.rs::{list_shows_the_cluster_manual_runbook_tagged,run_cluster_prints_the_runbook_and_exits_zero}` |
+| HTTP auth: Bearer key + constant-time compare + body cap | **Verified** | `surface_http::{router,auth_ok}` and bounded request extraction |
+| `omega serve` has no half-wired flag | **Verified** | `omega::serve::{parse_args,run}` and its composition tests |
 
 ## Acceptance
 
@@ -143,9 +143,9 @@ is remote (`ctx.gated`); RO = `readOnlyHint`/never gated.
   grep-level check (or the matrix here) confirms no doc enumerates a phantom `alpha_allow_ai`.
 - `allow-ai`'s REPL-only posture is discoverable from a gated surface (MCP `instructions`/HTTP caps note,
   or documented `repl-only` capability) — verified by reading the surface's own self-description.
-- `alpha demo list` and `demos/README.md` agree on `cluster`: it is either in `demos.json` (and runs via
-  `alpha demo run cluster`) or `alpha demo list` points at the manual runbook; the disposition is
-  recorded (R7 / ADR-0045).
+- ✅ `alpha demo list` and `demos/README.md` agree on all six registry entries. `cluster` is tagged as
+  a manual runbook, and `alpha demo run cluster` prints its step sequence and exits successfully;
+  ADR-0045 records why it is not launched as one child.
 - `Verb::Watch`'s pointer response is documented as intentional (not a stub) at its definition and in the
   surface design doc.
 - `omega serve --help` / boot output matches the wired flags; no flag claims an undelivered capability.

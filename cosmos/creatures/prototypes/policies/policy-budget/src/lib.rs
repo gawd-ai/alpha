@@ -19,17 +19,19 @@
 //! the *control ops* (`Unload`, `ExtendBudget`, and a creature's `sanctum::BudgetRequest`), never the decision.
 //!
 //! **The full gradient loop is live:**
-//! - The wasm engine emits `Warn` (via `budget_warn_at`), so `BudgetGraceful`'s Warn branches fire
-//!   from real beast execution, not just injection.
-//! - The kernel **honors** `ExtendBudget`: a granted fuel lift takes effect on the creature's next
-//!   handle (the wasm tier's live fuel ceiling). So a grace grant here actually rescues a creature.
+//! - The wasm and script engines emit structured `Warn`/`Hard` budget signals for their supported
+//!   dimensions, so `BudgetGraceful`'s Warn branches fire from real execution, not just injection.
+//! - The kernel **honors** `ExtendBudget` per tier: beasts can live-lift fuel, memory, and wall;
+//!   critters can live-lift fuel and wall. A dimension the tier cannot enforce is reported as such,
+//!   never silently accepted. So a compatible grace grant here actually rescues a creature.
 //! - `BudgetGraceful` also consumes a creature-initiated `sanctum::BudgetRequest` (schema `budget_request`):
 //!   it honors the first fuel ask per module (one-shot) by issuing `ExtendBudget`. The symmetric,
 //!   creature-side direction of the same gradient.
 //!
 //! **Remaining honest limits:**
-//! - `mem_bytes`/`wall_ms` `ExtendBudget` lifts are accepted by the wire but not yet honored (the
-//!   wasm `StoreLimiter` isn't live-mutable); only the fuel dimension lifts today.
+//! - The creature-initiated `BudgetRequest` path in this reference deliberately acts only on its
+//!   `fuel` field. That is a narrow policy choice, not an engine limitation; another injected policy
+//!   can issue memory/wall lifts where the target tier reports them enforceable.
 //! - Per-module grace/decision state is bounded by default ([`DEFAULT_MAX_TRACKED_MODULES`]). A
 //!   production policy would also subscribe to unload lifecycle and prune; this reference refuses
 //!   new tracked modules at capacity while preserving decisions for already-tracked modules.
@@ -365,8 +367,9 @@ impl BudgetGraceful {
     /// this reference honors the *first* fuel ask per module (one-shot, reusing the same `grace_granted`
     /// guard as the Warn path) so a creature can't loop-request unbounded budget, and observes the
     /// rest. A production policy would weigh `justification` against a quota / trajectory / cost
-    /// model — the substrate ships the seam, never the model (IoC). Only the fuel dimension is
-    /// honored (the kernel lifts fuel live; mem/wall lifts are future engine work).
+    /// model — the substrate ships the seam, never the model (IoC). This reference deliberately
+    /// honors only the fuel field; the kernel can live-lift other dimensions for tiers that expose
+    /// them, and a different injected policy may choose to request those lifts.
     fn on_budget_request(&mut self, env: &Envelope) -> Outcome {
         let Ok(req) = decode_budget_request(&env.payload) else {
             return Outcome::none();

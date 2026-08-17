@@ -9,10 +9,14 @@ fn handle(env) {
 }
 ```
 
+```text
+envelope payload "hello world", schema "world"   →   "yes"
+envelope payload "hello world", schema "xyz"     →   "no"
 ```
-send <id> "hello world"   (schema "world")   →   "yes"
-send <id> "hello world"   (schema "xyz")     →   "no"
-```
+
+These are envelope/API examples, not literal `alpha node` `send` commands: that convenience verb
+sets payload text but has no schema argument. The example test constructs the schema-bearing
+`Dispatch` directly.
 
 The honest **stateless** example: every answer derives only from *this* envelope. Critters can retain
 bounded instance-local state explicitly through `mem_get` / `mem_set` / `mem_del`; `contains` does not.

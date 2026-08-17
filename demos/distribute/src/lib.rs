@@ -8,6 +8,8 @@
 //! This is the cross-node ship → admit → load that `cosmos/sanctum/tests/m2_two_node.rs` proves over
 //! real sockets — but as one command an operator (or an AI over MCP) types, instead of a hand-rolled
 //! plan/pull/assemble loop. The verb that does it: `Verb::FetchLoad` in `cosmos/omni`.
+//! This narrated run is deliberately loss-free: it exercises the bounded windowed transfer but does
+//! not inject a stall or claim to demonstrate the verb's missing-chunk re-request branch.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -217,6 +219,7 @@ fn run_inner() -> Result<(), String> {
     // ---- the payoff: ONE fetch-load on B pulls + verifies + loads the creature from A ----
     banner("Node B — `registry fetch-load <hash> node-A <registry-id>`");
     step("B issues one control verb; under it: FetchGxPlan → windowed FetchGxChunk → assemble → admit → load");
+    step("this run is loss-free; the verb supports gap re-requests, but this demo does not induce a stall");
     let res = control_b(
         &k_b,
         1,
@@ -243,8 +246,11 @@ fn run_inner() -> Result<(), String> {
     let res =
         control_b(&k_b, 2, &Verb::Send { id: loaded_id, text: "it ran on B".into(), node: None })?;
     let reply = res.json.get("reply").and_then(|v| v.as_str()).unwrap_or_default();
-    if !res.ok || !reply.contains("it ran on B") {
-        return Err(format!("the fetched creature did not run: {}", res.human));
+    if !res.ok || reply != "it ran on B" {
+        return Err(format!(
+            "the fetched echo creature returned {reply:?}, expected byte-exact \"it ran on B\": {}",
+            res.human
+        ));
     }
     ok(&format!("sent → echoed: \"{reply}\" — the creature A published is now alive on B"));
 

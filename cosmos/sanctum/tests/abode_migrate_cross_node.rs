@@ -15,7 +15,8 @@
 //! ## What this test deliberately is NOT
 //!
 //! - Not a transport test (transport-tcp is already exercised by `m2_two_node`).
-//! - Not a fork test (single-active-fork only; fork is the reconciler's job).
+//! - Not a crash-safe authority-fence or fork-repair test: the acknowledged endpoint is source
+//!   sealed/destination active, but a lost response can leave an overlap; reconciliation is separate.
 //! - Not a Realm/Omega test.
 
 use std::sync::Arc;

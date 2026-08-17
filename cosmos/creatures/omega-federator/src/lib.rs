@@ -27,9 +27,11 @@
 //! 4. **Cross-Realm quarantine path.** On a `FederateQuarantine` control op the federator ships a
 //!    [`FederatorMsg::QuarantineNotice`] to a peer federator, which writes
 //!    [`RegistryOp::MarkQuarantine`] (reversible — T5) into its local registry. The federator ships
-//!    the *path*; the immune-response creature decides what triggers a notice and how to react. The
-//!    federator rejects oversized quarantine keys, reasons, and attesting-peer lists on outbound,
-//!    inbound, and pulled anti-entropy paths before forwarding them.
+//!    the *path*. This direct federator recipient is shape-gated, not `QuarantineTrust`-gated; an
+//!    operator that requires a trust decision routes the notice to `immune-response`, whose injected
+//!    trust model decides whether to write it. The federator rejects oversized quarantine keys,
+//!    reasons, and attesting-peer lists on outbound, inbound, and pulled anti-entropy paths before
+//!    forwarding them. A marker itself is reversible input to admission policy, not an unload.
 //!
 //! ## What stays the substrate's, not the federator's
 //!
@@ -761,8 +763,9 @@ impl OmegaFederator {
             );
             return Outcome::none();
         }
-        // Write the quarantine into the local registry (reversible — T5). No reply to the peer:
-        // fire-and-forget defense signal. The local immune-response creature acts on it.
+        // Direct federator posture: write the reversible marker after shape validation, with no
+        // QuarantineTrust consult. Operators wanting that gate address the notice to immune-response
+        // instead. No reply to the peer: this is a fire-and-forget registry signal, not an unload.
         let op = RegistryOp::MarkQuarantine { artifact_hash, realm, reason, attesting_peers };
         let Some(me) = self.me_id() else {
             return Outcome::none();

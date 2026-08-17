@@ -3,8 +3,9 @@
 //!
 //! Proves three things through a loaded `verifiable-die` creature, on the real kernel bus:
 //! 1. **Commit** — the die replies `Committed { commitment }` and the commitment **also rides the
-//!    reply envelope's `commitment` header slot** (so a relay/journal carries it without parsing the
-//!    body — the substrate's verifiable-randomness primitive is real on the wire, not just in a payload).
+//!    reply envelope's `commitment` header slot** (so a relay or live observer carries it without
+//!    parsing the body — the substrate's primitive is real on the wire, not just in a payload; the
+//!    metadata-only router journal deliberately does not retain it).
 //! 2. **Reveal** — the die reveals the seed + the pick for the requester's nonce.
 //! 3. **Verify** — `verify_roll(commitment, round, n, seed, nonce)` (the function any skeptical peer
 //!    runs) recomputes the same pick from the public commitment + revealed seed + agreed nonce.

@@ -35,8 +35,9 @@ The reference echo critter is [`echo-critter`](./echo-critter) above; start ther
 - `env.to` — this envelope's local destination, used with `env.from` by proof-bound adapters.
 - `env.corr` — an int correlation id, present only on correlated requests.
 
-Return a **Blob or string** to reply; return **`()`** for no reply; call **`emit(addr, blob)`** to send
-an extra, capability-gated dispatch (`addr` is `creature:N` / `role:R` / `topic:T` / `intent:X` / `kernel`).
+Return a **Blob or string** to reply with exact bytes, or another non-unit value for a best-effort
+string reply; return **`()`** for no reply; call **`emit(addr, blob)`** to send an extra,
+capability-gated dispatch (`addr` is `creature:N` / `role:R` / `topic:T` / `intent:X` / `kernel`).
 `json_parse(text)` and `json_stringify(value)` provide deterministic, value-only JSON conversion for
 typed protocols without adding an authority-bearing host service.
 `function_call_verify(text, env.from, env.to)` verifies the Home grant, executor dispatch signature,
@@ -59,8 +60,9 @@ and exact local executor/target route before a critter accepts a typed Function 
 
 ## Run them
 
-```
-cargo test -p sanctum --test critter_examples
+```sh
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 \
+  cargo test --locked -p sanctum --test critter_examples -- --test-threads=1
 ```
 
 Or load one live in the daemon: `alpha node` → `load <manifest> <artifact>` (see each critter's README),

@@ -6,8 +6,9 @@
 // answer derives only from THIS envelope. Critters can opt into bounded instance-local persistence
 // through mem_get/mem_set/mem_del; this one deliberately does not.
 //
-// Try:  send <id> "hello world"   with schema "world"   →   "yes"
-//       send <id> "hello world"   with schema "xyz"     →   "no"
+// Example envelope: payload "hello world", schema "world" → "yes"; schema "xyz" → "no".
+// (`alpha node`'s convenience `send` verb has no schema argument; the example test constructs the
+// schema-bearing Dispatch directly.)
 fn handle(env) {
     if env.text.contains(env.schema) {
         "yes"

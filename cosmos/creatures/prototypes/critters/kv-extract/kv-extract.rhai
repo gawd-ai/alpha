@@ -1,11 +1,12 @@
 // kv-extract — parse a `k=v;k=v;...` payload into a map and reply with ONE value, selected by the
 // request's SCHEMA tag (the key to look up). Replies "" if the key is absent.
 //
-// The honest substitute for "a JSON transform": the critter engine has no JSON, but string `split`
-// plus a `#{}` object map cover the common shape. A real structured-transform critter would parse a
-// format it controls; this shows the building blocks (`env.text`, `split`, a map, the `in` operator).
+// This deliberately uses a tiny grammar instead of the engine's bounded `json_parse` and
+// `json_stringify` helpers. String `split` plus a `#{}` object map cover this small controlled format;
+// the example shows those building blocks (`env.text`, `split`, a map, the `in` operator).
 //
-// Try:  send <id> "a=1;b=2;c=3"   with schema "b"   →   "2"
+// Example envelope: payload "a=1;b=2;c=3", schema "b" → "2". (`alpha node`'s convenience `send`
+// verb has no schema argument; the example test constructs the schema-bearing Dispatch directly.)
 fn handle(env) {
     let pairs = env.text.split(";");
     let m = #{};

@@ -65,16 +65,38 @@ fn short(s: &str) -> String {
 // ----- timing scaffolding (mirrors the cross-node test harnesses) --------------------------------
 
 /// `GAWD_SLOW_TEST=N` scales every budget (so the demo survives a valgrind/ASan run the way the
-/// transport tests do). Default 1 = native speed.
-fn slow_factor() -> u64 {
-    std::env::var("GAWD_SLOW_TEST")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(1)
+/// transport tests do). Values are clamped to 1..=64; default 1 = native speed.
+fn slow_factor() -> u32 {
+    const MAX_SLOW_FACTOR: u32 = 64;
+    static FACTOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+    *FACTOR.get_or_init(|| match std::env::var("GAWD_SLOW_TEST") {
+        Ok(raw) => match raw.parse::<u32>() {
+            Ok(value) => {
+                let bounded = value.clamp(1, MAX_SLOW_FACTOR);
+                if bounded != value {
+                    eprintln!(
+                        "federation: GAWD_SLOW_TEST={value} is outside 1..={MAX_SLOW_FACTOR}; using {bounded}"
+                    );
+                }
+                bounded
+            }
+            Err(_) => {
+                eprintln!(
+                    "federation: invalid GAWD_SLOW_TEST={raw:?}; expected an integer in 1..={MAX_SLOW_FACTOR}, using 1"
+                );
+                1
+            }
+        },
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("federation: non-Unicode GAWD_SLOW_TEST; using 1");
+            1
+        }
+    })
 }
 fn scaled(d: Duration) -> Duration {
-    d * (slow_factor() as u32)
+    d.saturating_mul(slow_factor())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -157,12 +179,12 @@ pub fn run(args: &[String]) {
     banner("Done");
     println!("Everything above ran against live kernels through the same transport · registry ·");
     println!("federator path the test suite uses. The proofs over real sockets:");
-    println!("  sanctum/tests/omega_federation_cross_node.rs   (cross-Realm pull · reputation · quarantine · routing)");
+    println!("  cosmos/sanctum/tests/omega_federation_cross_node.rs   (cross-Realm pull · reputation · quarantine · routing)");
     println!(
-        "  sanctum/tests/m2_two_node.rs                      (within-Realm ship → admit → run)"
+        "  cosmos/sanctum/tests/m2_two_node.rs                      (within-Realm ship → admit → run)"
     );
     println!(
-        "  sanctum/tests/distributor_cross_node.rs           (cross-node capability placement)\n"
+        "  cosmos/sanctum/tests/distributor_cross_node.rs           (cross-node capability placement)\n"
     );
 }
 
@@ -198,9 +220,10 @@ fn parse_args(args: &[String]) -> (usize, usize) {
 /// higher global index dials the lower; nodes boot in index order, so a dialer's target is always
 /// already listening.
 ///
-/// Each gateway is the in-process equivalent of one [`omega serve`](omega) process: its
-/// `OMEGA_GATEWAY` binding is bound by [`omega::serve::boot_federator`] — the same recipe the binary
-/// runs in production — so what this demo narrates and what an operator deploys cannot drift.
+/// These are deliberately small demo Sanctums rather than full `omega serve` / `alpha node`
+/// compositions. Each gateway's `OMEGA_GATEWAY` binding is nevertheless bound by
+/// [`omega::serve::boot_federator`] — the exact federator recipe the server runs — so that shared
+/// organ wiring cannot drift.
 fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
     let n = realms * sanctums;
     let g = |r: usize, s: usize| r * sanctums + s; // global index
@@ -250,7 +273,7 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
     } else {
         note("registry backend: in-memory registry-mem (set ALPHA_DURABLE_BESTIARY=1 to run on the durable Bestiary)");
     }
-    note("each gateway = one `omega serve` Sanctum in-process (its OMEGA_GATEWAY binding is omega::serve::boot_federator, the very recipe the binary runs); workers are `alpha node` Sanctums");
+    note("these are minimal demo Sanctums; each gateway's OMEGA_GATEWAY binding uses omega::serve::boot_federator, while workers bind only the organs this scenario needs");
     let mut nodes: Vec<Node> = Vec::with_capacity(n);
     for idx in 0..n {
         let r = realm_of(idx);
@@ -313,9 +336,9 @@ fn boot_topology(realms: usize, sanctums: usize) -> Result<Vec<Node>, String> {
         };
         kernel.bind_role(Role::new(Role::REGISTRY), registry_id);
 
-        // Federator (gateways only) — maps every *other* Realm to that Realm's gateway node. Each
-        // gateway Sanctum here is the in-process equivalent of one `omega serve` process, so its
-        // `OMEGA_GATEWAY` binding comes from the very recipe the binary runs in production —
+        // Federator (gateways only) — maps every *other* Realm to that Realm's gateway node. Although
+        // this is a minimal demo Sanctum rather than the full `omega serve` composition, its
+        // `OMEGA_GATEWAY` binding comes from the exact recipe the binary uses —
         // `omega::serve::boot_federator` — rather than a demo-local copy. The manifest is the demo's
         // *signed* boot manifest (this kernel runs the strict `SignedPolicy`, not the binary's
         // `DevPolicy`), which is exactly why `boot_federator` takes the manifest as a parameter.
@@ -440,7 +463,8 @@ fn run_scenario(nodes: &[Node], realms: usize, sanctums: usize) -> Result<(), St
     } else {
         let gw = &nodes[0]; // realm 0 gateway
         let worker = &nodes[1]; // realm 0, sanctum 1
-        let hash = sha256_hex(&artifact_bytes(&gw.realm));
+        let expected_artifact = artifact_bytes(&gw.realm);
+        let hash = sha256_hex(&expected_artifact);
         step(&format!(
             "{} asks {} (a different node) for artifact {}… in Realm `{}`, via Address::Node",
             worker.name,
@@ -459,11 +483,20 @@ fn run_scenario(nodes: &[Node], realms: usize, sanctums: usize) -> Result<(), St
         )
         .ok_or("no fetch reply across the wire")?;
         match reply {
-            RegistryReply::Fetched { artifact, .. } => ok(&format!(
-                "fetched {} bytes (\"{}\") over the peer-authenticated TCP channel — admission (the integrity gate) runs at load time, which walkthrough shows",
-                artifact.len(),
-                String::from_utf8_lossy(&artifact)
-            )),
+            RegistryReply::Fetched { artifact, .. } => {
+                if artifact.as_slice() != expected_artifact.as_slice() {
+                    return Err(format!(
+                        "cross-node fetch returned {:?}, expected byte-exact {:?}",
+                        String::from_utf8_lossy(&artifact),
+                        String::from_utf8_lossy(&expected_artifact)
+                    ));
+                }
+                ok(&format!(
+                    "fetched {} bytes (\"{}\") over the peer-authenticated TCP channel — admission (the integrity gate) runs at load time, which walkthrough shows",
+                    artifact.len(),
+                    String::from_utf8_lossy(&artifact)
+                ));
+            }
             other => return Err(format!("expected Fetched across the wire, got {other:?}")),
         }
     }
@@ -606,7 +639,10 @@ fn run_scenario(nodes: &[Node], realms: usize, sanctums: usize) -> Result<(), St
     ) {
         return Err("quarantine notice did not propagate to the peer Realm".into());
     }
-    ok(&format!("{} marked the artifact quarantined — the cross-Realm immune signal (the path Loop 4 reacts to)", gw1.name));
+    ok(&format!(
+        "{} stored the peer federator's reversible quarantine marker (direct registry-flagging posture)",
+        gw1.name
+    ));
 
     // C5: Omega-addressed routing — a query into realm1 from realm0, routed by gw0's federator.
     step(&format!(

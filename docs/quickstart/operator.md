@@ -173,10 +173,12 @@ You introduce a node **once** (to any existing member); gossip propagates it so 
 self-completes — no node is pre-configured with every peer. The graph is also a live sense stream
 (peer-connect/disconnect on `/api/ws`), and `GET /api/cluster` / `POST /api/cluster/connect` expose the
 same over HTTP/MCP. The hands-on numbered runbook that stands up **three nodes**, forms the mesh,
-cross-executes, and attaches an AI to each is [`demos/cluster/`](../../demos/cluster/):
+cross-executes, and attaches one pre-admitted remote MCP hub to a chosen operator is
+[`demos/cluster/`](../../demos/cluster/):
 
 ```sh
-cd demos/cluster && ./00-build.sh && ./01-boot.sh && ./02-join.sh && ./03-graph.sh poll && ./04-cross-run.sh
+cd demos/cluster && ./00-build.sh && ./01-boot.sh && ./02-join.sh && \
+  ./03-graph.sh poll && ./04-cross-run.sh && ./05-connect-ai.sh
 ```
 
 **Realms meet at Omega.** The mesh above is one Realm of alpha control surfaces. To federate *across*
@@ -209,8 +211,8 @@ The cluster above is real, separate processes. Several *narrated* demos run the 
 in a single process, each riding code the tests prove:
 
 ```sh
-# One node's whole loop: an AI authors → compiles → signs → runs a creature, then a running self
-# migrates between two Sanctums with cryptographic continuity.
+# One node's whole loop: a reference author → compile → sign → run, then a signed local hand-off
+# between two bodies in one Sanctum. Cross-Sanctum transport is covered by integration tests.
 cargo run -p walkthrough
 
 # The federation fabric: several Sanctums across 2–3 Realms, wired over real ed25519-authenticated TCP

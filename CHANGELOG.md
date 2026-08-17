@@ -167,6 +167,16 @@ the complete suite-compositional acceptance evidence is recorded in
   sides recovers byte-identical progress, Steer, child, and terminal proofs without another invocation.
   Dedicated suites complete R3 undeploy and R8 unacknowledged-control recovery. The bounded claim is
   explicit: hard cuts occur at durable protocol boundaries, not inside an unfinished GX transfer.
+- **Truthful, gated example applications.** `alpha demo` accepts only a bounded, validated list of
+  registry-declared Cargo features, so the managed `bestiary-live` entry enables its opt-in model
+  backend without admitting arbitrary Cargo arguments. The required one-CPU CI job now executes all
+  four hermetic narrated applications and entry-smokes `bestiary-live` with credentials removed;
+  cluster scripts are syntax-checked and required to remain executable. The manual cluster runbook
+  itself fails closed on graph convergence, exact cross-node output, stable MCP-hub pre-admission,
+  and a real remote `alpha_cluster` reply. Demo prose now distinguishes reference agents from live
+  models, a local two-body hand-off from its separate cross-Sanctum proof, the loss-free GX narration
+  from injected retry faults, and deterministic store-level Bestiary convergence from optional AI
+  curation and transport replication.
 
 ## 0.4.3 - 2026-06-17
 
@@ -192,9 +202,10 @@ is additive — no existing wire shape changes.**
   *session-scoped* (reset on reconnect); cross-reconnect exactly-once is an application property keyed
   on `corr`, not a transport promise. The contract is now pinned by a test.
 - **Origin-verdict posture (ADR-0041).** The router/transport stay non-enforcing (publish an
-  `OriginVerdict`, never drop a `BadSig` frame); a clustered node with no `Role::IMMUNE_RESPONSE` bound
-  now prints a loud boot warning (`omni::warn_if_no_immune_response`), and SECURITY.md documents the
-  baseline. No fail-closed mode in the kernel.
+  `OriginVerdict`, never drop a `BadSig` frame); a clustered composition with no origin-defense
+  subscriber now prints a loud boot warning (`omni::warn_if_no_origin_defense`), and SECURITY.md
+  documents `policy-origin` as the reference baseline. `immune-response` remains the distinct local
+  artifact-quarantine loop. No fail-closed mode in the kernel.
 
 ### Resource-safety & hygiene
 - **Bounded topic-subscription table (ADR-0037).** `Router` gains a finite `max_topics` cap (+ existing

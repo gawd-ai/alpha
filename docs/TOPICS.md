@@ -13,35 +13,60 @@ and roles). Browse the rendered API with `cargo doc -p aether --open` or
 
 ---
 
-## Orientation — three ways to address (don't confuse them)
+## Orientation — four address grains (don't confuse them)
 
-Alpha has one envelope and three kinds of destination ([`aether::Address`](../cosmos/aether/src/address.rs)):
+Alpha has one envelope and four address grains ([`aether::Address`](../cosmos/aether/src/address.rs)):
 
 | Kind | Address form | What it means | This doc |
 |---|---|---|---|
 | **Identity** | `Creature(id)` / `Node(node,id)` / `Kernel` | "talk to *this* creature/node" | — |
 | **Topic** (pub/sub) | `Topic(name)` | "fan out to every subscriber of this channel" | **§1 below** |
-| **Capability** (IoC) | `Role(name)` / `Intent{…}` | "route to *whoever* fills this socket" | **§4 + CONCEPTS** |
+| **Capability** (IoC) | `Role(name)` / `NodeRole(node,role)` / `Intent{…}` | "route to whoever fills this socket, locally or on one exact node" | **§4 + CONCEPTS** |
+| **Federation** | `Realm{realm,target}` / `Omega{realm,target}` | "resolve this nested target at Realm or Omega grain" | **addressing design** |
 
 A **topic** is a fan-out channel you subscribe to. A **role** is an inversion-of-control socket you
 *bind a creature into* (the substrate ships the socket; you inject the model). The **SEER topics**
-(§2) are a layer *on top of* the envelope — a typed conversation protocol that rides identity or
-topic delivery. Keep the three straight and the rest follows.
+(§2) are a layer *on top of* the envelope — a typed conversation protocol that can ride any
+`Address`. `NodeRole(node, role)` targets the current filling of that role on one exact remote node;
+transport accepts it only when the destination host explicitly exposed that role, so it is neither
+a topic subscription nor ambient role discovery. `Realm` and `Omega` wrap another address rather
+than creating a second message system. Keep the four grains straight and the rest follows.
 
 ---
 
 ## 1. Broadcast bus topics
 
-Fan-out channels published by the kernel. Subscribe with `Kernel::subscribe(Topic::new(name), endpoint)`.
-The substrate publishes; what the signal *means for action* is the subscribing creature's model.
+Fan-out channels published over the bus by the kernel and observer-capable creatures. Subscribe with
+`Kernel::subscribe(Topic::new(name), endpoint)`. The substrate routes; what the signal *means for
+action* is the subscribing creature's model.
 
 | Topic | Const | Meaning | Publisher | Typical subscribers | Payload |
 |---|---|---|---|---|---|
-| `proprioception` | `Topic::PROPRIOCEPTION` | Liveness / sense stream — Loops **1** (Sense) & **4** (Defend) | kernel, on creature **load / unload / leak**, plus the `BudgetSignalEvent` | [`cosmos/creatures/immune-response`](../cosmos/creatures/immune-response) (senses faults), [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor) (the nervous-system observer) | kernel sense events; `BudgetSignalEvent` |
+| `proprioception` | `Topic::PROPRIOCEPTION` | Liveness / sense stream — Loops **1** (Sense) & **4** (Defend) | kernel and observer-capable creatures; exact schemas below | [`cosmos/creatures/immune-response`](../cosmos/creatures/immune-response) (senses faults), [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor) (the nervous-system observer), operator-injected policy/telemetry | schema-selected sense event |
 | `fitness` | `Topic::FITNESS` | Outcome stream — Loop **2** (Select). Kernel emits `Fitness{creature, ok}` after **every** handle (`creature` is the creature id field) | kernel (only when a subscriber exists — no-listener short-circuit) | **passive observers only** — [`cosmos/creatures/prototypes/monitor`](../cosmos/creatures/prototypes/monitor); and a passive relay → [`cosmos/creatures/fitness-selector`](../cosmos/creatures/fitness-selector) (see note) | `{ creature, ok }`, schema `"fitness"` |
+| `seer` | literal `Topic("seer")` | streaming progress for a long control verb; **not** a `SeerEnvelope` consult | `omni::ControlCore` | HTTP/WS sense endpoint and operator observers | `{ corr, line }`, schema `"control_progress"` |
+
+The public `proprioception` schemas are deliberately discriminated by
+`Envelope.header.schema`; subscribers should ignore schemas they do not implement:
+
+| Schema | Payload | Publisher / meaning |
+|---|---|---|
+| `proprioception` | `sanctum::Proprioception` | kernel load, unload, or leak sense |
+| `budget_signal` | `sanctum::BudgetSignalEvent` | engine/resource warning or hard-limit observation surfaced by the kernel |
+| `budget_request` | `sanctum::BudgetRequest` | creature-initiated grace request for an injected policy to consider |
+| `build_event` | `build_cargo::BuildEvent` | best-effort build started/succeeded/failed telemetry |
+| `origin_verdict` | `aether::OriginEvent` | transport's non-enforcing cross-node origin-verification verdict |
+| `peer_event` | `transport_tcp::PeerEvent` | authenticated peer/link, routing-drop, and cluster-membership observation |
+| `federation.ingest_drop` | `omega_federator::IngestDropEvent` | malformed signed-reputation attestation rejected by a federator |
+| `bestiary_maintenance_stall` | `bestiary_daemon::MaintenanceStallEvent` | bounded anti-entropy, curation, or compaction pass refused without progress |
 
 Sense-topic consumers bound JSON parsing with `aether::MAX_SENSE_EVENT_BYTES` (1 MiB) before
-decoding `proprioception`, `fitness`, or `budget_signal` payloads.
+decoding a supported `proprioception` schema; `fitness` consumers apply the same cap to the separate
+fitness topic.
+
+The unfortunate literal topic name `"seer"` predates the richer consult protocol in §2. Always
+discriminate it by schema: `control_progress` is a small ControlCore progress frame, while a real
+`SeerEnvelope` has header schema `"seer"` and the typed conversation payload described below.
 The reference `fitness-selector` also bounds selector control payloads, its distinct watch map, and
 its observed-module tally by default; operators can explicitly opt out of retained-state caps with
 `with_max_watched_modules(0)` / `with_max_obs(0)` for unbounded replay or lab workloads.
@@ -83,20 +108,25 @@ topic and the conversation move live in the payload.
 
 ### The topics (`SeerTopic`)
 
-All eight are reserved at the substrate level so a consumer can never widen the wire later. Status is
-**live** (a shipped consumer) or **reserved/draft** (the shape compiles; bodies may still change
-before a consumer pins them).
+All eight are reserved at the substrate level so a consumer can never widen the wire later. Status
+separates **body stability** from **implementation availability**: **live contract** means a shipped
+path has pinned the body; **reserved/draft body; live responder** means a standing reference
+responder ships today, but the typed body may still change before the contract is promoted.
 
 | Topic | Status | Conversation | Initiator → Responder | Typed body (`seer::topics::*`) |
 |---|---|---|---|---|
-| `authoring` | **live** | author a creature from intent | orchestrator → [`agent-curious`](../cosmos/creatures/agent-curious) / [`agent-templated`](../cosmos/creatures/agent-templated) | `authoring::{QueryBody, AnswerBody}` |
-| `placement` | **live** | "who can run this work?" | [`distributor-requirements`](../cosmos/creatures/distributor-requirements) → [`embodiment-advertiser`](../cosmos/creatures/embodiment-advertiser) | `placement::{QueryBody, AnswerBody, Predicate, Embodiment, EmbodimentOffer}` |
-| `consensus` | **live** | weighted vote / VRF / quorum | [`omega-federator`](../cosmos/creatures/omega-federator) (signed reputation deltas) | `consensus::{QueryBody, AnswerBody}` (federator carries its own signed body) |
-| `policy` | reserved/draft | richer admission consult | — (live path: mechanically-applied policy creatures) | `policy::{QueryBody, AnswerBody}` |
-| `budget` | reserved/draft | grace request | — (live path: `proprioception` + `KernelControl::ExtendBudget`) | `budget::{QueryBody, AnswerBody}` |
-| `fitness` | reserved/draft | fitness-score consult across raters | — (live path: injected `FitnessScorer` + registry promotion) | `fitness::{QueryBody, AnswerBody}` |
-| `curation` | reserved/draft | durable Bestiary curation consult | — (live path: in-process `bestiary::AICurator`) | `curation::{QueryBody, AnswerBody}` |
-| `dialogue` | **live** | named-peer agent-to-agent turns | [`dialogue-initiator`](../cosmos/creatures/prototypes/dialogue/dialogue-initiator) → [`dialogue-responder`](../cosmos/creatures/prototypes/dialogue/dialogue-responder) | `dialogue::{QueryBody, AnswerBody}` |
+| `authoring` | **live contract** | clarify a template-missed authoring request | [`agent-curious`](../cosmos/creatures/agent-curious) → orchestrator/model responder | `authoring::{QueryBody, AnswerBody}` |
+| `placement` | **live contract** | "who can run this work?" | [`distributor-requirements`](../cosmos/creatures/distributor-requirements) → [`embodiment-advertiser`](../cosmos/creatures/embodiment-advertiser) | `placement::{QueryBody, AnswerBody, Predicate, Embodiment, EmbodimentOffer}` |
+| `consensus` | **live contract** | weighted vote / VRF / quorum | [`omega-federator`](../cosmos/creatures/omega-federator) (signed reputation deltas) | `consensus::{QueryBody, AnswerBody}` (federator carries its own signed body) |
+| `policy` | **reserved/draft body; live responder** | richer admission consult | initiator → [`responder-policy`](../cosmos/creatures/prototypes/responders/responder-policy) | `policy::{QueryBody, AnswerBody}` |
+| `budget` | **reserved/draft body; live responder** | grace request | initiator → [`responder-budget`](../cosmos/creatures/prototypes/responders/responder-budget) | `budget::{QueryBody, AnswerBody}` |
+| `fitness` | **reserved/draft body; live responder** | fitness-score consult across raters | initiator → [`responder-fitness`](../cosmos/creatures/prototypes/responders/responder-fitness) | `fitness::{QueryBody, AnswerBody}` |
+| `curation` | **reserved/draft body; live responder** | durable Bestiary curation consult | initiator → [`responder-curation`](../cosmos/creatures/prototypes/responders/responder-curation) | `curation::{QueryBody, AnswerBody}` |
+| `dialogue` | **live contract** | named-peer agent-to-agent turns | [`dialogue-initiator`](../cosmos/creatures/prototypes/dialogue/dialogue-initiator) → [`dialogue-responder`](../cosmos/creatures/prototypes/dialogue/dialogue-responder) | `dialogue::{QueryBody, AnswerBody}` |
+
+The initial orchestrator → authoring-creature `AuthoringRequest` and terminal `AuthoringReply` are
+plain authoring-role messages, not SEER. `agent-curious` opens the SEER exchange only after its
+template path misses; `agent-templated` stays entirely on the plain request/reply reduction path.
 
 > Note: a SEER **`fitness` consult topic** (ask N raters to score) is distinct from the **`fitness`
 > broadcast topic** in §1 (the kernel's per-handle outcome stream). Same word, two layers.
@@ -155,8 +185,10 @@ other GAWD systems, and dynamically authored creatures cannot drift into crate-l
 | `gawd.function.policy.v1` | `PolicyMessageV1` | replaceable deployment selection and retry decisions |
 
 The contract has an eighth signed application domain, `gawd.function.custody.rewrap.v1`, for the
-nested destination-epoch KMS request and aggregate receipt carried by `HomeMessageV1::Stage`. It is
-not an `Envelope.header.schema`, pub/sub topic, or independently addressable role.
+nested destination-epoch KMS request and aggregate receipt carried by the `Stage`/`Staged` exchange.
+`HomeMessageV1::Stage` carries the source's prepared proof; the returned `CustodyStagedV1` embeds the
+aggregate receipt, which itself binds the exact request. The signed domain is not an
+`Envelope.header.schema`, pub/sub topic, or independently addressable role.
 
 Every untrusted message is bounded and structurally validated by `gawdfn`; signed records use its
 canonical-JSON and SHA-256 helpers. A `FunctionCallV1` does not create a fourth creature tier or a
@@ -186,6 +218,11 @@ substrate concern. They are the other half of "what can I plug into." The full s
 `distributor`, `transport`, `policy`, `registry`, `authoring`, `build`, `realm-gateway`,
 `omega-gateway`, `abode-migrator`, `fitness-selector`, `immune-response`, `abode-reconciler`,
 `control`.
+
+`Role::POLICY` is the one reserved/future entry in that list: current kernel admission receives an
+`Arc<dyn sanctum::Policy>` at `Kernel::new`, before ordinary creature routing exists. A hot-swappable
+bus creature bound to the policy role is explicitly later work; do not claim that role is live
+admission machinery today.
 
 The additive function roles live in `gawdfn`: `function-home`, `function-executor`,
 `function-resolver`, `function-locator`, and `function-policy`. The first four are

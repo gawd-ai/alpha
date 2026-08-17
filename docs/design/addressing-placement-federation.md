@@ -75,7 +75,8 @@ creatures, which doubles as the evolutionary gene pool.
 
 The substrate ships a socket, `Role::REGISTRY`, and two creatures fill it: `creatures/registry-mem`,
 the reference **in-memory** store (the stub — no persistence, no replication), and
-`creatures/bestiary-daemon`, a **durable, distributed, AI-curated** store. Both speak the *same* op
+`creatures/bestiary-daemon`, a **durable, distributed, curator-injected** store (deterministic in the
+stock compositions, optionally model-backed). Both speak the *same* op
 vocabulary, so a test or a demo picks one by which `Box<dyn Creature>` it loads; an operator who wants
 something else writes a third on the same socket and the kernel is none the wiser. The wire types
 themselves live in the `bestiary` contract crate (`registry-mem` re-exports them), so the catalogue
@@ -157,8 +158,9 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
   arbitrary-file-write primitive; hashing closes it.
 - **A self-owned journal.** `recover()` replays the log at bind and **rejects any record not authored by
   the daemon's own key** (`ForeignAuthor`). The on-disk log is a self-owned journal, not a federation
-  inbox: peer entries never arrive as foreign records replayed at bind — they arrive only through
-  `PushEntries`, verified and **re-signed under the local identity** on ingest.
+  inbox: peer entries never arrive as foreign records replayed at bind. Imports arrive through
+  validated daemon operations (`PushEntries`, or ordinary `Publish` when a federator uses the daemon
+  as its local registry) and are **re-signed under the local identity** on ingest.
 - **Bounded by default, like the in-memory registry.** The durable store retains at most **1,024**
   distinct `(RealmId, artifact_hash)` keys across live entries and permanent tombstones
   (`DEFAULT_MAX_BESTIARY_ENTRIES`), rejects an artifact above the **128 MiB** ceiling, caps unique
@@ -210,7 +212,8 @@ works against it unchanged. Its new capability rides an additive `bestiary.op` s
   `Tombstone` federates as a *permanent* eviction for a regretted artifact, complementing reversible
   quarantine. Membership converges to the union idempotently; mutable signals converge by the lattice —
   no wall-clock arrival-order assumption, because the substrate ships no clock.
-- **AI-curated.** An injected `Curator` decides `Keep` / `Promote` / `Demote` / `Quarantine` / `Gc`
+- **Curator-injected; optionally model-backed.** An injected `Curator` decides `Keep` / `Promote` /
+  `Demote` / `Quarantine` / `Gc`
   per entry. The reference `DeterministicCurator` is **safe-by-default** — it never collects an entry it
   hasn't ruled on, and disables GC entirely until configured. An `AICurator` consults an injected
   `mind::Model` over each entry's *manifest + artifact bytes* for content-aware near-duplicate and
@@ -399,7 +402,8 @@ the future Ω authority rather than bolting it on later.
 
 `creatures/omega-federator` fills `Role::OMEGA_GATEWAY` as the real federation creature, riding
 existing wire — registry ops for catalog sync, the SEER `consensus` topic for reputation. It does
-four things, and admission gates them all:
+four things, each with its own route, shape, signature, or injected-model checks; artifact admission
+remains the later load-time choke point:
 
 1. **Cross-Realm routing.** An `Omega { realm, target: Creature(m) }` envelope resolves `realm → peer`
    and re-routes `Node(peer, m)`. Exact `Node(peer, m)` and `NodeRole(peer, role)` targets are also
@@ -428,10 +432,12 @@ four things, and admission gates them all:
    local registry.
 4. **Cross-Realm quarantine.** A `FederateQuarantine` op ships a `QuarantineNotice` to a peer
    federator, which writes a reversible `MarkQuarantine` into its local registry. The federation
-   carries the *path*; what triggers a notice and how a Sanctum reacts is the immune-response
-   creature's call, gated by an injected trust model (a peer cannot quarantine your creatures unless
-   you trust it). Outbound, inbound, and pulled quarantine notices are shape-checked for bounded,
-   NUL-free short fields before the federator ships or forwards them.
+   carries the *path*; a federator-targeted notice is shape-checked but not `QuarantineTrust`-gated.
+   Operators that do not grant a peer direct registry-flagging power route notices to
+   `immune-response`, whose injected trust model gates the write. In either posture the marker is
+   reversible and affects loading only if the operator's admission policy consults it. Outbound,
+   inbound, and pulled notices are shape-checked for bounded, NUL-free short fields before a
+   federator ships, stores, or forwards them.
 
 **Admission stays the only choke point.** Federation moves *bytes* into registries; loading any
 artifact still runs the operator's admission policy. A forged-signer artifact pulled from a peer is
@@ -466,14 +472,16 @@ the outcome:
 
 1. **Commit.** A requester asks the die to roll among `n` for a `round`. The die draws a secret
    `seed` from its **injected** `EntropySource`, computes `commitment = sha256(round ‖ n ‖ seed)`, and
-   replies with the commitment **also in the reply envelope's `commitment` slot** — so a relay or the
-   journal carries it without parsing the body. The seed stays hidden; the commitment binds it to
+   replies with the commitment **also in the reply envelope's `commitment` slot** — so a relay or
+   live observer carries it without parsing the body. The metadata-only router journal does not
+   retain payloads or commitments. The seed stays hidden; the commitment binds it to
    `(round, n)`.
 2. **Reveal.** The requester supplies a `nonce`, chosen *without* knowing the seed. The die discloses
    the seed; the result is `pick = sha256(seed ‖ nonce) mod n`.
 
-Anyone — the requester, a skeptical peer, an auditor reading the journal — calls `verify_roll` with
-the commitment, the revealed seed, and the nonce: it recomputes `sha256(round ‖ n ‖ seed)`, confirms
+Anyone — the requester, a skeptical peer, or an auditor with the captured application envelopes —
+calls `verify_roll` with the commitment, the revealed seed, and the nonce: it recomputes
+`sha256(round ‖ n ‖ seed)`, confirms
 it equals the commitment (the die did not swap the seed after seeing the nonce), and returns the
 recomputed `pick` (the honest function of the agreed inputs). A swapped seed, a tampered commitment,
 or a wrong `(round, n)` returns `None` — provable cheating. The die has no privileged verification

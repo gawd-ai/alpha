@@ -2,8 +2,9 @@
 
 A sanctum's unit of capability is a **creature** — a loadable, addressable, evictable thing that
 holds a body of behavior. Everything that does work in GAWD is a creature: a policy, a gateway, a
-distributor, an authoring agent, an echo. A creature is admitted from a signed manifest, bound to
-the bus (`aether`), driven by one drain thread, and unloaded on demand. The substrate is the
+distributor, an authoring agent, an echo. A creature is admitted from a manifest plus the evidence
+available at its load boundary (signature requirements are injected policy), bound to the bus
+(`aether`), driven by one drain thread, and unloaded on demand. The substrate is the
 machinery that loads, runs, contains, and tears down creatures — and it does so across three
 execution tiers behind one path.
 
@@ -16,13 +17,15 @@ what executes the bytes and in how much they confine by nature.
 
 - **daemon** — a native `.so`, loaded via `dlopen`. The trusted, local, performance core: full host
   access, native speed, the richest expressiveness. A daemon is **trusted-by-admission** — the
-  substrate cannot fully contain malicious in-process native code, so foreign or mobile code never
-  arrives as a daemon. You load native code you vouch for.
+  substrate cannot fully contain malicious in-process native code, so an operator **must not admit**
+  foreign or mobile code as a daemon. The wire preserves a manifest's declared tier; it does not
+  rewrite an unsafe native artifact into a safer backend. Load native code only when you vouch for it.
 
 - **beast** — WASM, run on `wasmtime`. Portable bytecode that runs unchanged on a server, an ARM
   robot, or a satellite. A beast is **isolated by construction**: it has no host imports, so it
   reaches no filesystem, network, or syscall — it sees only bytes in its own linear memory. This is
-  the home of untrusted, mobile, foreign code. An artifact arriving over the wire lands as a beast.
+  the required home for untrusted, mobile, foreign compiled code; admission policy must enforce that
+  posture because fetch/load preserves the manifest backend.
 
 - **critter** — a Rhai script, run by a metered, sandboxed interpreter. The cheapest, most ephemeral
   tier: no compile step, portable source text, sub-millisecond authoring. Ideal for high-variation
@@ -185,9 +188,11 @@ drops the **instance** (the native `destroy` runs while the library is still map
 **resources** (`dlclose` runs **last**). The same order is encoded structurally: `LoadedModule`
 declares `instance` before `resources`, and struct fields drop in declaration order, so even an
 implicit drop tears down in the right sequence. Native resources also hold the staged-artifact guard
-that unlinks the exact `.so` and removes its per-load directory *after* the library unmaps—declared
-after the library, so it drops second. Staged paths are per-load unique and opened with `create_new`,
-so two same-content loads in one process never truncate or reuse the same `.so` path.
+declared after the library, so it drops second. On Linux/Android that guard retains the sealed memfd
+through `dlclose` and closes it afterward; each newly prepared stage receives a process-unique
+`/proc/self/fd` spelling. On fallback platforms it unlinks the exact `.so` and removes its private,
+OS-random per-stage directory after the library unmaps; those files are opened with `create_new`.
+Thus independently prepared same-content stages never alias a mutable path or truncate one another.
 
 **Creatures do no self-teardown.** The kernel owns the drain. Unload deregisters the creature from
 the router (no new envelopes reach it), the drain thread reads the disconnect, the creature's
@@ -207,7 +212,7 @@ ships a *discipline*, not a contract — `forge::spawn` is the compatible fire-a
 **The kernel's thread-count guard is the floor.** A creature that bypasses the discipline (a raw or
 detached thread) is caught by a `/proc/self/task` snapshot diff — tids before `bind` versus after
 `shutdown`. When the guard fires, the kernel **leaks the resources**: it `Box::leak`s the `Library`
-and its stage guard, so both the mapping and exact staged file remain, the runaway thread keeps
+and its stage guard, so both the mapping and exact staged artifact remain, the runaway thread keeps
 dereferencing live code, and the proprioception bus publishes `unload_leaked_resources`. This is a
 **bounded leak—one library plus one staged artifact per misbehavior, and never a use-after-free.** A
 healthy creature beside the offender keeps serving and unloads normally.
@@ -318,12 +323,13 @@ escalation — all live outside the kernel. Swap the rule by swapping the creatu
 
 **The control surface is one socket.** The kernel address is a live destination served by a
 dispatcher that drains kernel-addressed envelopes and executes `KernelControl` ops. `Unload` runs
-the same safe-unload path any explicit unload uses. `ExtendBudget` lifts a creature's live per-handle
-fuel or operation ceiling — a lock-free atomic the engine shares with the running instance, read
-fresh each `handle`, so a granted lift takes effect on the very next envelope without reaching into a
-creature on its own drain thread. A native creature exposes no such ceiling, so a grant to it is an
-honest no-op the kernel reports rather than a silent lie. The control enum is tagged so future ops
-land additively; a malformed payload is skipped, never a panic.
+the same safe-unload path any explicit unload uses. `ExtendBudget` lifts enforceable per-handle
+ceilings through lock-free cells shared with the running engine: beasts support fuel, memory, and
+wall; critters support operation budget (reported as fuel) and wall, while their structural memory
+caps stay fixed at load. The next handle sees the lift without the kernel reaching into the drain
+thread. Native exposes no budget control, and any unsupported dimension is reported
+`Unenforceable` rather than silently accepted. The control enum is tagged so future ops land
+additively; a malformed payload is skipped, never a panic.
 
 ## Bounded growth and the `0 = unbounded` escape-hatch convention
 

@@ -27,7 +27,7 @@ env:
 
 jobs:
   ci:
-    name: fmt · clippy · build · docs · test · demos
+    name: fmt · clippy · build · docs · test · all demos
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -91,6 +91,17 @@ jobs:
       - name: Patch hygiene
         run: git diff --check HEAD^ HEAD
 
+      # The manual cluster demo cannot be launched as one process in CI, but every lifecycle script
+      # is still executable documentation. Parse all of them before compiling so a shell-language
+      # regression cannot ship behind otherwise-green Rust gates.
+      - name: Cluster runbook syntax
+        run: |
+          set -eu
+          for script in demos/cluster/*.sh; do
+            test -x "$script"
+            bash -n "$script"
+          done
+
       - name: Clippy (warnings are errors)
         run: taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -130,17 +141,30 @@ jobs:
       - name: Demo — federation (the multi-Realm fabric runs end to end)
         run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p federation
 
+      # These two hermetic applications are separate public demos, not aliases for the workspace
+      # tests. Execute their real binaries so registry/docs drift cannot leave a compiling but
+      # unusable example behind.
+      - name: Demo — distribute (bounded GX fetch-load runs end to end)
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p distribute
+
+      - name: Demo — dialogue (cross-Realm conversation runs end to end)
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p dialogue
+
       # The opt-in real-model author (`agent-mind`) and `bestiary-live` model path live behind
       # `--features openai`, which links `ureq` + a ring-backed rustls TLS stack the default build
       # never touches. Gate those cfg branches so the composition roots and creatures cannot rot.
-      # No live model call is made in CI (no network, no key): this compiles, clippies, and runs the
-      # model-independent unit tests only.
+      # No live model call is made in CI (no network, no key): this compiles and clippies the feature
+      # branches, runs model-independent unit tests, and entry-smokes the public no-credential demo.
       - name: Clippy + test (the opt-in `openai` features)
         run: |
           taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
           taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p alpha --features openai -- -D warnings
           taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p bestiary-live --all-targets --features openai -- -D warnings
           taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked -p agent-mind --features openai -- --test-threads=1
+          # Exercise the public opt-in demo binary without credentials. Its no-model path must stay
+          # bounded, make no network call, explain the opt-in, and exit successfully.
+          taskset --cpu-list "$ALPHA_CI_CPU" env -u ALPHA_LLM_MODEL -u ALPHA_LLM_API_KEY \
+            cargo run --locked -p bestiary-live --features openai
 
   # Supply-chain + license gate (config in `deny.toml`). Runs in parallel with the build job:
   # a new dependency carrying a security advisory, an out-of-policy license, or an unexpected

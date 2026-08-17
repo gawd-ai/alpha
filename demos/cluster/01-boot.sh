@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Step 1 — boot three Sanctum nodes on one mesh, two poles. Node **A** is the **Ω server**
 # (`omega serve` — a federation/gateway Sanctum, the mesh anchor); nodes **B** and **C** are **α
-# operators** (`alpha node`). Each gets a cluster transport (`--cluster-listen`) and an HTTP/MCP
-# control plane (`--listen`). B and C are handed A as their seed, so they know how to reach the one
+# operators** (`alpha node`). Each gets a cluster transport (`--cluster-listen`) and an HTTP/WS
+# control plane (`--listen`). MCP is a separate stdio hub demonstrated in Step 05. B and C are handed
+# A as their seed, so they know how to reach the one
 # node that already exists. Each prints its identity; we capture each node's pubkey for the join step.
 #
 # Both poles boot the same control plane + transport, so the flags are identical — only the
@@ -14,9 +15,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source ./env.sh
 
+require_command curl
 [ -x "$BIN" ]   || { echo "✗ $BIN not found — run ./00-build.sh first"; exit 1; }
 [ -x "$OMEGA" ] || { echo "✗ $OMEGA not found — run ./00-build.sh first"; exit 1; }
 mkdir -p "$RUN"
+[[ -d "$RUN" && ! -L "$RUN" ]] || {
+  echo "✗ run path $RUN must be a real directory, not a symlink" >&2
+  exit 1
+}
 acquire_cluster_lifecycle_lock
 
 # Refuse to overwrite a live or unverifiable node PID file. Only a validated record whose exact
@@ -142,9 +148,26 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Atomically replace non-lifecycle metadata without ever opening an existing destination (which may
+# have been changed into a symlink). PID ownership uses the stronger no-clobber protocol in env.sh;
+# these pubkey/control-id snapshots are replaceable outputs of an already validated new boot.
+write_node_metadata() { # destination value
+  local destination="$1" value="$2" temporary
+  temporary="$(mktemp "${destination}.tmp.XXXXXXXX")" || return 1
+  if ! (umask 077; printf '%s\n' "$value" >"$temporary"); then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  if ! mv -fT -- "$temporary" "$destination"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
 boot() { # bin subcmd name host cport aport key seed [extra_args...]
   local bin="$1" subcmd="$2" name="$3" host="$4" cport="$5" aport="$6" key="$7" seed="$8"
-  local pid identity owned_index deferred_signal=0 pid_file="$RUN/$name.pid"
+  local pid identity owned_index deferred_signal=0 pid_file="$RUN/$name.pid" pubkey control_id
+  local log_file="$RUN/$name.log"
   shift 8
   echo "▸ booting node $name (\`$(basename "$bin") $subcmd\`)  cluster=$host:$cport  api=$host:$aport"
 
@@ -153,13 +176,18 @@ boot() { # bin subcmd name host cport aport key seed [extra_args...]
   trap 'deferred_signal=129' HUP
   trap 'deferred_signal=130' INT
   trap 'deferred_signal=143' TERM
+  open_cluster_log "$log_file" || {
+    echo "✗ could not prepare safe log file $log_file" >&2
+    exit 1
+  }
   "$bin" "$subcmd" --node-id "$name" \
     --cluster-listen "$host:$cport" \
     --cluster-key "$seed" \
     --listen "$host:$aport" --api-key "$key" \
     --allow-ai --headless "$@" \
-    >"$RUN/$name.log" 2>&1 {CLUSTER_LIFECYCLE_LOCK_FD}>&- &
+    >&"$CLUSTER_LOG_FD" 2>&1 {CLUSTER_LIFECYCLE_LOCK_FD}>&- &
   pid=$!
+  close_cluster_log
   OWNED_NAMES+=("$name")
   OWNED_PIDS+=("$pid")
   OWNED_PID_FILES+=("$pid_file")
@@ -180,13 +208,33 @@ boot() { # bin subcmd name host cport aport key seed [extra_args...]
     exit 1
   }
   wait_health "$host" "$aport" 50 "$pid" "$identity" || {
-    echo "✗ node $name did not come up; see $RUN/$name.log"
+    echo "✗ node $name did not come up; see $log_file"
     exit 1
   }
-  # Capture the node's pubkey (printed once at boot) so later steps can introduce it. Both
-  # `alpha node` and `omega serve` print a "node pubkey = …" line, so this works for either pole.
-  grep -m1 "node pubkey = " "$RUN/$name.log" | sed 's/.*node pubkey = //' >"$RUN/$name.pub"
-  echo "  ✓ $name up — pubkey $(cut -c1-16 "$RUN/$name.pub")…"
+  # Capture the node's pubkey and process-local ControlCore id from this exact boot. Both composition
+  # roots print these before the HTTP health endpoint becomes ready. Fail rather than publishing an
+  # empty/stale identity that would make a later join or MCP target look usable when it is not.
+  pubkey="$(awk '/node pubkey = / { sub(/^.*node pubkey = /, ""); print; exit }' "$RUN/$name.log")"
+  control_id="$(awk '/Role::CONTROL \(id=[0-9]+\)/ {
+    line=$0; sub(/^.*Role::CONTROL \(id=/, "", line); sub(/\).*$/, "", line); print line; exit
+  }' "$RUN/$name.log")"
+  [[ "$pubkey" =~ ^[0-9A-Fa-f]{64}$ ]] || {
+    echo "✗ node $name became healthy but its pubkey was not found in $RUN/$name.log" >&2
+    exit 1
+  }
+  [[ "$control_id" =~ ^[0-9]+$ ]] || {
+    echo "✗ node $name became healthy but its ControlCore id was not found in $RUN/$name.log" >&2
+    exit 1
+  }
+  write_node_metadata "$RUN/$name.pub" "$pubkey" || {
+    echo "✗ could not atomically write $RUN/$name.pub" >&2
+    exit 1
+  }
+  write_node_metadata "$RUN/$name.control" "$control_id" || {
+    echo "✗ could not atomically write $RUN/$name.control" >&2
+    exit 1
+  }
+  echo "  ✓ $name up — pubkey ${pubkey:0:16}…  control-id=$control_id  HTTP/WS=$host:$aport"
 }
 
 # A first (the Ω server / seed); then B and C (α operators), each seeded with A so they can

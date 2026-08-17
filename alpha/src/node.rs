@@ -276,9 +276,10 @@ pub fn run(args: &[String]) -> std::io::Result<()> {
                     "cluster: peers join this node with  cluster join {node_id}@{listen}#{}",
                     nk.key.public_hex()
                 );
-                // ADR-0041: clustering is on but the dev node binds no immune-response by default —
-                // warn loudly that BadSig frames are admitted absent an injected enforcer.
-                omni::warn_if_no_immune_response(&kernel);
+                // ADR-0041: clustering is on but the reference dev composition subscribes no
+                // origin-defense policy by default. Warn loudly that BadSig frames are admitted
+                // absent an injected `policy-origin` (or equivalent) consumer.
+                omni::warn_if_no_origin_defense(false);
             }
             Err(e) => {
                 eprintln!("alpha node: cluster boot failed: {e}");

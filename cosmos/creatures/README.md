@@ -1,9 +1,11 @@
 # creatures — the substrate's production-capable reference organs
 
 GAWD's real creatures: the reference implementation of each substrate role and governing loop — the
-kind an operator could actually run ([`alpha node`](../../alpha) boots several of them at startup). Every
-loadable organ is a creature loaded through the single `Kernel::load` path; none is privileged
-substrate. The one explicit non-creature entry, `job-blob-fs`, is a direct injected storage adapter
+kind an operator could actually run ([`alpha node`](../../alpha) boots several of them at startup).
+Every loadable organ is a creature: artifact-backed bodies use `Kernel::load`, while trusted stock
+compositions install built-in organs through `load_instance` (and transport through its attesting
+variant); all then share the same creature lifecycle. The one explicit non-creature entry,
+`job-blob-fs`, is a direct injected storage adapter
 kept beside the organs that consume its seam rather than promoted into the model-free kernel. They
 sit at the top of a **reduction gradient**: production organs here, the operator-replaceable
 strategy models one level down in [`prototypes/`](prototypes), and the test-only specimens deepest in
@@ -16,10 +18,12 @@ These are distinct organs (not a family of interchangeable models), so the direc
 |---|---|---|
 | `agent-templated` | AUTHORING | deterministic template-matching authoring creature — the seam an LLM-backed agent plugs into |
 | `agent-curious` | AUTHORING | consultative authoring: asks an `AuthoringQuery` when no template matches, resumes on the answer |
-| `build-cargo` | BUILD | sandboxed `cargo` compiler — source → signed, content-addressed `(manifest, artifact)` |
+| `agent-mind` | AUTHORING | opt-in model-backed authoring filling over the injected `mind::Model` seam |
+| `build-cargo` | BUILD | `cargo` compiler with an operator-injected containment seam (`Sandbox::None` by default) — source → signed, content-addressed `(manifest, artifact)` |
 | `build-critter` | BUILD | the no-cargo sibling: validates Rhai source and signs a `Backend::Critter` manifest |
 | `transport-tcp` | TRANSPORT | authenticated TCP peer link (mutual ed25519) + dynamic gossip clustering |
 | `registry-mem` | REGISTRY | in-memory content-addressed Bestiary seed (`publish` / `fetch`) |
+| `bestiary-daemon` | REGISTRY | durable Realm-sharded Bestiary filling with signed journaling, entry proofs, curation, and bounded PUSH anti-entropy |
 | `surface-http` | (control surface) | loadable HTTP + WebSocket control plane driving `Role::CONTROL` over the bus |
 | `surface-mcp` | (control surface) | loadable MCP surface owning stdio; each tool call becomes a `Verb` envelope |
 | `distributor-requirements` | DISTRIBUTOR (Loop 3) | the real placement creature — consults SEER on `placement`, routes the Intent |

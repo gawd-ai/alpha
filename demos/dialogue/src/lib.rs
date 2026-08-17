@@ -1,5 +1,5 @@
-//! dialogue — two AI agents holding a conversation **across a Realm boundary**, narrated, over real
-//! TCP on loopback.
+//! dialogue — two reference agents holding a conversation **across a Realm boundary**, narrated,
+//! over real TCP on loopback.
 //!
 //! `federation` shows catalogues, reputation, and quarantine crossing between Realms. This demo shows
 //! the thing those rails were laid for: **application traffic — a live, multi-turn agent conversation
@@ -10,8 +10,8 @@
 //! Topology (two Sanctums, two Realms, real `transport-tcp` over ed25519 loopback):
 //! - **crew** (Realm A): an `omega-federator` (the OMEGA_GATEWAY) + a `dialogue-initiator` that opens
 //!   conversations with a peer named by a plain [`Address`] — here `Omega{guests, …}`.
-//! - **guests** (Realm B): a **stateful** conversational agent (a `dialogue-responder` over a model
-//!   that *remembers how many turns* the conversation has run).
+//! - **guests** (Realm B): a **stateful** conversational agent (a `dialogue-responder` over a
+//!   reference responder that *remembers how many turns* the conversation has run).
 //!
 //! Each turn the initiator on crew sends a SEER `dialogue` Query addressed into Realm `guests`; the
 //! federator routes it across the boundary; the agent answers, its reply rides `reply_to` back, and
@@ -64,15 +64,38 @@ fn note(msg: &str) {
     println!("    {msg}");
 }
 
-fn slow_factor() -> u64 {
-    std::env::var("GAWD_SLOW_TEST")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(1)
+/// `GAWD_SLOW_TEST=N` scales every transport budget, bounded to 1..=64.
+fn slow_factor() -> u32 {
+    const MAX_SLOW_FACTOR: u32 = 64;
+    static FACTOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+    *FACTOR.get_or_init(|| match std::env::var("GAWD_SLOW_TEST") {
+        Ok(raw) => match raw.parse::<u32>() {
+            Ok(value) => {
+                let bounded = value.clamp(1, MAX_SLOW_FACTOR);
+                if bounded != value {
+                    eprintln!(
+                        "dialogue: GAWD_SLOW_TEST={value} is outside 1..={MAX_SLOW_FACTOR}; using {bounded}"
+                    );
+                }
+                bounded
+            }
+            Err(_) => {
+                eprintln!(
+                    "dialogue: invalid GAWD_SLOW_TEST={raw:?}; expected an integer in 1..={MAX_SLOW_FACTOR}, using 1"
+                );
+                1
+            }
+        },
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("dialogue: non-Unicode GAWD_SLOW_TEST; using 1");
+            1
+        }
+    })
 }
 fn scaled(d: Duration) -> Duration {
-    d * (slow_factor() as u32)
+    d.saturating_mul(slow_factor())
 }
 
 /// Reserve `n` distinct loopback ports up front (bind :0, read the port, drop the listener so the
@@ -231,6 +254,11 @@ pub fn run(_args: &[String]) {
     // ---- Realm A (crew): the federator + the initiator -------------------------------------------
     banner("2. boot Realm `crew` — the gateway + the initiator");
     let crew = kernel(vec![crew_key.public_hex().to_string()]);
+    // Subscribe before the transport can accept the guests dial. Peer events are best-effort topic
+    // traffic, so opening this endpoint later could miss an already-completed handshake and make a
+    // healthy demo time out. Keep the same bus/rx for the conversation below.
+    let (_probe, bus, rx) = crew.open_endpoint(Capabilities::default());
+    crew.router().subscribe(Topic::new(Topic::PROPRIOCEPTION), bus.id());
     let c_transport = crew
         .load_instance(
             signed_manifest("transport-tcp", &crew_key),
@@ -252,7 +280,9 @@ pub fn run(_args: &[String]) {
     crew.bind_role(Role::new(Role::REGISTRY), registry_id);
 
     // The federator maps Realm `guests` to the guests Sanctum, so an Omega-addressed envelope
-    // resolves across the boundary — the same OMEGA_GATEWAY recipe `omega serve` runs.
+    // resolves across the boundary. This directly wires the same OmegaFederator + OMEGA_GATEWAY
+    // role/config seam used by `omega serve`; unlike `federation`, it does not call the server's
+    // shared boot helper.
     let mut realm_to_peer = std::collections::HashMap::new();
     realm_to_peer.insert(RealmId::new(GUESTS), NodeId(NODE_GUESTS.into()));
     let federator_id = crew
@@ -289,8 +319,6 @@ pub fn run(_args: &[String]) {
 
     // ---- the conversation ------------------------------------------------------------------------
     banner("3. open the mesh — wait for the cross-Realm handshake");
-    let (_probe, bus, rx) = crew.open_endpoint(Capabilities::default());
-    crew.router().subscribe(Topic::new(Topic::PROPRIOCEPTION), bus.id());
     // On any failure past this point, shut both Sanctums down and exit non-zero — the same fail-loud
     // discipline `demos/walkthrough` and `demos/federation` use, so `alpha demo dialogue` (and CI)
     // actually catch a cross-mesh regression instead of printing "done" over a broken run.
@@ -315,17 +343,14 @@ pub fn run(_args: &[String]) {
             eprintln!("  ✗ no reply within the window on turn {turn}");
             bail(1);
         };
-        ok(&format!("guests → crew:  {reply}"));
-        // The agent stamps each reply with its running turn count — proof it carried state across the
-        // boundary, in order. A stateless agent, or a dropped/duplicated turn, would not show this
-        // exact climbing count, so asserting it makes the demo a real regression anchor (P5).
-        let marker = format!("(turn {turn} ");
-        if !reply.contains(&marker) {
-            eprintln!(
-                "  ✗ turn {turn} reply lacked the expected `{marker}…` state marker: {reply}"
-            );
+        // Check the entire deterministic reply, not only its turn marker: this proves both state
+        // continuity and byte-exact prompt delivery across the Realm boundary.
+        let expected = format!("(turn {turn} with you) I heard: \"{prompt}\"");
+        if reply != expected {
+            eprintln!("  ✗ turn {turn} reply was {reply:?}; expected byte-exact {expected:?}");
             bail(1);
         }
+        ok(&format!("guests → crew:  {reply}"));
         note("the turn rode Omega(guests, …) across the boundary; the reply's turn-count climbed.");
     }
 

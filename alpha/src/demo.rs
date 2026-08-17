@@ -4,10 +4,10 @@
 //! listed in an external manifest (`demos/demos.json`), compiled separately, and added or removed by
 //! editing that manifest with **no `alpha` recompile** — the same "added/removed by manifest" rule the
 //! rest of the substrate applies to creatures. The front door is a *managed runner*: it resolves the
-//! named demo and launches it (its cargo `package` in a source checkout, or a prebuilt `bin` for an
-//! installed alpha). On Unix the selected command replaces Alpha, so signals and process ownership
-//! stay direct; other platforms wait for it and forward its exit code. Running a demo crate directly
-//! (`cargo run -p walkthrough`) is unchanged.
+//! named demo and launches it (its cargo `package`, plus any validated package features, in a source
+//! checkout, or a prebuilt `bin` for an installed alpha). On Unix the selected command replaces
+//! Alpha, so signals and process ownership stay direct; other platforms wait for it and forward its
+//! exit code. Running a demo crate directly (`cargo run -p walkthrough`) is unchanged.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,10 @@ struct DemoEntry {
     /// Prebuilt binary to exec (installed alpha). Wins over `package` if both are set; a relative
     /// path resolves against the manifest's directory.
     bin: Option<String>,
+    /// Bounded Cargo feature names enabled when this entry is launched from its source `package`.
+    /// Not forwarded when `bin` wins: a prebuilt binary already has its feature set baked in.
+    #[serde(default)]
+    features: Vec<String>,
     /// A **manual runbook** demo (ADR-0045): a multi-process walkthrough the runner can't launch as a
     /// single child (e.g. `cluster`, which stands up an `omega serve` + two `alpha node`s). It is
     /// *listed* (tagged `(manual runbook)`) so `alpha demo list` is authoritative, and `alpha demo run
@@ -38,6 +42,48 @@ struct DemoEntry {
     /// Directory holding the runbook scripts (relative to the manifest dir), printed by `run` for a
     /// `manual` demo. Ignored for runner-launched demos.
     runbook: Option<String>,
+}
+
+/// Keep registry-controlled Cargo feature expansion small and predictable. These are package-local
+/// feature names, not arbitrary Cargo arguments: the runner joins them into the single value after
+/// `--features`, and never invokes a shell.
+const MAX_DEMO_FEATURES: usize = 16;
+const MAX_DEMO_FEATURE_NAME_BYTES: usize = 64;
+
+fn validate_manifest(manifest: &DemoManifest) -> Result<(), String> {
+    for demo in &manifest.demos {
+        if demo.features.len() > MAX_DEMO_FEATURES {
+            return Err(format!(
+                "alpha demo: `{}` declares {} Cargo features; limit is {MAX_DEMO_FEATURES}",
+                demo.name,
+                demo.features.len()
+            ));
+        }
+        for (index, feature) in demo.features.iter().enumerate() {
+            let first_is_safe = feature
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+            let valid = first_is_safe
+                && feature.len() <= MAX_DEMO_FEATURE_NAME_BYTES
+                && feature
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+            if !valid {
+                return Err(format!(
+                    "alpha demo: `{}` has invalid Cargo feature {feature:?}; feature names must start with an ASCII alphanumeric or `_`, contain only ASCII alphanumeric, `_`, or `-` bytes, and be at most {MAX_DEMO_FEATURE_NAME_BYTES} bytes",
+                    demo.name
+                ));
+            }
+            if demo.features[..index].contains(feature) {
+                return Err(format!(
+                    "alpha demo: `{}` declares duplicate Cargo feature {feature:?}",
+                    demo.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Locate `demos.json`: explicit `$ALPHA_DEMOS_MANIFEST` (or legacy `$GAWD_DEMOS_MANIFEST`), then the
@@ -77,6 +123,7 @@ fn load() -> Result<(PathBuf, DemoManifest), String> {
     )?;
     let manifest: DemoManifest = serde_json::from_str(&text)
         .map_err(|e| format!("alpha demo: invalid {}: {e}", path.display()))?;
+    validate_manifest(&manifest)?;
     Ok((path, manifest))
 }
 
@@ -169,7 +216,13 @@ fn spawn(entry: &DemoEntry, manifest_path: &Path, rest: &[String]) -> ExitCode {
         // Build + run the demo crate from the workspace root (manifest is <root>/demos/demos.json).
         let root = manifest_dir.parent().unwrap_or_else(|| Path::new("."));
         let mut c = Command::new("cargo");
-        c.current_dir(root).args(["run", "--locked", "-p", pkg, "--"]).args(rest);
+        c.current_dir(root).args(["run", "--locked", "-p", pkg]);
+        if !entry.features.is_empty() {
+            // One joined argument after `--features` means registry data can select only validated
+            // package features; it can never grow a new Cargo flag or cross the `--` boundary.
+            c.arg("--features").arg(entry.features.join(","));
+        }
+        c.arg("--").args(rest);
         c
     } else {
         eprintln!("alpha demo: `{}` has neither `package` nor `bin` set.", entry.name);

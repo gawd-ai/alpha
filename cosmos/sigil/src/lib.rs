@@ -108,10 +108,11 @@ impl Default for RealmId {
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     /// Native in-process `.so` (libloading). **Trusted-by-admission**: the fabric cannot
-    /// fully contain malicious in-process native code, so foreign/mobile code never arrives
-    /// as a daemon — only as a beast.
+    /// fully contain malicious in-process native code, so operators must not admit foreign/mobile
+    /// code as a daemon. The wire preserves this declared backend; policy must enforce the posture.
     Daemon,
-    /// WASM (wasmtime). First-class, isolated by construction — the home of untrusted code.
+    /// WASM (wasmtime). First-class, isolated by construction — the preferred home of untrusted
+    /// compiled code.
     Beast,
     /// Script (interpreter). The critter tier is a metered, sandboxed Rhai interpreter.
     Critter,

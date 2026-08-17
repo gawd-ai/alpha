@@ -89,7 +89,7 @@ fn recv_match<F: Fn(&MigratorMsg) -> bool>(
 }
 
 // =================================================================================================
-// abode_migrate_local — one Sanctum, two migrators, single-active-fork hand-off
+// abode_migrate_local — one Sanctum, two migrators, acknowledged in-memory hand-off
 // =================================================================================================
 
 /// A counter-state Abode migrates loopback (one Sanctum, two migrator
@@ -98,7 +98,7 @@ fn recv_match<F: Fn(&MigratorMsg) -> bool>(
 #[test]
 fn abode_migrate_local_two_migrators_on_one_sanctum_hand_off_state() {
     // One Abode key used both as the *signing identity* for both migrators (they're the same
-    // Abode — single-Active-fork; the destination is just a new body for the same self) and as
+    // Abode — the destination is a new body for the same self) and as
     // the *one entry* in the destination's allowlist. The ABODE is the self; the SANCTUM is the
     // body; the same Abode legitimately migrates between bodies it owns.
     let abode = Ed25519KeyMaterial::from_seed([0xA9u8; 32]).unwrap();
@@ -111,8 +111,8 @@ fn abode_migrate_local_two_migrators_on_one_sanctum_hand_off_state() {
     let k = kernel(allowlist);
 
     // Two migrators on the same kernel. Both clone the same Abode key so they're the same self
-    // in two bodies — single-active-fork semantics: only one of them can be
-    // authoritative at a time.
+    // in two bodies. This successful request/reply endpoint seals the source after the destination
+    // activates; it does not claim a crash-safe no-overlap fence.
     //
     // The destination's allowlist trusts the Abode's pubkey, so the substrate-shipped gates +
     // the policy will both admit when the source ships its RestoreRequest.

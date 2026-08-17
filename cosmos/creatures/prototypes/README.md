@@ -17,7 +17,7 @@ Organized by the seam each fills — `ls` this directory and you are reading GAW
 | Folder | Seam (the socket it fills) | Reference models |
 |---|---|---|
 | [`critters/`](critters) | Rhai **script-tier creatures** | `echo-critter`, `uppercase`, `rot13`, `contains`, `kv-extract`, `route-by-prefix`, `typed-add-one` |
-| [`policies/`](policies) | admission `Policy`, `RestorePolicy`, `QuarantineTrust`, budget policy, Function placement/retry policy | `policy-dev / -signed / -budget / -abode-allowlist / -prefer-promoted / -quarantine-{aware,trust-all,trust-realm} / policy-job-basic` |
+| [`policies/`](policies) | admission `Policy`, `RestorePolicy`, `QuarantineTrust`, origin defense, budget policy, Function placement/retry policy | `policy-dev / policy-signed / policy-budget / policy-origin / policy-abode-allowlist / policy-prefer-promoted / policy-quarantine-{aware,trust-all,trust-realm} / policy-job-basic` |
 | [`scorers/`](scorers) | `FitnessScorer` for `fitness-selector` | `scorer-success-rate / -latency / -roundrobin` |
 | [`distributors/`](distributors) | placement `PickModel` for `Role::DISTRIBUTOR` | `distributor-roundrobin` |
 | [`reputation/`](reputation) | `ReputationWeigher` for `omega-federator` | `reputation-roundrobin` |

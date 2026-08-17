@@ -25,10 +25,11 @@
 //!
 //! ### What this module deliberately does NOT do
 //!
-//! - **No built-in CRDT.** Single-active-fork migration uses explicit hand-off — the
-//!   source migrator marks its Abode `Migrated { to }` the moment the destination acks. The
-//!   reconciler adds fork + merge by injecting a merge model; this crate still carries bytes,
-//!   integrity, and signatures, never a state lattice.
+//! - **No built-in CRDT.** Migration uses an acknowledged hand-off — the source migrator marks its
+//!   Abode `Migrated { to }` after it receives the destination ack. Because the destination becomes
+//!   authoritative before that ack returns, loss or crash can leave an authority-overlap window;
+//!   this is not the fenced durable-Home protocol. The reconciler adds fork + merge by injecting a
+//!   merge model; this crate still carries bytes, integrity, and signatures, never a state lattice.
 //! - **No checkpoint scheduler.** When to take a snapshot is injected policy on top of these
 //!   types, not fabric.
 //! - **No snapshot durability.** Where a snapshot persists in between hops (registry, fs, network)

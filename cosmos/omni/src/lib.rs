@@ -339,7 +339,8 @@ pub enum Verb {
     /// **load** it into this node — the operator path that the `m2_two_node` test hand-scripted. Drives
     /// `FetchGxPlan` → a windowed `FetchGxChunk` pull (re-requesting only the gaps on a stall, so a
     /// dropped chunk resumes rather than restarts) → `gawdxfer::ChunkAssembler` (per-chunk + whole-file
-    /// SHA-256) → `kernel.load` (which re-verifies signature + bytes at admission). Loads code → gated;
+    /// SHA-256) → `kernel.load` (which recomputes signature/content/hash evidence and gives it to the
+    /// injected admission policy). Loads code → gated;
     /// request/reply → needs the worker probe.
     FetchLoad {
         /// `sha256(artifact_bytes)` hex — the content-address key to fetch.
@@ -1460,8 +1461,9 @@ impl GxChunkPuller<'_> {
 /// Fetch a creature artifact over GX, assemble + integrity-check it, and load it into this node. This
 /// is the operator path the `m2_two_node` test hand-scripted: `FetchGxPlan` → a windowed `FetchGxChunk`
 /// pull (re-requesting only the gaps on a stall, so a dropped chunk resumes rather than restarts) →
-/// `ChunkAssembler` (per-chunk + whole-file SHA-256) → `kernel.load` (which re-verifies signature +
-/// bytes at admission, so a tampered fetch is refused there).
+/// `ChunkAssembler` (per-chunk + whole-file SHA-256) → `kernel.load` (which recomputes
+/// signature/content/hash evidence for the injected admission policy). GX integrity rejects a
+/// tampered transfer before this load step.
 fn verb_fetch_load(
     ctx: &mut VerbCtx,
     artifact_hash: &str,
@@ -3670,22 +3672,25 @@ pub fn boot_control_with_function_deployer(
     Ok(id)
 }
 
-/// ADR-0041 clustered-boot posture check. The transport computes an `OriginVerdict` for every inbound
-/// cross-node frame and **publishes** it (non-enforcing, R5) — it never drops a `BadSig` frame itself.
-/// Enforcement is an injected `Role::IMMUNE_RESPONSE` decision. So a clustered node with **no**
-/// immune-response bound admits forged-signature frames to inboxes. The substrate must not silently
-/// enforce (that would move a trust decision into the kernel), so the honest move is to *warn loudly*
-/// at boot. Call this from a clustered composition root after wiring; it prints a one-line warning to
-/// stderr when no immune-response is bound, and is a no-op when one is. Returns `true` if it warned.
-pub fn warn_if_no_immune_response(kernel: &Kernel) -> bool {
-    if kernel.role_binding(&Role::new(Role::IMMUNE_RESPONSE)).is_some() {
+/// ADR-0041 clustered-boot posture check. The transport computes an `OriginVerdict` for every
+/// inbound cross-node frame and **publishes** it (non-enforcing, R5) — it never drops a `BadSig`
+/// frame itself. Enforcement is an injected topic consumer such as the reference `policy-origin`
+/// creature. That policy subscribes to `PROPRIOCEPTION`; it is deliberately not an
+/// `IMMUNE_RESPONSE` role filling, because the latter quarantines local artifacts rather than
+/// evicting transport peers.
+///
+/// The kernel cannot infer a subscriber's decision model from the topic table, so the composition
+/// root must pass the wiring fact it owns. This prints a one-line warning when no origin-defense
+/// consumer was wired and is a no-op otherwise. Returns `true` if it warned.
+pub fn warn_if_no_origin_defense(origin_defense_wired: bool) -> bool {
+    if origin_defense_wired {
         return false;
     }
     eprintln!(
-        "warning: clustering is on but no Role::IMMUNE_RESPONSE is bound. The transport publishes an \
+        "warning: clustering is on but no origin-defense policy is wired. The transport publishes an \
          OriginVerdict for each peer frame but does not drop BadSig frames itself — so forged-signature \
-         frames are admitted. Bind the reference `immune-response` creature (see SECURITY.md) as the \
-         recommended baseline for any clustered node."
+         frames are admitted. Subscribe the reference `policy-origin` creature to PROPRIOCEPTION (see \
+         SECURITY.md), or inject an equivalent policy, on any clustered node."
     );
     true
 }

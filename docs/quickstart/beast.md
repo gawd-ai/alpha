@@ -13,7 +13,7 @@ a beast when you specifically need portability or hard sandboxing.
 
 ## 1. The ABI
 
-A beast module must export exactly three things (`cosmos/anima/src/wasm.rs`):
+A beast module must export these three things (`cosmos/anima/src/wasm.rs`):
 
 - `memory` — its linear memory.
 - `alloc(len: i32) -> i32` — return a pointer to `len` writable bytes (the host writes the request there).

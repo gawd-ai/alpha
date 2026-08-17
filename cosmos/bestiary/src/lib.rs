@@ -14,7 +14,8 @@
 //!    filling (a realm-hashed, signed-log, content-addressed on-disk Bestiary), the standalone
 //!    [`EntryProof`] attestation, and the injected [`Curator`] seam. The `bestiary-daemon` creature
 //!    binds a `BestiaryStore` to `Role::REGISTRY`, serving every existing `RegistryOp` byte-identically
-//!    while persisting, replicating, and AI-curating the catalog.
+//!    while persisting, replicating, and applying an injected curator to the catalog (deterministic
+//!    or model-backed).
 //!
 //! ## The load-bearing layering invariant (B-guard)
 //!

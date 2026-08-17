@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Abode fork + MERGE. Where abode-migrator does single-active-fork hand-off, the reconciler takes TWO divergent (independently-evolved) snapshots of the SAME Abode and merges them into one authoritative snapshot via an INJECTED CRDT MergeModel, re-signed by the Abode key. The substrate ships the reconciler socket + the snapshot verify/sign primitives; the conflict-free merge SEMANTICS are the operator's model (IoC). Reference: merge-lww-map."
+description = "Abode fork + MERGE. Where abode-migrator does acknowledged in-memory hand-off with a possible authority-overlap window, the reconciler takes TWO divergent (independently-evolved) snapshots of the SAME Abode and merges them into one authoritative snapshot via an INJECTED CRDT MergeModel, re-signed by the Abode key. The substrate ships the reconciler socket + snapshot verify/sign primitives; conflict-free merge SEMANTICS are the operator's model (IoC). Reference: merge-lww-map."
 
 [dependencies]
 aether = { path = "../../aether" }

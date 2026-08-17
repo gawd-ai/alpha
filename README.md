@@ -38,10 +38,12 @@ git clone https://github.com/gawd-ai/alpha && cd alpha
 cargo build --release -p alpha -p omega        # → target/release/{alpha,omega}
 ```
 
-In a hurry? `cargo run -p walkthrough` narrates the whole loop in one process: an AI authors a creature
-from an English request, compiles and ed25519-signs it, hot-loads and runs it, then migrates a *running
-self* between two Sanctums with its state intact. (The authoring step shells out to a real `cargo
-build`, so a cold cache takes a minute; later runs are seconds.)
+In a hurry? `cargo run -p walkthrough` narrates the whole loop in one process: a reference author
+creates a creature from an English request, compiles and ed25519-signs it, hot-loads and runs it, then
+performs a signed local hand-off of a *running self* between two bodies inside one Sanctum with its
+state intact. The cross-Sanctum transport variant is integration-test-proven rather than simulated by
+the narrated demo. (The authoring step shells out to a real `cargo build`, so a cold cache takes a
+minute; later runs are seconds.)
 
 ### 2. Run a node, author a creature
 
@@ -62,8 +64,8 @@ That is one node authoring and running its own capability. Now make it a **fabri
 must already hold the other's pubkey (every node prints its own `node pubkey = …` at boot).
 
 ```sh
-# Terminal 1 — your alpha control surface, given a peer port (note the pubkey it prints):
-alpha node --node-id op --cluster-listen 127.0.0.1:9302
+# Terminal 1 — alpha operator + HTTP/WS control surface (note its pubkey and ControlCore id):
+alpha node --node-id op --cluster-listen 127.0.0.1:9302 --listen 127.0.0.1:7302
 
 # Terminal 2 — an omega fabric node, seeded to your alpha so it can authenticate the first hop:
 omega serve --node-id fab --realm crew --cluster-listen 127.0.0.1:9301 \
@@ -77,8 +79,9 @@ alpha> cluster
        op ── fab   (connected)
 ```
 
-A lone `alpha node` already authors and runs creatures by itself; `omega` is what turns separate nodes
-into one fabric. With a single Realm the gateway is just a mesh anchor — it earns its keep in rung 3.
+A lone `alpha node` already authors and runs creatures by itself, and alpha nodes can form an
+authenticated Realm mesh directly. `omega serve` is the headless gateway/federation pole; with one
+Realm it can act as a mesh anchor, and it earns its cross-Realm role in rung 3.
 
 Typed Functions and durable Jobs are an explicit composition because a node cannot guess an Abode
 root, operational keys, trust policy, or durable custody directory. Start the bounded reference
@@ -143,13 +146,23 @@ REST proxy: each tool call becomes a `Verb` envelope on `Role::CONTROL`. Registe
 
 That spawns a self-contained, **headless** hub with mutating tools enabled at boot. Omit `--allow-ai`
 for a read-only session; there is no REPL inside the MCP process and no MCP tool that can change its
-gate later. To instead drive a node already running on a mesh, point the hub at a peer's control
-creature and give the hub its own mesh identity, listener, and seed:
+gate later. To instead drive a node already running on a mesh, the target must have booted a control
+surface (`--listen`) and printed its process-local `ControlCore` id. First pre-admit the hub's stable
+identity at that mesh (there is no TOFU), then point it at that control creature. The hub needs
+its own identity seed and listener as well as the peer seed:
+
+```text
+alpha> cluster join hub@127.0.0.1:9190#<hub-pub-derived-from-hub-seed>
+```
 
 ```sh
 alpha mcp --node-id hub --listen 127.0.0.1:9190 \
+    --cluster-key <hub-ed25519-seed> \
     --target op@<control-id> --seed op@127.0.0.1:9302#<op-pub>
 ```
+
+The [`demos/cluster/`](demos/cluster/) Step 05 shows the complete fail-closed pre-admission and remote
+`alpha_cluster` check with a fixed demo identity. Generate fresh keys outside a demo.
 
 Tools: `alpha_author`, `alpha_author_critter`, `alpha_send`, `alpha_cluster`, `alpha_status`,
 `alpha_list`, `alpha_registry_*`, and the rest of the REPL surface. In remote mode the **target node**
@@ -182,14 +195,14 @@ surface itself can never grant permission.
 
 ## Creatures — the unit of work
 
-A **creature** is a hot-loadable unit of capability. All three tiers load through the *same*
-`Kernel::load` path, differing only by `abi.backend`:
+A **creature** is a hot-loadable unit of capability. Artifact-backed creatures in all three tiers
+load through the *same* `Kernel::load` path, differing only by `abi.backend`:
 
 | Tier | What it is | Author it with |
 |---|---|---|
 | **`critter`** | A metered **Rhai script** — cheap, portable, authored with no compiler. | `author --critter <request>` ([quickstart](docs/quickstart/critter.md)) |
 | **`daemon`** | A **native** in-process creature (`dlopen` + safe hot-unload), trusted by admission. | `author <request>` → real `cargo build` ([quickstart](docs/quickstart/daemon.md)) |
-| **`beast`** | A sandboxed **WASM** creature — where untrusted or mobile code runs. | the [beast quickstart](docs/quickstart/beast.md) (authored via the SDK) |
+| **`beast`** | A sandboxed **WASM** creature — where untrusted or mobile code runs. | compile a guest that exports the [minimal beast ABI](docs/quickstart/beast.md) |
 
 The bundled reference author is a deterministic template matcher (it keys on `reverse` / `uppercase`),
 which proves the author → compile → sign → admit → load *seam* with no network. A real model-backed
@@ -208,7 +221,7 @@ re-author). Every row links to tested code:
 | **1 Sense → act** | proprioception → reason → motor act | the kernel's sense streams + control surface | [`v01_end_to_end.rs`](cosmos/sanctum/tests/v01_end_to_end.rs) |
 | **2 Author → select → promote** | variation → fitness → heredity | `fitness-selector` (signs a promotion from an injected criterion) | [`fitness_selection_local.rs`](cosmos/sanctum/tests/fitness_selection_local.rs) |
 | **3 Distribute** | intent → match requirements ↔ embodiment → place | `distributor-requirements` (capability-addressed routing) | [`distributor_cross_node.rs`](cosmos/sanctum/tests/distributor_cross_node.rs) |
-| **4 Defend** | observe → self/non-self → contain / quarantine | `immune-response` (trust-gated, reversible quarantine) | [`immune_response_local.rs`](cosmos/sanctum/tests/immune_response_local.rs) |
+| **4 Defend** | observe → self/non-self → contain / quarantine | `immune-response` (reversible local quarantine; injected trust gates inbound peer notices) | [`immune_response_local.rs`](cosmos/sanctum/tests/immune_response_local.rs) |
 | **5 Acculturate** | observe peers → adopt better models | `omega-federator` (cross-Realm pull + signed reputation) | [`omega_federation_cross_node.rs`](cosmos/sanctum/tests/omega_federation_cross_node.rs) |
 
 The composed `cosmos/sanctum/tests/v0{1,2,3}_end_to_end.rs` stitch the whole thing together. And
@@ -236,8 +249,9 @@ Four terms carry the rest; the full glossary is [`docs/CONCEPTS.md`](docs/CONCEP
 
 The load-bearing decisions; full reasoning in the [design notes](docs/design/).
 
-- **One substrate, three tiers** — native / WASM / script load through one `Kernel::load` path,
-  differing only by `abi.backend`.
+- **One substrate, three artifact tiers** — native / WASM / script artifacts load through one
+  `Kernel::load` path, differing only by `abi.backend`; trusted compiled-in organs use the privileged
+  instance-loading seam and then share the same lifecycle.
 - **Safe native hot-unload** — kernel-driven `deregister → drain → engine::unload`, proven over a
   1000-cycle, RSS-stable, ASan-clean reload loop.
 - **Proof of trust** — trust primitives ride structurally on every envelope; concrete trust *models*
@@ -270,7 +284,7 @@ The root holds the two poles — the **α** door (`alpha/`) and the **Ω** serve
 | `omega/` | **Ω — the federation/gateway server.** One binary: `omega serve` boots a headless gateway Sanctum (transport mesh + registry + `omega-federator` on `Role::OMEGA_GATEWAY`), the dual of `alpha node`. |
 | `foundation/{gawdxfer,gawdfn}/` | Shared GAWD contracts Alpha consumes: GX bulk transfer and typed Function/durable Job identities, wires, and proof verification. |
 | `cosmos/sigil/` | The at-rest contract — a creature's signed `Manifest` (identity / capabilities / provenance / content address). The sole metadata source. |
-| `cosmos/aether/` | The bus spine — typed `Envelope`, `Address`, the sharded `Router`, and its bounded journal. `seer` and `abode` are separate first-class concept crates. |
+| `cosmos/aether/` | The bus spine — typed `Envelope`, `Address`, bounded Router tables, and the bounded metadata journal. `seer` and `abode` are separate first-class concept crates. |
 | `cosmos/anima/` | The per-tier loaders — `NativeEngine` (dlopen + safe-unload), `WasmEngine` (wasmtime), `ScriptEngine` (Rhai). |
 | `cosmos/sanctum/` | **The kernel** — model-free lifecycle, routing, and admission *mechanism*. Tier-blind. |
 | `cosmos/forge/` | The creature-authoring SDK — `declare_creature!`, the bus, managed spawn, the prelude. |
@@ -280,18 +294,21 @@ The root holds the two poles — the **α** door (`alpha/`) and the **Ω** serve
 | `cosmos/creatures/prototypes/` | Injected, operator-replaceable strategy models (policies, scorers, distributors, gateways) — **not** substrate. |
 | `demos/` · `docs/` | Runnable narrated walkthroughs; the prose documentation. |
 
-All three tiers are real: integration tests compile and run WebAssembly inline via `WasmEngine` and
-load signed Rhai through `ScriptEngine`, both through the same `Kernel::load` path as native.
+All three artifact tiers are real: integration tests compile and run WebAssembly inline via
+`WasmEngine` and load signed Rhai through `ScriptEngine`, both through the same `Kernel::load` path
+as artifact-backed native creatures.
 
 ## Build, test, and platform
 
 This first public release is **source-first**: clone the repo and build from the workspace — that's the
 whole install. The crates aren't published to a package registry; on Alpha the unit you distribute is
-the **creature** (a signed `gawd_creature_v1` artifact), published and fetched by **content address
+the **creature** (a signed artifact; daemon/beast use `gawd_creature_v1`, critter uses
+`gawd_critter_v1`), published and fetched by **content address
 between nodes over the bus**, not through a package manager. (The registry that catalogues them — the
 *Bestiary* — ships in two forms: an in-memory seed (`registry-mem`) and a **durable, federated,
-AI-curated** one (`bestiary-daemon`) — a realm-hashed signed-log store with verifiable entry proofs and
-monotonic-lattice replication. Both fill `Role::REGISTRY`; pick either.)
+curator-injected** one (`bestiary-daemon`) — a realm-hashed signed-log store with verifiable entry
+proofs and monotonic-lattice replication. Its curator may be deterministic or model-backed; both
+fillings use `Role::REGISTRY`.)
 
 ```sh
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo build --locked -p alpha -p omega
@@ -336,7 +353,7 @@ repository layout, run/test commands, and the load-bearing invariants.
 |---|---|
 | [AGENTS.md](AGENTS.md) | AI-agent orientation: the fast map + invariants you must not break |
 | [Quickstarts](docs/quickstart/) | Run a node as the operator, and write your first creature on each tier (critter / daemon / beast) |
-| [Demos](demos/) | Narrated, runnable walkthroughs — one node's whole loop, a multi-Realm federation, and a real cluster |
+| [Demos](demos/) | Narrated, runnable apps — local authoring/hand-off, federation, GX transfer, cross-Realm dialogue, opt-in live-model Bestiary, and a real cluster runbook |
 | [Concepts](docs/CONCEPTS.md) | Cosmology + glossary |
 | [Vision](docs/VISION.md) | The thesis and why now |
 | [Architecture](docs/ARCHITECTURE.md) | As-built engineering truth |

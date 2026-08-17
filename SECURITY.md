@@ -104,12 +104,14 @@ connection-authenticated key. Two properties are deliberately specified, not sil
 
 - **Origin verdicts are published, not enforced (ADR-0041).** For every inbound frame the transport
   computes an `OriginVerdict` (`Verified` / `BadSig` / `Unresolved`) and **publishes** it on
-  `PROPRIOCEPTION` — it does **not** drop a `BadSig` frame. Enforcement (quarantine the peer, drop the
-  sender) is an injected `Role::IMMUNE_RESPONSE` decision, keeping the kernel model-free (R5/R6).
-  **Consequence:** a clustered node with **no** immune-response bound admits forged-signature frames to
-  inboxes. Bind the reference `immune-response` creature (`cosmos/creatures/immune-response`) reacting
-  to `OriginVerdict::BadSig` as the **recommended baseline for any clustered node**. The clustered boot
-  path prints a one-line warning when clustering is on and no immune-response is bound — heed it.
+  `PROPRIOCEPTION` — it does **not** drop a `BadSig` frame. Peer eviction is an injected topic-consumer
+  decision, keeping the kernel model-free (R5/R6). **Consequence:** a clustered node with no such
+  consumer admits forged-signature frames to inboxes. Subscribe the reference `policy-origin`
+  creature (`cosmos/creatures/prototypes/policies/policy-origin`) to `PROPRIOCEPTION`, or inject an
+  equivalent policy, as the recommended clustered baseline. `immune-response` is a different loop:
+  it quarantines watched local artifacts and does not consume `OriginVerdict`. The stock clustered
+  compositions install neither policy by default and print a one-line origin-defense warning — heed
+  it.
 - **Origin is hop-by-hop; end-to-end agent identity is application-signed (ADR-0038).** The transport
   `Origin` attributes the *immediate authenticated peer* and does **not** survive a relay. A component
   that needs to prove *which agent* produced a multi-hop reply (cross-Realm dialogue) signs the message

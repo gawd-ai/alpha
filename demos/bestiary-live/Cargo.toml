@@ -6,10 +6,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Opt-in, key-gated Alpha demo: a real model authors a creature that is compiled, signed, admitted, hot-loaded, and then published into a durable, replicated, AI-curated Bestiary (with a verifiable entry proof). The headline loop, against a live kernel."
+description = "Opt-in, key-gated Alpha demo: a real model authors a creature that is compile-checked, signed, admitted, hot-loaded, and published into a durable Bestiary with a verifiable entry proof, journal recovery, and store-level signed-entry convergence. The safe deterministic curator is bound; model-backed curation and transport replication are deliberately not claimed."
 
-# The demo body (`run`) lives in the lib so `alpha demo bestiary-live` can run it in-process;
-# the binary is a thin wrapper.
+# The demo body (`run`) lives in the lib for reuse and focused testing; the binary is a thin wrapper.
+# `alpha demo bestiary-live` launches that binary as an external child with the registry's `openai`
+# package feature.
 [lib]
 name = "bestiary_live"
 path = "src/lib.rs"

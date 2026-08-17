@@ -88,9 +88,11 @@ pub enum SeerParseError {
 /// - `Authoring` — consumed by `agent-curious`.
 /// - `Placement` — consumed by `distributor-requirements` + `embodiment-advertiser`.
 /// - `Consensus` — consumed by `creatures/omega-federator` (signed reputation deltas).
-/// - `Policy`, `Budget`, `Fitness`, `Curation` — reserved/draft typed bodies; consumers may use the
-///   generic SEER envelope without changing the wire. `Curation` is the durable Bestiary's
-///   external-curator consult seam (the in-process `bestiary::AICurator` curates directly today).
+/// - `Policy`, `Budget`, `Fitness`, `Curation` — reserved/draft typed bodies with shipped standing
+///   reference consumers under `creatures/prototypes/responders/`. Their bodies may still evolve;
+///   the responders prove the generic SEER exchange without promoting those bodies to stable.
+///   `Curation` is the durable Bestiary's external-curator consult seam (the in-process
+///   `bestiary::AICurator` also curates directly today).
 ///
 /// `snake_case` serde rename matches the on-wire convention used by every other enum in `aether`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -104,14 +106,16 @@ pub enum SeerTopic {
     /// `placement` and reconciles by its own model (round-robin / verifiable-die / first-fit /
     /// consult-N-somethings).
     Placement,
-    /// Admission-policy consultation. Reserved/draft topic for richer admission than the current
-    /// mechanically-applied policy examples.
+    /// Admission-policy consultation. Reserved/draft body with a shipped standing reference
+    /// responder; richer admission remains operator-injected.
     Policy,
-    /// `BudgetRequest` / `ExtendBudget` consultation topic. Reserved/draft typed body; the
-    /// live budget path currently uses proprioception events plus `KernelControl::ExtendBudget`.
+    /// `BudgetRequest` / `ExtendBudget` consultation topic. Reserved/draft body with a shipped
+    /// standing reference responder; the direct live budget path also uses proprioception events
+    /// plus `KernelControl::ExtendBudget`.
     Budget,
-    /// Loop 2's selection signal — fitness-score consultation across N raters. Reserved/draft typed
-    /// body; the current local selector uses an injected scorer trait and registry promotion.
+    /// Loop 2's selection signal — fitness-score consultation across N raters. Reserved/draft body
+    /// with a shipped standing reference responder; the local selector also supports an injected
+    /// scorer trait and registry promotion.
     Fitness,
     /// Weighted-vote / VRF / quorum reconciliation. Live topic: the Omega federator uses it
     /// for signed reputation deltas; additional consensus mechanisms can land as consumers without
@@ -119,9 +123,10 @@ pub enum SeerTopic {
     Consensus,
     /// The durable Bestiary's curation consult — a daemon's anti-entropy/compaction thread asks an
     /// injected curator creature whether to keep / GC / quarantine an entry. **Reserved/draft typed
-    /// body** (`bestiary::AICurator` curates in-process today over the injected `mind::Model`; this
-    /// topic is the seam for an *external* curator creature, consulted off the synchronous decide
-    /// path so the model call never blocks the catalog).
+    /// body with a shipped standing reference responder.** `bestiary::AICurator` also curates
+    /// in-process today over the injected `mind::Model`; this topic is the seam for an external
+    /// curator creature, consulted off the synchronous decide path so the model call never blocks
+    /// the catalog.
     Curation,
     /// Agent-to-agent dialogue — one creature takes a *turn* by sending a `Query` to a *named peer*
     /// (not its own requester, the way every other topic answers upward), the peer answers, and the
@@ -211,8 +216,9 @@ pub struct SeerEnvelope {
     /// discrimination — there's no router-level enforcement, by design).
     pub topic: SeerTopic,
     /// The thread id. Matches the originating envelope's `header.corr`. Mirrored here so a
-    /// journal entry's payload self-identifies (journal entries carry `corr` in their header but
-    /// not the payload schema).
+    /// serialized SEER payload stays self-identifying for consumers and any application-level
+    /// durable capture. The current router journal is metadata-only and retains neither payload nor
+    /// schema.
     pub corr: u64,
     /// What move this envelope makes in the conversation. See [`SeerKind`].
     pub kind: SeerKind,

@@ -251,10 +251,11 @@ watermark resets on reconnect, where a fresh session legitimately restarts `seq`
 **What this is and isn't.** `Verified` proves *node* A signed the content; because one node key signs
 on behalf of all its creatures, it is node-grain, not per-creature non-repudiation. Because the check
 is content-signature (not merely "arrived on an authenticated link"), it survives an on-path attacker
-tampering with the plaintext frames the link carries after the handshake. What is deliberately
-deferred: per-creature portable identity, end-to-end proof to the *final* recipient across an
-untrusted relay (the mesh is direct authenticated links, no transport relay — so there is none to
-cross today), revocation, and signed membership gossip.
+tampering with the plaintext frames the link carries after the handshake. Realm/Omega gateways and
+dialogue creatures do relay application envelopes, so transport origin remains deliberately
+hop-by-hop there; the dialogue answer body supplies one implemented application-signed end-to-end
+identity path. What remains deferred is a general per-creature portable identity/provenance scheme
+for every relayed application, plus revocation and signed membership gossip.
 
 ## Dynamic clustering
 

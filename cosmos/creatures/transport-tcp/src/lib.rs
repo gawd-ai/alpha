@@ -196,8 +196,11 @@ pub struct TransportConfig {
 /// forward subscribers' interest across.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PeerEvent {
-    pub peer: String,  // NodeId
-    pub event: String, // "peer_connected" | "peer_disconnected" | "peer_auth_failed"
+    pub peer: String, // NodeId
+    /// Open diagnostic vocabulary: connection/admission lifecycle plus bounded routing, replay,
+    /// remote-role, and GX drop reasons. Consumers must treat unknown future values as observability
+    /// data, not authority.
+    pub event: String,
 }
 
 // ---- cluster membership types -------------------------------------------------------------------

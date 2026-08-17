@@ -3,8 +3,9 @@
 A hands-on runbook: stand up **three real Sanctum nodes** across **both poles** — node **A** is the
 **Ω server** (`omega serve`, a federation/gateway Sanctum and the mesh anchor), nodes **B** and **C**
 are **α operators** (`alpha node`) — form a **dynamic many-to-many mesh** from one seed, watch the
-graph converge, get the nodes **cross-executing** each other's creatures, and **attach an AI** to
-each — all through the shipped control surfaces (the shell, the HTTP API, and MCP). This is the
+graph converge, get the nodes **cross-executing** each other's creatures, and prove that one
+pre-admitted remote MCP hub can read a specific operator's graph over a **real MCP-over-mesh hop** —
+all through the shipped control surfaces (the shell, the HTTP/WS API, and MCP). This is the
 operator-facing counterpart to the in-process [`federation`](../federation/) demo: here the nodes are
 separate processes (or separate machines) you actually log into.
 
@@ -23,15 +24,17 @@ cross-Realm job (pull anti-entropy, signed reputation, Omega-addressed routing) 
 ```sh
 cd demos/cluster
 ./00-build.sh          # build alpha + omega (release)
-./01-boot.sh           # boot 3 nodes: A = omega serve, B/C = alpha node (each: cluster port + HTTP/MCP port)
+./01-boot.sh           # boot 3 nodes: A = omega serve, B/C = alpha node (cluster + HTTP/WS ports)
 ./02-join.sh           # introduce B and C to A; gossip forms the full mesh
-./03-graph.sh poll     # watch each node's view converge to the full 3-node mesh
-./04-cross-run.sh      # author a creature on B, run it from A (the Ω server) over the mesh
-./05-connect-ai.sh     # the .mcp.json per node + a live MCP read of the graph
+./03-graph.sh poll     # fail unless every node sees both expected peers connected
+./04-cross-run.sh      # author on B; require A's cross-node reply to be exactly "olleh"
+./05-connect-ai.sh     # pre-admit a hub, then read B's live graph through remote MCP over the mesh
 ./09-teardown.sh       # stop all three
 ```
 
-Each step prints what it did and what to run next. Node logs/pids/pubkeys land in `./run/`.
+Each step prints what it did and what to run next. For the local launcher, node logs, PID records,
+pubkeys, and process-local ControlCore ids land in `./run/`. The runbook needs Linux `/proc`, `flock`,
+`curl`, and `jq`; MCP remains newline-delimited JSON-RPC on stdio and does not consume an HTTP port.
 
 The lifecycle helpers require Linux `/proc` plus `flock`. Boot and teardown hold one stable
 `run/.lifecycle.lock`, so concurrent commands cannot unlink or replace one another's PID records.
@@ -41,18 +44,30 @@ and teardown uses bounded TERM-then-KILL waits, retaining the record if death ca
 
 ## Run it across three real machines
 
-Every script reads hosts/ports from the environment (see [`env.sh`](env.sh)). On three boxes, point the
-`*_HOST` vars at each box's reachable address and supply your own keys/seeds:
+`01-boot.sh` is intentionally a **local process launcher**; setting three remote `*_HOST` values does
+not make Bash remote-exec. On separate boxes, first build/install the same candidate, then boot A with
+`omega serve` and B/C with `alpha node` on their respective hosts, using the same flags Step 01 shows:
 
 ```sh
-# one shell, driving three hosts:
-A_HOST=10.0.0.1 B_HOST=10.0.0.2 C_HOST=10.0.0.3 \
-A_KEY=… B_KEY=… C_KEY=… ./01-boot.sh   # (boot each node on its own host; then ./02-join.sh, …)
+# host A (advertise 10.0.0.1:9101 to peers; bind addresses may differ by deployment)
+export A_SEED=your-64-hex-seed A_KEY=your-strong-api-key
+omega serve --node-id A --realm crew --cluster-listen 0.0.0.0:9101 \
+  --cluster-key "$A_SEED" --listen 0.0.0.0:7101 --api-key "$A_KEY" --allow-ai --headless
+
+# host B (host C is the same shape with C / 9103 / 7103 / C-seed)
+export B_SEED=your-64-hex-seed B_KEY=your-strong-api-key A_PUB=copy-from-A-boot-log
+alpha node --node-id B --cluster-listen 0.0.0.0:9102 --cluster-key "$B_SEED" \
+  --seed "A@10.0.0.1:9101#$A_PUB" \
+  --listen 0.0.0.0:7102 --api-key "$B_KEY" --allow-ai --headless
 ```
 
-(`01-boot.sh` backgrounds local processes; for genuinely separate hosts, run the per-node boot on each
-host — A with the `omega` binary, B/C with `alpha` — and run `02`–`05` from wherever can reach all
-three.)
+Those logs remain on the machines that own the processes; this directory cannot capture remote PID
+ownership or stop those processes. From a fourth driver, export reachable `A_HOST/B_HOST/C_HOST`, API
+and cluster ports/keys, plus `A_PUB`, `B_PUB`, and `C_PUB` copied from the current boot logs. Step 05
+also needs `B_CONTROL_ID`, copied from B's current `ControlCore on Role::CONTROL (id=...)` line; that id
+is process-local and must be refreshed after every B restart. Set `MCP_HUB_HOST` to a literal IP the
+mesh can reach (its `MCP_HUB_CPORT` is a cluster port), then run Steps 02–05 on the driver. Stop each
+remote service on its owning host; `09-teardown.sh` only owns local children recorded by Step 01.
 
 ## What each step proves
 
@@ -60,15 +75,17 @@ three.)
 |---|---|---|
 | 01 | CLI flags | both poles join one mesh: A `omega serve`, B/C `alpha node` — `--node-id --cluster-listen --seed --cluster-key` |
 | 02 | HTTP `POST /api/cluster/connect` | the operator/AI-gated **join**; gossip propagates it |
-| 03 | HTTP `GET /api/cluster` | the **observable graph** + many-to-many convergence (also on the `/api/ws` sense stream) |
-| 04 | HTTP `POST /api/author/critter` + `POST /api/send {node}` | **cross-execution between the poles**: author on B (α operator), run it from A (Ω server) over the mesh |
-| 05 | MCP (`alpha mcp`) | **connect an AI** to each node — read the graph, drive the node, cross-execute |
+| 03 | HTTP `GET /api/cluster` | the **observable graph** + an exact fail-closed assertion that A sees B/C, B sees A/C, and C sees A/B connected (events also appear on `/api/ws`, on the same HTTP/WS API port) |
+| 04 | HTTP `POST /api/author/critter` + `POST /api/send {node}` | **cross-execution between the poles**: author on B (α operator), run it from A (Ω server), and parse/assert the exact `olleh` reply |
+| 05 | MCP (`alpha mcp`) | pre-admit a stable hub identity, route `alpha_cluster` to B's actual ControlCore over authenticated GAWD mesh traffic, and assert B's live graph; the printed MCP-host entry reuses that admitted identity |
 
 ## Posture (honest)
 
-- The nodes boot with **`--allow-ai`** because they're headless — a remote curl/MCP caller is the
-  operator. On a node you sit at, keep the gate **off** and use the REPL (`allow-ai on` when you want
-  to hand control to an AI). The gate is the same allow-AI gate the control plane describes.
+- The nodes boot with **`--allow-ai`** because they're headless and this demo deliberately chooses a
+  remote-mutation posture: A admits peers and sends, B authors, and C is available for the same
+  operator-driven exercises. On a node you sit at, keep the gate **off** and use the REPL
+  (`allow-ai on` when you choose to hand control to an AI). In Step 05, the remote hub does **not**
+  receive `--allow-ai`: the target B owns the gate; the hub cannot grant itself permission.
 - **Authoring is the α seat.** The Ω server (`omega serve`) has no authoring organ, so creatures are
   authored on the `alpha node` operators (B/C) and run from anywhere on the mesh — including A.
 - Clustering trust is **transitive**: the first join is operator-gated, then gossip propagates

@@ -3,7 +3,7 @@
 //! Binds an injected [`BestiaryStore`] + [`Curator`] to `Role::REGISTRY`. It serves every existing
 //! `RegistryOp` **byte-identically** to `registry-mem` (so any creature consulting REGISTRY over the
 //! bus is served unchanged), while adding durability, an additive `bestiary.op` schema
-//! ([`BestiaryOp`]: `ProveEntry` / `Compact` / `PushEntries`), off-drain AI curation, and
+//! ([`BestiaryOp`]: `ProveEntry` / `Compact` / `PushEntries`), off-drain injected curation, and
 //! monotonic-lattice PUSH replication. `registry-mem` stays the in-memory stub for the same role; a
 //! test or demo picks one by which `Box<dyn Creature>` it loads.
 //!

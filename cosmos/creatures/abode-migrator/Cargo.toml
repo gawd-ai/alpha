@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "A consumer of the abode snapshot contract. A long-lived per-Sanctum creature bound to Role::ABODE_MIGRATOR that snapshots local Abode state (signed with the Abode key, sha256-bound), ships AbodeRestore envelopes peer-to-peer, and admits incoming snapshots via the substrate-shipped integrity/size/signature gates plus an operator-injected RestorePolicy. Single-active-fork migration with explicit hand-off; fork/merge + CRDT semantics live in abode-reconciler."
+description = "A consumer of the abode snapshot contract. A long-lived per-Sanctum creature bound to Role::ABODE_MIGRATOR that snapshots local Abode state (signed with the Abode key, sha256-bound), ships AbodeRestore envelopes peer-to-peer, and admits incoming snapshots via the substrate-shipped integrity/size/signature gates plus an operator-injected RestorePolicy. Acknowledged in-memory hand-off may have an authority-overlap window; fork/merge + CRDT semantics live in abode-reconciler."
 
 [dependencies]
 aether = { path = "../../aether" }

@@ -1,4 +1,4 @@
-//! bestiary-live — the v0.4.1 headline, narrated in your terminal.
+//! bestiary-live — live-model authoring into a durable Bestiary, narrated in your terminal.
 //!
 //! `walkthrough` proves the authoring loop with a deterministic *template* author and an in-memory
 //! registry. This demo runs the **real** thing end to end:
@@ -10,12 +10,12 @@
 //!    prompt);
 //! 2. `build-critter` compile-checks + ed25519-signs it, and the kernel admits + hot-loads + runs it;
 //! 3. it is published into a **durable Bestiary** (`bestiary-daemon` over `FsBestiaryStore`) — a
-//!    realm-hashed, content-addressed, signed-log store — and a **verifiable `EntryProof`** is
-//!    obtained and checked;
-//! 4. a brand-new store re-opens the same on-disk root and **recovers** the signed journal (it
-//!    persisted across a restart);
-//! 5. a second node **converges** on the entry via the monotonic-lattice push (re-signed under its own
-//!    identity).
+//!    realm-hashed, content-addressed, signed-log store with the safe deterministic curator bound —
+//!    and a **verifiable `EntryProof`** is obtained and checked;
+//! 4. a fresh store handle opens the same on-disk root and **recovers** the persisted signed journal;
+//! 5. a second independent store accepts the self-verifying entry through the same monotonic merge
+//!    used by `PushEntries`, re-signs it under its own identity, and **converges**. This last phase is
+//!    deliberately store-level; the demo does not claim to exercise node transport replication.
 //!
 //! It is **opt-in and key-gated**: with `ALPHA_LLM_MODEL` unset it prints a hint and exits 0, so CI
 //! never invokes a network call. Everything else uses only the public APIs an operator would drive.
@@ -28,6 +28,8 @@
 //! To see the durable Bestiary *without* a model (hermetic): `ALPHA_DURABLE_BESTIARY=1 cargo run -p
 //! federation`.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +52,171 @@ use build_cargo::BuildReply;
 use build_critter::{BuildCritter, BuildCritterOp};
 use mind::Model;
 use policy_signed::SignedPolicy;
+
+const DEFAULT_LLM_MAX_ATTEMPTS: u32 = 3;
+const MAX_LLM_MAX_ATTEMPTS: u32 = 5;
+#[cfg(feature = "openai")]
+const DEFAULT_LLM_TIMEOUT_SECS: u32 = 60;
+#[cfg(feature = "openai")]
+const MAX_LLM_TIMEOUT_SECS: u32 = 90;
+
+const DEMO_TEMP_ROOT_PREFIX: &str = "alpha-bestiary-live";
+const DEMO_TEMP_ROOT_MARKER: &str = ".alpha-bestiary-live-owned";
+
+fn bounded_positive_env(name: &str, default: u32, max: u32) -> Result<u32, String> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw
+                .parse::<u32>()
+                .map_err(|_| format!("{name} must be an integer in 1..={max}, got {raw:?}"))?;
+            if !(1..=max).contains(&value) {
+                return Err(format!("{name} must be in 1..={max}, got {value}"));
+            }
+            Ok(value)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} must be valid UTF-8 and in 1..={max}"))
+        }
+    }
+}
+
+/// A per-process demo root that removes only a freshly created, marker-owned directory.
+///
+/// The unarmed state uses non-recursive cleanup. Recursive cleanup is enabled only after the exact
+/// root path and private marker have both been established, and re-validates both before deletion.
+struct DemoTempRoot {
+    base: PathBuf,
+    path: PathBuf,
+    name: String,
+    marker_payload: String,
+    armed: bool,
+}
+
+impl DemoTempRoot {
+    fn create(slot: &str) -> Result<Self, String> {
+        if !matches!(slot, "A" | "B") {
+            return Err(format!("invalid bestiary-live temp-root slot {slot:?}"));
+        }
+
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let name = format!("{DEMO_TEMP_ROOT_PREFIX}-{slot}-{pid}");
+        let path = base.join(&name);
+        if path.parent() != Some(base.as_path())
+            || path.file_name() != Some(std::ffi::OsStr::new(&name))
+        {
+            return Err(format!("refusing unexpected bestiary-live temp root {}", path.display()));
+        }
+
+        std::fs::create_dir(&path).map_err(|error| {
+            format!(
+                "create private bestiary-live temp root {} (refusing to reuse an existing path): {error}",
+                path.display()
+            )
+        })?;
+
+        let marker_payload = format!("alpha-bestiary-live temp root v1\npid={pid}\nslot={slot}\n");
+        let mut root = Self { base, path, name, marker_payload, armed: false };
+        root.write_marker()?;
+        root.armed = true;
+        Ok(root)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn validate_path(&self) -> Result<(), String> {
+        let expected = self.base.join(&self.name);
+        if self.path != expected
+            || self.path.parent() != Some(self.base.as_path())
+            || self.path.file_name() != Some(std::ffi::OsStr::new(&self.name))
+        {
+            return Err(format!(
+                "refusing cleanup for unexpected bestiary-live path {}",
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        self.path.join(DEMO_TEMP_ROOT_MARKER)
+    }
+
+    fn write_marker(&self) -> Result<(), String> {
+        let marker_path = self.marker_path();
+        let mut marker =
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&marker_path).map_err(
+                |error| format!("create ownership marker {}: {error}", marker_path.display()),
+            )?;
+        marker
+            .write_all(self.marker_payload.as_bytes())
+            .and_then(|()| marker.sync_all())
+            .map_err(|error| format!("write ownership marker {}: {error}", marker_path.display()))
+    }
+
+    fn cleanup_unarmed(&self) -> Result<(), String> {
+        self.validate_path()?;
+        let marker_path = self.marker_path();
+        match std::fs::remove_file(&marker_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("remove incomplete marker {}: {error}", marker_path.display()));
+            }
+        }
+        match std::fs::remove_dir(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove unarmed root {}: {error}", self.path.display())),
+        }
+    }
+
+    fn cleanup_owned(&self) -> Result<(), String> {
+        self.validate_path()?;
+        let root_meta = match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("inspect root {}: {error}", self.path.display())),
+        };
+        if !root_meta.file_type().is_dir() {
+            return Err(format!("refusing cleanup: {} is not a directory", self.path.display()));
+        }
+
+        let marker_path = self.marker_path();
+        let marker_meta = std::fs::symlink_metadata(&marker_path).map_err(|error| {
+            format!("inspect ownership marker {}: {error}", marker_path.display())
+        })?;
+        if !marker_meta.file_type().is_file() {
+            return Err(format!(
+                "refusing cleanup: ownership marker {} is not a regular file",
+                marker_path.display()
+            ));
+        }
+        let marker = std::fs::read_to_string(&marker_path)
+            .map_err(|error| format!("read ownership marker {}: {error}", marker_path.display()))?;
+        if marker != self.marker_payload {
+            return Err(format!(
+                "refusing cleanup: ownership marker {} does not match this process",
+                marker_path.display()
+            ));
+        }
+
+        std::fs::remove_dir_all(&self.path)
+            .map_err(|error| format!("remove demo-owned root {}: {error}", self.path.display()))
+    }
+}
+
+impl Drop for DemoTempRoot {
+    fn drop(&mut self) {
+        let result = if self.armed { self.cleanup_owned() } else { self.cleanup_unarmed() };
+        if let Err(error) = result {
+            eprintln!("bestiary-live: temp-root cleanup warning: {error}");
+        }
+    }
+}
 
 // ----- narration (matches the walkthrough house style) -------------------------------------------
 
@@ -105,21 +272,11 @@ fn request_reply(
 /// environment itself — this demo *is* the operator surface, so it reads the env and constructs the
 /// `ModelConfig` here.
 #[cfg(feature = "openai")]
-fn make_model(model_id: String) -> Option<Arc<dyn Model>> {
+fn make_model(model_id: String, timeout: Duration) -> Option<Arc<dyn Model>> {
     let base_url = std::env::var("ALPHA_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
     let api_key = std::env::var("ALPHA_LLM_API_KEY").ok().filter(|s| !s.is_empty());
-    let timeout = std::env::var("ALPHA_LLM_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(60);
-    let cfg = mind::ModelConfig {
-        base_url,
-        model: model_id,
-        api_key,
-        timeout: Duration::from_secs(timeout),
-    };
+    let cfg = mind::ModelConfig { base_url, model: model_id, api_key, timeout };
     Some(Arc::new(mind::OpenAiModel::new(cfg)))
 }
 
@@ -131,9 +288,11 @@ fn make_model(_model_id: String) -> Option<Arc<dyn Model>> {
 
 fn print_hint() {
     println!(
-        "\x1b[1mbestiary-live\x1b[0m — a real model authors a creature that lands in a durable,"
+        "\x1b[1mbestiary-live\x1b[0m — a real model authors a creature that lands in a durable"
     );
-    println!("replicated, AI-curated Bestiary (with a verifiable entry proof).");
+    println!(
+        "Bestiary with a verifiable entry proof, journal recovery, and store-level convergence."
+    );
     println!();
     println!("This demo is opt-in and needs a model. Set ALPHA_LLM_MODEL and build with --features openai:");
     println!();
@@ -167,17 +326,44 @@ pub fn run(_args: &[String]) {
             return;
         }
     };
-    let Some(model) = make_model(model_id.clone()) else {
+    #[cfg(feature = "openai")]
+    let selected_model = {
+        let timeout_secs = bounded_positive_env(
+            "ALPHA_LLM_TIMEOUT_SECS",
+            DEFAULT_LLM_TIMEOUT_SECS,
+            MAX_LLM_TIMEOUT_SECS,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("bestiary-live: invalid configuration: {error}");
+            std::process::exit(2);
+        });
+        make_model(model_id.clone(), Duration::from_secs(u64::from(timeout_secs)))
+    };
+    #[cfg(not(feature = "openai"))]
+    let selected_model = make_model(model_id.clone());
+
+    let Some(model) = selected_model else {
         print_no_backend_hint(&model_id);
         return;
     };
+    let max_attempts = bounded_positive_env(
+        "ALPHA_LLM_MAX_ATTEMPTS",
+        DEFAULT_LLM_MAX_ATTEMPTS,
+        MAX_LLM_MAX_ATTEMPTS,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("bestiary-live: invalid configuration: {error}");
+        std::process::exit(2);
+    });
 
     println!(
         "\x1b[1mAlpha — a real model authors into a durable Bestiary, live in your terminal\x1b[0m"
     );
-    println!("Model: {model_id}. Watch a creature be authored, run, persisted, proven, and replicated.\n");
+    println!(
+        "Model: {model_id}. Watch a creature be authored, run, persisted, proven, and merged into an independent store.\n"
+    );
 
-    if let Err(e) = demo(model, &model_id) {
+    if let Err(e) = demo(model, &model_id, max_attempts) {
         eprintln!("\n\x1b[31mbestiary-live failed:\x1b[0m {e}");
         std::process::exit(1);
     }
@@ -189,10 +375,15 @@ pub fn run(_args: &[String]) {
     println!("and the durable-store paths the integration tests prove:");
     println!("  cosmos/sanctum/tests/agent_mind_authoring_loop.rs        (model author → build → load → run)");
     println!("  cosmos/sanctum/tests/bestiary_durable_local.rs           (publish · prove · persist · GC)");
-    println!("  cosmos/sanctum/tests/bestiary_replication_cross_node.rs  (push-replication, the monotonic lattice)\n");
+    println!("  cosmos/sanctum/tests/bestiary_replication_cross_node.rs  (the separate cross-node PushEntries proof)\n");
 }
 
-fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
+fn demo(model: Arc<dyn Model>, model_id: &str, max_attempts: u32) -> Result<(), String> {
+    // Construct both guards before anything that can return early. They delete only their exact,
+    // freshly created, marker-owned roots after all later stores and the kernel have dropped.
+    let root_a = DemoTempRoot::create("A")?;
+    let root_b = DemoTempRoot::create("B")?;
+
     let abode = Ed25519KeyMaterial::from_seed([0xB5u8; 32]).map_err(|e| format!("key: {e}"))?;
     let author = abode.public_hex().to_string();
     let realm = RealmId::new("bestiary-live");
@@ -229,11 +420,10 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
         .map_err(|e| format!("build-critter admits: {e}"))?;
     kernel.bind_role(Role::new(Role::BUILD), build_id);
 
-    // REGISTRY = a durable Bestiary daemon over an on-disk, signed-log store (node A). We keep the
-    // `store_a` handle to read its signed entries for the replication phase.
-    let root_a = std::env::temp_dir().join(format!("alpha-bestiary-live-A-{}", std::process::id()));
+    // REGISTRY = a durable Bestiary daemon over an on-disk, signed-log store (store A). We keep the
+    // `store_a` handle to read its signed entries for the store-level convergence phase.
     let store_a = Arc::new(
-        FsBestiaryStore::new(&root_a, abode.clone())
+        FsBestiaryStore::new(root_a.path(), abode.clone())
             .map_err(|e| format!("bestiary store A: {e}"))?,
     );
     let daemon = BestiaryDaemon::new(
@@ -248,7 +438,7 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
     ok(&format!(
         "AUTHORING (model: {model_id}) + BUILD + a durable REGISTRY are all creatures on the bus"
     ));
-    note(&format!("Bestiary root: {}", root_a.display()));
+    note(&format!("Bestiary root: {}", root_a.path().display()));
 
     let (probe_id, bus, rx) = kernel.open_endpoint(Capabilities::default());
     let reply_to = Address::Creature(probe_id);
@@ -257,12 +447,6 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
     // --- Phase 1 — a real model authors a critter, with a bounded compile-error retry -------------
     banner("Phase 1 · A real model authors, signs, and runs a creature");
     let request = "write a critter that reverses a string";
-    let max_attempts: u32 = std::env::var("ALPHA_LLM_MAX_ATTEMPTS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(3);
-
     let mut prev_error: Option<String> = None;
     let mut built: Option<(Manifest, Vec<u8>)> = None;
     for attempt in 1..=max_attempts {
@@ -351,6 +535,12 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
         Duration::from_secs(5),
     )
     .ok_or("no reply from the authored critter")?;
+    if env.payload.as_slice() != b"cba" {
+        return Err(format!(
+            "the model-authored reverse critter returned {:?}, expected byte-exact `cba`",
+            String::from_utf8_lossy(&env.payload)
+        ));
+    }
     ok(&format!(
         "ran it: “abc” → “{}” — a real model wrote running code",
         String::from_utf8_lossy(&env.payload)
@@ -422,23 +612,22 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
     // --- Phase 3 — durability: a fresh store recovers the signed journal --------------------------
     banner("Phase 3 · Durability — a fresh store recovers the signed journal from disk");
     store_a.flush().map_err(|e| format!("flush: {e}"))?;
-    let store_a2 =
-        FsBestiaryStore::new(&root_a, abode.clone()).map_err(|e| format!("reopen store A: {e}"))?;
+    let store_a2 = FsBestiaryStore::new(root_a.path(), abode.clone())
+        .map_err(|e| format!("reopen store A: {e}"))?;
     let replayed = store_a2.recover().map_err(|e| format!("recover: {e}"))?;
     let survived = store_a2.get(&realm, &artifact_hash).map_err(|e| format!("get: {e}"))?;
     if survived.is_none() {
-        return Err("the entry did not survive a store restart".into());
+        return Err("the fresh store handle did not recover the persisted entry".into());
     }
     ok(&format!(
         "a brand-new store replayed {replayed} signed record(s) and still has the creature — persisted"
     ));
 
-    // --- Phase 4 — replication: a second node converges via the monotonic lattice -----------------
-    banner("Phase 4 · Replication — a second node converges via the monotonic lattice");
+    // --- Phase 4 — store seam: an independent replica converges via the monotonic lattice ----------
+    banner("Phase 4 · Store-level convergence — an independent replica merges signed entries");
     let abode_b = Ed25519KeyMaterial::from_seed([0xB6u8; 32]).map_err(|e| format!("key B: {e}"))?;
-    let root_b = std::env::temp_dir().join(format!("alpha-bestiary-live-B-{}", std::process::id()));
-    let store_b =
-        FsBestiaryStore::new(&root_b, abode_b).map_err(|e| format!("bestiary store B: {e}"))?;
+    let store_b = FsBestiaryStore::new(root_b.path(), abode_b)
+        .map_err(|e| format!("bestiary store B: {e}"))?;
     let entries =
         store_a.signed_entries(Some(&realm)).map_err(|e| format!("signed_entries: {e}"))?;
     let mut accepted = 0usize;
@@ -449,19 +638,17 @@ fn demo(model: Arc<dyn Model>, model_id: &str) -> Result<(), String> {
     }
     let converged = store_b.get(&realm, &artifact_hash).map_err(|e| format!("get B: {e}"))?;
     if converged.is_none() {
-        return Err("node B did not converge on the pushed entry".into());
+        return Err("independent store B did not converge on the signed entry".into());
     }
     ok(&format!(
-        "node B ingested {accepted} entr(y/ies), re-signed under its own identity, and now has the creature"
+        "store B ingested {accepted} entr(y/ies), re-signed under its own identity, and now has the creature"
     ));
-    note("(over the bus this is BestiaryOp::PushEntries; shown here via the store API for a one-process demo)");
+    note("This phase calls the store merge seam directly. BestiaryOp::PushEntries uses that seam over the bus, but node transport replication is not exercised here.");
     note(&format!(
         "the daemon's injected Curator decides keep/promote/GC — this demo binds DeterministicCurator (safe-by-default); bind AICurator({}) for an AI-curated gene pool",
         model.describe()
     ));
 
     kernel.shutdown_all(Deadline::from_millis(2000));
-    let _ = std::fs::remove_dir_all(&root_a);
-    let _ = std::fs::remove_dir_all(&root_b);
     Ok(())
 }

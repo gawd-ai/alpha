@@ -23,11 +23,13 @@
 //!    (before the requester saw the seed), neither party can steer `pick` toward a *specific favoured
 //!    value*.
 //!
-//! Anyone — the requester, a skeptical peer, an auditor reading the journal — calls
-//! [`verify_roll`] with the commitment, the revealed seed, and the nonce to **recompute and confirm**
+//! Anyone — the requester, a skeptical peer, or an auditor with the captured application envelopes
+//! — calls [`verify_roll`] with the commitment, revealed seed, and nonce to **recompute and confirm**
 //! both halves: that `sha256(round ‖ n ‖ seed)` equals the commitment (so the die didn't swap the
 //! seed after seeing the nonce) and that `pick = sha256(seed ‖ nonce) mod n` (so the pick is the
-//! honest function of the agreed inputs). A mismatch is provable cheating.
+//! honest function of the agreed inputs). The router's metadata-only journal does not retain the
+//! commitment or payload; durable audit must capture the application envelopes. A mismatch is
+//! provable cheating.
 //!
 //! **The one residual influence (inherent to plain commit-reveal).** The die reveals *last*: it sees
 //! the pick before disclosing the seed, so it can *withhold* the reveal (reply nothing / a bogus

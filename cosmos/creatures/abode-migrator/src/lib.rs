@@ -1,4 +1,4 @@
-//! `abode-migrator` — the single-active-fork Abode hand-off creature: the real consumer of
+//! `abode-migrator` — the acknowledged in-memory Abode hand-off creature: the real consumer of
 //! the [`abode`] snapshot shape (a top-level crate).
 //!
 //! It rides the `AbodeSnapshot` + `AbodeRestore` types on the contract, the substrate-shipped
@@ -16,13 +16,15 @@
 //!   with the Abode key, returns an [`AbodeSnapshot`] the operator can inspect or hand to another
 //!   subsystem. Pure read, allowed in any state.
 //! - `Migrate { destination_node, destination_migrator }` *(local op)* — orchestrates the
-//!   single-active-fork hand-off. Steps: take a snapshot → sign → ship `RestoreRequest` (carrying
+//!   acknowledged hand-off. Steps: take a snapshot → sign → ship `RestoreRequest` (carrying
 //!   an unguessable per-migration challenge) to the destination's migrator → await a
 //!   `RestoreResponse` that echoes the challenge and names the destination node, so a misrouted or
 //!   spoofed reply can't seal the source and lose the self. On `admitted: true`, transitions
 //!   `Authoritative → Migrated { to: destination_node }` and replies `MigrateAck` to the operator.
 //!   The source's Abode is now non-authoritative; further `SetState` / `Migrate` /
-//!   `SnapshotRequest` reject. (T5 in spirit: hand-off is explicit; no two-active-fork window.)
+//!   `SnapshotRequest` reject. The destination becomes authoritative *before* sending its response,
+//!   so there is a transient authority-overlap window; a lost response or source crash can leave
+//!   both bodies active. This reference is not a durable fencing protocol.
 //! - `RestoreRequest { snapshot, note }` *(peer op)* — admission's only public surface. Bounds the
 //!   serialized migrator message before JSON decode, then runs the substrate-shipped gates
 //!   ([`AbodeSnapshot::assert_payload_size`] →
@@ -49,10 +51,11 @@
 //!
 //! ## What this creature deliberately does NOT do
 //!
-//! - **No fork / merge.** This creature is single-active-fork hand-off only. Fork (two Sanctums
-//!   simultaneously authoritative) and merge (reconcile divergent forks) live in
-//!   `creatures/abode-reconciler`. RestoreRequest at an `Authoritative` migrator rejects
-//!   structurally and tells the caller to use the reconciler path.
+//! - **No fork / merge or durable authority fence.** A successful acknowledged endpoint has the
+//!   source sealed and destination authoritative, but a lost response can leave an overlap. Merge
+//!   of divergent snapshots lives in `creatures/abode-reconciler`; crash-safe single authority is
+//!   the separate fenced Function Home custody protocol. `RestoreRequest` at an already
+//!   `Authoritative` migrator rejects structurally and tells the caller to use the reconciler path.
 //! - **No checkpoint scheduler.** *When* the operator calls `SnapshotRequest` is injected policy
 //!   on top of the migrator; the substrate ships no schedule.
 //! - **No snapshot durability.** A snapshot returned from `SnapshotRequest` is yours to keep,
@@ -221,13 +224,14 @@ impl RestorePolicy for PermissiveRestorePolicy {
     }
 }
 
-/// The migrator's current state. Single-active-fork: a migrator is `Empty` (just
-/// booted, no Abode), `Authoritative` (owns the Abode), or `Migrated` (handed off, sealed).
+/// The migrator's current state. A migrator is `Empty` (just booted, no Abode), `Authoritative`
+/// (owns the Abode), or `Migrated` (the destination acknowledged and this source sealed).
 ///
 /// **Why `Migrated` is sealed**: the promise is *explicit hand-off* — the moment
 /// the destination acknowledges, the source's Abode is non-authoritative. Letting the source
-/// revert to `Authoritative` (e.g. via `SetState`) would create the very fork-window the
-/// reconciler's CRDT semantics are designed to handle properly. The invariant stays tight.
+/// revert to `Authoritative` (e.g. via `SetState`) would deliberately create another fork. This
+/// seal narrows authority after acknowledgement; it cannot remove the destination-before-ack
+/// overlap or make the in-memory hand-off crash-safe. The reconciler exists for explicit forks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbodeState {
     /// Just-booted migrator, no Abode seeded. Accepts `SetState` (operator seed) or
@@ -296,7 +300,7 @@ pub enum MigratorMsg {
     /// Take a snapshot of the current authoritative state. The reply carries the snapshot with
     /// the schema prefix already wrapped + the migrator's signature already attached.
     SnapshotRequest,
-    /// Orchestrate a single-active-fork migration to the destination peer's migrator. Replies
+    /// Orchestrate an acknowledged in-memory hand-off to the destination peer's migrator. Replies
     /// `MigrateAck { migrated_to }` on success or `MigrateFailed { reason }` otherwise.
     Migrate {
         destination_node: NodeId,
@@ -1736,9 +1740,8 @@ mod tests {
 
     #[test]
     fn restore_while_authoritative_points_callers_to_the_reconciler_path() {
-        // This hand-off migrator is single-active-fork only. A migrator that's already
-        // authoritative refuses a peer's RestoreRequest with a structured reason and points callers
-        // at the reconciler path.
+        // This hand-off migrator never merges into an already-authoritative body. It refuses the
+        // peer RestoreRequest with a structured reason and points callers at the reconciler path.
         let mut m = build_migrator(key(0xB8));
         m.handle(op_env(MigratorMsg::SetState { payload: b"local".to_vec() }, 1));
         let snapshot = make_signed_snapshot(0xC8, None, b"peer");

@@ -57,8 +57,8 @@ Each term has a precise engineering meaning and a build status. Status legend:
 
 | Term | Engineering meaning | Status |
 |---|---|---|
-| **creature** | An autonomous, dynamically-loadable unit of capability — the substrate's only kind of loadable unit. Loaded through one `Kernel::load` path; the same path runs *infrastructure* (transport, registry, the authoring agent, the admission policy, the placement distributor) and *workloads* alike, which is what makes the substrate **self-hosting**. | ✅ |
-| **daemon / beast / critter** | The three execution **tiers** of a creature, chosen by `abi.backend`: native in-process (`daemon`, a Rust `.so` exposing the `gawd_creature_v1` entry), sandboxed WASM (`beast`), sandboxed script (`critter`, a metered Rhai interpreter). | ✅ daemon + beast + critter |
+| **creature** | An autonomous unit of capability — the substrate's only kind of loadable unit. Artifact-backed creatures enter through `Kernel::load`; trusted built-in organs use `load_instance` (and transport uses its attesting variant), then share the same bind/handle/shutdown lifecycle. Infrastructure and workloads use that one creature seam. Admission policy is the bootstrap exception: an injected host trait, not yet a role-bound creature. | ✅ |
+| **daemon / beast / critter** | The three execution **tiers** of a creature, chosen by `abi.backend`: native in-process (`daemon`; artifact-backed ones are Rust `.so`s exposing `gawd_creature_v1`), sandboxed WASM (`beast`), sandboxed script (`critter`, a metered Rhai interpreter). | ✅ daemon + beast + critter |
 | **Function** | A named, typed entrypoint advertised inside a creature's signed Manifest. Canonical identity is the Manifest content address + entrypoint; it is not another loadable unit or execution tier. | ✅ v0.4.4 |
 | **deployment** | An explicit, signed fact that an immutable Function's creature was fetched/verified/admitted/loaded at an executor. Call follows deploy; it never silently loads code. | ✅ v0.4.4 |
 | **Job / attempt** | A Job is the durable asynchronous record/handle for one Function invocation. An attempt is one separately identified execution authorization under it. | ✅ v0.4.4 |
@@ -204,15 +204,16 @@ elsewhere in the docs run straight through this table:
   (reconcile), and **re-instantiate** after a node is lost — the basis for a machine **collective**
   across many bodies. It is also the **learning seat**: the substrate supplies *instinct* (inherited
   primitives, shared by every node) while the Abode accumulates what is *learned* within a lifetime.
-- **Self-hosting / reflective substrate** — the substrate's own infrastructure (transport, the
-  registry, the authoring agent, the admission policy, the placement distributor) are themselves
-  hot-loadable creatures. The same author→load→unload loop that creates workloads can replace the
-  substrate's organs — so an AI can improve the system it runs *on*, not only the work running *on* it.
+- **Self-hosting / reflective substrate** — most infrastructure (transport, registry, authoring
+  agent, placement distributor) is itself hot-loadable. The same author→load→unload loop that creates
+  workloads can replace those organs. Admission policy is the explicit bootstrap exception today:
+  `Arc<dyn sanctum::Policy>` is injected at `Kernel::new`; a role-bound policy is later work.
 - **Proprioception (observability as a sense)** — the substrate is built to perceive its own
   distributed state: the live node graph, resource flows, daemon health and lineage. For an AI
   operator this is not an ops dashboard but a *sense* — the feedback needed to place, heal, and
-  improve itself. Exposed over the kernel's `proprioception` topic; a dedicated metrics/telemetry creature is future work.
-- **Lineage (heredity)** — every daemon carries provenance and a content address: a creature's
+  improve itself. Exposed over the kernel's `proprioception` topic; the shipped `monitor` creature is
+  the reference stdout sense tape, while a metrics exporter/dashboard remains operator work.
+- **Lineage (heredity)** — every published/artifact-backed creature carries provenance and a content address: a creature's
   **genome**, making capability heritable and auditable across the registry. The basis of the
   evolutionary model below.
 - **Resilience / partition & delay tolerance** — with no central control plane, nodes operate
@@ -340,7 +341,7 @@ and every row is a claim you can click through to running, tested code.
 | **1** | Sense → decide → act | proprioception → reason → motor act (author / load / place / contain / ship) | the `proprioception` + `fitness` sense streams the kernel publishes, acted on through the control surface | `cosmos/sanctum/tests/v01_end_to_end.rs` |
 | **2** | Author → select → promote | variation → fitness → heredity → propagation | `cosmos/creatures/fitness-selector` (signs a promotion onto the registry's reputation slot from an injected criterion) | `cosmos/sanctum/tests/fitness_selection_local.rs` |
 | **3** | Distribute | intent → match requirements ↔ embodiment → place → execute → return | `cosmos/creatures/distributor-requirements` (+ `embodiment-advertiser`) over the placement SEER topic | `cosmos/sanctum/tests/distributor_{local,cross_node}.rs` |
-| **4** | Defend (immune) | observe → self/non-self → weigh → contain / quarantine | `cosmos/creatures/immune-response` (trust-gated, reversible quarantine on a sensed fault) | `cosmos/sanctum/tests/immune_response_local.rs` |
+| **4** | Defend (immune) | observe → self/non-self → weigh → contain / quarantine | `cosmos/creatures/immune-response` (reversible quarantine on a watched local fault; injected trust gates inbound peer notices) | `cosmos/sanctum/tests/immune_response_local.rs` |
 | **5** | Acculturate | observe peers → adopt better models → teach the deserving | `cosmos/creatures/omega-federator` (cross-Realm pull anti-entropy + signed reputation over SEER) | `cosmos/sanctum/tests/omega_federation_cross_node.rs` |
 
 The numbering is fixed; where the docs say "Loop 2" / "Loop 4 (defend)" they mean this
@@ -356,7 +357,7 @@ resolved differently (the integration risk the substrate was designed around; se
 | Sanctum (node) | `sanctum` (the kernel library), realized as a process by `alpha node` (an operator/authoring seat — the α front door) or `omega serve` (a federation/gateway server — the Ω pole) |
 | the bus | `aether` — one `Envelope`, one `Router`, the `Creature` seam, the journal |
 | creature load mechanism | one `Kernel::load` over `anima` — `libloading` for native `daemon`s, `wasmtime` for `beast`s, Rhai for `critter`s — selected by `abi.backend` |
-| self-hosting | transport, registry, the authoring agent, the admission policy, and the placement distributor are all ordinary creatures (`cosmos/creatures/*`, `cosmos/creatures/prototypes/*`) |
+| self-hosting | transport, registry, authoring, and placement are ordinary creatures (`cosmos/creatures/*`, `cosmos/creatures/prototypes/*`); admission policy remains the constructor-injected bootstrap exception |
 | Abode (portable self) | `abode::AbodeSnapshot` + `cosmos/creatures/abode-migrator` (hand-off) + `cosmos/creatures/abode-reconciler` (fork/merge) |
 | Realm / Omega (federation) | the `Realm` / `Omega` address grain + `cosmos/creatures/prototypes/gateways/realm-gateway` & `omega-gateway` + `cosmos/creatures/omega-federator` |
 | embodiment / placement | `cosmos/creatures/distributor-requirements` + `embodiment-advertiser`, over the `placement` SEER topic |

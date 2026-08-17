@@ -146,7 +146,8 @@ homepage = "https://gawd.ai"
 repository = "https://github.com/gawd-ai/alpha"
 # Source-only workspace: every member sets `publish.workspace = true`, so nothing is
 # published to crates.io. Distribution is clone-and-build; on Alpha the distributable
-# unit is the creature (a signed gawd_creature_v1 artifact), fetched by content address
+# unit is the creature (a signed artifact: daemon/beast use gawd_creature_v1; critter uses
+# gawd_critter_v1), fetched by content address
 # over the bus (the registry role; `bestiary-daemon` is the durable reference filling).
 publish = false
 

@@ -94,6 +94,14 @@ must both equal the organ's current `CreatureId`; an authenticated remote peer t
 that numeric id cannot drive the sweep. The continuation visits the captured tail once rather than
 turning an unacknowledged item into an unbounded retry loop.
 
+The stock `alpha node --functions` composition injects no KMS/enclave custody-rewrap adapter. It
+uses the fail-closed unavailable rewrapper: a grant without a `CustodyRewrapRequirementV1` retains
+the legacy custody behavior, while staging under a grant that requires rewrap is refused rather
+than fabricating destination decryption authority. The config exposes no KMS adapter, endpoint, or
+KMS key field. A custom host may inject a real `CustodyKeyRewrapper` into `function-home`; the
+in-process acceptance harness exercises that seam, but does not imply that the stock Alpha CLI
+supplies one.
+
 Durable receipts do not pretend that process-local code survived a restart. Kernel creature
 instances are not restored from the executor ledger: stale deployment rows are excluded from
 lookup and refused before dispatch unless the exact creature id, Manifest content address, and
@@ -148,8 +156,9 @@ each pinned to one composition responsibility. The bounded reference pins one lo
 resolver, executor, policy, and deployer identities and deliberately treats evidence as inert.
 Proof-of-trust can inform a future replacement trust/admission/delegation creature, but never becomes
 authority merely by being present. To expose the opt-in node over MCP, attach a remote-profile
-`alpha mcp` hub to that node's ControlCore; remote mode requires `--target`, the hub's `--node-id` and
-`--listen`, and at least one `--seed`. A separate local `alpha mcp` process is a different Sanctum.
+`alpha mcp` hub to that node's ControlCore; remote mode requires `--target`, the hub's `--node-id`,
+`--listen`, stable `--cluster-key`, and at least one `--seed`, after an existing member pre-admits the
+hub's derived public identity. A separate local `alpha mcp` process is a different Sanctum.
 
 ## Typed entrypoints and immutable identity
 

@@ -6,14 +6,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./env.sh
+require_command curl
+require_command jq
 
 introduce() { # at_host at_port at_key  peer_node peer_host peer_cport peer_pub
-  local ah="$1" ap="$2" ak="$3" pn="$4" ph="$5" pc="$6" pk="$7"
+  local ah="$1" ap="$2" ak="$3" pn="$4" ph="$5" pc="$6" pk="$7" payload response
   echo "▸ introducing $pn ($ph:$pc) to the node at $ah:$ap"
-  curl -fsS -X POST "http://$ah:$ap/api/cluster/connect" \
+  payload="$(jq -cn --arg node_id "$pn" --arg addr "$ph:$pc" --arg pubkey "$pk" \
+    '{node_id:$node_id, addr:$addr, pubkey:$pubkey}')"
+  response="$(cluster_curl -X POST "http://$ah:$ap/api/cluster/connect" \
     -H "Authorization: Bearer $ak" -H "Content-Type: application/json" \
-    -d "{\"node_id\":\"$pn\",\"addr\":\"$ph:$pc\",\"pubkey\":\"$pk\"}"
-  echo
+    -d "$payload")"
+  if ! jq -e --arg node_id "$pn" '.ok == true and .joined == $node_id' \
+      >/dev/null <<<"$response"; then
+    echo "✗ node at $ah:$ap did not acknowledge admission of $pn: $response" >&2
+    return 1
+  fi
+  printf '  %s\n' "$response"
 }
 
 # Tell A about B and C. (B and C already know A — it was their seed.)

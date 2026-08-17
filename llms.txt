@@ -25,13 +25,15 @@ realm-scale concepts, and the broader objective say GAWD.
 - [docs/VISION.md](docs/VISION.md): the thesis and why now.
 - [docs/design/](docs/design/): design notes — the mechanism and reasoning behind each subsystem.
 
-## The two contracts (read before authoring a creature)
-- [docs/TOPICS.md](docs/TOPICS.md): the pub/sub + SEER consult contract — what a creature may listen to and emit (broadcast topics, consult topics, capability roles).
+## Substrate and application contracts
+- [docs/TOPICS.md](docs/TOPICS.md): the pub/sub + SEER consult surface and typed Function/Job schema/role map — what a creature may listen to and emit.
 - [cosmos/sigil/README.md](cosmos/sigil/README.md): the at-rest Manifest — field table, a minimal valid manifest per tier (daemon/beast/critter), and the signing rules. Machine-readable JSON Schema: [cosmos/sigil/manifest.schema.json](cosmos/sigil/manifest.schema.json) (drift-guarded against the Rust type).
+- [foundation/gawdfn/README.md](foundation/gawdfn/README.md): the additive, application-level typed Function + durable Job wire contract; it does not replace the Envelope or Manifest substrate contracts.
+- [docs/design/functions-and-jobs.md](docs/design/functions-and-jobs.md): Alpha's v0.4.4 reference composition, custody, recovery, routing, and replaceable-policy boundaries.
 
 ## Run it
 - [docs/quickstart/](docs/quickstart/): operator (run a node) + write your first creature on each tier (critter / daemon / beast).
-- [demos/](demos/): narrated, runnable walkthroughs — one node's whole loop, a multi-Realm federation, and a three-node cluster.
+- [demos/demos.json](demos/demos.json): authoritative demo registry — walkthrough, federation, distribute, bestiary-live, dialogue, and the manual three-node cluster runbook.
 - Drive a live node as an AI over MCP: see the HTTP/WS control plane in [README.md](README.md) and [.mcp.json.example](.mcp.json.example).
 
 ## Browse the code

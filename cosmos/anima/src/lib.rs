@@ -210,16 +210,16 @@ fn read_artifact_path_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, En
     Ok(bytes)
 }
 
-/// A handle to a loaded creature's **live per-handle fuel ceiling**. It exists so the
-/// kernel can *lift* a creature's budget — honoring a `KernelControl::ExtendBudget` grant — **without
+/// A handle to a loaded creature's **live per-handle resource ceilings**. It exists so the kernel can
+/// *lift* an enforceable dimension — honoring a `KernelControl::ExtendBudget` grant — **without
 /// reaching into the instance running on its own drain thread**. The engine shares one end with the
-/// running instance (which reads the ceiling each `handle`); the kernel keeps the other and writes to
-/// it on a grant. Lock-free (`Arc<AtomicU64>`); the next handle observes the new ceiling.
+/// running instance (which reads the ceilings each `handle`); the kernel keeps the other and writes
+/// to it on a grant. The cells are lock-free; the next handle observes the new values.
 ///
-/// The **beast (wasm)** tier (per-handle fuel) and the **critter (script)** tier (per-handle
-/// operation budget) populate it, so an `ExtendBudget` grant lifts a running creature of either tier.
-/// **Native** is trusted-by-admission (no metering), so its [`LoadedModule::budget`] is `None` and a
-/// grant to it is an honest no-op (not a silent lie — the kernel reports it via `extend_budget`).
+/// The **beast (wasm)** tier enforces fuel, memory, and wall; the **critter (script)** tier enforces
+/// its operation budget as fuel plus wall (its structural memory caps are fixed at load). **Native**
+/// is trusted-by-admission (no metering), so its [`LoadedModule::budget`] is `None`. The kernel
+/// reports an unsupported dimension as unenforceable rather than silently claiming a lift.
 #[derive(Clone)]
 pub struct BudgetControl {
     fuel_cap: Arc<AtomicU64>,
@@ -308,9 +308,10 @@ impl BudgetControl {
 pub struct LoadedModule {
     pub instance: Box<dyn Creature>,
     resources: Box<dyn std::any::Any + Send>,
-    /// The live budget-ceiling control: `Some` for the wasm (fuel) and critter
-    /// (operation-budget) tiers, `None` for native (see [`BudgetControl`]). The kernel `take()`s this
-    /// at install and keys it by `CreatureId` so a later `ExtendBudget` reaches the right creature.
+    /// The live budget-ceiling control: `Some` for wasm (fuel/memory/wall) and critter
+    /// (operation-budget fuel/wall) tiers, `None` for native (see [`BudgetControl`]). The kernel
+    /// `take()`s this at install and keys it by `CreatureId` so a later `ExtendBudget` reaches the
+    /// right creature.
     pub budget: Option<BudgetControl>,
 }
 

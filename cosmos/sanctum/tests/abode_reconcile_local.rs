@@ -1,5 +1,5 @@
 //! **The fork+merge half of the distributed self, in-process.** Where
-//! `abode_migrate_local` proves single-active-fork hand-off, this proves the merge case:
+//! `abode_migrate_local` proves the acknowledged hand-off endpoint; this proves the merge case:
 //! two divergent snapshots of the *same* Abode are merged, through the real kernel, by a loaded
 //! `abode-reconciler` running the reference LWW-Element-Map CRDT.
 //!

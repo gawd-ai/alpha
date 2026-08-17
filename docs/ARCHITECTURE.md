@@ -40,7 +40,7 @@ makes "fabric, not model" structurally enforced, not promised.
 .                          # repo root: the α door + support dirs only — "nothing mixed"
 alpha/                      # the α pole — front door + local operator (client): node/mcp/http compose in-process; demo spawns external demos
 omega/                      # the Ω pole — federation apex / mesh (server), dual to alpha: a lib+bin — `omega serve` boots a federation/gateway Sanctum (the frozen Ω wire contract is the cosmos/omega-contract leaf)
-demos/                     # narrated, runnable demos (walkthrough, federation, distribute, bestiary-live; cluster/ is a runbook)
+demos/                     # narrated, runnable demos (walkthrough, federation, distribute, bestiary-live, dialogue; cluster/ is a runbook)
 docs/                      # CONCEPTS / ARCHITECTURE / ROADMAP / TOPICS + design notes …
 foundation/                # shared GAWD foundations Alpha CONSUMES but does not own (cross-system, gawd-prefixed, externalize later):
   gawdxfer/                #   the GX bulk-transfer contract: chunk-frame codec + chunk math + streaming SHA-256; shared with sctl
@@ -66,23 +66,25 @@ cosmos/                    # everything between α and Ω — the interior the f
                            #     distributor-requirements          (the Distributor; consumes placement SEER)
                            #     embodiment-advertiser             (answers placement Queries with node embodiment)
                            #     abode-migrator                    (in-memory Abode hand-off reference; not durable home authority)
-                           #     omega-federator                (cross-Realm pull anti-entropy + reputation + quarantine)
+                           #     omega-federator, federation-scheduler  (cross-Realm pull anti-entropy + its cadence)
                            #     fitness-selector                  (signed promotion on an injected criterion — Loop 2)
-                           #     immune-response                   (trust-gated reversible quarantine — Loop 4)
+                           #     immune-response                   (reversible local quarantine; optional inbound trust gate — Loop 4)
                            #     verifiable-die                    (commit-reveal randomness over the `commitment` slot)
                            #     abode-reconciler                  (CRDT fork/merge on an injected lattice)
                            #     function-{home,executor,locator,resolver} + job-blob-fs  (v0.4.4 Job mechanisms)
   creatures/prototypes/    #   injected reference-strategy MODELS — not substrate:
                            #     distributors/{distributor-roundrobin, …}         (IoC composability proof)
-                           #     reputation/reputation-roundrobin                 (reputation-weighted distributor)
-                           #     policies/{policy-dev, policy-signed, …}          (admission policies)
+                           #     reputation/reputation-roundrobin                 (uniform verified-attestation weigher)
+                           #     policies/{policy-dev, policy-signed, policy-origin, …}  (admission + origin-defense policies)
                            #     policies/policy-job-basic                         (bounded deterministic Job policy)
                            #     policies/policy-budget                           (consumes the BudgetSignal)
                            #     policies/policy-quarantine-{trust-all,trust-realm,aware}  (immune gates)
                            #     scorers/scorer-{success-rate,latency,roundrobin} (injected FitnessScorer models)
                            #     gateways/{realm-gateway, omega-gateway}       (federation gateways)
                            #     merge/merge-lww-map                              (LWW merge lattice for the reconciler)
+                           #     responders/responder-{policy,budget,fitness,curation} (standing SEER consumers)
                            #     monitor/                                         (the nervous-system observer)
+                           #     dialogue/{dialogue-initiator,dialogue-responder} (named-peer SEER conversation)
                            #     critters/{echo-critter, uppercase, rot13, …}     (reference Rhai source creatures; not crates)
   creatures/prototypes/fixtures/   # test-only specimens (the most reduced prototype) the kernel test suite dlopens:
                            #     echo-daemon, echo-daemon-v2       (reload pair)
@@ -123,7 +125,7 @@ a manifest from author → compile → admit → load → run → ship → publi
   transport. The fabric never substitutes a model of its own. The `Realm`/`Omega` federation grain
   wraps an inner `target` address and resolves via a bound gateway creature —
   composition by depth, not a parallel routing system.
-- **`Router`** — a sharded address table + per-creature inboxes + the journal + the
+- **`Router`** — bounded address/role/topic tables + per-creature inboxes + the journal. The
   role-binding table. The kernel holds the table, not the traffic.
 - **`Creature`** — the kernel-facing trait. Three verbs:
   `bind(CreatureCtx)`, `handle(Envelope) → Outcome`, `shutdown(Deadline)`. Local
@@ -146,8 +148,8 @@ is a *bus-level* capability enforced at the one router choke point. `provides[]`
 declares which roles a creature can fill (e.g. `resolver`, `policy`) so the
 operator can `bind` it.
 
-**`Envelope`** — described above. One wire format, carrying the trust primitives,
-real `ring` ed25519 signatures, and a capability check at admission.
+**`Envelope`** — described above. One wire format, carrying the trust primitives and real `ring`
+ed25519 signatures; `capabilities.calls` is checked at the routing/delivery choke point.
 
 ## The function/Job foundation (`gawdfn`) — an application contract
 
@@ -183,12 +185,13 @@ retention, trust, and recovery choices remain injected creature policy. See
    1000-cycle reload loop (`cosmos/sanctum/tests/m1_reload_loop.rs`) is the ASan-clean
    RSS-stable proof.
 2. **Routing.** Delegates to `aether::Router`. Same router for every address shape;
-   same admission choke point for every send (`may_send` checks
+   same delivery choke point for every send (`may_send` checks
    `capabilities.calls`).
 3. **Admission.** The kernel runs the *mechanism* — parse manifest, verify signature
-   if required, check capabilities, compute build-hash; the *policy* is an injected
-   creature (`cosmos/creatures/prototypes/policies/policy-dev`, `policy-signed`, or `policy-budget` — the
-   operator binds one). The kernel never decides what is admissible.
+   evidence, check capabilities, compute build-hash; the *policy* is an
+   `Arc<dyn sanctum::Policy>` injected at `Kernel::new` (reference implementations include
+   `policy-dev` and `policy-signed`). Admission is not yet a hot-swappable role-bound creature;
+   `policy-budget` is instead a proprioception consumer. The kernel never decides what is admissible.
 
 The kernel contains no built-in capability and no model of its own — that is why
 it stays small and why it is the fixed fabric an AI cannot re-author; everything
@@ -264,12 +267,14 @@ column below shows each crate's home.
 | `cosmos/creatures/prototypes/fixtures/loopback-gateway` | native | The local↔remote symmetry test — routes `Node(self, …)` envelopes through a local socket as serialized bytes; proves the wire format is real without a remote peer. |
 | `cosmos/creatures/transport-tcp` | native | The cross-node creature — ed25519 handshake + framed TCP. Bridges exact numeric `aether::Address::Node(…)` routes and explicitly remote-exposed `NodeRole(…)` bindings to a real peer Sanctum. |
 | `cosmos/creatures/registry-mem` | native | The Bestiary seed — content-addressed `publish` / `fetch`; a manifest + bytes addressed by `artifact_hash`. |
-| `cosmos/creatures/bestiary-daemon` | native | The durable `Role::REGISTRY` filling — Realm-sharded content-addressed artifacts/catalog entries, a signed local journal, entry proofs, curation, and bounded pull anti-entropy. It stores package availability, not live deployments or the mutable Job ledger. |
+| `cosmos/creatures/bestiary-daemon` | native | The durable `Role::REGISTRY` filling — Realm-sharded content-addressed artifacts/catalog entries, a signed local journal, entry proofs, curation, and bounded full-live-set PUSH anti-entropy. It stores package availability, not live deployments or the mutable Job ledger. |
 | `cosmos/creatures/build-cargo` | native | The compiler — takes the author's `crate_name + source + manifest_stub + deps + template`, compiles in an isolated cargo workspace, and returns `BuildReply::Built { manifest, artifact }` signed by the Abode key. `Sandbox::None` is the default; operators inject containment with `Sandbox::Custom`. |
 | `cosmos/creatures/build-critter` | native | The no-cargo BUILD sibling for critters: validates Rhai source, assembles a `Backend::Critter` manifest (`gawd_critter_v1`), signs it, and returns the source bytes as the artifact through the same `BuildReply` shape as `build-cargo`. |
 | `cosmos/creatures/agent-templated` | native | The deterministic authoring creature — matches the request against a template catalog, emits an `AuthoringResponse`. |
 | `cosmos/creatures/agent-curious` | native | The consultative authoring creature — when no template matches, emits `AuthoringQuery`, parks the conversation, resumes terminally on `AuthoringAnswer`. Reduction theorem preserved (single-shot `Request → Reply` works unchanged). |
 | `cosmos/creatures/agent-mind` | native | The opt-in model-backed authoring filling. It consumes the injected `mind::Model` seam and binds the same authoring socket as the deterministic references. |
+| `cosmos/creatures/surface-http` | native | **Loadable HTTP/WS surface.** Owns its listener and runtime, maps authenticated REST/WebSocket traffic to `Verb` envelopes on `Role::CONTROL`, and holds no kernel reference. |
+| `cosmos/creatures/surface-mcp` | native | **Loadable MCP surface.** Owns stdio JSON-RPC, maps tool calls to `Verb` envelopes for a local or remote ControlCore, and uses no REST side channel. |
 | `cosmos/creatures/prototypes/fixtures/panic-daemon` | native | Misbehavior specimen — panics in `handle`; verifies the FFI seam catches it and routes to unload. |
 | `cosmos/creatures/prototypes/fixtures/runaway-thread-daemon` | native | Misbehavior specimen — spawns via raw `std::thread::spawn`; verifies the kernel's thread-count guard refuses `dlclose` (bounded leak, not UAF). |
 | `cosmos/creatures/prototypes/fixtures/welbehaved-thread-daemon` | native | Control specimen — spawns via `managed::spawn`; verifies join-on-unload is clean. |
@@ -279,8 +284,9 @@ column below shows each crate's home.
 | `cosmos/creatures/embodiment-advertiser` | native | One per Sanctum; configured with `self_node` + a list of `(CreatureId, Embodiment)` offers. Answers placement Queries with the matching subset, tagged by `node + creature_id` for the distributor's local-or-peer collapse. |
 | `cosmos/creatures/abode-migrator` | native | **Portable-state hand-off reference.** Ships a signed `abode::AbodeSnapshot` through an injected restore gate. Its payload and pending hand-off are memory-only, and the destination currently becomes authoritative before the source seals; it is not the crash-safe authority protocol used for a durable Job home. |
 | `cosmos/creatures/omega-federator` | native | **Cross-Realm federation.** An `OMEGA_GATEWAY` consumer: pull anti-entropy across Realms, signed reputation over SEER consensus, and a quarantine path. Writes reputation/quarantine onto the registry `Entry`. |
+| `cosmos/creatures/federation-scheduler` | native | **Federation cadence.** Pokes the federator's bounded anti-entropy pull at the operator-injected `omega serve --pull-interval`; it supplies timing, not trust or merge policy. |
 | `cosmos/creatures/fitness-selector` | native | **Loop 2 (author → select → promote).** Aggregates the proprioceptive fitness signal per watched creature, scores each by an *injected* `FitnessScorer`, and signs a self-verifying promotion onto the registry reputation slot. The substrate ships no fitness criterion. |
-| `cosmos/creatures/immune-response` | native | **Loop 4 (defend).** The dual of the selector: subscribes to PROPRIOCEPTION and, on a sensed fault, applies a reversible quarantine gated by an *injected* `QuarantineTrust`. Defense overrides selection. |
+| `cosmos/creatures/immune-response` | native | **Loop 4 (defend).** The dual of the selector: subscribes to PROPRIOCEPTION and applies a reversible quarantine for a watched local fault. Its injected `QuarantineTrust` gates only inbound cross-Realm notices. Defense overrides selection when the operator's admission policy consults the marker. |
 | `cosmos/creatures/verifiable-die` | native | **Verifiable randomness.** A commit-and-reveal die over the envelope `commitment` slot; any peer can later verify a "random" pick was not secretly chosen. |
 | `cosmos/creatures/abode-reconciler` | native | **Abode fork & merge.** Reconciles two forks of an Abode over an *injected* merge lattice (CRDT-style). |
 | `cosmos/creatures/function-home` | native | **v0.4.4 Job authority mechanism.** A fail-closed, signed, hash-chained home ledger for submit/status/events, commands, grants, causal children, and verified execution observations. Scheduling and workflow stay outside it. |
@@ -289,10 +295,11 @@ column below shows each crate's home.
 | `cosmos/creatures/function-locator` | native | **v0.4.4 location mechanism.** Tracks signed home leases; higher epochs supersede lower ones, while a same-epoch higher sequence may refresh only the coordinator over an otherwise identical authority/custody/location binding. |
 | `cosmos/creatures/job-blob-fs` | native library | **v0.4.4 value mechanism.** Bounded fail-closed filesystem CAS for opaque input/result/checkpoint bytes, including ciphertext; it decides no retention, authorization, or encryption policy. |
 | `cosmos/creatures/prototypes/distributors/distributor-roundrobin` | native | **Injected prototype, NOT substrate.** Binds to `Role::DISTRIBUTOR`; a minimal-viable round-robin demo that proves the `Intent` socket works. Coexists with the real Distributor as the IoC-composability proof — two distributor creatures can coexist; operator picks one with `bind_role`. |
-| `cosmos/creatures/prototypes/reputation/reputation-roundrobin` | native | **Injected prototype, NOT substrate.** A reputation-weighted distributor `PickModel` — consumes the reputation slot. |
+| `cosmos/creatures/prototypes/reputation/reputation-roundrobin` | native | **Injected prototype, NOT substrate.** A `ReputationWeigher` for `omega-federator` that assigns weight `1.0` to every verified attestation. |
 | `cosmos/creatures/prototypes/policies/policy-dev` | native | **Injected prototype, NOT substrate.** Permissive dev policy — admits everything. |
 | `cosmos/creatures/prototypes/policies/policy-signed` | native | **Injected prototype, NOT substrate.** Requires an Abode-signed manifest + verified build-hash. |
 | `cosmos/creatures/prototypes/policies/policy-budget` | native | **Injected prototype, NOT substrate.** Consumes the `BudgetSignal { level, kind, vector }`; ships `BudgetApoptosis` and `BudgetGraceful` siblings. |
+| `cosmos/creatures/prototypes/policies/policy-origin` | native | **Injected prototype, NOT substrate.** Consumes authenticated origin verdicts and, after an injected threshold of non-`Verified` events, asks `Role::TRANSPORT` to reversibly forget that peer. |
 | `cosmos/creatures/prototypes/policies/policy-job-basic` | native | **Injected prototype, NOT substrate.** Deterministic bounded placement/retry filling for the `function-policy` socket; an AI-authored scheduler or workflow policy replaces it without changing Job custody. |
 | `cosmos/creatures/prototypes/policies/policy-abode-allowlist` | native | **Injected prototype, NOT substrate.** Reference `RestorePolicy` for the abode-migrator's admission gate. |
 | `cosmos/creatures/prototypes/policies/policy-prefer-promoted` | native | **Injected prototype, NOT substrate.** Admits by the fitness-selector's signed promotion (vs. an `AllowAll` baseline). |
@@ -300,6 +307,9 @@ column below shows each crate's home.
 | `cosmos/creatures/prototypes/scorers/scorer-{success-rate,latency,roundrobin}` | native | **Injected prototypes, NOT substrate.** `FitnessScorer` models for the selector. |
 | `cosmos/creatures/prototypes/gateways/realm-gateway`, `cosmos/creatures/prototypes/gateways/omega-gateway` | native | **Injected prototypes, NOT substrate.** Reference gateways for the `Realm` / `Omega` address grain; preserve `commitment` on rewrite. |
 | `cosmos/creatures/prototypes/merge/merge-lww-map` | native | **Injected prototype, NOT substrate.** A last-writer-wins merge lattice for the abode-reconciler. |
+| `cosmos/creatures/prototypes/responders/responder-{policy,budget,fitness,curation}` | native | **Injected prototypes, NOT substrate.** Standing SEER consumers that share the bounded responder skeleton and inject only the topic-specific decision. |
+| `cosmos/creatures/prototypes/monitor` | native | **Injected prototype, NOT substrate.** Read-only renderer for bounded PROPRIOCEPTION and FITNESS sense events. |
+| `cosmos/creatures/prototypes/dialogue/dialogue-initiator`, `cosmos/creatures/prototypes/dialogue/dialogue-responder` | native | **Injected prototypes, NOT substrate.** A named-peer, multi-turn SEER conversation pair that uses the same local, cross-node, or cross-Realm address seam. |
 
 ## Cosmology map
 
