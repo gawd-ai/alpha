@@ -203,6 +203,12 @@ fn boot_node_a(node_key: Ed25519KeyMaterial, b_advertiser_id: CreatureId) -> Nod
     let allowlist = vec![node_key.public_hex().to_string()];
     let k = kernel(allowlist);
 
+    // Subscribe before transport startup. B is already retrying its dial, so the handshake can
+    // otherwise finish while A is still loading its federator/distributor and the one-shot
+    // `peer_connected` readiness fact would be published before this test has an observer.
+    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
+    k.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe_id);
+
     let peer_b_pub = Ed25519KeyMaterial::from_seed([0xBB; 32]).unwrap();
     let cfg = TransportConfig {
         self_key: node_key.clone(),
@@ -258,9 +264,6 @@ fn boot_node_a(node_key: Ed25519KeyMaterial, b_advertiser_id: CreatureId) -> Nod
         )
         .expect("A distributor admits");
     k.bind_role(Role::new(Role::DISTRIBUTOR), distributor_id);
-
-    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
-    k.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe_id);
 
     NodeA { kernel: k, probe_id, probe_bus, probe_rx }
 }
