@@ -36,6 +36,11 @@ Each step prints what it did and what to run next. For the local launcher, node 
 pubkeys, and process-local ControlCore ids land in `./run/`. The runbook needs Linux `/proc`, `flock`,
 `curl`, and `jq`; MCP remains newline-delimited JSON-RPC on stdio and does not consume an HTTP port.
 
+CI runs the same Steps 01–05 through [`ci-smoke.sh`](ci-smoke.sh), using the debug `alpha` and `omega`
+binaries produced by the existing workspace build. The wrapper never invokes Cargo, requires a fresh
+absolute `ALPHA_CLUSTER_RUN` directory, and guarantees bounded Step 09 teardown on success, failure,
+or signal.
+
 The lifecycle helpers require Linux `/proc` plus `flock`. Boot and teardown hold one stable
 `run/.lifecycle.lock`, so concurrent commands cannot unlink or replace one another's PID records.
 Each record binds a PID to the kernel boot id and `/proc/<pid>/stat` start time; a stale, reused, or

@@ -27,9 +27,9 @@ view_converged() { # self host api-port key expected-peer-1 expected-peer-2
     -H "Authorization: Bearer $key")" || return 1
   jq -e --arg self "$self" --arg peer_one "$peer_one" --arg peer_two "$peer_two" '
     .self == $self and
-    (.connected | type == "number") and .connected >= 2 and
-    ([.members[]? | select(.node_id == $peer_one and .connected == true)] | length == 1) and
-    ([.members[]? | select(.node_id == $peer_two and .connected == true)] | length == 1)
+    .connected == 2 and
+    (([.members[]? | select(.connected == true) | .node_id] | sort) ==
+      ([$peer_one, $peer_two] | sort))
   ' >/dev/null <<<"$response"
 }
 

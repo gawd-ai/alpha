@@ -12,7 +12,9 @@
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 export ROOT="$(cd "$HERE/../.." && pwd)"
-export RUN="$HERE/run"     # local pids / logs / captured pubkeys + boot-local control ids
+# Local pids, logs, captured pubkeys, and boot-local control ids. Automated harnesses may opt into
+# a dedicated location through the namespaced override; ambient generic RUN variables are ignored.
+export RUN="${ALPHA_CLUSTER_RUN:-$HERE/run}"
 # Two poles, two binaries. `alpha` is the α front door — `alpha node` is an operator daemon,
 # `alpha mcp` the MCP hub; BIN/MCP both point at it (`"$BIN" node …` / `"$MCP" mcp …`). `omega` is
 # the Ω server — `omega serve` boots a federation/gateway Sanctum. This runbook makes node A an
