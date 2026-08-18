@@ -186,6 +186,10 @@ fn boot_node_a(abode: &Ed25519KeyMaterial, node_key: Ed25519KeyMaterial) -> Node
     let allowed = vec![abode.public_hex().to_string(), node_key.public_hex().to_string()];
     let k = kernel(allowed);
 
+    // `peer_connected` is live, non-replayed evidence; observe it before B can finish dialing A.
+    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
+    k.router().subscribe(Topic::new(Topic::PROPRIOCEPTION), probe_id);
+
     let peer_b_pub = Ed25519KeyMaterial::from_seed([0xBB; 32]).unwrap();
     let cfg = TransportConfig {
         self_key: node_key.clone(),
@@ -212,9 +216,6 @@ fn boot_node_a(abode: &Ed25519KeyMaterial, node_key: Ed25519KeyMaterial) -> Node
         .load_instance(signed_boot_manifest("abode-migrator-a", &node_key), Box::new(migrator))
         .expect("A migrator admits");
     k.bind_role(Role::new(Role::ABODE_MIGRATOR), migrator_id);
-
-    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
-    k.router().subscribe(Topic::new(Topic::PROPRIOCEPTION), probe_id);
 
     NodeA { kernel: k, migrator_id, probe_id, probe_bus, probe_rx }
 }

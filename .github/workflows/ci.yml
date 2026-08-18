@@ -91,9 +91,8 @@ jobs:
       - name: Patch hygiene
         run: git diff --check HEAD^ HEAD
 
-      # The manual cluster demo cannot be launched as one process in CI, but every lifecycle script
-      # is still executable documentation. Parse all of them before compiling so a shell-language
-      # regression cannot ship behind otherwise-green Rust gates.
+      # The cluster runbook remains executable documentation. Parse every script before compiling so
+      # a shell-language regression cannot ship behind otherwise-green Rust gates.
       - name: Cluster runbook syntax
         run: |
           set -eu
@@ -107,6 +106,21 @@ jobs:
 
       - name: Build
         run: taskset --cpu-list "$ALPHA_CI_CPU" cargo build --locked --workspace
+
+      # Reuse the workspace build above: this wrapper invokes no Cargo command and leaves no node
+      # running. Its whole process tree inherits the selected CPU, while timeout + the wrapper's
+      # exact-incarnation teardown bound both the behavioral proof and every exit path.
+      - name: Demo — cluster runbook (three processes, gossip, cross-run, remote MCP)
+        timeout-minutes: 5
+        env:
+          ALPHA_CLUSTER_RUN: ${{ runner.temp }}/alpha-cluster-${{ github.run_id }}-${{ github.run_attempt }}
+          BIN: ${{ github.workspace }}/target/debug/alpha
+          MCP: ${{ github.workspace }}/target/debug/alpha
+          OMEGA: ${{ github.workspace }}/target/debug/omega
+        run: |
+          taskset --cpu-list "$ALPHA_CI_CPU" \
+            timeout --signal=TERM --kill-after=45s 180s \
+            demos/cluster/ci-smoke.sh
 
       - name: Docs (rustdoc warnings are errors)
         run: |

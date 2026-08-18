@@ -178,6 +178,8 @@ fn cross_node_traffic_is_verified_and_attributed() {
     // A: passive (B dials it).
     let k_a = node_kernel(&key_a);
     cleanup.push(&k_a);
+    let (probe_a, bus_a, rx_events_a) = k_a.open_endpoint(Capabilities::default());
+    k_a.subscribe(Topic::new(Topic::PROPRIOCEPTION), probe_a);
     boot_transport(
         &k_a,
         TransportConfig {
@@ -191,8 +193,6 @@ fn cross_node_traffic_is_verified_and_attributed() {
             }],
         },
     );
-    let (_probe_a, bus_a, _rx_a) = k_a.open_endpoint(Capabilities::default());
-
     // B: dials A; has a target creature + a PROPRIOCEPTION observer.
     let k_b = node_kernel(&key_b);
     cleanup.push(&k_b);
@@ -214,8 +214,8 @@ fn cross_node_traffic_is_verified_and_attributed() {
     k_b.subscribe(Topic::new(Topic::PROPRIOCEPTION), events_b);
 
     assert!(
-        wait_for_peer_event(&rx_events, NODE_A, "peer_connected", Duration::from_secs(10)),
-        "B did not observe A connecting"
+        wait_for_peer_event(&rx_events_a, NODE_B, "peer_connected", Duration::from_secs(10)),
+        "A did not observe B connecting"
     );
 
     // A sends to a creature on B over the authenticated channel.
@@ -254,6 +254,8 @@ fn a_mismatched_bus_signer_is_flagged_bad_sig_at_the_peer() {
 
     let k_a = mismatched_kernel(&bus_key_a);
     cleanup.push(&k_a);
+    let (probe_a, bus_a, rx_events_a) = k_a.open_endpoint(Capabilities::default());
+    k_a.subscribe(Topic::new(Topic::PROPRIOCEPTION), probe_a);
     boot_transport(
         &k_a,
         TransportConfig {
@@ -267,8 +269,6 @@ fn a_mismatched_bus_signer_is_flagged_bad_sig_at_the_peer() {
             }],
         },
     );
-    let (_probe_a, bus_a, _rx_a) = k_a.open_endpoint(Capabilities::default());
-
     let k_b = node_kernel(&key_b);
     cleanup.push(&k_b);
     boot_transport(
@@ -289,8 +289,8 @@ fn a_mismatched_bus_signer_is_flagged_bad_sig_at_the_peer() {
     k_b.subscribe(Topic::new(Topic::PROPRIOCEPTION), events_b);
 
     assert!(
-        wait_for_peer_event(&rx_events, NODE_A, "peer_connected", Duration::from_secs(10)),
-        "B did not observe A connecting"
+        wait_for_peer_event(&rx_events_a, NODE_B, "peer_connected", Duration::from_secs(10)),
+        "A did not observe B connecting"
     );
 
     bus_a

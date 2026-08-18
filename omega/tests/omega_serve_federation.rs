@@ -61,7 +61,7 @@ fn boot_node(
     node_key: Ed25519KeyMaterial,
     seeds: Vec<String>,
     realm_to_peer: HashMap<RealmId, NodeId>,
-) -> (Arc<Kernel>, GatewayIds) {
+) -> (Arc<Kernel>, GatewayIds, CreatureId, BusHandle, InboxReceiver) {
     // `Kernel::new` already returns `Arc<Kernel>`.
     let kernel = Kernel::new(
         vec![Arc::new(NativeEngine), Arc::new(WasmEngine::new()), Arc::new(ScriptEngine)],
@@ -71,6 +71,9 @@ fn boot_node(
         128,
     );
     kernel.set_node_identity(node_key.public_hex().to_string());
+    // Subscribe before the gateway recipe starts transport: peer events are live and non-replayed.
+    let (probe, bus, rx) = kernel.open_endpoint(Capabilities::default());
+    kernel.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe);
     let cfg = GatewayConfig {
         node_id: node_id.to_string(),
         self_realm: RealmId::new(realm),
@@ -80,7 +83,7 @@ fn boot_node(
         node_key,
     };
     let ids = boot_gateway(&kernel, &cfg).expect("gateway recipe boots");
-    (kernel, ids)
+    (kernel, ids, probe, bus, rx)
 }
 
 fn wait_for_peer_event(rx: &InboxReceiver, peer: &str, event: &str, budget: Duration) -> bool {
@@ -190,11 +193,10 @@ fn omega_serve_gateway_federates_with_an_alpha_client() {
     // operator does the same with `--seed` on each node (or `cluster join` at runtime).
     let omega_seeds =
         vec![format!("{NODE_ALPHA}@127.0.0.1:{PORT_ALPHA}#{}", alpha_key.public_hex())];
-    let (omega_kernel, omega) =
+    let (omega_kernel, omega, omega_probe, omega_bus, omega_rx) =
         boot_node(NODE_OMEGA, "crew", PORT_OMEGA, omega_key.clone(), omega_seeds, HashMap::new());
 
     // Seed X@crew into Ω's registry (locally, over Ω's own probe — no transport needed).
-    let (omega_probe, omega_bus, omega_rx) = omega_kernel.open_endpoint(Capabilities::default());
     omega_bus
         .send(
             Dispatch::to(
@@ -230,11 +232,8 @@ fn omega_serve_gateway_federates_with_an_alpha_client() {
     a_routes.insert(RealmId::new("crew"), NodeId(NODE_OMEGA.into()));
     let alpha_seeds =
         vec![format!("{NODE_OMEGA}@127.0.0.1:{PORT_OMEGA}#{}", omega_key.public_hex())];
-    let (alpha_kernel, alpha) =
+    let (alpha_kernel, alpha, alpha_probe, alpha_bus, alpha_rx) =
         boot_node(NODE_ALPHA, "guests", PORT_ALPHA, alpha_key.clone(), alpha_seeds, a_routes);
-
-    let (alpha_probe, alpha_bus, alpha_rx) = alpha_kernel.open_endpoint(Capabilities::default());
-    alpha_kernel.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), alpha_probe);
 
     assert!(
         wait_for_peer_event(

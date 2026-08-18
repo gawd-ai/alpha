@@ -256,11 +256,11 @@ if ! REMOTE_GRAPH="$(jq -er '
 fi
 if ! jq -e --arg hub "$MCP_HUB_ID" '
     .self == "B" and
-    ([.members[]? | select(.node_id == "A" and .connected == true)] | length == 1) and
-    ([.members[]? | select(.node_id == "C" and .connected == true)] | length == 1) and
-    ([.members[]? | select(.node_id == $hub and .connected == true)] | length == 1)
+    .connected == 3 and
+    (([.members[]? | select(.connected == true) | .node_id] | sort) ==
+      (["A", "C", $hub] | sort))
   ' >/dev/null <<<"$REMOTE_GRAPH"; then
-  echo "✗ MCP reached a control plane, but it did not return B's converged graph: $REMOTE_GRAPH" >&2
+  echo "✗ MCP reached a control plane, but it did not return B's exact A+C+hub graph: $REMOTE_GRAPH" >&2
   exit 1
 fi
 

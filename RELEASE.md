@@ -46,8 +46,8 @@ caches `target/`, removes only rendered rustdoc output after that gate, cancels 
 the same ref, and has finite job timeouts. Its required phases are: workspace
 Clippy, build, strict rustdoc, serial tests, alpha/omega version smokes, every runnable hermetic demo
 (`walkthrough`, `federation`, `distribute`, and `dialogue`), the credential-free `bestiary-live`
-startup path, cluster-runbook shell parsing, and the opt-in `openai` Clippy/tests. The separate
-`cargo-deny` job evaluates all features.
+startup path, cluster-runbook shell parsing plus its behavioral Steps 01–05 smoke, and the opt-in
+`openai` Clippy/tests. The separate `cargo-deny` job evaluates all features.
 `.github/workflows/ci.yml` is the executable source of truth for those commands.
 
 Cargo does not garbage-collect stale local build variants. Use focused package checks while

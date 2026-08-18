@@ -109,6 +109,9 @@ fn wait_for_peer_event(rx: &InboxReceiver, peer: &str, event: &str, budget: Dura
 struct Node {
     kernel: Arc<Kernel>,
     echo_id: Option<CreatureId>,
+    probe_id: CreatureId,
+    probe_bus: BusHandle,
+    probe_rx: InboxReceiver,
 }
 
 /// Boot a node: transport (dialing or passive) + a registry + a federator mapping the peer Realm to
@@ -129,6 +132,10 @@ fn boot(
 ) -> Node {
     let allowed = vec![node_key.public_hex().to_string()];
     let k = kernel(allowed);
+    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
+    if dials {
+        k.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe_id);
+    }
 
     let cfg = TransportConfig {
         self_key: node_key.clone(),
@@ -180,7 +187,7 @@ fn boot(
         None
     };
 
-    Node { kernel: k, echo_id }
+    Node { kernel: k, echo_id, probe_id, probe_bus, probe_rx }
 }
 
 /// Send an application envelope to `to` and wait for the `pong:` reply matching `corr`.
@@ -251,9 +258,10 @@ fn omega_routes_arbitrary_application_traffic_across_realms() {
         false,
     );
 
-    // A probe on A drives the cross-Realm sends + reads the replies.
-    let (probe, bus, rx) = a.kernel.open_endpoint(Capabilities::default());
-    a.kernel.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe);
+    // A's probe subscribed before its dialing transport started, so the sender-side writer is ready.
+    let probe = a.probe_id;
+    let bus = a.probe_bus;
+    let rx = a.probe_rx;
 
     assert!(
         wait_for_peer_event(&rx, NODE_B, "peer_connected", scaled(Duration::from_secs(5))),

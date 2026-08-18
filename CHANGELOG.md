@@ -8,6 +8,16 @@ Semantic-versioning guarantees begin at 1.0.
 For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the design notes under [`docs/design/`](docs/design/).
 
+## Unreleased
+
+- CI now runs the public three-process cluster runbook through boot, exact gossip convergence,
+  cross-node execution, and a real remote MCP graph query. The smoke reuses already-built binaries,
+  inherits the one-CPU CI affinity, has a hard timeout, and guarantees bounded teardown without a
+  second Cargo build.
+- Cross-node integration fixtures now subscribe to live `peer_connected` readiness evidence before
+  starting their sender-side transport, eliminating false timeouts caused by missing a non-replayed
+  event under one-CPU scheduling.
+
 ## 0.4.4 - 2026-08-16
 
 v0.4.4 establishes **typed Functions and durable Jobs** without adding a
