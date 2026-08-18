@@ -857,7 +857,8 @@ fn run_drain(
                             // The signal rides on PROPRIOCEPTION (observability), not
                             // FITNESS (a budget event isn't a creature "bug," it's a declared-quota
                             // trajectory event).
-                            if let Some(mut signal) = outcome.budget_signal {
+                            let mut budget_signal = outcome.budget_signal;
+                            if let Some(signal) = budget_signal.as_mut() {
                                 // **Kernel-side enrichment.** The engine can't
                                 // see the outcome's dispatches list (it returns the Outcome and
                                 // hands it off); the kernel can. Fill in `dispatches_this_envelope`
@@ -868,7 +869,6 @@ fn run_drain(
                                 // [`policy_budget::BudgetGraceful`]'s productive classifier needs.
                                 signal.vector.dispatches_this_envelope =
                                     outcome.dispatches.len() as u32;
-                                publish_budget_signal(&bus, me, signal);
                             }
                             // Fitness here reflects "did the creature reply with useful work?"; a
                             // Hard signal with no dispatches is `false`. Without dispatches the
@@ -876,8 +876,7 @@ fn run_drain(
                             // selection wants to see. A Warn signal WITH dispatches is still
                             // `useful=true` — the creature did work and got a warning.
                             // Captured BEFORE we move `dispatches` into the bus.
-                            let useful =
-                                !outcome.dispatches.is_empty() || outcome.budget_signal.is_none();
+                            let useful = !outcome.dispatches.is_empty() || budget_signal.is_none();
                             for d in outcome.dispatches {
                                 // A creature's reply/work is its only output. Dropping it on a full
                                 // or unreachable target with no trace is exactly the "a migration can
@@ -893,7 +892,14 @@ fn run_drain(
                                     );
                                 }
                             }
+                            // Publish the per-envelope fitness fact before the budget event. A
+                            // budget subscriber may synchronously request unload; work and sense
+                            // produced by this completed handle must cross the sender-liveness
+                            // boundary before that control reaction can make `bus` stale.
                             publish_fitness(&bus, &router, me, useful);
+                            if let Some(signal) = budget_signal {
+                                publish_budget_signal(&bus, me, signal);
+                            }
                         }
                         Err(_panic) => {
                             // Creature-fault isolation (R9): a panic in `handle` (in-process OR

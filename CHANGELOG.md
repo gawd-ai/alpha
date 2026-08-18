@@ -27,6 +27,8 @@ For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
   matching malformed reply or abort into `dialogue.failed`. Existing dialogue wire and synchronous
   reference responder remain unchanged. Creature-owned bus sends now linearize against deregistration,
   so a detached worker's retained handle cannot enqueue after unload even if it races its stop check.
+  A completed handle's dispatches and fitness fact now leave before its budget signal is published,
+  preventing a fast Warn policy from deregistering the sender ahead of that same outcome's work.
 - **The approved-profile path now covers native, WASM, and Rhai through trusted lowering.** The
   approved model contract contains only schema, profile digest, tier, program kind, multiplier, and
   addend; unknown fields, source/dependency/authority smuggling, profile drift, and decorative fixture

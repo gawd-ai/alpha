@@ -42,7 +42,7 @@ use aether::{Address, Bus, Creature, CreatureCtx, Deadline, Dispatch, Envelope, 
 use anima::{Artifact, NativeEngine, ScriptEngine, WasmEngine};
 use policy_budget::BudgetGraceful;
 use policy_dev::DevPolicy;
-use sanctum::{BudgetSignalEvent, Kernel, KernelControl};
+use sanctum::{BudgetSignalEvent, Fitness, Kernel, KernelControl, Proprioception};
 use sigil::{Backend, Capabilities, Manifest};
 
 // A real wasm reverse module — the same shape the capability/sandbox tests use. We don't actually need its `handle` to do
@@ -337,9 +337,10 @@ fn load_echo_or_spin(
 ///   1. WasmEngine handles the envelope, the echo function consumes some fuel and returns.
 ///   2. Engine's `maybe_warn` sees fuel `consumed > 0` ≥ 0% of 1_000 → attaches
 ///      `BudgetSignal::warn(Fuel, vector)` to the outcome alongside the echo reply.
-///   3. Kernel drain enriches `vector.dispatches_this_envelope = 1` (the reply), then publishes
-///      `BudgetSignalEvent { level: "warn", kind: "fuel", vector: {dispatches=1, ...} }` on
-///      PROPRIOCEPTION.
+///   3. Kernel drain enriches `vector.dispatches_this_envelope = 1`, ships the reply and its
+///      per-envelope fitness fact, then publishes `BudgetSignalEvent { level: "warn", kind:
+///      "fuel", vector: {dispatches=1, ...} }` on PROPRIOCEPTION. A policy reaction therefore
+///      cannot unload the sender before that completed handle's work leaves.
 ///   4. BudgetGraceful subscribes; classifies the vector as ProductiveThenTerminal (≥1 dispatch);
 ///      grants one-shot grace → emits `KernelControl::ExtendBudget { fuel: Some(1.5×limit) }` to
 ///      Address::Kernel.
@@ -493,15 +494,29 @@ fn warn_self_apoptosis_relay_lets_beast_exit_cleanly() {
         })
         .expect("spawn relay thread");
 
-    // Step 2: load the beast with warn_at=0 so any handle triggers Warn. Add it to the watch-set
-    // so the relay knows to translate ITS Warns into Unloads.
+    // Step 2: establish the ordering observer before load, then consume the beast's asynchronous
+    // `loaded` boundary before asking it to work. This keeps that legitimate lifecycle fact from
+    // racing the same-inbox reply/Fitness/Warn order asserted below.
+    let (probe, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
+    k.subscribe(Topic::new(Topic::FITNESS), probe);
+    k.subscribe(Topic::new(Topic::PROPRIOCEPTION), probe);
+
+    // Load the beast with warn_at=0 so any handle triggers Warn. Add it to the watch-set so the
+    // relay knows to translate ITS Warns into Unloads.
     let beast = load_echo_or_spin(&k, "self-apoptosis-beast", 1, Some(0));
     watch.lock().unwrap().insert(beast.0);
+    let loaded_env = probe_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("beast loaded lifecycle boundary arrived");
+    assert_eq!(loaded_env.header.schema, "proprioception");
+    let loaded: Proprioception =
+        serde_json::from_slice(&loaded_env.payload).expect("loaded lifecycle payload decodes");
+    assert_eq!(loaded.creature, beast.0);
+    assert_eq!(loaded.event, "loaded");
 
     // Step 3: send the beast one envelope. The handle returns the echo (reply lands), the
     // engine attaches Warn to the outcome, the kernel publishes the BudgetSignalEvent, the
     // relay translates Warn → Unload, the kernel unloads the beast.
-    let (probe, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
     probe_bus
         .send(
             Dispatch::to(Address::Creature(beast), vec![7, 7, 7])
@@ -515,7 +530,28 @@ fn warn_self_apoptosis_relay_lets_beast_exit_cleanly() {
         .expect("echo reply arrived BEFORE unload — proof of clean exit at handle boundary");
     assert_eq!(reply.payload, vec![7, 7, 7], "the work was done before exit");
 
-    // (b) Beast is unloaded shortly after (the Warn → relay → Unload chain settled).
+    // (b) The completed handle's fitness fact arrives before the Warn can trigger unload.
+    let fitness_env = probe_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fitness arrived after reply and before budget reaction");
+    assert_eq!(fitness_env.header.schema, "fitness");
+    let fitness: Fitness =
+        serde_json::from_slice(&fitness_env.payload).expect("fitness payload decodes");
+    assert_eq!(fitness.creature, beast.0);
+    assert!(fitness.ok, "the Warn accompanied useful work");
+
+    // (c) The Warn is published only after the reply and fitness fact. Its relay may now unload.
+    let budget_env = probe_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("budget signal arrived after completed-handle outputs");
+    assert_eq!(budget_env.header.schema, "budget_signal");
+    let budget: BudgetSignalEvent =
+        serde_json::from_slice(&budget_env.payload).expect("budget signal payload decodes");
+    assert_eq!(budget.creature, beast.0);
+    assert_eq!(budget.level, "warn");
+    assert_eq!(budget.vector.dispatches_this_envelope, 1);
+
+    // (d) Beast is unloaded shortly after (the Warn → relay → Unload chain settled).
     let unloaded = wait_until(Duration::from_secs(5), || !k.is_loaded(beast));
     assert!(
         unloaded,
