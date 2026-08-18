@@ -727,6 +727,17 @@ pub mod function {
         Ok(Dispatch::reply_to_env(request, payload).with_schema(SCHEMA_CALL_V1))
     }
 
+    /// Build a successful, correlation-preserving typed Function reply from one serializable
+    /// inline value. The caller supplies the exact [`AttemptId`] decoded from the authenticated
+    /// call; this helper never reconstructs or substitutes it.
+    pub fn success<T: Serialize>(
+        request: &Envelope,
+        attempt: AttemptId,
+        value: &T,
+    ) -> Result<Dispatch, FunctionWireError> {
+        reply(request, FunctionResultV1 { attempt, outcome: Ok(inline(value)?) })
+    }
+
     /// Report cooperative progress to the executor that issued `request`. The executor, not the
     /// target, signs the durable Job receipt after authenticating the deployment sender.
     pub fn progress(
@@ -1335,6 +1346,57 @@ mod tests {
         let message: gawdfn::FunctionCallMessageV1 =
             serde_json::from_slice(&progress.payload).unwrap();
         assert!(matches!(message, gawdfn::FunctionCallMessageV1::Progress { sequence: 1, .. }));
+    }
+
+    #[test]
+    fn function_success_preserves_attempt_corr_and_inline_value() {
+        use std::collections::BTreeMap;
+
+        use aether::{Envelope, Header};
+        use gawdfn::{AttemptId, FunctionCallMessageV1, HomeId, JobId, SCHEMA_CALL_V1};
+
+        let attempt = AttemptId {
+            home: HomeId::new("home-forge-success"),
+            job: JobId::new("job-forge-success"),
+            number: 2,
+        };
+        let request = Envelope {
+            header: Header {
+                from: Address::Creature(CreatureId(10)),
+                to: Address::Creature(CreatureId(20)),
+                reply_to: Some(Address::Creature(CreatureId(30))),
+                seq: 1,
+                causal: vec![],
+                stamp: 1,
+                sig: "test".into(),
+                corr: Some(77),
+                commitment: None,
+                schema: SCHEMA_CALL_V1.into(),
+                origin: None,
+            },
+            payload: vec![],
+        };
+        let output = BTreeMap::from([("doubled".to_string(), -14_i64)]);
+
+        let dispatch = crate::function::success(&request, attempt.clone(), &output).unwrap();
+        assert_eq!(dispatch.to, Address::Creature(CreatureId(30)));
+        assert_eq!(dispatch.corr, Some(77));
+        assert_eq!(dispatch.schema, SCHEMA_CALL_V1);
+
+        let message: FunctionCallMessageV1 = serde_json::from_slice(&dispatch.payload).unwrap();
+        let FunctionCallMessageV1::Result { result } = message else {
+            panic!("success helper must emit a Function result");
+        };
+        assert_eq!(result.attempt, attempt, "the authenticated AttemptId is echoed exactly");
+        let value = result.outcome.expect("success carries an Ok value");
+        assert_eq!(crate::function::from_inline::<BTreeMap<String, i64>>(&value).unwrap(), output);
+
+        let mut invalid_attempt = attempt;
+        invalid_attempt.number = 0;
+        assert!(matches!(
+            crate::function::success(&request, invalid_attempt, &output),
+            Err(crate::function::FunctionWireError::Invalid(_))
+        ));
     }
 
     #[test]

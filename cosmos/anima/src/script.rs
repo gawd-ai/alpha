@@ -39,7 +39,7 @@ use aether::{
     Address, BudgetSignal, BudgetVector, Creature, CreatureCtx, CreatureId, Dispatch, Envelope,
     Intent, LimitKind, Outcome, Role, Topic,
 };
-use gawdfn::{FunctionCallMessageV1, Validate, MAX_JOB_MESSAGE_BYTES};
+use gawdfn::{FunctionCallMessageV1, FunctionId, Validate, MAX_JOB_MESSAGE_BYTES, SCHEMA_CALL_V1};
 use rhai::{Blob, Dynamic, Engine as RhaiEngine, EvalAltResult, Map as RhaiMap, Scope, AST};
 use serde_json::Value as JsonValue;
 use sigil::{Backend, Manifest};
@@ -144,6 +144,7 @@ impl Engine for ScriptEngine {
                 got: manifest.abi.abi_tag.clone(),
             });
         }
+        let function_bindings = ContractedFunctionBindings::from_manifest(manifest)?;
         let src = String::from_utf8(artifact.read_bytes()?)
             .map_err(|e| EngineError::Load(format!("critter source is not valid UTF-8: {e}")))?;
 
@@ -326,6 +327,7 @@ impl Engine for ScriptEngine {
             engine,
             ast,
             me: None,
+            function_bindings,
             live_ops_cap: budget.cell(),
             live_wall_ms_cap: budget.wall_cell(),
             wall_deadline,
@@ -348,6 +350,9 @@ struct ScriptInstance {
     engine: RhaiEngine,
     ast: AST,
     me: Option<CreatureId>,
+    /// Manifest-derived identities for contracted typed-Function entrypoints. Absent for ordinary
+    /// critters, whose payload-in/reply-out behavior remains unchanged.
+    function_bindings: Option<ContractedFunctionBindings>,
     /// The live per-handle operation ceiling, shared with the kernel via [`BudgetControl`]. Read
     /// fresh each `handle` so a granted `ExtendBudget` lifts the next call.
     live_ops_cap: Arc<AtomicU64>,
@@ -380,6 +385,21 @@ impl Creature for ScriptInstance {
     }
 
     fn handle(&mut self, env: Envelope) -> Outcome {
+        // A contracted typed-Function critter must not be allowed to interpret a validly shaped
+        // call for another immutable function. Bind identity at load from the manifest and
+        // enforce it before Rhai runs. The script's existing `function_call_verify` remains the
+        // grant/signature/route gate; keeping those checks there avoids verifying every signature
+        // twice while this host guard closes the manifest-identity gap independently of script
+        // control flow.
+        if let Some(bindings) = &self.function_bindings {
+            if let Err(error) = bindings.verify_identity(&env) {
+                eprintln!(
+                    "anima(critter): contracted Function refused envelope from {:?} (seq={}): {error}",
+                    env.header.from, env.header.seq
+                );
+                return Outcome::none();
+            }
+        }
         // Refill the operation budget to the *live* per-envelope ceiling BEFORE running:
         // this reads the shared atomic, so a granted `ExtendBudget` takes effect here; absent a grant
         // it equals the `cpu_ms`-derived cap seeded at load.
@@ -494,6 +514,81 @@ impl Creature for ScriptInstance {
                 }
             },
         }
+    }
+}
+
+/// Immutable Function identities derived from one loaded critter manifest.
+///
+/// Multiple contracted entrypoints remain legal: they share the manifest content address and are
+/// distinguished by entrypoint name. A critter with no contracted `gawd.function.call.v1`
+/// entrypoint does not get this guard, preserving the general script ABI exactly.
+struct ContractedFunctionBindings {
+    expected: Vec<FunctionId>,
+}
+
+impl ContractedFunctionBindings {
+    fn from_manifest(manifest: &Manifest) -> Result<Option<Self>, EngineError> {
+        let entrypoints = manifest
+            .entrypoints
+            .iter()
+            .filter(|entrypoint| {
+                entrypoint.signature == SCHEMA_CALL_V1 && entrypoint.contract.is_some()
+            })
+            .collect::<Vec<_>>();
+        if entrypoints.is_empty() {
+            return Ok(None);
+        }
+
+        let content_address = manifest.content_address.clone().ok_or_else(|| {
+            EngineError::Load(
+                "a contracted Function critter manifest must carry a content address".into(),
+            )
+        })?;
+        if content_address != manifest.compute_content_address() {
+            return Err(EngineError::Load(
+                "contracted Function critter manifest content address is stale".into(),
+            ));
+        }
+
+        let mut expected = Vec::with_capacity(entrypoints.len());
+        for entrypoint in entrypoints {
+            let function = FunctionId {
+                manifest_content_address: content_address.clone(),
+                entrypoint: entrypoint.name.clone(),
+            };
+            function.validate().map_err(|error| {
+                EngineError::Load(format!("contracted critter FunctionId: {error}"))
+            })?;
+            expected.push(function);
+        }
+        Ok(Some(Self { expected }))
+    }
+
+    fn verify_identity(&self, env: &Envelope) -> Result<(), String> {
+        if env.header.schema != SCHEMA_CALL_V1 {
+            return Err(format!(
+                "expected schema `{SCHEMA_CALL_V1}`, received `{}`",
+                env.header.schema
+            ));
+        }
+        if env.payload.len() > MAX_JOB_MESSAGE_BYTES {
+            return Err(format!(
+                "Function call is {} bytes, exceeds {MAX_JOB_MESSAGE_BYTES}",
+                env.payload.len()
+            ));
+        }
+        let message = serde_json::from_slice::<FunctionCallMessageV1>(&env.payload)
+            .map_err(|error| format!("invalid Function call JSON: {error}"))?;
+        let FunctionCallMessageV1::Call { call } = message else {
+            return Err("expected a Function call operation".into());
+        };
+        if self.expected.iter().any(|expected| expected == &call.function) {
+            return Ok(());
+        }
+        Err(format!(
+            "call targets {}#{}, which is not declared by the loaded manifest",
+            call.function.manifest_content_address, call.function.entrypoint
+        ))
     }
 }
 

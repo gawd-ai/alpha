@@ -308,6 +308,11 @@ impl BudgetControl {
 pub struct LoadedModule {
     pub instance: Box<dyn Creature>,
     resources: Box<dyn std::any::Any + Send>,
+    /// Whether unloading these resources can unmap code that an unmanaged creature thread may
+    /// still be executing. [`NativeEngine`] sets it after `dlopen`; custom engines retaining an
+    /// unloadable executable mapping must do the same. In-process instances and the wasm/script
+    /// tiers own no such mapping.
+    requires_unmanaged_thread_guard: bool,
     /// The live budget-ceiling control: `Some` for wasm (fuel/memory/wall) and critter
     /// (operation-budget fuel/wall) tiers, `None` for native (see [`BudgetControl`]). The kernel
     /// `take()`s this at install and keys it by `CreatureId` so a later `ExtendBudget` reaches the
@@ -317,9 +322,26 @@ pub struct LoadedModule {
 
 impl LoadedModule {
     /// Construct from an instance and the resources that must drop after it. No budget control by
-    /// default (native); the wasm and critter engines add one via [`LoadedModule::with_budget`].
+    /// default; the wasm and critter engines add one via [`LoadedModule::with_budget`]. Resources
+    /// are assumed not to own a dynamically loaded native library. [`NativeEngine`] marks that
+    /// exceptional case after `dlopen` succeeds.
     pub fn new(instance: Box<dyn Creature>, resources: Box<dyn std::any::Any + Send>) -> Self {
-        LoadedModule { instance, resources, budget: None }
+        LoadedModule { instance, resources, requires_unmanaged_thread_guard: false, budget: None }
+    }
+
+    /// Mark resources as owning a dynamically loaded native library whose final `dlclose` must be
+    /// withheld if the creature leaves an unmanaged thread alive. Custom [`Engine`]
+    /// implementations that retain any unloadable executable mapping **must** opt in before
+    /// returning their module; in-process, WASM, and script resources should leave the default off.
+    pub fn with_unmanaged_thread_guard(mut self) -> Self {
+        self.requires_unmanaged_thread_guard = true;
+        self
+    }
+
+    /// Report whether the kernel must run the unmanaged-thread guard before dropping tier
+    /// resources. This is lifecycle metadata, not a creature wire or policy decision.
+    pub fn requires_unmanaged_thread_guard(&self) -> bool {
+        self.requires_unmanaged_thread_guard
     }
 
     /// Attach a live budget-ceiling control (the wasm and critter engines).
@@ -353,7 +375,8 @@ pub trait Engine: Send + Sync {
     /// library is still mapped), then drop tier resources (native: `dlclose` **last**). Bindings
     /// drop in *reverse* declaration order, so the explicit drops here — not field order — set it.
     fn unload(&self, loaded: LoadedModule, deadline: Deadline) -> Result<(), EngineError> {
-        let LoadedModule { mut instance, resources, budget } = loaded;
+        let LoadedModule { mut instance, resources, requires_unmanaged_thread_guard: _, budget } =
+            loaded;
         instance.shutdown(deadline);
         drop(instance); // tier teardown (native: `destroy` via the still-loaded library)
         drop(resources); // tier resources (native: `dlclose`)
@@ -479,6 +502,10 @@ mod tests {
     fn script_engine_loads_runs_and_echoes() {
         let (e, m, art) = critter("fn handle(env) { env.payload }", 0);
         let mut loaded = e.load(&art, &m).expect("critter loads");
+        assert!(
+            !loaded.requires_unmanaged_thread_guard(),
+            "Rhai resources cannot unmap a native creature library"
+        );
         let out = loaded.instance.handle(test_envelope(b"hello critter"));
         assert_eq!(out.dispatches.len(), 1, "echo replies once");
         assert_eq!(out.dispatches[0].payload, b"hello critter", "return value → reply payload");
@@ -850,17 +877,385 @@ mod tests {
         }
     }
 
+    fn typed_beast_manifest() -> (Manifest, gawdfn::FunctionId) {
+        let mut manifest =
+            Manifest::new("typed-beast", "0.1.0", Backend::Beast, "gawd_creature_v1");
+        let mut entrypoint = sigil::Entrypoint::new("double_signed", gawdfn::SCHEMA_CALL_V1);
+        entrypoint.contract = Some(gawdfn::EntrypointContractV1 {
+            description: "Test the typed beast adapter.".into(),
+            input_schema: gawdfn::SchemaRefV1::Inline {
+                schema: serde_json::json!({"type": "object"}),
+            },
+            output_schema: gawdfn::SchemaRefV1::Inline {
+                schema: serde_json::json!({"type": "object"}),
+            },
+            error_schema: None,
+            effect: gawdfn::EffectClassV1::Idempotent,
+            controls: Default::default(),
+        });
+        manifest.entrypoints = vec![entrypoint];
+        let content_address = manifest.compute_content_address();
+        manifest.content_address = Some(content_address.clone());
+        let function = gawdfn::FunctionId {
+            manifest_content_address: content_address,
+            entrypoint: "double_signed".into(),
+        };
+        (manifest, function)
+    }
+
+    fn typed_critter_manifest() -> (Manifest, gawdfn::FunctionId) {
+        let mut manifest =
+            Manifest::new("typed-critter", "0.1.0", Backend::Critter, CRITTER_ABI_TAG);
+        let mut entrypoint = sigil::Entrypoint::new("double_signed", gawdfn::SCHEMA_CALL_V1);
+        entrypoint.contract = Some(gawdfn::EntrypointContractV1 {
+            description: "Test the typed critter identity binding.".into(),
+            input_schema: gawdfn::SchemaRefV1::Inline {
+                schema: serde_json::json!({"type": "object"}),
+            },
+            output_schema: gawdfn::SchemaRefV1::Inline {
+                schema: serde_json::json!({"type": "object"}),
+            },
+            error_schema: None,
+            effect: gawdfn::EffectClassV1::Idempotent,
+            controls: Default::default(),
+        });
+        manifest.entrypoints = vec![entrypoint];
+        let content_address = manifest.compute_content_address();
+        manifest.content_address = Some(content_address.clone());
+        let function = gawdfn::FunctionId {
+            manifest_content_address: content_address,
+            entrypoint: "double_signed".into(),
+        };
+        (manifest, function)
+    }
+
+    fn typed_call_envelope(
+        function: gawdfn::FunctionId,
+        input: gawdfn::ValueRefV1,
+        from: aether::CreatureId,
+        to: aether::CreatureId,
+        attempt_number: u8,
+    ) -> (aether::Envelope, gawdfn::AttemptId) {
+        use aether::{Address, Header};
+        use gawdfn::{
+            canonical_hash, AbodeKeyBindingV1, AttemptId, AuthoritySigner, DeliveryModeV1,
+            DeploymentId, DeploymentReceiptV1, Ed25519SeedSigner, ExecutionGrantV1,
+            ExecutorDispatchV1, FunctionCallMessageV1, FunctionCallV1, HomeAuthorityV1, HomeId,
+            JobId, OperationalCapabilityV1, OperationalKeyGrantV1, SignedRecordV1, SCHEMA_CALL_V1,
+            SCHEMA_EXECUTE_V1, SCHEMA_FUNCTION_DEPLOY_V1, SCHEMA_HOME_V1,
+        };
+
+        let root = Ed25519SeedSigner::from_seed([41; 32]).expect("root signer");
+        let operational = Ed25519SeedSigner::from_seed([42; 32]).expect("operational signer");
+        let executor = Ed25519SeedSigner::from_seed([43; 32]).expect("executor signer");
+        let home = HomeId::new(root.public_key());
+        let authority = HomeAuthorityV1 {
+            abode: SignedRecordV1::sign(
+                SCHEMA_HOME_V1,
+                AbodeKeyBindingV1 {
+                    abode: home.clone(),
+                    root_public_key: root.public_key().into(),
+                    issued_at_unix_ms: None,
+                },
+                &root,
+            )
+            .expect("root self-binding"),
+            operational: SignedRecordV1::sign(
+                SCHEMA_HOME_V1,
+                OperationalKeyGrantV1 {
+                    home: home.clone(),
+                    epoch: 1,
+                    operational_public_key: operational.public_key().into(),
+                    valid_from_unix_ms: None,
+                    expires_at_unix_ms: None,
+                    capabilities: vec![OperationalCapabilityV1::JobHome],
+                    evidence: vec![],
+                },
+                &root,
+            )
+            .expect("root grants operational key"),
+            prepared: None,
+        };
+        let attempt = AttemptId {
+            home: home.clone(),
+            job: JobId::new(format!("typed-beast-{attempt_number}")),
+            number: attempt_number,
+        };
+        let deployment = SignedRecordV1::sign(
+            SCHEMA_FUNCTION_DEPLOY_V1,
+            DeploymentReceiptV1 {
+                deployment: DeploymentId::new(format!("typed-beast-{attempt_number}")),
+                function: function.clone(),
+                artifact_hash: format!("sha256:{}", "b".repeat(64)),
+                realm: "test-realm".into(),
+                node: "test-node".into(),
+                executor: executor.public_key().into(),
+                executor_creature: from.0.to_string(),
+                creature: to.0.to_string(),
+                evidence: vec![],
+                registered_at_unix_ms: None,
+            },
+            &executor,
+        )
+        .expect("deployment receipt");
+        let grant = SignedRecordV1::sign(
+            SCHEMA_EXECUTE_V1,
+            ExecutionGrantV1 {
+                attempt: attempt.clone(),
+                request_hash: format!("sha256:{}", "c".repeat(64)),
+                home_epoch: 1,
+                home_route_sequence: 1,
+                home_realm: "test-realm".into(),
+                home_node: "home-node".into(),
+                home_coordinator: "30".into(),
+                owner: home,
+                authority,
+                function: function.clone(),
+                deployment,
+                input: input.clone(),
+                delivery: DeliveryModeV1::AtMostOnce,
+                grant_sequence: 1,
+                issued_at_unix_ms: None,
+                deadline_unix_ms: None,
+            },
+            &operational,
+        )
+        .expect("execution grant");
+        let executor_dispatch = SignedRecordV1::sign(
+            SCHEMA_CALL_V1,
+            ExecutorDispatchV1 {
+                attempt: attempt.clone(),
+                grant_hash: canonical_hash(&grant).expect("grant hash"),
+                deployment: grant.payload.deployment.payload.deployment.clone(),
+                executor_creature: from.0.to_string(),
+                target_creature: to.0.to_string(),
+            },
+            &executor,
+        )
+        .expect("executor dispatch");
+        let message = FunctionCallMessageV1::Call {
+            call: Box::new(FunctionCallV1 {
+                attempt: attempt.clone(),
+                function,
+                input,
+                grant: Box::new(grant),
+                executor_dispatch,
+            }),
+        };
+        let env = aether::Envelope {
+            header: Header {
+                from: Address::Creature(from),
+                to: Address::Creature(to),
+                reply_to: Some(Address::Creature(from)),
+                seq: 1,
+                causal: vec![],
+                stamp: 1,
+                sig: "test".into(),
+                corr: Some(77),
+                commitment: None,
+                schema: SCHEMA_CALL_V1.into(),
+                origin: None,
+            },
+            payload: serde_json::to_vec(&message).expect("serialize call"),
+        };
+        (env, attempt)
+    }
+
+    const TYPED_CRITTER_SENTINEL: &str = r#"
+        fn handle(env) {
+            if function_call_verify(env.text, env.from, env.to) {
+                "rhai-body-ran"
+            } else {
+                ()
+            }
+        }
+    "#;
+
+    #[test]
+    fn typed_critter_runs_for_its_manifest_derived_function_id() {
+        use aether::CreatureId;
+        use gawdfn::ValueRefV1;
+
+        let (manifest, function) = typed_critter_manifest();
+        let mut loaded = ScriptEngine
+            .load(&Artifact::Bytes(TYPED_CRITTER_SENTINEL.as_bytes().to_vec()), &manifest)
+            .expect("typed critter loads");
+        let (env, _) = typed_call_envelope(
+            function,
+            ValueRefV1::Inline { value: serde_json::json!({"value": 21}) },
+            CreatureId(10),
+            CreatureId(20),
+            10,
+        );
+
+        let out = loaded.instance.handle(env);
+        assert_eq!(out.dispatches.len(), 1, "the bound signed call reaches Rhai");
+        assert_eq!(out.dispatches[0].payload, b"rhai-body-ran");
+        ScriptEngine.unload(loaded, Deadline::default()).expect("typed critter unloads");
+    }
+
+    #[test]
+    fn typed_critter_refuses_another_function_id_before_rhai_runs() {
+        use aether::CreatureId;
+        use gawdfn::{FunctionId, ValueRefV1};
+
+        let (manifest, _) = typed_critter_manifest();
+        let mut loaded = ScriptEngine
+            .load(&Artifact::Bytes(TYPED_CRITTER_SENTINEL.as_bytes().to_vec()), &manifest)
+            .expect("typed critter loads");
+        let other_function = FunctionId {
+            manifest_content_address: format!("sha256:{}", "d".repeat(64)),
+            entrypoint: "double_signed".into(),
+        };
+        let (env, _) = typed_call_envelope(
+            other_function,
+            ValueRefV1::Inline { value: serde_json::json!({"value": 21}) },
+            CreatureId(10),
+            CreatureId(20),
+            11,
+        );
+
+        let out = loaded.instance.handle(env);
+        assert!(
+            out.dispatches.is_empty(),
+            "an internally valid call for another FunctionId must not enter the Rhai body"
+        );
+        ScriptEngine.unload(loaded, Deadline::default()).expect("typed critter unloads");
+    }
+
     #[test]
     fn wasm_engine_loads_runs_and_unloads_a_real_module() {
         let wasm = wat::parse_str(IDENTITY_WAT).expect("valid wat");
         let e = WasmEngine::new();
         let m = manifest(Backend::Beast, "gawd_creature_v1");
         let mut loaded = e.load(&Artifact::Bytes(wasm), &m).expect("beast loads");
+        assert!(
+            !loaded.requires_unmanaged_thread_guard(),
+            "WASM resources cannot unmap a native creature library"
+        );
         let out = loaded.instance.handle(test_envelope(b"hello wasm"));
         assert_eq!(out.dispatches.len(), 1);
         // identity round-trip through real linear memory proves alloc + write + call + read.
         assert_eq!(out.dispatches[0].payload, b"hello wasm");
         e.unload(loaded, Deadline::default()).expect("beast unloads");
+    }
+
+    #[test]
+    fn typed_wasm_adapter_verifies_route_and_identity_then_wraps_the_exact_attempt() {
+        use aether::CreatureId;
+        use gawdfn::{FunctionCallMessageV1, ValueRefV1};
+
+        let wasm = wat::parse_str(IDENTITY_WAT).expect("valid wat");
+        let e = WasmEngine::new();
+        let (manifest, function) = typed_beast_manifest();
+        let mut loaded = e.load(&Artifact::Bytes(wasm), &manifest).expect("typed beast loads");
+        let executor = CreatureId(10);
+        let target = CreatureId(20);
+        let (env, attempt) = typed_call_envelope(
+            function,
+            ValueRefV1::Inline { value: serde_json::json!({"value": 21}) },
+            executor,
+            target,
+            1,
+        );
+
+        let out = loaded.instance.handle(env);
+        assert_eq!(out.dispatches.len(), 1, "verified call reaches the beast");
+        assert_eq!(out.dispatches[0].schema, gawdfn::SCHEMA_CALL_V1);
+        assert_eq!(out.dispatches[0].corr, Some(77));
+        let message: FunctionCallMessageV1 =
+            serde_json::from_slice(&out.dispatches[0].payload).expect("typed result JSON");
+        let FunctionCallMessageV1::Result { result } = message else {
+            panic!("typed beast must return a Function result")
+        };
+        assert_eq!(result.attempt, attempt, "host copies the exact verified AttemptId");
+        assert_eq!(
+            result.outcome,
+            Ok(ValueRefV1::Inline { value: serde_json::json!({"value": 21}) }),
+            "identity WAT proves only canonical inline application JSON reached the guest"
+        );
+        e.unload(loaded, Deadline::default()).expect("typed beast unloads");
+    }
+
+    #[test]
+    fn typed_wasm_adapter_refuses_wrong_route_wrong_function_and_non_inline_input() {
+        use aether::CreatureId;
+        use gawdfn::{BlobRefV1, FunctionId, ValueRefV1};
+
+        let wasm = wat::parse_str(IDENTITY_WAT).expect("valid wat");
+        let e = WasmEngine::new();
+        let (manifest, function) = typed_beast_manifest();
+        let mut loaded = e.load(&Artifact::Bytes(wasm), &manifest).expect("typed beast loads");
+        let executor = CreatureId(10);
+        let target = CreatureId(20);
+
+        let (mut wrong_route, _) = typed_call_envelope(
+            function.clone(),
+            ValueRefV1::Inline { value: serde_json::json!({"value": 21}) },
+            executor,
+            target,
+            1,
+        );
+        wrong_route.header.from = aether::Address::Creature(CreatureId(11));
+        assert!(
+            loaded.instance.handle(wrong_route).dispatches.is_empty(),
+            "a valid proof on the wrong fabric route is refused before guest execution"
+        );
+
+        let wrong_function = FunctionId {
+            manifest_content_address: format!("sha256:{}", "d".repeat(64)),
+            entrypoint: "double_signed".into(),
+        };
+        let (wrong_identity, _) = typed_call_envelope(
+            wrong_function,
+            ValueRefV1::Inline { value: serde_json::json!({"value": 21}) },
+            executor,
+            target,
+            2,
+        );
+        assert!(
+            loaded.instance.handle(wrong_identity).dispatches.is_empty(),
+            "an internally valid call for another immutable FunctionId is refused"
+        );
+
+        let (blob_input, _) = typed_call_envelope(
+            function,
+            ValueRefV1::Blob {
+                blob: BlobRefV1 {
+                    digest: format!("sha256:{}", "e".repeat(64)),
+                    size: 1,
+                    media_type: "application/json".into(),
+                },
+            },
+            executor,
+            target,
+            3,
+        );
+        assert!(
+            loaded.instance.handle(blob_input).dispatches.is_empty(),
+            "the payload-only guest adapter never resolves an external blob implicitly"
+        );
+        e.unload(loaded, Deadline::default()).expect("typed beast unloads");
+    }
+
+    #[test]
+    fn typed_wasm_manifest_requires_one_exact_function_entrypoint_and_content_address() {
+        let e = WasmEngine::new();
+        let mut missing_address =
+            Manifest::new("typed-beast", "0.1.0", Backend::Beast, "gawd_creature_v1");
+        missing_address.entrypoints = typed_beast_manifest().0.entrypoints;
+        assert!(matches!(
+            e.load(&Artifact::Bytes(Vec::new()), &missing_address),
+            Err(EngineError::Load(message)) if message.contains("content address")
+        ));
+
+        let mut mixed = missing_address;
+        mixed.entrypoints.push(sigil::Entrypoint::new("raw", "bytes"));
+        mixed.content_address = Some(mixed.compute_content_address());
+        assert!(matches!(
+            e.load(&Artifact::Bytes(Vec::new()), &mixed),
+            Err(EngineError::Load(message)) if message.contains("exactly one")
+        ));
     }
 
     #[test]

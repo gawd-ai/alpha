@@ -24,7 +24,7 @@
     },
     {
       "name": "dialogue",
-      "summary": "Two reference agents hold a multi-turn conversation ACROSS a Realm boundary over ed25519 TCP (loopback): an initiator on one Realm speaks to a stateful responder on another through the Omega gateway.",
+      "summary": "Fixture-mode regression for v0.5's three-role cross-Realm composition: strict causal affine_i32 decisions, trusted host lowering into daemon/beast/critter, three signed/recovered FunctionIds, and six Jobs. Not product evidence; the required fresh retained OpenAI-enabled --live run and operator seal are documented in demos/README.md.",
       "package": "dialogue"
     },
     {

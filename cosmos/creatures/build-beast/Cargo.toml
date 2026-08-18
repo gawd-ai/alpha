@@ -1,0 +1,22 @@
+[package]
+name = "build-beast"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "No-Cargo BUILD creature for the beast tier: validates WAT, emits WASM, and signs a content-addressed Backend::Beast manifest."
+
+[dependencies]
+aether = { path = "../../aether" }
+sigil = { path = "../../sigil" }
+build-cargo = { path = "../build-cargo" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# WAT is the authored source format; compilation is in-process and never invokes Cargo or a
+# wasm32 target toolchain. wasmparser validates the emitted core module and keeps malformed/importing
+# guests from being signed only to fail later at the loader boundary.
+wat = "1"
+wasmparser = "0.251"

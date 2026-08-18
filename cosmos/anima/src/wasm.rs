@@ -1,8 +1,12 @@
 //! The beast (WASM) tier: real `wasmtime`. First-class alongside native (**R3**).
 //!
-//! The host marshals an envelope's **payload** into the guest's linear memory, calls the guest, and
-//! reads the result back — the guest sees only bytes in its own memory, never a host pointer, which
-//! is exactly why a beast is a safe citizen and the home of untrusted code. The minimal guest ABI:
+//! The host marshals bytes into the guest's linear memory, calls the guest, and reads the result
+//! back — the guest sees only bytes in its own memory, never a host pointer, which is exactly why a
+//! beast is a safe citizen and the home of untrusted code. An ordinary beast receives the envelope
+//! **payload** unchanged. A manifest declaring one contracted `gawd.function.call.v1` entrypoint
+//! activates the proof-bearing `FunctionAdapter`: the host authenticates the Function envelope
+//! and exposes only its canonical inline application JSON, then wraps guest JSON as the exact
+//! attempt's result. The minimal guest ABI remains:
 //! `memory` + `alloc(len) -> ptr` + `handle(ptr, len) -> i64` (packed `ptr<<32 | len`). The full
 //! envelope-into-wasm + host imports land later; this is enough to prove the tier end-to-end.
 //!
@@ -28,7 +32,12 @@
 //! `dispatches_this_envelope` stays zero because dispatch counting happens outside the engine.
 
 use aether::{
-    ffi::ABI_TAG, BudgetSignal, BudgetVector, Creature, CreatureCtx, Envelope, LimitKind, Outcome,
+    ffi::ABI_TAG, Address, BudgetSignal, BudgetVector, Creature, CreatureCtx, CreatureId, Envelope,
+    LimitKind, Outcome,
+};
+use gawdfn::{
+    FunctionCallMessageV1, FunctionId, FunctionResultV1, Validate, ValueRefV1,
+    MAX_JOB_MESSAGE_BYTES, SCHEMA_CALL_V1,
 };
 use sigil::{Backend, Manifest};
 use wasmtime::{
@@ -205,6 +214,151 @@ struct StoreData {
     limits: BudgetLimits,
 }
 
+/// Host-side adapter for the existing typed-Function wire over the payload-only beast ABI.
+///
+/// A beast cannot authenticate a Function call by itself: the v1 guest sees only payload bytes,
+/// while the proof binds the fabric's `from`/`to` route. For a manifest whose sole entrypoint uses
+/// `gawd.function.call.v1`, the loader therefore performs the same bounded proof/route/identity
+/// verification as the native and critter adapters before exposing application input to the guest.
+/// The guest receives canonical inline JSON and returns application JSON; the host wraps that value
+/// in a `FunctionResultV1` carrying the exact verified `AttemptId`.
+///
+/// This is deliberately not a host import or a second guest ABI. Ordinary beasts retain the exact
+/// payload-in/payload-out behavior, and typed beasts still export only memory/alloc/handle.
+struct FunctionAdapter {
+    expected: FunctionId,
+}
+
+struct PreparedFunctionCall {
+    attempt: gawdfn::AttemptId,
+    input: Vec<u8>,
+}
+
+impl FunctionAdapter {
+    fn from_manifest(manifest: &Manifest) -> Result<Option<Self>, EngineError> {
+        let declares_function = manifest.entrypoints.iter().any(|entrypoint| {
+            entrypoint.signature == SCHEMA_CALL_V1 || entrypoint.contract.is_some()
+        });
+        if !declares_function {
+            return Ok(None);
+        }
+        if manifest.entrypoints.len() != 1
+            || manifest.entrypoints[0].signature != SCHEMA_CALL_V1
+            || manifest.entrypoints[0].contract.is_none()
+        {
+            return Err(EngineError::Load(
+                "a typed beast must declare exactly one gawd.function.call.v1 entrypoint with a machine-readable contract".into(),
+            ));
+        }
+        let entrypoint = &manifest.entrypoints[0];
+        let content_address = manifest.content_address.clone().ok_or_else(|| {
+            EngineError::Load("a typed beast manifest must carry a content address".into())
+        })?;
+        if content_address != manifest.compute_content_address() {
+            return Err(EngineError::Load("typed beast manifest content address is stale".into()));
+        }
+        let expected = FunctionId {
+            manifest_content_address: content_address,
+            entrypoint: entrypoint.name.clone(),
+        };
+        expected
+            .validate()
+            .map_err(|error| EngineError::Load(format!("typed beast FunctionId: {error}")))?;
+        Ok(Some(Self { expected }))
+    }
+
+    fn prepare(&self, env: &Envelope) -> Result<PreparedFunctionCall, EngineError> {
+        if env.header.schema != SCHEMA_CALL_V1 {
+            return Err(EngineError::Load(format!(
+                "typed beast expected schema `{SCHEMA_CALL_V1}`, received `{}`",
+                env.header.schema
+            )));
+        }
+        if env.payload.len() > MAX_JOB_MESSAGE_BYTES {
+            return Err(EngineError::Load(format!(
+                "typed beast call is {} bytes, exceeds {MAX_JOB_MESSAGE_BYTES}",
+                env.payload.len()
+            )));
+        }
+        let message: FunctionCallMessageV1 = serde_json::from_slice(&env.payload)
+            .map_err(|error| EngineError::Load(format!("typed beast call JSON: {error}")))?;
+        let FunctionCallMessageV1::Call { call } = message else {
+            return Err(EngineError::Load("typed beast expected a call operation".into()));
+        };
+        call.validate()
+            .map_err(|error| EngineError::Load(format!("typed beast call proof: {error}")))?;
+        if call.function != self.expected {
+            return Err(EngineError::Load(format!(
+                "typed beast call targets {}#{}, expected {}#{}",
+                call.function.manifest_content_address,
+                call.function.entrypoint,
+                self.expected.manifest_content_address,
+                self.expected.entrypoint
+            )));
+        }
+        require_creature_route(
+            &env.header.from,
+            &call.executor_dispatch.payload.executor_creature,
+            "executor",
+        )?;
+        require_creature_route(
+            &env.header.to,
+            &call.executor_dispatch.payload.target_creature,
+            "target",
+        )?;
+        let ValueRefV1::Inline { value } = &call.input else {
+            return Err(EngineError::Load("typed beast requires inline application input".into()));
+        };
+        let input = serde_json::to_vec(value)
+            .map_err(|error| EngineError::Load(format!("typed beast input JSON: {error}")))?;
+        Ok(PreparedFunctionCall { attempt: call.attempt.clone(), input })
+    }
+
+    fn wrap_result(
+        &self,
+        attempt: gawdfn::AttemptId,
+        output: &[u8],
+    ) -> Result<Vec<u8>, EngineError> {
+        if output.len() > MAX_JOB_MESSAGE_BYTES {
+            return Err(EngineError::Load(format!(
+                "typed beast result is {} bytes, exceeds {MAX_JOB_MESSAGE_BYTES}",
+                output.len()
+            )));
+        }
+        let value: serde_json::Value = serde_json::from_slice(output)
+            .map_err(|error| EngineError::Load(format!("typed beast result JSON: {error}")))?;
+        let message = FunctionCallMessageV1::Result {
+            result: FunctionResultV1 { attempt, outcome: Ok(ValueRefV1::Inline { value }) },
+        };
+        message
+            .validate()
+            .map_err(|error| EngineError::Load(format!("typed beast result: {error}")))?;
+        serde_json::to_vec(&message)
+            .map_err(|error| EngineError::Load(format!("typed beast result JSON: {error}")))
+    }
+}
+
+fn require_creature_route(
+    actual: &Address,
+    declared: &str,
+    label: &'static str,
+) -> Result<(), EngineError> {
+    let parsed = declared.parse::<u64>().map_err(|_| {
+        EngineError::Load(format!("typed beast {label} route is not a numeric CreatureId"))
+    })?;
+    if parsed == 0 || parsed.to_string() != declared {
+        return Err(EngineError::Load(format!(
+            "typed beast {label} route is not one canonical positive CreatureId"
+        )));
+    }
+    if actual != &Address::Creature(CreatureId(parsed)) {
+        return Err(EngineError::Load(format!(
+            "typed beast call did not use its grant-pinned {label} route"
+        )));
+    }
+    Ok(())
+}
+
 /// The `ResourceLimiter`. `mem_bytes == 0` means "unlimited" (the default); otherwise refuse
 /// any grow past the cap by returning [`BudgetMemoryRefused`] as an `Err`, which wasmtime
 /// surfaces as a trap. We deliberately do NOT use wasmtime's bundled `StoreLimits`: that one
@@ -278,6 +432,7 @@ impl Engine for WasmEngine {
                     .to_string(),
             ));
         }
+        let function_adapter = FunctionAdapter::from_manifest(manifest)?;
         let bytes = artifact.read_bytes()?;
         let module = Module::new(&self.engine, &bytes)
             .map_err(|e| EngineError::Load(format!("wasm compile: {e}")))?;
@@ -343,6 +498,7 @@ impl Engine for WasmEngine {
             // from the shared cell, so an `ExtendBudget` wall lift takes effect on the next handle.
             live_wall_ms_cap: budget.wall_cell(),
             epoch_tick_ms: self.epoch_tick_ms,
+            function_adapter,
         };
         Ok(LoadedModule::new(Box::new(inst), Box::new(())).with_budget(budget))
     }
@@ -434,6 +590,8 @@ struct WasmInstance {
     live_wall_ms_cap: Arc<AtomicU64>,
     /// The engine-global ticker cadence (ms), cached to convert `wall_ms` to a number of epoch ticks.
     epoch_tick_ms: u64,
+    /// Present only for the exact typed-Function beast posture. Raw beasts never enter this path.
+    function_adapter: Option<FunctionAdapter>,
 }
 
 impl Creature for WasmInstance {
@@ -443,6 +601,22 @@ impl Creature for WasmInstance {
     }
 
     fn handle(&mut self, env: Envelope) -> Outcome {
+        let prepared_function = match self.function_adapter.as_ref() {
+            Some(adapter) => match adapter.prepare(&env) {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    eprintln!(
+                        "anima(wasm): typed beast refused envelope from {:?} (seq={}): {error}",
+                        env.header.from, env.header.seq
+                    );
+                    return Outcome::none();
+                }
+            },
+            None => None,
+        };
+        let input = prepared_function
+            .as_ref()
+            .map_or(env.payload.as_slice(), |prepared| prepared.input.as_slice());
         // Refill fuel to the *live* per-envelope ceiling BEFORE running. This reads the
         // shared atomic so a granted `ExtendBudget` takes effect here; absent a grant it equals the
         // declared `budget_to_fuel(cpu_ms, fuel_per_ms)` seeded at load. See `live_fuel_cap` doc.
@@ -466,10 +640,29 @@ impl Creature for WasmInstance {
         self.store.set_epoch_deadline(deadline_ticks);
         self.envelopes_handled = self.envelopes_handled.saturating_add(1);
         let started = std::time::Instant::now();
-        let result = self.run(&env.payload);
+        let result = self.run(input);
         let wall_ms_elapsed = started.elapsed().as_millis() as u64;
         match result {
             Ok(out) => {
+                let out = match (self.function_adapter.as_ref(), prepared_function) {
+                    (Some(adapter), Some(prepared)) => {
+                        match adapter.wrap_result(prepared.attempt, &out) {
+                            Ok(out) => out,
+                            Err(error) => {
+                                eprintln!(
+                                    "anima(wasm): typed beast returned an invalid result for envelope from {:?} (seq={}): {error}",
+                                    env.header.from, env.header.seq
+                                );
+                                return Outcome::none();
+                            }
+                        }
+                    }
+                    (None, None) => out,
+                    _ => {
+                        eprintln!("anima(wasm): typed adapter state drift; returning no reply");
+                        return Outcome::none();
+                    }
+                };
                 // **Engine-emitted Warn.** After a
                 // *successful* handle (no trap), if the operator opted in via `budget_warn_at`,
                 // check whether the consumed fraction crossed the declared threshold on any

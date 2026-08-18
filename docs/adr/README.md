@@ -13,6 +13,15 @@ The v0.4.4 function foundation continues at ADR-0046. Those decisions are **Impl
 suite-compositional acceptance evidence is indexed by
 [TRD-006](../trd/TRD-006-typed-functions-and-durable-jobs.md).
 
+ADR-0049 begins the v0.5 planning series. It remains **Accepted**, not Implemented, in the frozen
+v0.5.0 source candidate while the exact-commit proof stays external until tag. It binds v0.5.0 to a
+retained, operator-sealed three-role live collaboration → strict affine IR → trusted three-backend
+lowering proof, protected exact-SHA workflow, offline verifier, encrypted/disclosure-safe evidence
+packaging, and immutable external retention in
+[TRD-007](../trd/TRD-007-cross-mesh-model-collaboration.md) and supersedes ADR-0043's historical
+milestone labels without rewriting its inventory. A later post-tag documentation commit links the
+accepted external record and advances the status.
+
 ## Index
 
 | ADR | Title | Decision in one line | Drives | Status |
@@ -29,6 +38,7 @@ suite-compositional acceptance evidence is indexed by
 | [ADR-0046](ADR-0046-functions-are-typed-creature-entrypoints.md) | Functions are typed creature entrypoints | Add an optional structured entrypoint contract and dispatch over existing `handle`; no fourth tier/ABI | TRD-006 | Implemented |
 | [ADR-0047](ADR-0047-jobs-have-home-and-execution-ledgers.md) | Jobs have home and execution ledgers | Abode home owns intent/control; Realm executor owns durable claim/facts; delivery mode is explicit | TRD-006 | Implemented |
 | [ADR-0048](ADR-0048-home-authority-moves-by-fenced-handoff.md) | Home authority moves by fenced handoff | Freeze+fsync source before destination activation; separate root, epoch, and data keys | TRD-006 | Implemented |
+| [ADR-0049](ADR-0049-stage-v0.5-composition-and-mesh-autonomy.md) | Stage v0.5 composition before mesh autonomy | Require an exact-commit sealed three-role live run; validate and trusted-lower one strict affine IR into all tiers; stage mesh autonomy after v0.5.0 | TRD-007 | Accepted |
 
 ## Status lifecycle
 

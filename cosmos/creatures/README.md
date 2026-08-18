@@ -18,8 +18,9 @@ These are distinct organs (not a family of interchangeable models), so the direc
 |---|---|---|
 | `agent-templated` | AUTHORING | deterministic template-matching authoring creature — the seam an LLM-backed agent plugs into |
 | `agent-curious` | AUTHORING | consultative authoring: asks an `AuthoringQuery` when no template matches, resumes on the answer |
-| `agent-mind` | AUTHORING | opt-in model-backed authoring filling over the injected `mind::Model` seam |
-| `build-cargo` | BUILD | `cargo` compiler with an operator-injected containment seam (`Sandbox::None` by default) — source → signed, content-addressed `(manifest, artifact)` |
+| `agent-mind` | AUTHORING | opt-in model-backed authoring filling over the injected `mind::Model` seam; v0.5 approved mode accepts only a strict digest-bound affine data record and trusted-lowers it to Rust, no-import WAT, and Rhai |
+| `build-cargo` | BUILD | bounded native `cargo` compiler with an operator-injected containment seam (`Sandbox::None` by default) — source → signed, content-addressed `(manifest, artifact)` |
+| `build-beast` | BUILD | no-Cargo beast sibling: exact WAT → validated import-free core WASM + signed `Backend::Beast` manifest |
 | `build-critter` | BUILD | the no-cargo sibling: validates Rhai source and signs a `Backend::Critter` manifest |
 | `transport-tcp` | TRANSPORT | authenticated TCP peer link (mutual ed25519) + dynamic gossip clustering |
 | `registry-mem` | REGISTRY | in-memory content-addressed Bestiary seed (`publish` / `fetch`) |

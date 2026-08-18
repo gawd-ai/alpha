@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Patch hygiene compares the checked-out commit (or PR merge commit) with its base.
           fetch-depth: 2
@@ -77,7 +77,7 @@ jobs:
       # overflowing the hosted runner's ~14 GB disk. The registry/git caches give the real speedup
       # (no re-download / re-index); `target/` rebuilds from them fast enough.
       - name: Cache cargo registry + git
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -155,26 +155,47 @@ jobs:
       - name: Demo — federation (the multi-Realm fabric runs end to end)
         run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p federation
 
-      # These two hermetic applications are separate public demos, not aliases for the workspace
+      # These two bounded applications are separate public demos, not aliases for the workspace
       # tests. Execute their real binaries so registry/docs drift cannot leave a compiling but
       # unusable example behind.
       - name: Demo — distribute (bounded GX fetch-load runs end to end)
         run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p distribute
 
-      - name: Demo — dialogue (cross-Realm conversation runs end to end)
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p dialogue
+      # The workspace build above already produced the binary, so run it directly and avoid a second
+      # outer Cargo frontend/target mutation. The all-tier proof intentionally performs exactly one
+      # nested BuildCargo compile in target/gawd-build-cache; BuildCargo serializes the finite cache
+      # and pins one build job, one codegen unit, no incremental compilation, and its own timeout.
+      # CPU affinity and low priority are inherited by that child compiler.
+      # BuildBeast/BuildCritter invoke no Cargo, and the six Job executions reuse those three outputs.
+      # This is the strict scripted fixture: a credential-free regression of causal validation,
+      # trusted affine lowering, all three builders, durable proofs, and six Jobs. It deliberately
+      # produces no product-acceptance claim. v0.5 acceptance additionally requires a fresh live run
+      # on the exact clean commit with retained provider receipts and an operator-signed evidence seal.
+      - name: Demo — dialogue fixture (all-tier regression; not live product evidence)
+        timeout-minutes: 10
+        run: |
+          taskset --cpu-list "$ALPHA_CI_CPU" \
+            nice -n 10 \
+            timeout --signal=TERM --kill-after=30s 540s \
+            target/debug/dialogue --fixture
 
-      # The opt-in real-model author (`agent-mind`) and `bestiary-live` model path live behind
-      # `--features openai`, which links `ureq` + a ring-backed rustls TLS stack the default build
-      # never touches. Gate those cfg branches so the composition roots and creatures cannot rot.
+      # The opt-in real-model author (`agent-mind`), `bestiary-live`, and three-role `dialogue` model
+      # paths live behind `--features openai`, which links `ureq` + a ring-backed rustls TLS stack
+      # the default build never touches. Gate those cfg branches so the composition roots and
+      # creatures cannot rot.
       # No live model call is made in CI (no network, no key): this compiles and clippies the feature
-      # branches, runs model-independent unit tests, and entry-smokes the public no-credential demo.
+      # branches and runs model-independent unit tests. Passing this step cannot substitute for the
+      # exact-commit retained live acceptance ceremony documented in RELEASE.md and TRD-007.
       - name: Clippy + test (the opt-in `openai` features)
         run: |
           taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
           taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p alpha --features openai -- -D warnings
           taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p bestiary-live --all-targets --features openai -- -D warnings
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p dialogue --all-targets --features openai -- -D warnings
           taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked -p agent-mind --features openai -- --test-threads=1
+          # Credential-free/no-network tests exercise dialogue's live-role configuration,
+          # endpoint/key-file validation, and fail-closed preflight without making provider calls.
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked -p dialogue --features openai -- --test-threads=1
           # Exercise the public opt-in demo binary without credentials. Its no-model path must stay
           # bounded, make no network call, explain the opt-in, and exit successfully.
           taskset --cpu-list "$ALPHA_CI_CPU" env -u ALPHA_LLM_MODEL -u ALPHA_LLM_API_KEY \
@@ -190,8 +211,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           arguments: --all-features
           command: check

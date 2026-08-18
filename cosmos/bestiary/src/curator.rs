@@ -461,7 +461,12 @@ mod tests {
     struct VerbModel(&'static str);
     impl Model for VerbModel {
         fn complete(&self, _req: Prompt) -> Result<mind::Completion, mind::ModelError> {
-            Ok(mind::Completion { content: self.0.to_string(), model: "verb".into(), usage: None })
+            Ok(mind::Completion {
+                content: self.0.to_string(),
+                model: "verb".into(),
+                usage: None,
+                provider: None,
+            })
         }
         fn describe(&self) -> String {
             "verb-model".into()
@@ -481,7 +486,7 @@ mod tests {
     impl Model for SequenceModel {
         fn complete(&self, _req: Prompt) -> Result<mind::Completion, mind::ModelError> {
             let content = self.completions.lock().unwrap().remove(0).to_string();
-            Ok(mind::Completion { content, model: "sequence".into(), usage: None })
+            Ok(mind::Completion { content, model: "sequence".into(), usage: None, provider: None })
         }
         fn describe(&self) -> String {
             "sequence-model".into()
@@ -500,6 +505,7 @@ mod tests {
                 content: self.completion.to_string(),
                 model: "counting".into(),
                 usage: None,
+                provider: None,
             })
         }
         fn describe(&self) -> String {

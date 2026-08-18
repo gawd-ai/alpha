@@ -45,6 +45,41 @@ state intact. The cross-Sanctum transport variant is integration-test-proven rat
 the narrated demo. (The authoring step shells out to a real `cargo build`, so a cold cache takes a
 minute; later runs are seconds.)
 
+Alpha v0.5.0 includes a credential-free regression mode:
+
+```sh
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo run --locked -p dialogue -- --fixture
+```
+
+It exercises the whole composition with strict scripted Models, but it is regression evidence only.
+Product acceptance requires a fresh `--live` run on the exact clean release commit: a Builder,
+Reviewer, and Contract Tester make four signer-verified causal decisions across two Realms, producing
+one novel bounded `affine_i32_v1` program. The same live Builder confirms a tiny source-free record for
+each tier; host validation and audited templates—not model-supplied source—lower it into Rust, no-import
+WAT, and Rhai. Three builders sign and durably publish the results, and six Jobs execute the three
+distinct backend `FunctionId`s locally and cross-Realm using the Contract Tester's chosen inputs.
+
+The live run must retain sanitized configurations, seven exact provider calls and provider-reported
+receipts, four signed turns, decisions, lowered sources, artifacts, Bestiary proofs, six complete
+signed Job event/grant/call/deployment/result bundles, and exact
+commit/binary/toolchain identity in a hash-indexed evidence directory. An operator-controlled key
+signs a seal outside that directory. The protected exact-SHA release workflow builds/copies the
+candidate before materializing secrets, invokes the copied binary's standalone `dialogue verify-live`
+path with independently pinned trust/freshness inputs, encrypts raw prompt-bearing evidence, creates a
+disclosure-safe pack, and requests provenance attestations for the binary and both packages. Its
+90-day Actions artifacts are staging and must be promoted to immutable supported-lifetime storage.
+Provider receipts and workflow attestations are traceability/provenance metadata, not cryptographic
+proof of model weights; the latter are not a reproducible-build proof. This is constrained typed
+synthesis and a bounded three-mind fan-out/fan-in, not arbitrary-code generation, general agency,
+broadcast/group chat, consensus, or a three-process deployment proof. See
+[the release gate](RELEASE.md#additional-v050-live-acceptance-gate),
+[the demo instructions](demos/README.md#notes), and
+[TRD-007](docs/trd/TRD-007-cross-mesh-model-collaboration.md). The exact v0.5.0 source candidate
+deliberately carries pending TRD/ADR status: the protected external gate must succeed before its tag,
+and a later post-tag documentation commit links the acceptance record and advances status. Its final
+version/changelog metadata is already present before constrained push CI and the retained live run;
+changing tracked metadata after proof would create an unproved commit.
+
 ### 2. Run a node, author a creature
 
 Boot a node and you land in its REPL. A fresh `alpha node` self-hosts its own organs — an authoring
@@ -353,7 +388,7 @@ repository layout, run/test commands, and the load-bearing invariants.
 |---|---|
 | [AGENTS.md](AGENTS.md) | AI-agent orientation: the fast map + invariants you must not break |
 | [Quickstarts](docs/quickstart/) | Run a node as the operator, and write your first creature on each tier (critter / daemon / beast) |
-| [Demos](demos/) | Narrated, runnable apps — local authoring/hand-off, federation, GX transfer, cross-Realm dialogue, opt-in live-model Bestiary, and a real cluster runbook |
+| [Demos](demos/) | Narrated, runnable apps — local authoring/hand-off, federation, GX transfer, cross-Realm model collaboration into a typed capability, opt-in live-model Bestiary, and a real cluster runbook |
 | [Concepts](docs/CONCEPTS.md) | Cosmology + glossary |
 | [Vision](docs/VISION.md) | The thesis and why now |
 | [Architecture](docs/ARCHITECTURE.md) | As-built engineering truth |

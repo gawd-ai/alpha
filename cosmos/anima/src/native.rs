@@ -114,7 +114,7 @@ impl Engine for NativeEngine {
         // The kernel leak path leaks this whole resources value, deliberately retaining both the
         // mapping and the pathname for a runaway native thread rather than risking UAF.
         let resources = NativeResources { lib, _stage: stage };
-        Ok(LoadedModule::new(Box::new(instance), Box::new(resources)))
+        Ok(LoadedModule::new(Box::new(instance), Box::new(resources)).with_unmanaged_thread_guard())
     }
 }
 

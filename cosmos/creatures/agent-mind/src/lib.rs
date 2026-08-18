@@ -1,9 +1,11 @@
 //! `agent-mind` — the real, model-backed `Role::AUTHORING` creature.
 //!
 //! Where `agent-templated` keyword-matches canned source and `agent-curious` consults over SEER,
-//! `agent-mind` asks a **real model** (an injected [`Model`]) to write the source + manifest stub. It
-//! binds the same `Role::AUTHORING` socket and speaks the same wire contract (`AuthoringRequest` in,
-//! [`AuthoringReply`] out on schema `"authoring.reply"`) — a creature swap, not a substrate change.
+//! `agent-mind` asks a **real model** (an injected [`Model`]) to author a response. General mode
+//! accepts source + a manifest stub; approved-profile mode accepts a small source-free program IR
+//! and lowers it through audited tier templates. Both bind the same `Role::AUTHORING` socket and
+//! speak the same wire contract (`AuthoringRequest` in, [`AuthoringReply`] out on schema
+//! `"authoring.reply"`) — a creature swap, not a substrate change.
 //! This is the literal "ASI is the fabric, not the model": the model is injected through the `mind`
 //! leaf-crate trait; the fabric ships only the socket.
 //!
@@ -31,8 +33,10 @@
 //! ## Shutdown is honest best-effort
 //!
 //! A worker already blocked inside a model call cannot be interrupted. [`shutdown`](AgentMind) sets
-//! `stop` (gating *new* work + suppressing a stopped worker's reply) and joins, **deadline-bounded
-//! by polling** so it returns inside the kernel's unload budget. Any straggler is detached: because
+//! `stop` (gating *new* work + normally suppressing a stopped worker's reply) and joins,
+//! **deadline-bounded by polling** so it returns inside the kernel's unload budget. The bus also
+//! linearizes local emission against deregistration, closing the stop-check/send race: a retained
+//! handle cannot enqueue after unload. Any straggler is detached: because
 //! `agent-mind` is in-process only, a detached worker returns into no unmapped code — it finishes its
 //! (now-stopped) call and exits cleanly. The residual is a bounded, in-process thread that lingers
 //! for the call's duration, never a use-after-free.
@@ -46,14 +50,29 @@ use aether::{Address, Bus, Creature, CreatureCtx, Deadline, Dispatch, Envelope, 
 use agent_templated::{decode_authoring_request, AuthoringError, AuthoringReply};
 use sha2::{Digest, Sha256};
 
+mod profile;
 mod prompt;
+
+pub use profile::{
+    AffineI32ProgramV1, AffineI32SpecV1, AffineI32TruthPointV1, ApprovedImplementationV1,
+    ApprovedProgramKindV1, ApprovedTier, ApprovedTypedProfile, ProfileError, SemanticTruthTableV1,
+    AFFINE_I32_TRUTH_TABLE_V1, APPROVED_IMPLEMENTATION_V1, APPROVED_TYPED_REQUEST_V1,
+    MAX_AFFINE_ADDEND, MAX_AFFINE_DOMAIN_VALUES, MAX_AFFINE_MULTIPLIER, MAX_APPROVED_PROFILE_BYTES,
+    MAX_PROFILE_DESCRIPTION_BYTES, MAX_PROFILE_ENTRYPOINT_BYTES, MAX_PROFILE_NAME_BYTES,
+    MAX_PROFILE_SLUG_BYTES, MIN_AFFINE_ADDEND, MIN_AFFINE_MULTIPLIER,
+};
+pub use prompt::{
+    DOUBLE_SIGNED_BEAST_REQUEST_V1, DOUBLE_SIGNED_CRITTER_REQUEST_V1,
+    DOUBLE_SIGNED_DAEMON_REQUEST_V1, TYPED_FUNCTION_BEAST_SOURCE,
+};
 
 // Re-export the model contract so a composition root can construct a model without depending on the
 // `mind` crate directly. `pub use` also brings these names into scope for this module.
 #[cfg(feature = "openai")]
 pub use mind::OpenAiModel;
 pub use mind::{
-    Completion, FakeMode, FakeModel, Model, ModelConfig, ModelError, Prompt, SlowModel, TokenUsage,
+    Completion, FakeMode, FakeModel, Model, ModelConfig, ModelError, Prompt, ProviderReceipt,
+    SlowModel, TokenUsage,
 };
 
 /// The schema every AUTHORING reply rides on the bus (the established convention `agent-templated`
@@ -94,10 +113,14 @@ fn reap_finished_workers(workers: &Mutex<Vec<JoinHandle<()>>>) -> usize {
 /// The model-backed author.
 pub struct AgentMind {
     model: Arc<dyn Model>,
+    /// Present only for the fail-closed construction-time approved-profile posture. `None` retains
+    /// the existing general authoring behavior byte-for-byte.
+    approved_profile: Option<Arc<ApprovedTypedProfile>>,
     /// Optional SEER `Thought` target — when set, each completion emits an observable narration
     /// (the Loop-2 selection signal). Off by default.
     seer_to: Option<Address>,
-    /// Gates *new* work and suppresses a stopped worker's reply. Shared with every spawned worker.
+    /// Gates *new* work and supplies the worker's fast path for suppressing a stopped reply. The
+    /// bus's sender-lifecycle gate supplies the authoritative no-emission-after-deregister boundary.
     stop: Arc<AtomicBool>,
     /// In-flight worker handles, joined (best-effort, deadline-bounded) at shutdown.
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -113,12 +136,22 @@ impl AgentMind {
     pub fn new(model: Arc<dyn Model>) -> Self {
         AgentMind {
             model,
+            approved_profile: None,
             seer_to: None,
             stop: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT_MODEL_REQUESTS,
             bus: Mutex::new(None),
         }
+    }
+
+    /// Construct an author that accepts only the three exact digest-bound requests derived from
+    /// `profile`. Model output is a strict typed record; trusted renderers, never the model, produce
+    /// the native/WASM/Rhai source bytes.
+    pub fn approved_only(model: Arc<dyn Model>, profile: ApprovedTypedProfile) -> Self {
+        let mut agent = Self::new(model);
+        agent.approved_profile = Some(Arc::new(profile));
+        agent
     }
 
     /// Emit an observable SEER `Thought` (internal channel) to `to` per completion.
@@ -170,6 +203,18 @@ impl Creature for AgentMind {
             }
         };
 
+        // Resolve the request before starting a worker. In particular, a malformed selector in the
+        // reserved approved namespace must never fall through to general native authoring.
+        let mode = match prompt::resolve_mode(&req, self.approved_profile.as_ref()) {
+            Ok(mode) => mode,
+            Err(error) => {
+                return Outcome::send(
+                    Dispatch::reply_to_env(&env, AuthoringReply::Failed(error).to_bytes())
+                        .with_schema(AUTHORING_REPLY_SCHEMA),
+                );
+            }
+        };
+
         // During unload we refuse new work rather than spawn a worker that will be detached.
         if self.stop.load(Ordering::Relaxed) {
             return Outcome::none();
@@ -198,8 +243,7 @@ impl Creature for AgentMind {
         let reply_corr = env.header.corr;
 
         // Assemble the model request on the drain thread (cheap), move the slow call off-drain.
-        let tier = prompt::tier_of(&req);
-        let model_req = prompt::build_request(&req);
+        let model_req = prompt::build_request_for_mode(&req, &mode);
         let model = self.model.clone();
         let stop = self.stop.clone();
         let seer_to = self.seer_to.clone();
@@ -224,7 +268,7 @@ impl Creature for AgentMind {
                 stop,
                 seer_to,
                 model_label,
-                tier,
+                mode,
             );
         });
         match spawn {
@@ -287,7 +331,7 @@ fn run_worker(
     stop: Arc<AtomicBool>,
     seer_to: Option<Address>,
     model_label: String,
-    tier: prompt::Tier,
+    mode: prompt::AuthoringMode,
 ) {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     // R9 floor: a panicking model must not unwind out of this thread into nothing.
@@ -295,7 +339,7 @@ fn run_worker(
     let (reply, usage) = match result {
         Ok(Ok(completion)) => {
             let usage = completion.usage.clone();
-            (map_reply(tier, completion), usage)
+            (map_reply(&mode, completion), usage)
         }
         Ok(Err(e)) => (
             AuthoringReply::Failed(AuthoringError::Invalid {
@@ -354,28 +398,28 @@ fn run_worker(
         dispatch = dispatch.with_corr(c);
     }
     if let Err(e) = bus.emit(dispatch) {
-        // The creature may have been deregistered between the stop-check and here; a clean route
-        // error, not a UAF. Surface it so a dropped reply is discoverable.
+        // Deregistration may win the race after the stop check. BusHandle linearizes that boundary,
+        // so this becomes a clean stale-sender route error and can never enqueue a late reply.
         eprintln!("agent-mind: dropped authoring reply: {e}");
     }
 }
 
 /// Parse the model completion into an [`AuthoringReply`] for the requested tier (fail-closed).
-fn map_reply(tier: prompt::Tier, completion: Completion) -> AuthoringReply {
-    match prompt::parse_response(tier, &completion.content) {
+fn map_reply(mode: &prompt::AuthoringMode, completion: Completion) -> AuthoringReply {
+    match prompt::parse_response_for_mode(mode, &completion.content) {
         Ok(resp) => AuthoringReply::Authored(resp),
         Err(e) => AuthoringReply::Failed(e),
     }
 }
 
-/// One structured observability line per delivered completion — authored-source sha256 + the
+/// One structured observability line per delivered completion — resulting-source sha256 + the
 /// tier/model template label + token usage on success; the structured error on a fail-closed miss.
 fn log_completion(reply: &AuthoringReply, model_label: &str, usage: Option<&mind::TokenUsage>) {
     match reply {
         AuthoringReply::Authored(resp) => {
             let src_hash = sha256_hex(resp.source.as_bytes());
             eprintln!(
-                "agent-mind: authored crate={} source_sha256={src_hash} template={}/{model_label} usage={usage:?}",
+                "agent-mind: produced crate={} source_sha256={src_hash} template={}/{model_label} usage={usage:?}",
                 resp.crate_name, resp.template
             );
         }
@@ -398,6 +442,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
     use aether::{BusError, CreatureId, Header};
     use sigil::{Backend, Manifest};
 
@@ -444,6 +490,64 @@ mod tests {
         };
         agent.bind(ctx);
         bus
+    }
+
+    struct CountingModel(AtomicUsize);
+
+    impl Model for CountingModel {
+        fn complete(&self, _request: Prompt) -> Result<Completion, ModelError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ModelError::Decode("counting model should not have been called".into()))
+        }
+
+        fn describe(&self) -> String {
+            "counting-model".into()
+        }
+    }
+
+    fn approved_profile() -> ApprovedTypedProfile {
+        let spec = AffineI32SpecV1 {
+            kind: ApprovedProgramKindV1::AffineI32V1,
+            slug: "triple-minus-five".into(),
+            name: "Triple minus five".into(),
+            entrypoint: "triple_minus_five".into(),
+            description: "Multiply a bounded integer by three, then subtract five.".into(),
+            input_min: -32,
+            input_max: 32,
+            multiplier: 3,
+            addend: -5,
+            local_input: 21,
+            remote_input: -21,
+        };
+        let digest = ApprovedTypedProfile::canonical_digest(&spec).unwrap();
+        ApprovedTypedProfile::from_approved(spec, &digest).unwrap()
+    }
+
+    #[test]
+    fn approved_only_and_unbound_reserved_requests_fail_before_the_model_call() {
+        let model = Arc::new(CountingModel(AtomicUsize::new(0)));
+        let mut approved = AgentMind::approved_only(model.clone(), approved_profile());
+        let unrelated = serde_json::to_vec(&agent_templated::AuthoringRequest {
+            request: "write arbitrary native Rust".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let outcome = approved.handle(request_env(unrelated, 40));
+        assert_eq!(outcome.dispatches.len(), 1);
+        assert!(matches!(
+            serde_json::from_slice::<AuthoringReply>(&outcome.dispatches[0].payload).unwrap(),
+            AuthoringReply::Failed(AuthoringError::Invalid { .. })
+        ));
+
+        let mut legacy = AgentMind::new(model.clone());
+        let reserved = serde_json::to_vec(&agent_templated::AuthoringRequest {
+            request: format!("{APPROVED_TYPED_REQUEST_V1}\nprofile=sha256:wrong\ntier=daemon"),
+            ..Default::default()
+        })
+        .unwrap();
+        let outcome = legacy.handle(request_env(reserved, 41));
+        assert_eq!(outcome.dispatches.len(), 1);
+        assert_eq!(model.0.load(Ordering::SeqCst), 0, "no model worker was started");
     }
 
     #[test]

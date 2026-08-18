@@ -97,6 +97,12 @@ pub enum RouteError {
 
 pub struct Router {
     table: RwLock<HashMap<CreatureId, Registration>>,
+    /// Linearizes creature-owned [`BusHandle`](crate::BusHandle) sends against endpoint removal.
+    /// A local send holds a read guard from its sender-liveness check through delivery; deregister
+    /// takes the write guard through table removal. Thus an off-drain clone either finishes routing
+    /// before unload crosses this boundary or observes the missing sender and fails cleanly after.
+    /// Direct [`Router::route`] calls are host/trusted ingress and deliberately do not take this gate.
+    local_emission_gate: RwLock<()>,
     /// Host-only IoC bindings. Remote exposure is one bit on the same row, so the new seam adds no
     /// remotely growable table and an ordinary rebind clears exposure by default.
     roles: RwLock<HashMap<Role, RoleBinding>>,
@@ -136,6 +142,7 @@ impl Router {
     pub fn new(verifier: Arc<dyn Verifier>, inbox_capacity: usize) -> Self {
         Router {
             table: RwLock::new(HashMap::new()),
+            local_emission_gate: RwLock::new(()),
             roles: RwLock::new(HashMap::new()),
             topics: RwLock::new(HashMap::new()),
             journal: Mutex::new(VecDeque::new()),
@@ -199,7 +206,14 @@ impl Router {
     /// routing half of safe unload. Dropping the stored sender disconnects the inbox, so the drain
     /// thread's `recv` returns and it can exit (then the kernel joins it, then frees the library).
     pub fn deregister(&self, id: CreatureId) {
-        wlock(&self.table).remove(&id);
+        // Cross the local-emission lifecycle boundary atomically with table removal. Local sends
+        // already in their bounded final phase finish under the read guard first; preflight work
+        // holds no gate and will observe the missing sender afterward. Release before role/topic
+        // hygiene so unrelated live senders resume promptly.
+        {
+            let _emission = wlock(&self.local_emission_gate);
+            wlock(&self.table).remove(&id);
+        }
         wlock(&self.roles).retain(|_, binding| binding.creature != id);
         for subs in wlock(&self.topics).values_mut() {
             subs.retain(|v| *v != id);
@@ -278,9 +292,34 @@ impl Router {
         rlock(&self.roles).iter().map(|(role, binding)| (role.clone(), binding.creature)).collect()
     }
 
+    /// Route an envelope emitted by a live local creature. Structural validation, stamping, and the
+    /// injected verifier run before the lifecycle gate: unload must never wait on injected work. The
+    /// read guard then covers the bounded sender check, capability/history updates, and nonblocking
+    /// delivery. A deregistration that wins during preflight makes this send fail `NoSuchModule`.
+    pub(crate) fn route_local(
+        &self,
+        sender: CreatureId,
+        mut env: Envelope,
+    ) -> Result<(), RouteError> {
+        self.prepare_route(&mut env)?;
+        let _emission = rlock(&self.local_emission_gate);
+        if !rlock(&self.table).contains_key(&sender) {
+            return Err(RouteError::NoSuchModule(sender));
+        }
+        self.route_prepared(env)
+    }
+
     /// The one delivery method — every interaction flows through here, the single choke point for
     /// time (`stamp`), permission (verify), history (journal), and the bus-level capability check.
+    /// Creature-owned handles enter through an internal lifecycle-gated final phase; this direct
+    /// surface remains lifecycle-neutral for trusted host and already-authenticated inbound paths.
     pub fn route(&self, mut env: Envelope) -> Result<(), RouteError> {
+        self.prepare_route(&mut env)?;
+        self.route_prepared(env)
+    }
+
+    /// Run work shared by trusted and local routes that must not extend the unload critical section.
+    fn prepare_route(&self, env: &mut Envelope) -> Result<(), RouteError> {
         // Depth before size: the depth walk is iterative and cheap; the size gate serializes the
         // header, so an overdeep address must be refused before it can reach the serializer.
         if let Some((depth, max)) = address_depth_error(&env.header) {
@@ -301,7 +340,11 @@ impl Router {
             &env.signing_payload(),
             &env.header.sig,
         );
+        Ok(())
+    }
 
+    /// Apply bounded in-fabric state changes and nonblocking delivery to a prepared envelope.
+    fn route_prepared(&self, env: Envelope) -> Result<(), RouteError> {
         // bus-level capability at the one choke point (opt-in; empty `calls` = unrestricted).
         if let Address::Creature(from_id) = &env.header.from {
             let table = rlock(&self.table);

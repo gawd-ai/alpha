@@ -121,7 +121,9 @@ impl BusHandle {
     }
 
     /// Seal a dispatch into an envelope (set `from` / `seq` / `sig`) and route it. `stamp` is set by
-    /// the router. Returns the router's result (`NoProvider`, `NoSuchModule`, `Backpressure`, …).
+    /// the router. Local emission is lifecycle-gated: after this handle's sender is deregistered, a
+    /// retained/off-drain clone fails with `NoSuchModule` and cannot enqueue a late message. Returns
+    /// the router's result (`NoProvider`, `NoSuchModule`, `Backpressure`, …).
     pub fn send(&self, d: Dispatch) -> Result<(), RouteError> {
         self.send_sealed(d, None)
     }
@@ -154,7 +156,7 @@ impl BusHandle {
         }
         let mut env = Envelope { header, payload: d.payload };
         env.header.sig = self.signer.sign(&env.signing_payload());
-        self.router.route(env)
+        self.router.route_local(self.me, env)
     }
 }
 
@@ -227,8 +229,9 @@ impl BusError {
         matches!(self, BusError::Backpressure | BusError::Route(RouteError::Backpressure(_)))
     }
 
-    /// Whether this failure means the target doesn't exist (creature unloaded, no provider bound).
-    /// Permanent: retrying without re-resolving the address won't help.
+    /// Whether this failure means an endpoint is no longer reachable: either this sender handle is
+    /// stale, the target creature is gone, or no provider is bound. Permanent for the current
+    /// handle/address: retrying without reacquiring authority or re-resolving won't help.
     pub fn is_unreachable(&self) -> bool {
         matches!(
             self,

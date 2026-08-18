@@ -223,12 +223,14 @@ creature — the thread-count guard's bounded leak is the safety net for the aba
 unload in reverse-chronological order so a still-running neighbor's threads aren't misread as leaked.
 
 **Off-drain workers honor the same floor.** A creature whose `handle` must do something slow — a
-model call in `agent-mind`, say — runs that work on a self-owned worker thread and emits the reply
-through its captured bus, so the drain thread is never blocked. `agent-mind` caps the in-flight model
-worker set by default (`DEFAULT_MAX_IN_FLIGHT_MODEL_REQUESTS`), with `0` as the explicit lab/demo
-opt-out for deployments that accept unbounded blocking model calls. Its `shutdown` sets a stop flag
-(which suppresses a stopped worker's reply) and joins, **deadline-bounded by polling** so it returns
+model call in `agent-mind` or `dialogue-responder::DialogueMind`, say — runs that work on a self-owned
+worker thread and emits the reply through its captured bus, so the drain thread is never blocked.
+Both model creatures cap their own in-flight worker set by default, with `0` as the explicit lab/demo
+opt-out for deployments that accept unbounded blocking model calls. Their `shutdown` sets a stop flag
+(which normally suppresses a stopped worker's reply) and joins, **deadline-bounded by polling** so it returns
 inside the kernel's unload budget; a worker still blocked in its call at the deadline is detached.
+Local bus emission is linearized against deregistration, so the residual check/send race fails as an
+unreachable stale sender rather than enqueueing after unload.
 This is sound only for an **in-process** creature — the one place an emitting worker is safe, since
 there is no `.so` FFI bus shim on that path — where a detached worker returns into no unmapped code:
 it finishes its now-stopped call, drops its reply, and exits. The residual is a bounded, in-process
@@ -300,9 +302,12 @@ signed-provenance + net-restriction + author-allowlist + any custom rule. OS-lev
 (bwrap, firejail, seccomp, cgroups) is the operator's deployment decision, applied to the sanctum
 process, not a per-creature cage the kernel fakes.
 
-**A model-backed author is contained by the route, not the prompt.** `agent-mind` is the first place a
-real model decides what native code gets compiled and admitted — and it is prompt-injectable (both the
-request and the compiler `prev_error` fed back on retry are influenceable). The reference `build-cargo`
+**General model-backed authoring is contained by the route, not the prompt.** In its general mode,
+`agent-mind` lets a real model propose native source that may be compiled and admitted—and it is
+prompt-injectable (both the request and compiler `prev_error` fed back on retry are influenceable).
+The v0.5 `approved_only` path is intentionally different: a model can return only a strict bounded
+affine data record, and trusted host code validates and lowers it to audited tier templates. That
+narrow path is not evidence that arbitrary model-authored native code is safe. The reference `build-cargo`
 emits a native `Backend::Daemon` by default — a *trusted-by-admission* creature signed with the
 operator's own Abode key — and under the dev posture (an allow-all verifier) that signature is not
 load-bearing. So containment lives where it can be enforced, the **route + admission layer, not the

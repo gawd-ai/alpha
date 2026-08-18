@@ -557,6 +557,128 @@ mod tests {
     }
 
     #[test]
+    fn stale_bus_handle_cannot_emit_after_its_sender_is_deregistered() {
+        let r = router();
+        let (target, rx) = r.register(Capabilities::default());
+        let (sender, _sender_rx) = r.register(Capabilities::default());
+        let stale = bus(&r, sender);
+        let journal_len = r.journal_snapshot().len();
+
+        r.deregister(sender);
+        let error =
+            stale.send(Dispatch::to(Address::Creature(target), b"late".to_vec())).unwrap_err();
+
+        assert!(matches!(error, RouteError::NoSuchModule(id) if id == sender));
+        assert!(
+            matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "a stale sender handle must not enqueue after deregistration"
+        );
+        assert_eq!(
+            r.journal_snapshot().len(),
+            journal_len,
+            "a refused stale send must not advance the routed-history journal"
+        );
+    }
+
+    #[test]
+    fn deregister_does_not_wait_for_local_preflight_and_the_send_cannot_arrive_late() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        struct PausingVerifier {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Verifier for PausingVerifier {
+            fn verify(&self, _key: &str, _payload: &[u8], _signature: &str) -> bool {
+                self.entered.send(()).expect("test coordinator dropped before verifier entered");
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("test coordinator did not release verifier");
+                true
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let verifier =
+            Arc::new(PausingVerifier { entered: entered_tx, release: Mutex::new(release_rx) });
+        let r = Arc::new(Router::new(verifier, 16));
+        let (target, rx) = r.register(Capabilities::default());
+        let (sender, _sender_rx) = r.register(Capabilities::default());
+        let sender_bus = bus(&r, sender);
+        let journal_len = r.journal_snapshot().len();
+
+        let send_thread = std::thread::spawn(move || {
+            sender_bus.send(Dispatch::to(Address::Creature(target), b"in-flight".to_vec()))
+        });
+        // The send is paused in injected preflight work, before it may take the lifecycle read gate.
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let deregister_router = r.clone();
+        let deregister_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            deregister_router.deregister(sender);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deregistered_while_verifier_was_paused =
+            done_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+
+        // Always release and join before asserting, so a regression cannot strand test threads.
+        release_tx.send(()).unwrap();
+        let send_result = send_thread.join().expect("local send thread panicked");
+        if !deregistered_while_verifier_was_paused {
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        deregister_thread.join().expect("deregister thread panicked");
+
+        assert!(
+            deregistered_while_verifier_was_paused,
+            "deregister waited on injected verifier work outside the bounded final route phase"
+        );
+        let error = send_result.expect_err("preflight finishing after deregister must not deliver");
+        assert!(matches!(error, RouteError::NoSuchModule(id) if id == sender));
+        assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert_eq!(
+            r.journal_snapshot().len(),
+            journal_len,
+            "a send that loses the lifecycle race must not enter routed history"
+        );
+    }
+
+    #[test]
+    fn direct_router_route_remains_lifecycle_neutral_for_trusted_ingress() {
+        let r = router();
+        let (target, rx) = r.register(Capabilities::default());
+        let (former_sender, _sender_rx) = r.register(Capabilities::default());
+        r.deregister(former_sender);
+
+        let envelope = Envelope {
+            header: Header {
+                from: Address::Creature(former_sender),
+                to: Address::Creature(target),
+                reply_to: None,
+                seq: 1,
+                causal: Vec::new(),
+                stamp: 0,
+                sig: "trusted-ingress".into(),
+                corr: None,
+                commitment: None,
+                schema: "test".into(),
+                origin: None,
+            },
+            payload: b"trusted".to_vec(),
+        };
+        r.route(envelope).unwrap();
+        assert_eq!(rx.recv().unwrap().payload, b"trusted");
+    }
+
+    #[test]
     fn bounded_inbox_sheds_on_flood_without_blocking_or_oom() {
         let r = Arc::new(Router::new(Arc::new(StubVerifier), 4)); // tiny inbox
         let (target, _rx) = r.register(Capabilities::default()); // never drained

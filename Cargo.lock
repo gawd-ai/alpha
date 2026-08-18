@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abode"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "serde",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "abode-migrator"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "abode",
  "aether",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "abode-reconciler"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "abode",
  "abode-migrator",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "ring",
  "serde",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agent-curious"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "agent-templated",
@@ -73,11 +73,12 @@ dependencies = [
 
 [[package]]
 name = "agent-mind"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "agent-templated",
  "build-cargo",
+ "gawdfn",
  "mind",
  "seer",
  "serde",
@@ -88,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "agent-templated"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "build-cargo",
@@ -119,7 +120,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "alpha"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "anima",
@@ -147,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "anima"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "gawdfn",
@@ -264,7 +265,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bestiary"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "mind",
@@ -277,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "bestiary-daemon"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "bestiary",
@@ -290,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "bestiary-live"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "agent-mind",
@@ -332,8 +333,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-beast"
+version = "0.5.0"
+dependencies = [
+ "aether",
+ "build-cargo",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sigil",
+ "wasmparser 0.251.0",
+ "wat",
+]
+
+[[package]]
 name = "build-cargo"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "libc",
@@ -347,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "build-critter"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "build-cargo",
@@ -639,25 +654,41 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "dialogue"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
+ "agent-mind",
+ "agent-templated",
  "anima",
+ "bestiary",
+ "build-beast",
+ "build-cargo",
+ "build-critter",
  "dialogue-initiator",
  "dialogue-responder",
+ "function-executor",
+ "function-home",
+ "function-resolver",
+ "gawdfn",
+ "mind",
  "omega-federator",
+ "policy-job-basic",
  "policy-signed",
  "registry-mem",
  "reputation-roundrobin",
  "sanctum",
+ "seer",
+ "serde",
  "serde_json",
+ "sha2",
  "sigil",
  "transport-tcp",
+ "wat",
 ]
 
 [[package]]
 name = "dialogue-initiator"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "seer",
@@ -667,12 +698,14 @@ dependencies = [
 
 [[package]]
 name = "dialogue-responder"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
+ "mind",
  "seer",
  "serde",
  "serde_json",
+ "sigil",
 ]
 
 [[package]]
@@ -710,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "distribute"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "anima",
@@ -725,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "distributor-requirements"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "seer",
@@ -735,21 +768,21 @@ dependencies = [
 
 [[package]]
 name = "distributor-roundrobin"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
 ]
 
 [[package]]
 name = "echo-daemon"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "forge",
 ]
 
 [[package]]
 name = "echo-daemon-v2"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "forge",
 ]
@@ -774,7 +807,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "embodiment-advertiser"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "seer",
@@ -800,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "federation"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "anima",
@@ -819,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "federation-scheduler"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "omega-federator",
@@ -833,7 +866,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fitness-selector"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "registry-mem",
@@ -856,7 +889,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "gawdfn",
@@ -877,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "function-executor"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "function-home",
@@ -889,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "function-home"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "gawdfn",
@@ -903,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "function-locator"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "gawdfn",
@@ -914,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "function-resolver"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "bestiary",
@@ -990,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "gawdfn"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "ring",
  "serde",
@@ -1001,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "gawdxfer"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1261,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "immune-response"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "omega-federator",
@@ -1299,7 +1332,7 @@ checksum = "49f1f14873335454500d59611f1cf4a4b0f786f9ac11f4312a78e4cf2566695b"
 
 [[package]]
 name = "job-blob-fs"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "gawdfn",
  "sha2",
@@ -1366,7 +1399,7 @@ checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 
 [[package]]
 name = "loopback-gateway"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
 ]
@@ -1400,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "merge-lww-map"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "abode-reconciler",
  "serde",
@@ -1415,7 +1448,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mind"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1435,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "monitor"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "serde_json",
@@ -1501,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "omega"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "anima",
@@ -1523,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "omega-contract"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "realm",
@@ -1533,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "omega-federator"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "bestiary",
@@ -1547,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "omega-gateway"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "omega-contract",
@@ -1557,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "omni"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "agent-mind",
@@ -1592,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "panic-daemon"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "forge",
 ]
@@ -1611,7 +1644,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "policy-abode-allowlist"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "abode",
  "abode-migrator",
@@ -1621,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "policy-budget"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "sanctum",
@@ -1631,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "policy-dev"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "sanctum",
  "sigil",
@@ -1639,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "policy-job-basic"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "gawdfn",
@@ -1649,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "policy-origin"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "serde_json",
@@ -1658,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "policy-prefer-promoted"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "registry-mem",
  "sanctum",
@@ -1667,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "policy-quarantine-aware"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "registry-mem",
  "sanctum",
@@ -1676,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "policy-quarantine-trust-all"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "immune-response",
@@ -1684,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "policy-quarantine-trust-realm"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "immune-response",
@@ -1692,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "policy-signed"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "sanctum",
  "sigil",
@@ -1813,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "realm"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "serde",
@@ -1822,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "realm-gateway"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "realm",
@@ -1847,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "registry-mem"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "bestiary",
@@ -1860,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "reputation-roundrobin"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "omega-federator",
@@ -1868,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "responder-budget"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "seer",
@@ -1878,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "responder-curation"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "seer",
@@ -1888,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "responder-fitness"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "seer",
@@ -1898,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "responder-policy"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "seer",
@@ -1952,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "runaway-thread-daemon"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "forge",
 ]
@@ -2031,7 +2064,7 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 
 [[package]]
 name = "sanctum"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "abode",
  "abode-migrator",
@@ -2102,28 +2135,28 @@ dependencies = [
 
 [[package]]
 name = "scorer-latency"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "fitness-selector",
 ]
 
 [[package]]
 name = "scorer-roundrobin"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "fitness-selector",
 ]
 
 [[package]]
 name = "scorer-success-rate"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "fitness-selector",
 ]
 
 [[package]]
 name = "seer"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "serde",
@@ -2235,7 +2268,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sigil"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "gawdfn",
  "ring",
@@ -2308,7 +2341,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface-http"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "anima",
@@ -2325,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "surface-mcp"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "gawdfn",
@@ -2533,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "transport-tcp"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "gawdxfer",
@@ -2626,7 +2659,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "verifiable-die"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "aether",
  "serde",
@@ -2643,7 +2676,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 
 [[package]]
 name = "walkthrough"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "abode-migrator",
  "aether",
@@ -2999,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "welbehaved-thread-daemon"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "forge",
 ]

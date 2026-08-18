@@ -19,14 +19,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aether::{
-    Address, Bus, BusHandle, Deadline, Dispatch, Ed25519Signer, Ed25519Verifier, InboxReceiver,
-    Role,
+    Address, Bus, BusHandle, CreatureId, Deadline, Dispatch, Ed25519Signer, Ed25519Verifier,
+    InboxReceiver, Role,
 };
-use agent_mind::AgentMind;
+use agent_mind::{AgentMind, DOUBLE_SIGNED_CRITTER_REQUEST_V1};
 use agent_templated::{AuthoringReply, AuthoringRequest, AuthoringResponse};
 use anima::{Artifact, NativeEngine, ScriptEngine, WasmEngine};
 use build_cargo::{BuildCargo, BuildConfig, BuildErrorKind, BuildOp, BuildReply, Sandbox};
 use build_critter::{BuildCritter, BuildCritterOp};
+use gawdfn::{
+    canonical_hash, sha256_digest, AbodeKeyBindingV1, AttemptId, AuthoritySigner, DeliveryModeV1,
+    DeploymentId, DeploymentReceiptV1, Ed25519SeedSigner, EffectClassV1, ExecutionGrantV1,
+    ExecutorDispatchV1, FunctionCallMessageV1, FunctionCallV1, FunctionId, HomeAuthorityV1, HomeId,
+    JobId, OperationalCapabilityV1, OperationalKeyGrantV1, SchemaRefV1, SignedRecordV1, Validate,
+    ValueRefV1, SCHEMA_CALL_V1, SCHEMA_EXECUTE_V1, SCHEMA_FUNCTION_DEPLOY_V1, SCHEMA_HOME_V1,
+};
 use mind::{FakeModel, Model, SlowModel};
 use policy_signed::SignedPolicy;
 use sanctum::Kernel;
@@ -281,6 +288,319 @@ fn loop_critter_authored_built_loaded_run_correct() {
     assert_eq!(echo.payload, b"cba", "model-authored reverse-critter reverses bytes");
 
     world.kernel.shutdown_all(Deadline::default());
+}
+
+// =================================================================================================
+// (1c) typed Function critter: prose → exact contract → signed Rhai → proof-bearing calls. The
+//      wrong-sender probe demonstrates that the authored source actually invokes route verification;
+//      the two valid calls prove signed FunctionResultV1 output and exact AttemptId continuation.
+// =================================================================================================
+
+#[test]
+fn loop_typed_function_critter_authored_signed_and_doubles_exactly() {
+    let world = build_world(Arc::new(FakeModel::always_good()));
+
+    let response = author_ok(
+        &world,
+        AuthoringRequest { request: DOUBLE_SIGNED_CRITTER_REQUEST_V1.into(), ..Default::default() },
+        10,
+    );
+    assert_eq!(response.template, "agent-mind-function-critter");
+    assert_eq!(response.crate_name, "double-int-critter");
+
+    let op = BuildCritterOp::Author {
+        source: response.source.clone(),
+        manifest_stub: response.manifest_stub.clone(),
+    };
+    world
+        .probe_bus
+        .emit(
+            Dispatch::to(Address::Creature(world.critter_build_id), op.to_bytes())
+                .with_reply_to(Address::Creature(world.probe_bus.id()))
+                .with_corr(11),
+        )
+        .expect("send typed source to build-critter");
+    let env = recv_with_corr(&world.probe_rx, 11, scaled(Duration::from_secs(10)))
+        .expect("typed build-critter reply");
+    let (manifest, artifact) = match serde_json::from_slice::<BuildReply>(&env.payload).unwrap() {
+        BuildReply::Built { manifest, artifact } => (manifest, artifact),
+        BuildReply::Failed { kind, message, .. } => {
+            panic!("typed critter build failed ({kind:?}): {message}")
+        }
+    };
+    assert_eq!(manifest.abi.backend, Backend::Critter);
+    assert!(manifest.provenance.signature.is_some(), "build-critter signs the typed artifact");
+    let entrypoint = manifest.entrypoints.first().expect("one typed entrypoint");
+    assert_eq!(manifest.entrypoints.len(), 1);
+    assert_eq!(entrypoint.name, "double_signed");
+    assert_eq!(entrypoint.signature, SCHEMA_CALL_V1);
+    let contract = entrypoint.contract.as_ref().expect("machine-readable Function contract");
+    assert_eq!(contract.effect, EffectClassV1::Idempotent);
+    assert_eq!(contract.controls, Default::default(), "all Function controls remain false");
+    assert_eq!(
+        contract.input_schema,
+        SchemaRefV1::Inline {
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "integer", "minimum": -1_000_000, "maximum": 1_000_000 }
+                },
+                "required": ["value"],
+                "additionalProperties": false
+            })
+        }
+    );
+    assert_eq!(
+        contract.output_schema,
+        SchemaRefV1::Inline {
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "doubled": { "type": "integer", "minimum": -2_000_000, "maximum": 2_000_000 }
+                },
+                "required": ["doubled"],
+                "additionalProperties": false
+            })
+        }
+    );
+
+    let manifest_content_address =
+        manifest.content_address.clone().expect("build-critter assigns the Function identity");
+    let artifact_hash = sha256_digest(&artifact);
+    let target = world
+        .kernel
+        .load(manifest, Artifact::Bytes(artifact))
+        .expect("signed typed critter loads through ScriptEngine");
+    let function = FunctionId { manifest_content_address, entrypoint: "double_signed".into() };
+
+    // Pin a valid call to the real executor endpoint, then send it from a different endpoint. The
+    // authored script must produce no result because function_call_verify binds the envelope route.
+    let (_wrong_id, wrong_bus, wrong_rx) = world.kernel.open_endpoint(Capabilities::default());
+    let (route_attempt, route_call) =
+        signed_double_call(function.clone(), 21, 1, world.probe_bus.id(), target, &artifact_hash);
+    wrong_bus
+        .emit(
+            Dispatch::to(
+                Address::Creature(target),
+                serde_json::to_vec(&route_call).expect("serialize typed call"),
+            )
+            .with_schema(SCHEMA_CALL_V1)
+            .with_reply_to(Address::Creature(wrong_bus.id()))
+            .with_corr(12),
+        )
+        .expect("send deliberately misrouted typed call");
+    assert!(
+        recv_with_corr(&wrong_rx, 12, scaled(Duration::from_millis(250))).is_none(),
+        "a valid proof on the wrong local executor route must not reach Function code"
+    );
+
+    // Reuse the exact signed call from its pinned executor route: the result must now be accepted,
+    // proving the negative above was route verification rather than a malformed proof.
+    emit_function_call(&world.probe_bus, target, 13, &route_call);
+    assert_double_result(
+        recv_with_corr(&world.probe_rx, 13, scaled(Duration::from_secs(5)))
+            .expect("21 call result"),
+        &route_attempt,
+        42,
+    );
+
+    let (_extra_attempt, extra_property_call) = signed_double_call_with_input(
+        function.clone(),
+        serde_json::json!({"value": 21, "extra": true}),
+        3,
+        world.probe_bus.id(),
+        target,
+        &artifact_hash,
+    );
+    emit_function_call(&world.probe_bus, target, 15, &extra_property_call);
+    assert!(
+        recv_with_corr(&world.probe_rx, 15, scaled(Duration::from_millis(250))).is_none(),
+        "additionalProperties:false must be enforced by the canonical Function adapter"
+    );
+
+    let (_float_attempt, float_call) = signed_double_call_with_input(
+        function.clone(),
+        serde_json::json!({"value": 21.5}),
+        4,
+        world.probe_bus.id(),
+        target,
+        &artifact_hash,
+    );
+    emit_function_call(&world.probe_bus, target, 16, &float_call);
+    assert!(
+        recv_with_corr(&world.probe_rx, 16, scaled(Duration::from_millis(250))).is_none(),
+        "the declared integer schema must reject a signed float input"
+    );
+
+    let (negative_attempt, negative_call) =
+        signed_double_call(function, -21, 2, world.probe_bus.id(), target, &artifact_hash);
+    emit_function_call(&world.probe_bus, target, 14, &negative_call);
+    assert_double_result(
+        recv_with_corr(&world.probe_rx, 14, scaled(Duration::from_secs(5)))
+            .expect("-21 call result"),
+        &negative_attempt,
+        -42,
+    );
+
+    world.kernel.shutdown_all(Deadline::default());
+}
+
+fn signed_double_call(
+    function: FunctionId,
+    value: i64,
+    attempt_number: u8,
+    executor_route: CreatureId,
+    target: CreatureId,
+    artifact_hash: &str,
+) -> (AttemptId, FunctionCallMessageV1) {
+    signed_double_call_with_input(
+        function,
+        serde_json::json!({ "value": value }),
+        attempt_number,
+        executor_route,
+        target,
+        artifact_hash,
+    )
+}
+
+fn signed_double_call_with_input(
+    function: FunctionId,
+    input_value: serde_json::Value,
+    attempt_number: u8,
+    executor_route: CreatureId,
+    target: CreatureId,
+    artifact_hash: &str,
+) -> (AttemptId, FunctionCallMessageV1) {
+    let root = Ed25519SeedSigner::from_seed([81; 32]).expect("root signer");
+    let operational = Ed25519SeedSigner::from_seed([82; 32]).expect("operational signer");
+    let executor = Ed25519SeedSigner::from_seed([83; 32]).expect("executor signer");
+    let home = HomeId::new(root.public_key());
+    let authority = HomeAuthorityV1 {
+        abode: SignedRecordV1::sign(
+            SCHEMA_HOME_V1,
+            AbodeKeyBindingV1 {
+                abode: home.clone(),
+                root_public_key: root.public_key().into(),
+                issued_at_unix_ms: None,
+            },
+            &root,
+        )
+        .expect("root self-binding"),
+        operational: SignedRecordV1::sign(
+            SCHEMA_HOME_V1,
+            OperationalKeyGrantV1 {
+                home: home.clone(),
+                epoch: 1,
+                operational_public_key: operational.public_key().into(),
+                valid_from_unix_ms: None,
+                expires_at_unix_ms: None,
+                capabilities: vec![OperationalCapabilityV1::JobHome],
+                evidence: vec![],
+            },
+            &root,
+        )
+        .expect("root grants the Home operational key"),
+        prepared: None,
+    };
+    let attempt = AttemptId {
+        home: home.clone(),
+        job: JobId::new(format!("agent-mind-double-{attempt_number}")),
+        number: attempt_number,
+    };
+    let deployment = SignedRecordV1::sign(
+        SCHEMA_FUNCTION_DEPLOY_V1,
+        DeploymentReceiptV1 {
+            deployment: DeploymentId::new(format!("agent-mind-double-{attempt_number}")),
+            function: function.clone(),
+            artifact_hash: artifact_hash.to_string(),
+            realm: "local-test".into(),
+            node: "agent-mind-test".into(),
+            executor: executor.public_key().into(),
+            executor_creature: executor_route.0.to_string(),
+            creature: target.0.to_string(),
+            evidence: vec![],
+            registered_at_unix_ms: None,
+        },
+        &executor,
+    )
+    .expect("executor deployment receipt");
+    let input = ValueRefV1::Inline { value: input_value };
+    let grant = SignedRecordV1::sign(
+        SCHEMA_EXECUTE_V1,
+        ExecutionGrantV1 {
+            attempt: attempt.clone(),
+            request_hash: sha256_digest(format!("double-request-{attempt_number}").as_bytes()),
+            home_epoch: 1,
+            home_route_sequence: 1,
+            home_realm: "local-test".into(),
+            home_node: "agent-mind-test".into(),
+            home_coordinator: executor_route.0.to_string(),
+            owner: home,
+            authority,
+            function: function.clone(),
+            deployment,
+            input: input.clone(),
+            delivery: DeliveryModeV1::AtLeastOnce { max_attempts: 3 },
+            grant_sequence: 1,
+            issued_at_unix_ms: None,
+            deadline_unix_ms: None,
+        },
+        &operational,
+    )
+    .expect("Home execution grant");
+    let executor_dispatch = SignedRecordV1::sign(
+        SCHEMA_CALL_V1,
+        ExecutorDispatchV1 {
+            attempt: attempt.clone(),
+            grant_hash: canonical_hash(&grant).expect("grant hash"),
+            deployment: grant.payload.deployment.payload.deployment.clone(),
+            executor_creature: executor_route.0.to_string(),
+            target_creature: target.0.to_string(),
+        },
+        &executor,
+    )
+    .expect("executor route dispatch");
+    let call = FunctionCallV1 {
+        attempt: attempt.clone(),
+        function,
+        input,
+        grant: Box::new(grant),
+        executor_dispatch,
+    };
+    call.validate().expect("constructed Function call proof verifies");
+    (attempt, FunctionCallMessageV1::Call { call: Box::new(call) })
+}
+
+fn emit_function_call(
+    bus: &BusHandle,
+    target: CreatureId,
+    corr: u64,
+    call: &FunctionCallMessageV1,
+) {
+    bus.emit(
+        Dispatch::to(
+            Address::Creature(target),
+            serde_json::to_vec(call).expect("serialize typed call"),
+        )
+        .with_schema(SCHEMA_CALL_V1)
+        .with_reply_to(Address::Creature(bus.id()))
+        .with_corr(corr),
+    )
+    .expect("send proof-bearing typed call");
+}
+
+fn assert_double_result(env: aether::Envelope, expected_attempt: &AttemptId, expected: i64) {
+    assert_eq!(env.header.schema, SCHEMA_CALL_V1);
+    let message: FunctionCallMessageV1 =
+        serde_json::from_slice(&env.payload).expect("valid FunctionResultV1 JSON");
+    let FunctionCallMessageV1::Result { result } = message else {
+        panic!("expected FunctionResultV1, got {message:?}")
+    };
+    assert_eq!(&result.attempt, expected_attempt, "the exact AttemptId is propagated");
+    assert_eq!(
+        result.outcome,
+        Ok(ValueRefV1::Inline { value: serde_json::json!({ "doubled": expected }) })
+    );
 }
 
 // =================================================================================================

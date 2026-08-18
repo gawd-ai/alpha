@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Narrated, runnable demo of two reference agents holding a multi-turn conversation ACROSS a Realm boundary — over real ed25519-authenticated TCP on loopback. The initiator on one Realm and a stateful responder on another exchange turns through the Omega gateway; the responder remembers the conversation. The hermetic seam for the v0.5.0 'AIs interacting across the mesh' story, out of #[test] and into your terminal."
+description = "Executable v0.5 acceptance: three independently signing model-backed agents form a causal fan-out/fan-in collaboration across Realms, then author, sign, durably publish, deploy, and execute one typed Function through native, WASM, and Rhai engines."
 
 # The demo body (`run`) lives in the lib for reuse and focused testing; the binary is a thin wrapper.
 # `alpha demo dialogue` launches that binary as an external child from the registry.
@@ -23,11 +23,32 @@ aether = { path = "../../cosmos/aether" }
 sigil = { path = "../../cosmos/sigil" }
 anima = { path = "../../cosmos/anima" }
 sanctum = { path = "../../cosmos/sanctum" }
+mind = { path = "../../cosmos/mind" }
+gawdfn = { path = "../../foundation/gawdfn" }
+bestiary = { path = "../../cosmos/bestiary" }
 policy-signed = { path = "../../cosmos/creatures/prototypes/policies/policy-signed" }
+policy-job-basic = { path = "../../cosmos/creatures/prototypes/policies/policy-job-basic" }
 transport-tcp = { path = "../../cosmos/creatures/transport-tcp" }
 registry-mem = { path = "../../cosmos/creatures/registry-mem" }
 reputation-roundrobin = { path = "../../cosmos/creatures/prototypes/reputation/reputation-roundrobin" }
+seer = { path = "../../cosmos/seer" }
 omega-federator = { path = "../../cosmos/creatures/omega-federator" }
 dialogue-initiator = { path = "../../cosmos/creatures/prototypes/dialogue/dialogue-initiator" }
 dialogue-responder = { path = "../../cosmos/creatures/prototypes/dialogue/dialogue-responder" }
+agent-mind = { path = "../../cosmos/creatures/agent-mind" }
+agent-templated = { path = "../../cosmos/creatures/agent-templated" }
+build-cargo = { path = "../../cosmos/creatures/build-cargo" }
+build-beast = { path = "../../cosmos/creatures/build-beast" }
+build-critter = { path = "../../cosmos/creatures/build-critter" }
+function-executor = { path = "../../cosmos/creatures/function-executor" }
+function-home = { path = "../../cosmos/creatures/function-home" }
+function-resolver = { path = "../../cosmos/creatures/function-resolver" }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+wat = "1"
+
+[features]
+# Default CI and `alpha demo dialogue` are credential-free. Opting into `openai` only supplies the
+# three role-configurable HTTP model adapters; it never changes the wire or makes a live call in CI.
+openai = ["mind/openai"]

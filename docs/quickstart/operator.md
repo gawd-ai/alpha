@@ -23,7 +23,7 @@ builder), an in-memory registry (`REGISTRY`), and a `monitor` watching the sense
 probe id, the command list, and drops you at a prompt:
 
 ```
-alpha node — Alpha Sanctum daemon (v0.4.4)
+alpha node — Alpha Sanctum daemon (v0.5.0)
 posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.
 boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.
 probe endpoint id = 1
@@ -221,14 +221,37 @@ cargo run -p walkthrough
 cargo run -p federation                          # 2 Realms × 2 Sanctums (default)
 cargo run -p federation -- --realms 3 --sanctums 2
 
-# Two agents conversing ACROSS a Realm boundary: an initiator on one Realm holds a multi-turn dialogue
-# with a stateful agent on another, through the Omega gateway. The v0.5.0 cross-mesh interaction story.
-cargo run -p dialogue
+# Credential-free v0.5.0 mechanism regression. This is not live-model product acceptance.
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 \
+  cargo run --locked -p dialogue -- --fixture
 ```
 
 `federation` boots each Sanctum as its own kernel and forms the mesh in front of you — the closest
 thing to "stand up a small distributed Alpha deployment and poke it" without leaving one process;
-`dialogue` is the same wire carrying a live agent-to-agent conversation rather than catalogue state.
+`dialogue --fixture` carries strict scripted draft/review/test/approval decisions over the same wire,
+then validates one bounded `affine_i32_v1` profile and uses trusted host templates to lower it into
+Rust, no-import WAT, and Rhai. `BuildCargo`/`BuildBeast`/`BuildCritter`, durable
+publication/recovery, and one local plus one cross-Realm Job per engine exercise the rest. The three
+backend manifests intentionally yield distinct `FunctionId`s; each remains stable across its two
+Jobs. Models do not supply executable source in this approved path. The three minds occupy two
+in-process Kernel nodes, not three deployed Sanctum processes. One native Cargo compile uses the
+shared `target/gawd-build-cache`; beast/critter builds invoke no Cargo.
+
+For v0.5.0 product acceptance, use the protected exact-SHA workflow in the
+[release checklist](../../RELEASE.md#additional-v050-live-acceptance-gate); the explicit
+OpenAI-feature command in the [demo README](../../demos/README.md#notes) is an exploratory operator
+path, not a weaker release gate. The workflow runs only after exact push CI, builds and copies the
+candidate binary before materializing provider/operator secrets, and supplies three role-configured
+Model injections plus the complete external prior-semantic registry. The same packaged binary then
+runs `dialogue verify-live` offline with the pinned candidate SHA, authorized seal signer, evidence
+directory, signed seal, and prior digests. It verifies seven provider calls/receipts, signed causal
+decisions, trusted-lowered sources, three artifacts and Bestiary proofs, six complete Job bundles,
+and source/result identity under the signed index. Raw prompt-bearing evidence is encrypted; the
+separate disclosure-safe pack, exact binary, and both packages receive workflow attestations. The
+90-day Actions artifacts must be promoted to immutable supported-lifetime storage before tag.
+Fixture runs remain regression only. Provider receipts and workflow attestations do not prove model
+weights, and the attestations are not a reproducible-build proof; this bounded affine profile is not
+arbitrary-code synthesis or general agency.
 See [`demos/`](../../demos/) for what each demo shows and the tests it rides on.
 
 ## 9. Shut down

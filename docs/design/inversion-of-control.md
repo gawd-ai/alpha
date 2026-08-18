@@ -135,9 +135,13 @@ intent ──▶ AUTHORING ──▶ source + manifest stub ──▶ BUILD ─�
   job is to make the *seam* testable end-to-end without coupling the substrate to any model. A
   Claude/GPT/local agent is the **same creature answering the same request** — a swap, not a
   redesign. That swap ships: `agent-mind` binds this same socket and asks a real model — an injected
-  `Model` from the `mind` leaf crate — for the source + manifest stub, returned as two fenced
-  blocks (a `rust` source block + a `json` manifest stub) and parsed **fail-closed** (a missing or
-  malformed stub is a structured `Failed`, never a silently-defaulted permissive manifest). The shared
+  `Model` from the `mind` leaf crate. General mode parses fenced source + manifest responses
+  **fail-closed** (a missing or malformed stub is a structured `Failed`, never a silently-defaulted
+  permissive manifest). The v0.5 composition instead constructs `approved_only` with one validated
+  `affine_i32_v1` profile. In that posture the model may return only a strict source-free record
+  naming schema, profile digest, tier, program kind, multiplier, and addend. Unknown fields or drift
+  fail; trusted host templates produce the backend source and least-authority stub. This is a narrow
+  typed lowering path, not arbitrary model-authored native code. The shared
   `AuthoringRequest` contract caps the serialized request, natural-language request field, retry
   context, and no-template error echo before template matching, parking, or prompt assembly. It is
   opt-in (`--features openai` + an `--author-model` flag selecting the model per node instance — the
@@ -169,11 +173,14 @@ intent ──▶ AUTHORING ──▶ source + manifest stub ──▶ BUILD ─�
   The isolated home intentionally does not inherit the operator's global Cargo configuration,
   credentials, or warmed registry cache; mirrors, offline operation, and authenticated/private
   registries must be provisioned explicitly inside that budgeted boundary.
-  `build-critter` is the sibling on the same socket for the scripted tier — it validates that Rhai
-  source compiles and defines `fn handle(env)`, reuses the same manifest-stub shape gate before
-  compiling, then signs the source bytes themselves as the artifact under `abi_tag = gawd_critter_v1`.
-  Native daemons carry `gawd_creature_v1`. Cross-compile, AOT-from-WASM,
-  and remote build farms are the same socket, a different bindee.
+  `build-beast` and `build-critter` are no-Cargo siblings using the same signed `BuildReply`. The
+  former compiles exact WAT in-process, rejects imports and malformed `memory + alloc + handle`
+  exports, and signs the emitted core-WASM bytes as `Backend::Beast`; the latter validates that Rhai
+  source compiles and defines `fn handle(env)`, then signs the source bytes themselves as
+  `Backend::Critter`. Native daemons and beasts carry `gawd_creature_v1`; critters carry
+  `gawd_critter_v1`. Because `Role::BUILD` is single-binding, a composition needing all three
+  strategies addresses its pinned builder instances directly. Cross-compile, AOT-from-WASM, and
+  remote build farms are the same socket, a different bindee.
 
 The loop is **just composition of existing sockets** — admission and safe-load are unchanged, and
 nothing new lands in the fabric. Three properties make the loop sound:
