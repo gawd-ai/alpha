@@ -216,6 +216,10 @@ fn boot_node_a(abode: &Ed25519KeyMaterial, node_key: Ed25519KeyMaterial) -> Node
     let allowlist = vec![abode.public_hex().to_string(), node_key.public_hex().to_string()];
     let k = kernel(allowlist);
 
+    // `peer_connected` is live, non-replayed evidence; observe it before B can finish dialing A.
+    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
+    k.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe_id);
+
     let peer_b_pub = Ed25519KeyMaterial::from_seed([0xBB; 32]).unwrap();
     let cfg = TransportConfig {
         self_key: node_key.clone(),
@@ -246,9 +250,6 @@ fn boot_node_a(abode: &Ed25519KeyMaterial, node_key: Ed25519KeyMaterial) -> Node
         .load_instance(signed_boot_manifest("realm-gateway", &node_key), Box::new(gw))
         .expect("realm-gateway admits");
     k.bind_role(Role::new(Role::REALM_GATEWAY), gw_id);
-
-    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
-    k.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe_id);
 
     NodeA { kernel: k, probe_id, probe_bus, probe_rx }
 }

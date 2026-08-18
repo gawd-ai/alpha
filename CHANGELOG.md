@@ -14,6 +14,9 @@ For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
   cross-node execution, and a real remote MCP graph query. The smoke reuses already-built binaries,
   inherits the one-CPU CI affinity, has a hard timeout, and guarantees bounded teardown without a
   second Cargo build.
+- Cross-node integration fixtures now subscribe to live `peer_connected` readiness evidence before
+  starting their sender-side transport, eliminating false timeouts caused by missing a non-replayed
+  event under one-CPU scheduling.
 
 ## 0.4.4 - 2026-08-16
 

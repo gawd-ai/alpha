@@ -98,6 +98,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 struct Node {
     kernel: Arc<Kernel>,
     daemon_id: CreatureId,
+    probe_id: CreatureId,
+    probe_bus: BusHandle,
+    probe_rx: InboxReceiver,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -115,6 +118,10 @@ fn boot(
     push_interval: Duration,
 ) -> Node {
     let k = kernel(&node_key);
+    let (probe_id, probe_bus, probe_rx) = k.open_endpoint(Capabilities::default());
+    if dials {
+        k.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe_id);
+    }
     let cfg = TransportConfig {
         self_key: node_key.clone(),
         self_node: NodeId(node_id.into()),
@@ -149,7 +156,7 @@ fn boot(
         .load_instance(signed_boot_manifest("bestiary-daemon", &node_key), Box::new(daemon))
         .expect("daemon admits");
     k.bind_role(Role::new(Role::REGISTRY), daemon_id);
-    Node { kernel: k, daemon_id }
+    Node { kernel: k, daemon_id, probe_id, probe_bus, probe_rx }
 }
 
 fn wait_for_peer_event(rx: &InboxReceiver, peer: &str, event: &str, budget: Duration) -> bool {
@@ -284,8 +291,10 @@ fn bestiary_replication_converges_with_sticky_quarantine_and_federated_tombstone
         Duration::from_millis(120),
     );
 
-    let (probe, bus, rx) = a.kernel.open_endpoint(Capabilities::default());
-    a.kernel.router().subscribe(aether::Topic::new(aether::Topic::PROPRIOCEPTION), probe);
+    // A's probe subscribed before its dialing transport started, so the sender-side writer is ready.
+    let probe = a.probe_id;
+    let bus = a.probe_bus;
+    let rx = a.probe_rx;
     assert!(
         wait_for_peer_event(&rx, NODE_B, "peer_connected", scaled(Duration::from_secs(5))),
         "A↔B handshake must complete before replicating"
