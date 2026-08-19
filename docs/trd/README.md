@@ -15,6 +15,25 @@ before v0.5.0: the creature ABI, Envelope, and three-job Kernel remain unchanged
 acceptance item is Green through the explicitly suite-compositional local, store, surface,
 same-process, and real-process proofs recorded in the TRD.
 
+**TRD-007 defines the v0.5.0 product composition.** It is `Accepted`, not yet `Met`: three distinct
+live-model/signing agents—a Builder, Reviewer, and Contract Tester—must make one exact four-turn
+causal decision chain across two in-process Kernel nodes/Realms over authenticated TCP. Their approved
+result is a fresh bounded `affine_i32_v1` data program; trusted host validation/lowering produces
+daemon, beast, and critter source, three signed/recovered artifacts, three distinct immutable
+`FunctionId`s, and six tester-selected local/cross-Realm Job results. The clean exact-commit run must
+retain seven provider calls/receipts and all signed/build/execution proof under a verified evidence
+index plus an external operator seal. The frozen commit must first pass the exhaustive local
+`tools/local-validation.sh` gate and produce its report plus copied-binary handoff. The unchanged
+exact commit must then pass the short hosted sanity gate without exposing provider/operator keys or
+raw evidence. The local `tools/v05-live-acceptance.sh` ceremony consumes the handoff, runs the exact
+packaged binary's offline `dialogue verify-live` path, encrypts raw evidence, and produces the
+disclosure-safe pack containing the validation report, exact binary, signed seal/index, acceptance
+manifest, six-field verifier report, README, and hashes. Before tagging, the operator moves those
+exact objects directly to immutable supported-lifetime storage, then appends the accepted novelty and
+artifact identities to the external signed, append-only registry. The fixture run is regression only.
+This is constrained typed synthesis, not arbitrary code, general agency, a generic group protocol,
+or three-process deployment evidence, and no wire or creature-ABI shape changes.
+
 ## The convergence bar
 
 > By the end of v0.4.3, every load-bearing surface of Alpha is **bounded, attributable, coherent, and
@@ -33,6 +52,7 @@ same-process, and real-process proofs recorded in the TRD.
 | [TRD-004](TRD-004-reserved-seam-discipline.md) | Reserved-seam & embryo discipline | Anti-churn | 0043 | Met (v0.4.3) |
 | [TRD-005](TRD-005-hygiene-and-complexity.md) | Hygiene & complexity reduction | Hygiene | 0044 | Met (v0.4.3) |
 | [TRD-006](TRD-006-typed-functions-and-durable-jobs.md) | Typed functions, durable Jobs, and portable home custody | Function foundation | 0046, 0047, 0048 | Met (v0.4.4) |
+| [TRD-007](TRD-007-cross-mesh-model-collaboration.md) | Cross-mesh model collaboration to an all-tier typed capability | Product composition | 0049 | Accepted (v0.5.0) |
 
 ## How to read a TRD here
 
@@ -45,6 +65,10 @@ same-process, and real-process proofs recorded in the TRD.
 ## Status lifecycle
 
 `Draft` → `Accepted` (the requirements are agreed) → `Met` (implementation lands and acceptance passes).
-The index above is authoritative per document: TRD-001–005 are Met for v0.4.3 and TRD-006 is Met for
-v0.4.4. A TRD can be Met before its release heading is cut; release/version state is tracked in the
-workspace manifests and changelog rather than inferred from this lifecycle.
+The index above is authoritative per document: TRD-001–005 are Met for v0.4.3, TRD-006 is Met for
+v0.4.4, and TRD-007 is Accepted for v0.5.0 but is not Met until the exact commit passes exhaustive
+local validation, hosted sanity, a fresh retained operator-sealed local live proof, immutable
+retention, and the external signed acceptance record. A TRD can be Met before its release heading is
+cut;
+release/version state is tracked in the workspace manifests and changelog rather than inferred from
+this lifecycle.

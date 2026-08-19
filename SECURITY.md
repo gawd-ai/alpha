@@ -20,6 +20,91 @@ is **not** hardened for hostile production deployment. Treat it accordingly:
   caps fixed at load), not the byte-exact memory limiter the `beast` tier has — a critter that must be
   memory-capped exactly should run as a beast.
 
+## Live-model acceptance and retained evidence
+
+The v0.5.0 `dialogue --live` path is a release-acceptance harness, not a hardened agent
+service. Both authoritative gates run locally on the same frozen exact commit: exhaustive
+credential-free validation through `tools/local-validation.sh` with `--exact-commit` and
+`--output-dir`, followed by the retained live proof and packaging through
+`tools/v05-live-acceptance.sh` with the handoff's absolute `--validation-report`, the same
+`--candidate-sha`, and a new absolute `--output-dir`. Between them, push the unchanged commit and
+require its short hosted sanity check to pass. Hosted CI is required merge/tag hygiene but is not the
+authoritative validation gate, and it never receives provider/operator keys or raw evidence. Treat provider
+endpoints, prompts/completions, API keys, evidence, packaging keys, and the operator seal key as
+sensitive:
+
+- **Use HTTPS or exact loopback, with no URL credentials.** Live mode rejects non-loopback plain HTTP
+  and rejects URL user-info even when no bearer key is configured. The inter-Realm demo transport is
+  mutually authenticated but not encrypted, so its prompt-carrying TCP topology is intentionally
+  loopback. Authentication alone is not prompt confidentiality.
+- **Keep credentials out of evidence.** Prefer each role's `_API_KEY_FILE` over an inline environment
+  value and protect it according to the provider's policy. Evidence retains only the configured
+  normalized endpoint origin, requested/reported model labels, bounded prompts/completions, usage,
+  and receipt metadata; path/query/fragment and API credentials are never serialized. Inspect
+  retained prompts/completions before sharing them: absence of API keys does not make their content
+  non-sensitive. The credential-free local validation tool builds and copies the exact binary into
+  its handoff. The local acceptance tool verifies that handoff before it references or materializes
+  provider/operator secrets; it then uses private `0600` files and disables shell tracing for the
+  live step. Do not place these secrets in GitHub.
+- **Provider receipts are claims by the endpoint.** Response/request IDs, reported model, finish
+  reason, token usage, and `store_requested=false` improve traceability. They are not cryptographic
+  proof of the provider, model weights, training data, or inference process. The stock adapter asks
+  the provider not to store the call, but enforcement remains provider-side.
+- **The evidence directory is private and create-new.** Live mode requires an absolute new path
+  outside the worktree, refuses symlinks/reuse, writes private files, hashes every payload into an
+  index, and re-verifies that index. Preserve the complete directory with its sibling seal; copying
+  only a summary discards the audit chain. Store or transmit the bundle through an access-controlled
+  or encrypted channel appropriate to its prompt content.
+- **Verify from retained bytes, not the successful process's claim.** The standalone
+  `dialogue verify-live` command takes the operator-pinned seal public key, exact candidate SHA,
+  packaged dialogue binary, evidence directory, signed seal, and every prior accepted semantic
+  digest. It runs offline from providers, Git, mutable stores, running Sanctums, and private keys. It
+  verifies the sealed file set, source/binary identity, seven calls and exact replay, four signed
+  causal turns, novelty and approved IR, three sources/manifests/artifacts/Bestiary proofs, six signed
+  Job bundles, all result/summary hash links, and the three requested-model labels it reports from the
+  sealed calls. Supplying the seal's self-declared key—or trusting only the configured model
+  variables instead of that verified report—is not sufficient.
+- **A valid signature is not authorization.** The external seal binds the evidence-index root to the
+  public key corresponding to the supplied operator seed. The seed must be an absolute canonical
+  non-symlink file, contain exactly 32 bytes as 64 hex characters, and be mode `0600` or stricter.
+  Keep it separate from provider keys and the worktree. The demo verifies the signature, but release
+  policy must independently decide that the recorded public key is an authorized attester; a
+  self-chosen signing key is not automatically trusted.
+- **Commit/binary provenance is bounded.** A qualifying live binary embeds the explicitly supplied
+  `ALPHA_DIALOGUE_BUILD_COMMIT`, refuses a clean runtime HEAD mismatch, and records its own SHA-256
+  and toolchain in the sealed summary. Retain those exact bytes. This detects substitution relative
+  to the release ceremony. The exact-commit binding, Ed25519 evidence seal, offline verifier, package
+  digests, and external signed acceptance record are complementary provenance controls; they are not
+  a reproducible-build proof and do not attest provider/model weights.
+- **Plaintext raw evidence stays local.** The local acceptance tool packages complete
+  prompts/completions and evidence only into an OpenPGP-encrypted raw archive. Its separate
+  disclosure-safe pack is allowlisted to `local-validation.v1.json`, the copied dialogue binary,
+  `evidence-index.v1.json`, signed seal, `acceptance-manifest.v1.json`,
+  `offline-verification-report.v1.json`, `README.txt`, and `SHA256SUMS`. The acceptance manifest binds
+  the validation-report digest and portable sibling binary path/hash. A successful output directory
+  contains exactly the encrypted raw `.tar.gz.gpg` and disclosure-safe verification `.tar.gz`;
+  stdout is a disclosure-safe JSON summary. Neither plaintext raw evidence nor those packages leave
+  the local ceremony for hosted CI. Before tagging, move both packages and the exact binary directly to an
+  access-controlled immutable store retained for the supported release lifetime, checking every
+  digest in transit. Never upload the plaintext raw archive.
+- **Novelty state is external and append-only.** An operator-controlled JSON registry supplies every
+  previously accepted semantic digest to both generation and offline verification. Append the newly
+  verified digest and its exact commit/ceremony/validation-report/index/binary/package/retention
+  references only after acceptance; never edit the proven source commit to record it before tagging.
+- **Trusted lowering limits executable authority.** The accepted v0.5 profile lets live models return
+  only strict source-free `affine_i32_v1` decisions and implementation records. Host code validates
+  the complete finite truth table and renders audited Rust, no-import WAT, and Rhai templates. This
+  is constrained typed synthesis, not arbitrary-code generation or general agency. The resulting
+  daemon is still native, in-process, and trusted-by-admission even though its source came from a
+  trusted renderer; signatures and evidence do not sandbox it.
+
+The credential-free `--fixture` run and recorded replay are regression tools only. They do not prove
+that a live model participated and cannot satisfy the v0.5 product gate. See
+[TRD-007](docs/trd/TRD-007-cross-mesh-model-collaboration.md),
+[`tools/local-validation.sh`](tools/local-validation.sh),
+[`tools/v05-live-acceptance.sh`](tools/v05-live-acceptance.sh), and the
+[release checklist](RELEASE.md).
+
 ## The control plane (HTTP/WS + MCP surfaces)
 
 `alpha node` can expose an HTTP + WebSocket control plane (`--listen`, the loadable `surface-http`
@@ -129,8 +214,8 @@ connection-authenticated key. Two properties are deliberately specified, not sil
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.4.x   | :white_check_mark: |
-| < 0.4   | :x:                |
+| 0.5.x   | :white_check_mark: |
+| < 0.5   | :x:                |
 
 Only the latest minor release receives security fixes while the project is pre-1.0.
 

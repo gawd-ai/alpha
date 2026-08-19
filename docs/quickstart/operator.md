@@ -23,7 +23,7 @@ builder), an in-memory registry (`REGISTRY`), and a `monitor` watching the sense
 probe id, the command list, and drops you at a prompt:
 
 ```
-alpha node — Alpha Sanctum daemon (v0.4.4)
+alpha node — Alpha Sanctum daemon (v0.5.0)
 posture: DEV — the dev policy admits everything and the bus signer is a stub; not a hardened deployment.
 boot: live substrate — agent-templated→AUTHORING, build-cargo→BUILD (+build-critter), registry-mem→REGISTRY, monitor watching the sense streams.
 probe endpoint id = 1
@@ -221,14 +221,71 @@ cargo run -p walkthrough
 cargo run -p federation                          # 2 Realms × 2 Sanctums (default)
 cargo run -p federation -- --realms 3 --sanctums 2
 
-# Two agents conversing ACROSS a Realm boundary: an initiator on one Realm holds a multi-turn dialogue
-# with a stateful agent on another, through the Omega gateway. The v0.5.0 cross-mesh interaction story.
-cargo run -p dialogue
+# Credential-free v0.5.0 mechanism regression. This is not live-model product acceptance.
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 \
+  cargo run --locked -p dialogue -- --fixture
 ```
 
 `federation` boots each Sanctum as its own kernel and forms the mesh in front of you — the closest
 thing to "stand up a small distributed Alpha deployment and poke it" without leaving one process;
-`dialogue` is the same wire carrying a live agent-to-agent conversation rather than catalogue state.
+`dialogue --fixture` carries strict scripted draft/review/test/approval decisions over the same wire,
+then validates one bounded `affine_i32_v1` profile and uses trusted host templates to lower it into
+Rust, no-import WAT, and Rhai. `BuildCargo`/`BuildBeast`/`BuildCritter`, durable
+publication/recovery, and one local plus one cross-Realm Job per engine exercise the rest. The three
+backend manifests intentionally yield distinct `FunctionId`s; each remains stable across its two
+Jobs. Models do not supply executable source in this approved path. The three minds occupy two
+in-process Kernel nodes, not three deployed Sanctum processes. One native Cargo compile uses the
+shared `target/gawd-build-cache`; beast/critter builds invoke no Cargo.
+
+For v0.5.0 product acceptance, freeze one exact clean commit and run the two local tools named by the
+[release checklist](../../RELEASE.md#local-v050-live-acceptance-gate). First run the exhaustive,
+credential-free `tools/local-validation.sh` gate with `--exact-commit` and `--output-dir`. Push that
+unchanged commit and require its short hosted sanity check to pass. Then configure the three role
+Models, authorized operator seal signer, encryption recipient, and complete external prior-semantic
+registry outside the worktree and run
+`tools/v05-live-acceptance.sh` from the validation handoff. It verifies the prepared report and copied
+candidate before loading those secrets, performs the fresh live run, then uses the same packaged
+binary to run `dialogue verify-live` offline with the pinned candidate SHA, authorized signer, signed
+seal, and prior digests. Verification covers seven provider
+calls/receipts, signed causal decisions, trusted-lowered sources, three artifacts and Bestiary proofs,
+six complete Job bundles, and source/result identity under the signed index. The tool encrypts raw
+prompt-bearing evidence and creates a separate disclosure-safe pack. Its frozen interface is:
+
+```sh
+release_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+tools/v05-live-acceptance.sh \
+  --candidate-sha "$release_commit" \
+  --validation-report /absolute/handoff/local-validation.v1.json \
+  --output-dir /absolute/new/live-acceptance-output \
+  --builder-model MODEL --builder-base-url URL --builder-timeout-secs 60 \
+  --builder-api-key-file /absolute/private/builder.key \
+  --reviewer-model MODEL --reviewer-base-url URL --reviewer-timeout-secs 60 \
+  --reviewer-api-key-file /absolute/private/reviewer.key \
+  --contract-tester-model MODEL --contract-tester-base-url URL \
+  --contract-tester-timeout-secs 60 \
+  --contract-tester-api-key-file /absolute/private/contract-tester.key \
+  --evidence-signing-key-file /absolute/private/evidence-seed.hex \
+  --expected-evidence-signer 0123456789abcdef...64-lowercase-hex-total \
+  --prior-semantic-registry-file /absolute/operator/prior-semantics.json \
+  --encryption-public-key-file /absolute/operator/release-key.asc \
+  --encryption-recipient FULL_FINGERPRINT
+```
+
+The new output directory contains exactly one encrypted raw `.tar.gz.gpg` and one disclosure-safe
+verification `.tar.gz`; stdout is a safe JSON summary with `status`, `candidate_sha`, the local
+validation-report, evidence-index, semantic, and binary digests, the authorized evidence signer,
+the three verifier-derived requested-model labels, and the portable file/SHA-256 pairs
+`encrypted_raw` and `verification_pack`. The safe archive contains the copied dialogue binary,
+`evidence-index.v1.json`, signed seal, `acceptance-manifest.v1.json`,
+`offline-verification-report.v1.json`, `local-validation.v1.json`, `README.txt`, and `SHA256SUMS`.
+The acceptance manifest binds the validation-report digest and portable sibling binary path/hash.
+Move those exact packages, binary, and ceremony metadata directly to immutable supported-lifetime
+storage before tag, then append the external signed acceptance record. Hosted GitHub CI is only a short credential-free
+merge/tag hygiene check, not the authoritative validation gate, and receives no provider/operator
+keys or raw evidence. Fixture runs remain regression only. Provider receipts do not prove model
+weights, and retained provenance is not a reproducible-build proof; this bounded affine profile is
+not arbitrary-code synthesis or general
+agency.
 See [`demos/`](../../demos/) for what each demo shows and the tests it rides on.
 
 ## 9. Shut down

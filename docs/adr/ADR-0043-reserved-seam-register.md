@@ -4,6 +4,8 @@
   one "realize-in-v0.4.3" seam, signed dialogue provenance, landed via [ADR-0038](ADR-0038-origin-stays-hop-by-hop.md).
 - **Drives:** [TRD-004](../trd/TRD-004-reserved-seam-discipline.md) R2–R6
 - **Date:** 2026-06-16
+- **Milestone successor:** [ADR-0049](ADR-0049-stage-v0.5-composition-and-mesh-autonomy.md)
+  supersedes this register's historical `realize-v0.5.0` schedule; the seam inventory remains intact.
 
 ## Context
 
@@ -81,6 +83,16 @@ dispatches it through the existing `Creature::handle(Envelope)` ABI. Row 13 rema
 the Kernel still drives `fn handle(env)` and `gawd_critter_v1` is unchanged. Recording the erratum here
 preserves this ADR as the historical v0.4.3 inventory instead of silently rewriting its table.
 
+### v0.5 milestone successor
+
+[ADR-0049](ADR-0049-stage-v0.5-composition-and-mesh-autonomy.md) is authoritative for the forward
+schedule. It moves rows 1, 4, 12, and 15—operational Omega/Realm authority, signed discovery, and the
+authenticated node/routing/Abode identity map—to **v0.5.1**; row 16 (`OfferUpdate` and dynamic
+capability/placement advertisement) to **v0.5.2**; and a UDP transport for arbitrary application
+envelopes to **later/uncommitted**. Discovery may use datagrams in v0.5.1 without promising UDP
+application carriage. These are successor targets, not implementation claims. The table above remains
+the historical v0.4.3 decision, and its `keep-reserved` dispositions do not change.
+
 ## Consequences
 
 - v0.5.0's headline becomes provably *composition*: every shape it needs is either keep-reserved-and-
@@ -88,7 +100,8 @@ preserves this ADR as the historical v0.4.3 inventory instead of silently rewrit
 - The wire-locked names (`DeferredToV03`, the `omega.deferred` / `realm.no_route` schema strings, the
   closed `SeerTopic` set) are explicitly **frozen** — convergence cleanup cannot rename them.
 - Embryos (`OmegaServices`, `Realm` authority, the router pubkey map, `OfferUpdate`) stay unbound and
-  documented as v0.5.0 work; the pass confirms they remain empty rather than half-implementing them.
+  documented here under the historical v0.5.0 label; ADR-0049 supersedes that schedule with v0.5.1/
+  v0.5.2 targets. This pass confirms they remain empty rather than half-implementing them.
 - One concrete unit of v0.4.3 work falls out: land the signed-dialogue-provenance fields + verify test
   (row 11), per [ADR-0038](ADR-0038-origin-stays-hop-by-hop.md).
 
@@ -116,4 +129,6 @@ preserves this ADR as the historical v0.4.3 inventory instead of silently rewrit
 register schedules as realize-in-v0.4.3); [TRD-004](../trd/TRD-004-reserved-seam-discipline.md) (the
 anti-churn requirement this register satisfies); [TRD-001](../trd/TRD-001-substrate-resource-safety.md)
 and [ADR-0042](ADR-0042-escape-hatch-policy.md) (the `0 = unbounded` opt-out is itself a documented
-reserved posture, governed there rather than re-listed here).
+reserved posture, governed there rather than re-listed here); and
+[ADR-0049](ADR-0049-stage-v0.5-composition-and-mesh-autonomy.md) (the authoritative forward milestone
+schedule for this historical register).

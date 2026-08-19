@@ -39,9 +39,13 @@ pub const RESULT_SCHEMA: &str = "dialogue.result";
 
 /// Schema of a terminal *failure* the initiator relays to a conversation's original requester when it
 /// abandons the conversation (the parked entry was evicted under pending-pressure, or the peer's reply
-/// broke the turn-size contract). Distinct from [`RESULT_SCHEMA`] so a requester never mistakes an
-/// abandonment for a real reply — the same "structured terminal reply, never silent abandonment"
-/// discipline `distributor-requirements` commits to with its no-provider reply.
+/// broke the turn-size/shape/provenance contract, or the peer sent an admissible
+/// `Steer { kind: "abort" }`). When a peer signer is pinned, an abort is admissible only when its
+/// payload is an existing signed [`dialogue::AnswerBody`] bound to the parked `(corr, prompt)` and
+/// abort reason; unauthenticated aborts cannot evict live pending state.
+/// Distinct from [`RESULT_SCHEMA`] so a requester never mistakes an abandonment for a real reply —
+/// the same "structured terminal reply, never silent abandonment" discipline
+/// `distributor-requirements` commits to with its no-provider reply.
 pub const FAILED_SCHEMA: &str = "dialogue.failed";
 
 /// Default cap on conversations awaiting a peer reply. At capacity a new trigger evicts the **oldest**
@@ -49,6 +53,34 @@ pub const FAILED_SCHEMA: &str = "dialogue.failed";
 /// the new one — so a handful of dead peers can't permanently wedge the initiator into refuse-new.
 /// `0` (via [`DialogueInitiator::with_max_pending`]) is the explicit lab/demo unbounded opt-out.
 pub const DEFAULT_MAX_PENDING: usize = 128;
+
+/// Query id of the one opening turn currently parked per conversation corr.
+const OPENING_QUERY_ID: u64 = 1;
+
+/// One app-signed dialogue turn retained after provenance verification and before the initiator
+/// reduces the answer to the plaintext [`RESULT_SCHEMA`] reply.
+///
+/// This is a composition-local audit record, not a new wire shape. Keeping the original
+/// [`dialogue::AnswerBody`] lets an evidence writer later re-check the peer signature over the exact
+/// `(corr, prompt, reply)` tuple. The `query_id` remains explicit because it is part of the parked
+/// SEER exchange even though the current answer signature deliberately binds only corr + prompt +
+/// reply (ADR-0038).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct VerifiedDialogueTurn {
+    pub corr: u64,
+    pub query_id: u64,
+    pub prompt: String,
+    pub answer: dialogue::AnswerBody,
+}
+
+/// Nonblocking composition-local sink for signer-verified dialogue turns.
+///
+/// Implementations MUST bound retained state and MUST NOT perform network or unbounded filesystem
+/// work on the creature drain thread. A sink failure is terminal for that conversation: Alpha will
+/// not return a successful plaintext result while silently omitting its requested audit evidence.
+pub trait VerifiedTurnSink: Send + Sync {
+    fn record_verified_turn(&self, turn: VerifiedDialogueTurn) -> Result<(), String>;
+}
 
 /// The terminal failure body relayed on [`FAILED_SCHEMA`]. `reason` is free-form audit prose; the
 /// schema is the dispatch key (a requester branches on the schema, then surfaces the reason).
@@ -67,12 +99,13 @@ impl DialogueFailed {
     }
 }
 
-/// A conversation awaiting the peer's reply: where to relay it, on which corr, and the prompt that
-/// opened it (kept so the relay can recompute the app-signed provenance payload, ADR-0038).
+/// A conversation awaiting the peer's reply: where to relay it, on which corr/query, and the prompt
+/// that opened it (kept so the relay can recompute the app-signed provenance payload, ADR-0038).
 struct Pending {
     reply_to: Address,
     orig_corr: Option<u64>,
     prompt: String,
+    query_id: u64,
 }
 
 impl Pending {
@@ -108,10 +141,14 @@ pub struct DialogueInitiator {
     /// authenticity that survives the relay even though the transport `Origin` is hop-by-hop. `None`
     /// is the reference posture (relay unverified, wire-identical to before provenance existed).
     verifier: Option<Arc<dyn Verifier>>,
-    /// Optional expected peer signer (hex pubkey). When set (and a verifier is configured), the relay
-    /// additionally requires the reply to be signed *by this key* — an unsigned or wrong-key reply
-    /// fails the conversation rather than being relayed as if authentic.
+    /// Optional expected peer signer (hex pubkey). With a verifier configured, the relay requires
+    /// replies and terminal aborts to be signed *by this key*. Abort handling is always fail-closed
+    /// once the key is pinned: without a verifier, or with an invalid abort, it leaves the live turn
+    /// pending so an unauthenticated peer cannot terminate somebody else's conversation.
     expect_signer: Option<String>,
+    /// Optional in-memory/nonblocking audit hook invoked only after cryptographic provenance and
+    /// the expected signer (when pinned) have both been verified.
+    verified_turn_sink: Option<Arc<dyn VerifiedTurnSink>>,
 }
 
 impl DialogueInitiator {
@@ -126,6 +163,7 @@ impl DialogueInitiator {
             me: None,
             verifier: None,
             expect_signer: None,
+            verified_turn_sink: None,
         }
     }
 
@@ -138,10 +176,24 @@ impl DialogueInitiator {
         self
     }
 
-    /// Pin the peer's expected signer (hex pubkey). Implies verification: a relayed reply must be
-    /// signed by exactly this key, or the conversation fails. No effect without a verifier set.
+    /// Pin the peer's expected signer (hex pubkey). With [`Self::with_verifier`], a relayed reply
+    /// must be signed by exactly this key or the conversation fails. A terminal abort always enters
+    /// the strict posture: it must carry a signed [`dialogue::AnswerBody`] from exactly this key,
+    /// bound to the pending corr, prompt, and reason. If no verifier is configured, or verification
+    /// fails, the abort is ignored and the turn remains pending.
     pub fn with_expected_signer(mut self, signer_pubkey: impl Into<String>) -> Self {
         self.expect_signer = Some(signer_pubkey.into());
+        self
+    }
+
+    /// Retain each successfully verified signed answer before relaying its plaintext reply.
+    ///
+    /// The sink is deliberately additive and local: it changes neither Envelope nor SEER. If a
+    /// sink is configured without a verifier, unsigned/unchecked replies fail instead of being
+    /// mislabelled as verified evidence. Configure [`Self::with_verifier`] and, for a pinned peer,
+    /// [`Self::with_expected_signer`] on the same initiator.
+    pub fn with_verified_turn_sink(mut self, sink: Arc<dyn VerifiedTurnSink>) -> Self {
+        self.verified_turn_sink = Some(sink);
         self
     }
 
@@ -172,7 +224,10 @@ impl DialogueInitiator {
         if env.payload.len() > dialogue::MAX_TURN_BYTES {
             return Outcome::none();
         }
-        let prompt = String::from_utf8_lossy(&env.payload).into_owned();
+        let prompt = match std::str::from_utf8(&env.payload) {
+            Ok(prompt) => prompt.to_owned(),
+            Err(_) => return Outcome::none(),
+        };
 
         // Pending-pressure guard: at capacity, evict the OLDEST parked conversation (smallest corr —
         // `next_corr` is monotone, so smallest == oldest) and relay a terminal failure to its
@@ -199,11 +254,17 @@ impl DialogueInitiator {
                 reply_to: env.reply_target(),
                 orig_corr: env.header.corr,
                 prompt: prompt.clone(),
+                query_id: OPENING_QUERY_ID,
             },
         );
 
         // Send the opening turn to the named peer; reply_to points back here so the Answer returns.
-        let q = SeerEnvelope::query(SeerTopic::Dialogue, corr, 1, &dialogue::QueryBody { prompt });
+        let q = SeerEnvelope::query(
+            SeerTopic::Dialogue,
+            corr,
+            OPENING_QUERY_ID,
+            &dialogue::QueryBody { prompt },
+        );
         dispatches.push(
             Dispatch::to(self.peer.clone(), q.to_bytes())
                 .with_schema(SEER_SCHEMA)
@@ -213,16 +274,24 @@ impl DialogueInitiator {
         Outcome { dispatches, budget_signal: None }
     }
 
-    fn on_answer(&mut self, seer: SeerEnvelope) -> Outcome {
-        let SeerKind::Answer { body, .. } = seer.kind else {
-            return Outcome::none(); // Steer/Progress/Thought/Query — not the move we await.
-        };
-        let Some(p) = self.pending.remove(&seer.corr) else {
+    fn on_answer(&mut self, corr: u64, query_id: u64, body: serde_json::Value) -> Outcome {
+        // Pair on the complete SEER thread identity. A stale/spoofed query_id on a live corr is not
+        // an answer to this exchange and MUST NOT evict it; the legitimate answer can still arrive.
+        let Some(pending) = self.pending.get(&corr) else {
             return Outcome::none(); // late/unknown conversation; drop silently.
+        };
+        if pending.query_id != query_id {
+            return Outcome::none();
+        }
+
+        // A matching answer is terminal even when its body is malformed. Consume exactly once,
+        // then surface a structured failure rather than silently losing the original requester.
+        let Some(p) = self.pending.remove(&corr) else {
+            return Outcome::none();
         };
         let answer: dialogue::AnswerBody = match serde_json::from_value(body) {
             Ok(a) => a,
-            Err(_) => return Outcome::none(),
+            Err(_) => return Outcome::send(p.failed("peer returned a malformed dialogue answer")),
         };
         // The reply is held to the same turn cap the prompt side already enforces — a peer that
         // breaks the contract fails the conversation rather than having an over-cap turn relayed.
@@ -234,8 +303,9 @@ impl DialogueInitiator {
         // the transport path. When a verifier is configured we check it before relaying: a tampered
         // or forged signature (`Invalid`) fails the conversation rather than being passed off as
         // authentic; an unsigned reply fails only if a signer was pinned (else it relays, lenient).
+        let mut provenance_verified = false;
         if let Some(verifier) = &self.verifier {
-            match answer.verify_provenance(seer.corr, &p.prompt, verifier.as_ref()) {
+            match answer.verify_provenance(corr, &p.prompt, verifier.as_ref()) {
                 Provenance::Verified(pk) => {
                     if let Some(expected) = &self.expect_signer {
                         if &pk != expected {
@@ -244,6 +314,7 @@ impl DialogueInitiator {
                             );
                         }
                     }
+                    provenance_verified = true;
                 }
                 Provenance::Invalid => {
                     return Outcome::send(p.failed("peer reply failed provenance verification"));
@@ -257,12 +328,82 @@ impl DialogueInitiator {
                 }
             }
         }
+        if let Some(sink) = &self.verified_turn_sink {
+            if !provenance_verified {
+                return Outcome::send(
+                    p.failed("dialogue evidence sink requires a signer-verified peer reply"),
+                );
+            }
+            let turn = VerifiedDialogueTurn {
+                corr,
+                query_id,
+                prompt: p.prompt.clone(),
+                answer: answer.clone(),
+            };
+            let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sink.record_verified_turn(turn)
+            }));
+            match recorded {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => {
+                    return Outcome::send(
+                        p.failed(&format!("could not retain verified dialogue evidence: {reason}")),
+                    )
+                }
+                Err(_) => {
+                    return Outcome::send(p.failed("verified dialogue evidence sink panicked"))
+                }
+            }
+        }
         // Relay the peer's reply to the original requester, on its own corr.
         let mut d = Dispatch::to(p.reply_to, answer.reply.into_bytes()).with_schema(RESULT_SCHEMA);
         if let Some(c) = p.orig_corr {
             d = d.with_corr(c);
         }
         Outcome::send(d)
+    }
+
+    fn on_abort(&mut self, corr: u64, payload: serde_json::Value) -> Outcome {
+        let Some(pending) = self.pending.get(&corr) else {
+            return Outcome::none(); // late/unknown abort; no live requester to notify.
+        };
+
+        // An abort is a destructive terminal move: validate it before removing pending state. A
+        // pinned peer reuses the existing AnswerBody provenance shape, with `reply` carrying the
+        // reason. Its signature already binds `(corr, prompt, reply)`, so no parallel abort crypto
+        // contract is needed. Legacy string payloads remain accepted only in the unpinned posture.
+        let signed_reason = if let Some(expected) = &self.expect_signer {
+            let Some(verifier) = &self.verifier else {
+                return Outcome::none();
+            };
+            let answer: dialogue::AnswerBody = match serde_json::from_value(payload) {
+                Ok(answer) => answer,
+                Err(_) => return Outcome::none(),
+            };
+            if answer.reply.len() > dialogue::MAX_TURN_BYTES {
+                return Outcome::none();
+            }
+            match answer.verify_provenance(corr, &pending.prompt, verifier.as_ref()) {
+                Provenance::Verified(key) if &key == expected => answer.reply,
+                Provenance::Verified(_) | Provenance::Unsigned | Provenance::Invalid => {
+                    return Outcome::none()
+                }
+            }
+        } else {
+            // Preserve the pre-provenance responder contract. New signed abort objects are also
+            // terminal here; without a pinned identity there is intentionally no key policy.
+            match payload {
+                serde_json::Value::String(reason) => reason,
+                body => serde_json::from_value::<dialogue::AnswerBody>(body)
+                    .map(|answer| answer.reply)
+                    .unwrap_or_else(|_| "peer supplied no abort reason".to_string()),
+            }
+        };
+
+        let Some(p) = self.pending.remove(&corr) else {
+            return Outcome::none();
+        };
+        Outcome::send(p.failed(&format!("peer aborted the dialogue turn: {signed_reason}")))
     }
 }
 
@@ -276,7 +417,15 @@ impl Creature for DialogueInitiator {
         // SEER consumer of the peer's `Answer` that ALSO handles a non-SEER trigger — exactly the
         // initiator shape `classify` exists for.
         match classify(&env, SeerTopic::Dialogue) {
-            Inbound::Ours(seer) => self.on_answer(seer),
+            Inbound::Ours(seer) => match seer.kind {
+                SeerKind::Answer { query_id, body } => self.on_answer(seer.corr, query_id, body),
+                SeerKind::Steer { kind, payload } if kind == "abort" => {
+                    self.on_abort(seer.corr, payload)
+                }
+                // Query/Progress/Thought and non-abort Steer are not terminal moves for the opening
+                // exchange. Ignore them without consuming the parked turn.
+                _ => Outcome::none(),
+            },
             Inbound::NotSeer => {
                 if env.header.schema == START_SCHEMA {
                     self.on_start(env)
@@ -301,6 +450,17 @@ impl DialogueInitiator {
 mod tests {
     use super::*;
     use aether::Header;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingTurnSink(Mutex<Vec<VerifiedDialogueTurn>>);
+
+    impl VerifiedTurnSink for RecordingTurnSink {
+        fn record_verified_turn(&self, turn: VerifiedDialogueTurn) -> Result<(), String> {
+            self.0.lock().unwrap_or_else(|poison| poison.into_inner()).push(turn);
+            Ok(())
+        }
+    }
 
     fn env(
         schema: &str,
@@ -351,7 +511,8 @@ mod tests {
         assert_eq!(seer.topic, SeerTopic::Dialogue);
         assert_eq!(seer.corr, 700_000, "conversation corr from the seed");
         match seer.kind {
-            SeerKind::Query { body, .. } => {
+            SeerKind::Query { query_id, body } => {
+                assert_eq!(query_id, OPENING_QUERY_ID);
                 let q: dialogue::QueryBody = serde_json::from_value(body).unwrap();
                 assert_eq!(q.prompt, "hello agent");
             }
@@ -398,6 +559,198 @@ mod tests {
         );
         let out = i.handle(env(SEER_SCHEMA, ans.to_bytes(), Some(999), None));
         assert!(out.dispatches.is_empty(), "no parked conversation for corr 999 → dropped");
+    }
+
+    #[test]
+    fn mismatched_query_id_does_not_evict_the_live_conversation() {
+        let mut i = initiator();
+        i.handle(env(
+            START_SCHEMA,
+            b"hi".to_vec(),
+            Some(1),
+            Some(Address::Creature(CreatureId(100))),
+        ));
+
+        // Even a malformed body cannot terminate the exchange when its query_id is stale/spoofed.
+        let wrong = SeerEnvelope {
+            topic: SeerTopic::Dialogue,
+            corr: 700_000,
+            kind: SeerKind::Answer {
+                query_id: OPENING_QUERY_ID + 1,
+                body: serde_json::json!({"reply": 7}),
+            },
+        };
+        let out = i.handle(env(SEER_SCHEMA, wrong.to_bytes(), Some(700_000), None));
+        assert!(out.dispatches.is_empty());
+        assert_eq!(i.pending_conversations(), 1, "mismatch leaves the legitimate turn parked");
+
+        let matching = SeerEnvelope::answer(
+            SeerTopic::Dialogue,
+            700_000,
+            OPENING_QUERY_ID,
+            &dialogue::AnswerBody::unsigned("echo: hi"),
+        );
+        let out = i.handle(env(SEER_SCHEMA, matching.to_bytes(), Some(700_000), None));
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].schema, RESULT_SCHEMA);
+        assert_eq!(out.dispatches[0].payload, b"echo: hi");
+        assert_eq!(i.pending_conversations(), 0);
+    }
+
+    #[test]
+    fn matching_malformed_answer_is_a_terminal_failure() {
+        let mut i = initiator();
+        i.handle(env(
+            START_SCHEMA,
+            b"hi".to_vec(),
+            Some(1),
+            Some(Address::Creature(CreatureId(100))),
+        ));
+        let malformed = SeerEnvelope {
+            topic: SeerTopic::Dialogue,
+            corr: 700_000,
+            kind: SeerKind::Answer {
+                query_id: OPENING_QUERY_ID,
+                body: serde_json::json!({"reply": 7}),
+            },
+        };
+        let out = i.handle(env(SEER_SCHEMA, malformed.to_bytes(), Some(700_000), None));
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].schema, FAILED_SCHEMA);
+        assert_eq!(out.dispatches[0].corr, Some(1));
+        let failed = DialogueFailed::parse(&out.dispatches[0].payload).expect("failure body");
+        assert!(failed.reason.contains("malformed"));
+        assert_eq!(i.pending_conversations(), 0, "a matching malformed answer is terminal");
+    }
+
+    #[test]
+    fn matching_abort_is_a_terminal_failure_but_other_steers_do_not_evict() {
+        let mut i = initiator();
+        i.handle(env(
+            START_SCHEMA,
+            b"hi".to_vec(),
+            Some(1),
+            Some(Address::Creature(CreatureId(100))),
+        ));
+
+        let info =
+            SeerEnvelope::steer(SeerTopic::Dialogue, 700_000, "info", &serde_json::json!({}));
+        assert!(i
+            .handle(env(SEER_SCHEMA, info.to_bytes(), Some(700_000), None))
+            .dispatches
+            .is_empty());
+        assert_eq!(i.pending_conversations(), 1, "non-abort steer is advisory");
+
+        let abort =
+            SeerEnvelope::steer(SeerTopic::Dialogue, 700_000, "abort", &"model call failed");
+        let out = i.handle(env(SEER_SCHEMA, abort.to_bytes(), Some(700_000), None));
+        assert_eq!(out.dispatches.len(), 1);
+        assert_eq!(out.dispatches[0].schema, FAILED_SCHEMA);
+        assert_eq!(out.dispatches[0].corr, Some(1));
+        let failed = DialogueFailed::parse(&out.dispatches[0].payload).expect("failure body");
+        assert!(failed.reason.contains("aborted"));
+        assert_eq!(i.pending_conversations(), 0);
+    }
+
+    #[test]
+    fn pinned_abort_rejects_plain_unsigned_and_wrong_key_before_consuming_pending() {
+        use aether::{Ed25519Signer, Ed25519Verifier, Signer as _};
+
+        let (peer, _peer_seed) = Ed25519Signer::generate().expect("peer key");
+        let (impostor, _impostor_seed) = Ed25519Signer::generate().expect("impostor key");
+        let mut i = initiator()
+            .with_verifier(Arc::new(Ed25519Verifier))
+            .with_expected_signer(peer.public_key());
+        i.handle(env(
+            START_SCHEMA,
+            b"hi".to_vec(),
+            Some(1),
+            Some(Address::Creature(CreatureId(100))),
+        ));
+
+        let plain =
+            SeerEnvelope::steer(SeerTopic::Dialogue, 700_000, "abort", &"model call failed");
+        assert!(i
+            .handle(env(SEER_SCHEMA, plain.to_bytes(), Some(700_000), None))
+            .dispatches
+            .is_empty());
+        assert_eq!(i.pending_conversations(), 1, "a legacy unsigned abort cannot evict a pin");
+
+        let unsigned = SeerEnvelope::steer(
+            SeerTopic::Dialogue,
+            700_000,
+            "abort",
+            &dialogue::AnswerBody::unsigned("model call failed"),
+        );
+        assert!(i
+            .handle(env(SEER_SCHEMA, unsigned.to_bytes(), Some(700_000), None))
+            .dispatches
+            .is_empty());
+        assert_eq!(i.pending_conversations(), 1, "an unsigned AnswerBody also keeps pending");
+
+        let wrong_key = SeerEnvelope::steer(
+            SeerTopic::Dialogue,
+            700_000,
+            "abort",
+            &dialogue::AnswerBody::signed(700_000, "hi", "model call failed", &impostor),
+        );
+        assert!(i
+            .handle(env(SEER_SCHEMA, wrong_key.to_bytes(), Some(700_000), None))
+            .dispatches
+            .is_empty());
+        assert_eq!(
+            i.pending_conversations(),
+            1,
+            "a valid signature from the wrong key keeps pending"
+        );
+
+        let wrong_turn = SeerEnvelope::steer(
+            SeerTopic::Dialogue,
+            700_000,
+            "abort",
+            &dialogue::AnswerBody::signed(
+                700_000,
+                "a different pending prompt",
+                "model call failed",
+                &peer,
+            ),
+        );
+        assert!(i
+            .handle(env(SEER_SCHEMA, wrong_turn.to_bytes(), Some(700_000), None))
+            .dispatches
+            .is_empty());
+        assert_eq!(
+            i.pending_conversations(),
+            1,
+            "even the expected key cannot replay an abort across prompts"
+        );
+
+        let mut tampered_reason =
+            dialogue::AnswerBody::signed(700_000, "hi", "model call failed", &peer);
+        tampered_reason.reply = "a different reason".into();
+        let tampered = SeerEnvelope::steer(SeerTopic::Dialogue, 700_000, "abort", &tampered_reason);
+        assert!(i
+            .handle(env(SEER_SCHEMA, tampered.to_bytes(), Some(700_000), None))
+            .dispatches
+            .is_empty());
+        assert_eq!(
+            i.pending_conversations(),
+            1,
+            "the signed reason cannot be changed before termination"
+        );
+
+        let valid = SeerEnvelope::steer(
+            SeerTopic::Dialogue,
+            700_000,
+            "abort",
+            &dialogue::AnswerBody::signed(700_000, "hi", "model call failed", &peer),
+        );
+        let out = i.handle(env(SEER_SCHEMA, valid.to_bytes(), Some(700_000), None));
+        assert_eq!(out.dispatches.len(), 1, "the expected peer can terminate its turn");
+        assert_eq!(out.dispatches[0].schema, FAILED_SCHEMA);
+        let failed = DialogueFailed::parse(&out.dispatches[0].payload).expect("failure body");
+        assert!(failed.reason.contains("model call failed"), "signed reason is preserved");
+        assert_eq!(i.pending_conversations(), 0, "valid signed abort consumes exactly once");
     }
 
     #[test]
@@ -518,6 +871,39 @@ mod tests {
         });
         assert_eq!(d.schema, RESULT_SCHEMA, "a valid signature relays normally");
         assert_eq!(d.payload, b"echo: hi");
+    }
+
+    #[test]
+    fn verified_turn_sink_retains_the_exact_signed_body_before_plaintext_relay() {
+        let (signer, _seed) = Ed25519Signer::generate().unwrap();
+        let sink = Arc::new(RecordingTurnSink::default());
+        let i = initiator()
+            .with_verifier(Arc::new(Ed25519Verifier))
+            .with_expected_signer(signer.public_key())
+            .with_verified_turn_sink(sink.clone());
+        let expected = dialogue::AnswerBody::signed(700_000, "hi", "echo: hi", &signer);
+        let d = run_conversation(i, "hi", |_corr, _prompt| expected.clone());
+        assert_eq!(d.schema, RESULT_SCHEMA);
+        assert_eq!(d.payload, b"echo: hi");
+        assert_eq!(
+            *sink.0.lock().unwrap_or_else(|poison| poison.into_inner()),
+            vec![VerifiedDialogueTurn {
+                corr: 700_000,
+                query_id: OPENING_QUERY_ID,
+                prompt: "hi".into(),
+                answer: expected,
+            }]
+        );
+    }
+
+    #[test]
+    fn evidence_sink_never_labels_an_unsigned_lenient_reply_as_verified() {
+        let sink = Arc::new(RecordingTurnSink::default());
+        let i = initiator().with_verified_turn_sink(sink.clone());
+        let d =
+            run_conversation(i, "hi", |_corr, _prompt| dialogue::AnswerBody::unsigned("echo: hi"));
+        assert_eq!(d.schema, FAILED_SCHEMA);
+        assert!(sink.0.lock().unwrap_or_else(|poison| poison.into_inner()).is_empty());
     }
 
     #[test]

@@ -58,7 +58,8 @@ both sits `foundation/` — shared GAWD foundations Alpha *consumes but does not
 contracts/tools, `gawd`-prefixed, destined to externalize into their own repos); **not** part of the
 cosmology, so beside it, not within it (filing one under `cosmos/` would falsely claim it is Alpha's
 interior). `demos/` and `docs/` stay at the root. (The memory-safety harnesses live with the tests they
-drive, in `cosmos/sanctum/tests/memcheck/` — not a root `ci/` dir; the real CI is `.github/workflows/`.)
+drive, in `cosmos/sanctum/tests/memcheck/` — not a root `ci/` dir; hosted sanity definitions live in
+`.github/workflows/`.)
 
 | Path | What it is |
 |---|---|
@@ -91,9 +92,16 @@ cargo run -p omega -- serve --node-id Ω --cluster-listen 127.0.0.1:9100   # boo
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo doc --locked -p sanctum --no-deps --open
 ```
 
-Run only the smallest affected package/test target locally. The full workspace gate runs once on the
-exact candidate in constrained CI, never as a second local pass. Cargo does not garbage-collect stale
-`target/` variants; if space must be reclaimed, inspect the directory first and use
+Run only the smallest affected package/test target while iterating. Freeze the candidate, then run
+the authoritative exhaustive gate exactly once and locally with
+`tools/local-validation.sh --exact-commit <40-hex-sha>`. For a v0.5 release, also supply
+`--output-dir <absolute-new-handoff-dir>` so that gate prepares the exact report and copied binary for
+live acceptance. Push the unchanged commit and require its short hosted sanity check to pass, then
+run `tools/v05-live-acceptance.sh` locally with the exact `--candidate-sha`, handoff's absolute
+`--validation-report`, and a new absolute `--output-dir`. GitHub CI is not the
+exhaustive validation authority and must never receive provider/operator keys or raw live evidence.
+After the live proof, move the packages directly to external retention. Cargo does not
+garbage-collect stale `target/` variants; if space must be reclaimed, inspect the directory first and use
 `cargo clean -p <exact-package>` rather than deleting a broad workspace or any runtime state.
 Before launching any Cargo command, confirm another agent or shell is not already compiling this
 workspace; concurrent/repeated gates are forbidden. Reuse the existing result or wait for the active

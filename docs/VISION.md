@@ -348,6 +348,29 @@ ladder, not decoration. The endgame the primitives point at:
   and re-form across nodes — so the operator survives the hardware, scales across bodies, and is
   bounded by the reach of the mesh rather than the limits of one box.
 
+The concrete v0.5.0 proof joins interaction to the first two outcomes above: three independently
+signing live-model agents—a Builder, Reviewer, and Contract Tester—must make four material causal
+decisions across two Realms. Their exact normalized approval is one fresh, bounded `affine_i32_v1`
+data program. The same Builder confirms digest-bound source-free records; host validation and audited
+templates lower that IR into daemon, beast, and critter code. This deliberately proves constrained
+typed synthesis, not arbitrary-code generation or general agency. The three builder-produced,
+signed, durably recovered artifacts have equal contracts and behavior but distinct immutable backend
+identities, and all three execute both locally and across a Realm boundary. Product acceptance needs
+the clean exact commit to pass `tools/local-validation.sh` and produce the copied-binary handoff. The
+unchanged commit then passes short hosted sanity before a local `tools/v05-live-acceptance.sh` run
+consumes that handoff. Its provider-reported receipts, signed decisions, sources, artifacts, and
+execution proofs are retained
+under a verified evidence index and external operator seal; the exact packaged binary then validates
+the whole bundle offline with `dialogue verify-live` under pinned trust and prior-semantic inputs.
+Encrypted raw evidence, the disclosure-safe pack, exact binary, and ceremony metadata must move
+directly to immutable supported-lifetime storage. GitHub CI remains a short credential-free sanity
+check required for merge/tag hygiene, not the authoritative validation gate; it receives neither
+provider/operator keys nor raw evidence. Provider metadata does not prove model weights, and retained
+provenance is not reproducible-build proof. The scripted run is regression only. This remains bounded
+pairwise Dialogue, not generic group chat, arbitrary-N, quorum/consensus, a durable signed group
+transcript, or a three-process deployment proof.
+The normative bar is [TRD-007](trd/TRD-007-cross-mesh-model-collaboration.md).
+
 None of this requires belief — only that the hard problems below actually hold. Get those
 right and the rest is reachable. That is the whole bet.
 

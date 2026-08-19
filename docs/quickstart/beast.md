@@ -6,10 +6,12 @@ right choice for foreign or cross-Realm code, and the only tier with a **byte-ex
 speak a small ABI directly. For most work, prefer `critter` (instant) or `daemon` (full Rust); reach for
 a beast when you specifically need portability or hard sandboxing.
 
-> **No standalone beast crate ships.** Unlike `echo-daemon`/`echo-critter`, the reference beast is the
-> small WAT module compiled inline (via the `wat` crate) in the integration test —
-> [`cosmos/sanctum/tests/m0_integration.rs`](../../cosmos/sanctum/tests/m0_integration.rs). That test is the runnable
-> reference for this quickstart.
+> **No checked-in beast artifact crate is needed.** `build-beast` is the shipped native BUILD organ:
+> it compiles exact WAT to core WASM in-process, rejects imports or a malformed guest ABI, and signs
+> the emitted bytes. The small raw-payload specimen remains inline in
+> [`cosmos/sanctum/tests/m0_integration.rs`](../../cosmos/sanctum/tests/m0_integration.rs); the
+> [`dialogue` demo](../../demos/) trusted-lowers an approved bounded affine IR, then builds,
+> publishes, recovers, and executes the typed beast. Its model does not supply WAT.
 
 ## 1. The ABI
 
@@ -22,6 +24,13 @@ A beast module must export these three things (`cosmos/anima/src/wasm.rs`):
 
 Manifest: `backend = "beast"` (wasm), `abi_tag = "gawd_creature_v1"` (the same tag native daemons use — the
 tier is selected by `backend`, not the tag).
+
+An ordinary beast receives an envelope's payload bytes unchanged. A manifest with exactly one
+contracted `gawd.function.call.v1` entrypoint activates `WasmEngine`'s host-side typed adapter: the
+host verifies the existing call proof, exact manifest-derived `FunctionId`, and creature routes,
+passes only canonical inline application JSON through these same exports, and wraps returned JSON in
+the exact verified attempt's `FunctionResultV1`. This is **not a host import** or a second ABI. Typed
+beasts still import nothing, and raw beasts keep their original payload-in/payload-out behavior.
 
 ## 2. The reference beast (reverses its payload), in WAT
 
@@ -50,9 +59,10 @@ tier is selected by `backend`, not the tag).
             (i64.extend_i32_u (local.get $len)))))
 ```
 
-You normally won't hand-write WAT — compile a guest in any language that targets WASM (Rust with
-`--target wasm32-unknown-unknown`, AssemblyScript, …) and export those three symbols. Hand-written WAT is
-just the smallest way to *see* the contract.
+Hand-written WAT is the exact source accepted by `BuildBeast` and the smallest way to *see* the
+contract. You can also produce a compatible `.wasm` with another external toolchain (Rust with
+`--target wasm32-unknown-unknown`, AssemblyScript, …) and load it directly after supplying a matching
+signed manifest.
 
 ## 3. Load it
 

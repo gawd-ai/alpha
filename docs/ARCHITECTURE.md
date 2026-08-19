@@ -60,7 +60,7 @@ cosmos/                    # everything between α and Ω — the interior the f
                            #     transport-tcp                     (ed25519 + framed TCP)
                            #     registry-mem, bestiary-daemon     (ephemeral + durable registry fillings)
                            #     build-cargo                       (native compile; operator-injected sandbox)
-                           #     build-critter                     (no-cargo critter builder)
+                           #     build-beast, build-critter        (no-cargo WASM/Rhai builders)
                            #     agent-templated, agent-curious, agent-mind  (reference authoring fillings)
                            #     surface-http, surface-mcp         (loadable control surfaces)
                            #     distributor-requirements          (the Distributor; consumes placement SEER)
@@ -211,7 +211,13 @@ woven *on* it is hot-swappable, but the fabric itself is not.
 - **`WasmEngine`** — real `wasmtime`, with a fuel + linear-memory limiter.
   Dropping the `Store` collapses all linear memory + tables (Opt D); no UAF class
   exists for beasts. Emits `BudgetSignal::Warn` at the configured threshold
-  (`Capabilities.budget_warn_at`) — the budget-gradient emission on the path.
+  (`Capabilities.budget_warn_at`) — the budget-gradient emission on the path. A manifest with exactly
+  one contracted `gawd.function.call.v1` entrypoint activates a host-side typed adapter: before guest
+  execution the host validates the existing call proof, exact manifest-derived `FunctionId`, and
+  canonical creature routes, then passes only canonical inline application JSON through the existing
+  exported `memory + alloc + handle` ABI. It parses returned JSON and wraps it in a
+  `FunctionResultV1` carrying the exact verified `AttemptId`. This is **not a host import** or a new
+  guest ABI; typed modules still declare no imports, and ordinary beast payload handling is unchanged.
 - **`ScriptEngine`** — the critter tier: a bare Rhai interpreter
   with no filesystem, network, clock, process, rand, imports, or runtime `eval`.
   The artifact is UTF-8 Rhai source (`abi_tag = gawd_critter_v1`) defining
@@ -221,6 +227,33 @@ woven *on* it is hot-swappable, but the fabric itself is not.
   to fixed-at-load Rhai structural caps (string / array / map size), a best-effort memory guard rather
   than the beast tier's byte-exact limiter. Bounded instance-local memory and pure JSON/Function-proof
   helpers add no ambient authority.
+
+The v0.5.0 composition proves both that collaboration is not fixed to one model
+pair and that these are three real execution backends. Builder, Reviewer, and Contract Tester make
+four signer-verified, strictly decoded causal decisions across two in-process Kernel nodes/Realms over
+authenticated TCP. The accepted result is a fresh bounded `affine_i32_v1` data program. The same
+Builder Model injection confirms one source-free record per tier; `AgentMind` validates it against
+the approved digest and trusted renderers produce Rust, no-import WAT, and Rhai. Models cannot place
+source, dependencies, or authority in that path. Three builder outputs are durably recovered and
+three distinct `FunctionId`s each execute one tester-selected local and one A-Home → B-executor Job.
+Each retained Job proof carries the signed submission, complete contiguous Home event history and
+terminal snapshot, execution grant/call/dispatch route, deployment receipt, and terminal execution
+receipt; the final summary anchors a record hashing all six bundles. That proves intended signed
+Home/deployment topology and one-attempt history, not packet-level traversal.
+The default scripted run is regression only. TRD-007 remains Accepted/not Met until one clean exact
+commit passes the exhaustive local `tools/local-validation.sh` gate, which prepares a validation
+report plus copied-binary handoff. That unchanged commit must pass short hosted sanity before a fresh
+local `tools/v05-live-acceptance.sh` run consumes the handoff and retains provider-reported receipts
+and all signed/build/execution evidence under a verified index plus external operator seal. The same
+packaged binary must independently accept that bundle through `dialogue verify-live` under pinned
+commit/signer/novelty inputs; encrypted raw evidence, the disclosure-safe pack, exact binary, and
+ceremony metadata then move directly to immutable supported-lifetime storage. Hosted GitHub CI is
+required merge/tag hygiene but is not the authoritative validation gate; it receives neither
+provider/operator keys nor raw evidence.
+Provider metadata does not prove model weights, and the retained provenance is not a
+reproducible-build proof. This proves constrained typed synthesis, not arbitrary code, general
+agency, broadcast/group Dialogue, arbitrary-N consensus, a durable group transcript, or a
+three-process Sanctum deployment.
 
 ## The SDK (`forge`)
 
@@ -269,16 +302,17 @@ column below shows each crate's home.
 | `cosmos/creatures/registry-mem` | native | The Bestiary seed — content-addressed `publish` / `fetch`; a manifest + bytes addressed by `artifact_hash`. |
 | `cosmos/creatures/bestiary-daemon` | native | The durable `Role::REGISTRY` filling — Realm-sharded content-addressed artifacts/catalog entries, a signed local journal, entry proofs, curation, and bounded full-live-set PUSH anti-entropy. It stores package availability, not live deployments or the mutable Job ledger. |
 | `cosmos/creatures/build-cargo` | native | The compiler — takes the author's `crate_name + source + manifest_stub + deps + template`, compiles in an isolated cargo workspace, and returns `BuildReply::Built { manifest, artifact }` signed by the Abode key. `Sandbox::None` is the default; operators inject containment with `Sandbox::Custom`. |
+| `cosmos/creatures/build-beast` | native | The no-Cargo BUILD sibling for beasts: compiles exact WAT in-process, rejects imports and invalid `memory + alloc + handle` exports, assembles a `Backend::Beast` manifest, and signs the emitted core-WASM bytes through the same `BuildReply` shape. |
 | `cosmos/creatures/build-critter` | native | The no-cargo BUILD sibling for critters: validates Rhai source, assembles a `Backend::Critter` manifest (`gawd_critter_v1`), signs it, and returns the source bytes as the artifact through the same `BuildReply` shape as `build-cargo`. |
 | `cosmos/creatures/agent-templated` | native | The deterministic authoring creature — matches the request against a template catalog, emits an `AuthoringResponse`. |
 | `cosmos/creatures/agent-curious` | native | The consultative authoring creature — when no template matches, emits `AuthoringQuery`, parks the conversation, resumes terminally on `AuthoringAnswer`. Reduction theorem preserved (single-shot `Request → Reply` works unchanged). |
-| `cosmos/creatures/agent-mind` | native | The opt-in model-backed authoring filling. It consumes the injected `mind::Model` seam and binds the same authoring socket as the deterministic references. |
+| `cosmos/creatures/agent-mind` | native | The opt-in model-backed authoring filling. It consumes the injected `mind::Model` seam and binds the same authoring socket as the deterministic references. General mode can parse source/stub completions; v0.5 uses `approved_only`, which accepts a strict digest-bound affine data record and performs trusted host lowering to all three tiers. |
 | `cosmos/creatures/surface-http` | native | **Loadable HTTP/WS surface.** Owns its listener and runtime, maps authenticated REST/WebSocket traffic to `Verb` envelopes on `Role::CONTROL`, and holds no kernel reference. |
 | `cosmos/creatures/surface-mcp` | native | **Loadable MCP surface.** Owns stdio JSON-RPC, maps tool calls to `Verb` envelopes for a local or remote ControlCore, and uses no REST side channel. |
 | `cosmos/creatures/prototypes/fixtures/panic-daemon` | native | Misbehavior specimen — panics in `handle`; verifies the FFI seam catches it and routes to unload. |
 | `cosmos/creatures/prototypes/fixtures/runaway-thread-daemon` | native | Misbehavior specimen — spawns via raw `std::thread::spawn`; verifies the kernel's thread-count guard refuses `dlclose` (bounded leak, not UAF). |
 | `cosmos/creatures/prototypes/fixtures/welbehaved-thread-daemon` | native | Control specimen — spawns via `managed::spawn`; verifies join-on-unload is clean. |
-| _(beast tier)_ | beast (wasm) | No standalone crate ships — the integration test compiles a small WAT module inline (the `wat` crate) and runs it on `WasmEngine` (wasmtime), proving the beast tier through the same `Kernel::load` path as native. |
+| trusted-lowered affine beast | beast (wasm) | The v0.5 dialogue composition lowers the approved affine IR to audited no-import WAT, sends it through `BuildBeast`, durably recovers the signed output, and loads it through `WasmEngine`; raw payload behavior remains covered by the smaller inline-WAT integration specimen. |
 | `cosmos/creatures/prototypes/critters/echo-critter` | critter (Rhai) | The reference script-tier creature: a single `echo.rhai` source artifact, loaded as bytes through `ScriptEngine`, with no Cargo crate or compiled `.so`. |
 | `cosmos/creatures/distributor-requirements` | native | **The Loop-3 keystone.** The Distributor: bound to `Role::DISTRIBUTOR`, consults SEER on the `placement` topic for every Intent (even N=1 local), reconciles `EmbodimentOffer`s by an injected `PickModel` (FirstFit / RoundRobin), routes the Intent to the picked target (local or peer). Companion: `embodiment-advertiser`. |
 | `cosmos/creatures/embodiment-advertiser` | native | One per Sanctum; configured with `self_node` + a list of `(CreatureId, Embodiment)` offers. Answers placement Queries with the matching subset, tagged by `node + creature_id` for the distributor's local-or-peer collapse. |
@@ -309,7 +343,7 @@ column below shows each crate's home.
 | `cosmos/creatures/prototypes/merge/merge-lww-map` | native | **Injected prototype, NOT substrate.** A last-writer-wins merge lattice for the abode-reconciler. |
 | `cosmos/creatures/prototypes/responders/responder-{policy,budget,fitness,curation}` | native | **Injected prototypes, NOT substrate.** Standing SEER consumers that share the bounded responder skeleton and inject only the topic-specific decision. |
 | `cosmos/creatures/prototypes/monitor` | native | **Injected prototype, NOT substrate.** Read-only renderer for bounded PROPRIOCEPTION and FITNESS sense events. |
-| `cosmos/creatures/prototypes/dialogue/dialogue-initiator`, `cosmos/creatures/prototypes/dialogue/dialogue-responder` | native | **Injected prototypes, NOT substrate.** A named-peer, multi-turn SEER conversation pair that uses the same local, cross-node, or cross-Realm address seam. |
+| `cosmos/creatures/prototypes/dialogue/dialogue-initiator`, `cosmos/creatures/prototypes/dialogue/dialogue-responder` | native | **Injected prototypes, NOT substrate.** A named-peer SEER turn pair over the same local, cross-node, or cross-Realm address seam. The responder retains its immediate injected `Responder` reference path and adds signed, bounded, off-drain `DialogueMind` calls through `mind::Model`; compositions causally chain turns. |
 
 ## Cosmology map
 

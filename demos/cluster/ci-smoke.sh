@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# CI-only composition of Steps 01-05. This script never invokes Cargo: it consumes the debug
-# binaries produced by the workflow's existing workspace build, runs every public behavioral
-# assertion on one inherited CPU, and always tears down the three long-lived node processes.
+# Automation-only composition of Steps 01-05. This script never invokes Cargo: it consumes
+# prebuilt debug binaries, runs every public behavioral assertion on one inherited CPU, and always
+# tears down the three long-lived node processes. The exhaustive local release gate is its primary
+# caller; hosted CI only parses this runbook.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../.. && pwd)"
 
 # Requiring a fresh caller-owned run directory prevents this automated harness from adopting or
-# stopping an operator's ordinary ./run cluster. GitHub Actions supplies a unique runner-temp path.
+# stopping an operator's ordinary ./run cluster. The caller supplies a unique private path.
 [[ -n "${ALPHA_CLUSTER_RUN:-}" ]] || {
   echo "✗ ALPHA_CLUSTER_RUN must name a fresh, dedicated diagnostics directory" >&2
   exit 2
@@ -44,7 +45,7 @@ fi
 cleanup_cluster_smoke() {
   local original_status="$?" teardown_status=0
   trap - EXIT
-  # Once cleanup begins, finish the bounded exact-incarnation teardown. The workflow's outer
+  # Once cleanup begins, finish the bounded exact-incarnation teardown. The caller's outer
   # kill-after remains the hard backstop if the operating system itself stops making progress.
   trap '' HUP INT TERM
   if ./09-teardown.sh; then
@@ -68,4 +69,4 @@ trap 'exit 143' TERM
 ./04-cross-run.sh
 ./05-connect-ai.sh
 
-echo "✓ cluster CI smoke passed: boot, gossip, exact cross-run, and remote MCP graph"
+echo "✓ cluster behavior smoke passed: boot, gossip, exact cross-run, and remote MCP graph"

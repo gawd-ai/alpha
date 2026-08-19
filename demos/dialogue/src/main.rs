@@ -2,5 +2,8 @@
 //! binary as an external child.
 
 fn main() {
-    dialogue::run(&std::env::args().skip(1).collect::<Vec<_>>())
+    if let Err(error) = dialogue::run(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        eprintln!("dialogue: {error}");
+        std::process::exit(1);
+    }
 }

@@ -1204,7 +1204,7 @@ fn generate_cargo_toml(
     s.push_str(&format!("version = {}\n", toml_string(crate_version)));
     s.push_str("edition = \"2021\"\n");
     // The authored creature inherits the workspace's allocator invariant — no custom allocators —
-    // implicitly: it has no `#[global_allocator]` because the template doesn't add one. The
+    // implicitly: the template never installs a process-wide custom allocator. The
     // generated Cargo.toml does NOT belong to the Alpha workspace (it's standalone), so the
     // workspace `[workspace]` invariant comment doesn't propagate; the agent must know not to add
     // one. The substrate's safeguard is the allocator-tied FFI: misuse manifests as UAF on unload.

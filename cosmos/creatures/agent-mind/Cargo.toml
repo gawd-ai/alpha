@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "A real, model-backed AUTHORING creature. Bound to Role::AUTHORING (in-process only — never shipped as a .so), it takes an AuthoringRequest, asks an injected mind::Model for source + a manifest stub (two fenced blocks), and replies with the same AuthoringReply the templated reference uses. The literal 'ASI is the fabric, not the model': the model is injected via the mind leaf-crate trait; the fabric ships only the socket. The slow model call runs off the kernel drain thread (transport-tcp threading discipline)."
+description = "Model-backed AUTHORING creature for general source replies and approved source-free IR lowered through audited tier templates; in-process only, with model calls off the kernel drain thread."
 
 [lib]
 name = "agent_mind"
@@ -23,6 +23,7 @@ agent-templated = { path = "../agent-templated" }
 # `ManifestStub` / `CargoDep` are defined in build-cargo and not re-exported by agent-templated.
 # agent-curious already pays this exact edge — accepted precedent, not a new cost.
 build-cargo = { path = "../build-cargo" }
+gawdfn = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Hashing authored source for the per-completion observability log line. Already ubiquitous in the

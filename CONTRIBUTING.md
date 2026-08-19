@@ -9,8 +9,11 @@
 ## Toolchain
 
 - Rust **1.97.1** (pinned by `rust-toolchain.toml`), **edition 2021**.
-- Build the two entry points: `cargo build --locked -p alpha -p omega`; the complete workspace gate
-  runs once in constrained CI.
+- Build the two entry points: `cargo build --locked -p alpha -p omega`; after freezing a candidate,
+  its complete workspace gate runs once locally through
+  `tools/local-validation.sh --exact-commit <40-hex-sha>`. Hosted CI stays a short, credential-free
+  sanity check that the unchanged exact
+  commit must pass; it is not the exhaustive validation authority.
 - Run a node: `cargo run -p alpha -- node` (REPL — see [README](README.md)).
 - Artifact-backed native creatures are `cdylib` crates (`crate-type = ["cdylib"]`); trusted organs
   compiled into a host may instead be installed as in-process creature instances.
@@ -206,12 +209,13 @@ primitive); either way, call out in its README that it is an injected model, not
 ## Tests
 
 - **Unit tests** live next to the code they test; run a focused crate with `cargo test -p <crate>`.
-- **Full suite:** do not duplicate it locally. It runs once on the exact release candidate in
-  constrained CI. Iterate with
+- **Full suite:** do not duplicate it during iteration. Once the exact release candidate is frozen,
+  run `tools/local-validation.sh --exact-commit <40-hex-sha>` locally exactly once. Iterate with
   `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo test -p <crate> -- --test-threads=1`;
   `.cargo/config.toml` also defaults forgotten invocations to one build job and one libtest thread.
-- **Disk courtesy:** CI runs the full suite once per candidate; focused package tests are the local
-  iteration loop. The workspace profiles retain line tables but disable full
+- **Disk courtesy:** the local validation tool runs the full suite once per frozen candidate;
+  focused package tests are the iteration loop. Hosted CI runs only the short sanity gate. The
+  workspace profiles retain line tables but disable full
   debug/incremental artifact graphs. Cargo does not garbage-collect old target variants; inspect
   `target/` and use `cargo clean -p <exact-package>` when generated package artifacts must be
   reclaimed. Never clean runtime state, journals, keys, or fixtures as build output. Do not launch a

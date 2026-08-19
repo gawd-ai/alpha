@@ -8,12 +8,63 @@ Semantic-versioning guarantees begin at 1.0.
 For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the design notes under [`docs/design/`](docs/design/).
 
-## Unreleased
+## 0.5.0 - 2026-08-18
 
-- CI now runs the public three-process cluster runbook through boot, exact gossip convergence,
-  cross-node execution, and a real remote MCP graph query. The smoke reuses already-built binaries,
-  inherits the one-CPU CI affinity, has a hard timeout, and guarantees bounded teardown without a
-  second Cargo build.
+- **v0.5.0 composes live causal decisions into all three execution tiers without a wire
+  rewrite.** Builder, Reviewer, and Contract Tester use strict source-free schemas to choose, narrow,
+  test, and approve one fresh bounded `affine_i32_v1` program across two Realms. The same Builder
+  Model injection confirms one digest-bound implementation record per tier. Host validation and
+  audited templates—not completion-supplied Rust, WAT, or Rhai—lower the approved program before
+  `BuildCargo`, `BuildBeast`, and `BuildCritter` sign it. A durable Bestiary recovers three verified
+  `EntryProof`s, and three distinct `FunctionId`s each complete one tester-selected local and one
+  A-Home → B-executor Job. This is constrained typed synthesis and one bounded three-mind causal
+  fan-out/fan-in, not arbitrary-code generation, general agency, broadcast/group chat, quorum,
+  arbitrary-N orchestration, a durable group transcript, or a three-process deployment proof.
+- **Blocking dialogue models stay off the fabric drain.** The additive `DialogueMind` owns a bounded
+  worker set (default eight; the demo pins one), signed existing `AnswerBody` replies, bounded model
+  instructions/completions, terminal SEER aborts for pressure/error/panic/oversize, and deadline-bounded
+  shutdown. `DialogueInitiator` now pins `(corr, query_id)`, keeps mismatches parked, and converts a
+  matching malformed reply or abort into `dialogue.failed`. Existing dialogue wire and synchronous
+  reference responder remain unchanged. Creature-owned bus sends now linearize against deregistration,
+  so a detached worker's retained handle cannot enqueue after unload even if it races its stop check.
+  A completed handle's dispatches and fitness fact now leave before its budget signal is published,
+  preventing a fast Warn policy from deregistering the sender ahead of that same outcome's work.
+- **The approved-profile path now covers native, WASM, and Rhai through trusted lowering.** The
+  approved model contract contains only schema, profile digest, tier, program kind, multiplier, and
+  addend; unknown fields, source/dependency/authority smuggling, profile drift, and decorative fixture
+  substitution fail before trusted templates produce executable bytes.
+  `WasmEngine` adds a private host-side typed adapter that validates the existing Function proof,
+  manifest-derived identity, and routes; passes canonical inline JSON through the unchanged exported
+  `memory + alloc + handle` ABI; and wraps guest JSON with the exact verified attempt. It is not a host
+  import, and ordinary beast payloads are unchanged. The demo performs exactly one bounded native
+  Cargo compile in `target/gawd-build-cache` (serialized, one job, one codegen unit, no incremental
+  compilation); the constrained runner supplies one-CPU affinity and low priority. Beast and critter
+  builds invoke no Cargo and both Job worlds reuse the built bytes.
+- **Live evidence is now part of product acceptance.** Default/`--fixture` dialogue and hosted CI
+  checks remain credential-free regression only. The authoritative exhaustive credential-free gate
+  runs once locally on the frozen commit through `tools/local-validation.sh`, producing a report plus
+  exact copied-binary handoff. The unchanged commit then passes hosted CI's short sanity check. A
+  qualifying local `tools/v05-live-acceptance.sh` run consumes that handoff, originates fresh
+  semantics, and retains seven provider calls and provider-reported receipts plus signed turns,
+  decisions, lowered sources, artifacts, Bestiary proofs, and six complete signed Job
+  submission/event/grant/call/deployment/result bundles in a verified hash-indexed directory, and
+  creates a separate operator-signed evidence seal. The same copied candidate binary's
+  standalone `dialogue verify-live` path revalidates the complete bundle offline under pinned
+  commit/signer/prior-semantic inputs. The local ceremony encrypts raw prompt-bearing evidence and
+  creates a disclosure-safe pack containing the validation report, exact binary, signed seal/index,
+  acceptance manifest, six-field verifier report, README, and hashes; GitHub receives no provider/operator keys or raw
+  evidence. Both packages and the exact binary then move directly to immutable supported-lifetime storage and an
+  external append-only acceptance registry. The retained routes prove intended signed
+  Home/deployment topology and one-attempt histories, not
+  packet-level traversal. Provider metadata does not prove model weights, and retained provenance is
+  not reproducible-build proof. TRD-007 and ADR-0049 deliberately remain Accepted, not
+  Met/Implemented, in this frozen source candidate until the qualifying exact-commit live ceremony
+  succeeds. Release policy forbids tracked edits between that proof and tag; a later post-tag
+  documentation commit links the external acceptance record and advances those statuses.
+- The authoritative local validation gate now runs the public three-process cluster runbook through
+  boot, exact gossip convergence, cross-node execution, and a real remote MCP graph query. The smoke
+  reuses already-built binaries, inherits the gate's one-CPU affinity, has a hard timeout, and
+  guarantees bounded teardown without a second Cargo build.
 - Cross-node integration fixtures now subscribe to live `peer_connected` readiness evidence before
   starting their sender-side transport, eliminating false timeouts caused by missing a non-replayed
   event under one-CPU scheduling.
@@ -121,11 +172,11 @@ the complete suite-compositional acceptance evidence is recorded in
   still fails closed.
 - **Resource-courteous build defaults.** Development and test profiles retain line tables for useful
   backtraces while disabling full debug/incremental artifact graphs and limiting code generation to
-  one unit. Workspace Cargo config defaults to one build job and one test thread. The heavyweight
-  gate runs once only in CI: every heavyweight command and its child tree is pinned to one allowed
-  CPU; superseded runs cancel; timeouts are finite; incremental output and clean-runner debug
-  sections are disabled; `target/` is never cached; and rendered rustdoc output is removed after its
-  gate without discarding compiled dependencies. Wasmtime's optional `parallel-compilation`/Rayon
+  one unit. Workspace Cargo config defaults to one build job and one test thread. For v0.4.4 the
+  heavyweight gate ran once in hosted CI; v0.5 supersedes that posture with the exact-commit local
+  validation tool and a short hosted sanity gate. Heavyweight commands and their child trees remain
+  pinned to one allowed CPU; timeouts are finite and incremental output is disabled. Wasmtime's
+  optional `parallel-compilation`/Rayon
   pool is excluded and guarded before compilation, while the engine's compatibility seam disables
   it if dependency feature unification ever makes the setter available. This keeps the
   Wasmtime-heavy matrix from monopolizing contributor CPUs or accumulating hundreds of GiB across
@@ -179,9 +230,9 @@ the complete suite-compositional acceptance evidence is recorded in
   explicit: hard cuts occur at durable protocol boundaries, not inside an unfinished GX transfer.
 - **Truthful, gated example applications.** `alpha demo` accepts only a bounded, validated list of
   registry-declared Cargo features, so the managed `bestiary-live` entry enables its opt-in model
-  backend without admitting arbitrary Cargo arguments. The required one-CPU CI job now executes all
-  four hermetic narrated applications and entry-smokes `bestiary-live` with credentials removed;
-  cluster scripts are syntax-checked and required to remain executable. The manual cluster runbook
+  backend without admitting arbitrary Cargo arguments. For v0.4.4, the required one-CPU CI job
+  executed all four hermetic narrated applications and entry-smoked `bestiary-live` with credentials
+  removed; v0.5 moves that exhaustive coverage into the local validation tool. The manual cluster runbook
   itself fails closed on graph convergence, exact cross-node output, stable MCP-hub pre-admission,
   and a real remote `alpha_cluster` reply. Demo prose now distinguishes reference agents from live
   models, a local two-body hand-off from its separate cross-Sanctum proof, the loss-free GX narration

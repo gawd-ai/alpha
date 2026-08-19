@@ -68,6 +68,7 @@ members = [
     "cosmos/creatures/transport-tcp",
     "cosmos/creatures/registry-mem",
     "cosmos/creatures/bestiary-daemon",
+    "cosmos/creatures/build-beast",
     "cosmos/creatures/build-cargo",
     "cosmos/creatures/build-critter",
     "cosmos/creatures/agent-templated",
@@ -138,7 +139,7 @@ members = [
     "cosmos/creatures/prototypes/fixtures/welbehaved-thread-daemon",
 ]
 [workspace.package]
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 authors = ["Alex Grenier <alex@gawd.ai>"]
 license = "GPL-3.0-or-later"

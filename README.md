@@ -45,6 +45,48 @@ state intact. The cross-Sanctum transport variant is integration-test-proven rat
 the narrated demo. (The authoring step shells out to a real `cargo build`, so a cold cache takes a
 minute; later runs are seconds.)
 
+Alpha v0.5.0 includes a credential-free regression mode:
+
+```sh
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo run --locked -p dialogue -- --fixture
+```
+
+It exercises the whole composition with strict scripted Models, but it is regression evidence only.
+Product acceptance requires a fresh `--live` run on the exact clean release commit: a Builder,
+Reviewer, and Contract Tester make four signer-verified causal decisions across two Realms, producing
+one novel bounded `affine_i32_v1` program. The same live Builder confirms a tiny source-free record for
+each tier; host validation and audited templates—not model-supplied source—lower it into Rust, no-import
+WAT, and Rhai. Three builders sign and durably publish the results, and six Jobs execute the three
+distinct backend `FunctionId`s locally and cross-Realm using the Contract Tester's chosen inputs.
+
+The live run must retain sanitized configurations, seven exact provider calls and provider-reported
+receipts, four signed turns, decisions, lowered sources, artifacts, Bestiary proofs, six complete
+signed Job event/grant/call/deployment/result bundles, and exact
+commit/binary/toolchain identity in a hash-indexed evidence directory. An operator-controlled key
+signs a seal outside that directory. Release validation is local: first run the exhaustive
+credential-free `tools/local-validation.sh` gate with an external `--output-dir` on the frozen exact
+commit; its handoff contains the validation report and copied candidate binary. Push that unchanged
+commit and require its short hosted sanity check to pass, then run `tools/v05-live-acceptance.sh`
+locally with that absolute `--validation-report` and a new absolute `--output-dir`. It validates the
+handoff before loading provider/operator keys, invokes the
+copied binary's standalone `dialogue verify-live` path with independently pinned trust/freshness
+inputs, encrypts raw prompt-bearing evidence, and creates a disclosure-safe pack containing the local
+validation report, exact binary, signed seal and index, acceptance manifest, six-field verifier
+report, README, and hashes. GitHub receives neither those keys nor raw evidence; hosted sanity is
+required merge/tag hygiene but is not the authoritative validation gate.
+Provider receipts are traceability metadata, not cryptographic proof of model weights,
+and the retained binary identity is not a reproducible-build proof. This is constrained typed
+synthesis and a bounded three-mind fan-out/fan-in, not arbitrary-code generation, general agency,
+broadcast/group chat, consensus, or a three-process deployment proof. See
+[the release gate](RELEASE.md#local-v050-live-acceptance-gate),
+[the demo instructions](demos/README.md#notes), and
+[TRD-007](docs/trd/TRD-007-cross-mesh-model-collaboration.md). The exact v0.5.0 source candidate
+deliberately carries pending TRD/ADR status: exact-commit validation, hosted sanity, live acceptance,
+and external retention must succeed before its tag, and a later post-tag documentation commit links
+the acceptance record and advances status. Its final
+version/changelog metadata is already present before exhaustive local validation and the retained
+live run; changing tracked metadata after proof would create an unproved commit.
+
 ### 2. Run a node, author a creature
 
 Boot a node and you land in its REPL. A fresh `alpha node` self-hosts its own organs — an authoring
@@ -317,8 +359,10 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo test --locked -p sanctum
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo doc --locked -p sanctum --no-deps --open
 ```
 
-Use focused package tests while iterating; the full workspace gate runs once on the exact candidate in
-constrained CI, not again locally. Workspace Cargo config defaults to one build job and one libtest
+Use focused package tests while iterating. After freezing the exact candidate, run the authoritative
+full workspace gate once locally with `tools/local-validation.sh --exact-commit <40-hex-sha>`.
+Hosted GitHub CI is deliberately a short credential-free sanity check, not a second exhaustive run.
+Workspace Cargo config defaults to one build job and one libtest
 thread. The development/test profiles keep only line-table debug information, disable incremental
 artifacts, and use one codegen unit to keep repeat builds responsive and reduce generated volume.
 Cargo does not garbage-collect stale target variants; inspect before cleaning, and use the exact
@@ -353,7 +397,7 @@ repository layout, run/test commands, and the load-bearing invariants.
 |---|---|
 | [AGENTS.md](AGENTS.md) | AI-agent orientation: the fast map + invariants you must not break |
 | [Quickstarts](docs/quickstart/) | Run a node as the operator, and write your first creature on each tier (critter / daemon / beast) |
-| [Demos](demos/) | Narrated, runnable apps — local authoring/hand-off, federation, GX transfer, cross-Realm dialogue, opt-in live-model Bestiary, and a real cluster runbook |
+| [Demos](demos/) | Narrated, runnable apps — local authoring/hand-off, federation, GX transfer, cross-Realm model collaboration into a typed capability, opt-in live-model Bestiary, and a real cluster runbook |
 | [Concepts](docs/CONCEPTS.md) | Cosmology + glossary |
 | [Vision](docs/VISION.md) | The thesis and why now |
 | [Architecture](docs/ARCHITECTURE.md) | As-built engineering truth |

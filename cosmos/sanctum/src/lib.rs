@@ -237,6 +237,9 @@ pub struct Kernel {
     router: Arc<Router>,
     engines: HashMap<Backend, Arc<dyn Engine>>,
     signer: Arc<dyn Signer>,
+    /// Shared kernel-owned sender for terminal lifecycle facts emitted after a creature has crossed
+    /// the deregistration boundary. Every clone shares one sequence counter for [`aether::KERNEL_ID`].
+    lifecycle_bus: BusHandle,
     verifier: Arc<dyn Verifier>,
     policy: Arc<dyn Policy>,
     loaded: Mutex<HashMap<CreatureId, Loaded>>,
@@ -347,10 +350,15 @@ impl Kernel {
         // dispatcher thread (spawned just below, once the `Arc<Kernel>` exists) listens on it.
         // Done BEFORE the kernel is wrapped so the receiver belongs to the listener.
         let control_rx = router.register_kernel();
+        // Terminal lifecycle facts are known only after the creature has been deregistered, when
+        // its own BusHandle is intentionally stale. Keep one kernel-owned handle and clone it into
+        // drains so every KERNEL_ID emission shares a single monotone sequence counter.
+        let lifecycle_bus = BusHandle::new(aether::KERNEL_ID, router.clone(), signer.clone());
         let kernel = Arc::new(Kernel {
             router,
             engines: map,
             signer,
+            lifecycle_bus,
             verifier,
             policy,
             loaded: Mutex::new(HashMap::new()),
@@ -516,13 +524,15 @@ impl Kernel {
         let ctx = CreatureCtx { me: id, bus: Arc::new(bus.clone()), manifest: manifest.clone() };
         let deadline_ms = Arc::new(AtomicU64::new(Deadline::default().0.as_millis() as u64));
         let router = self.router.clone();
+        let lifecycle_bus = self.lifecycle_bus.clone();
         let dl = deadline_ms.clone();
         // Drain → kernel completion signal. Capacity 1: the drain sends exactly one `()` at the very
         // end (or its sender drops on the rare case the drain panics outside the catch_unwinds — in
         // which case `recv_timeout` returns `Disconnected`, still observable as "thread is gone").
         let (done_tx, done_signal) = mpsc::sync_channel::<()>(1);
-        let drain =
-            std::thread::spawn(move || run_drain(loaded, ctx, bus, rx, id, router, dl, done_tx));
+        let drain = std::thread::spawn(move || {
+            run_drain(loaded, ctx, bus, lifecycle_bus, rx, id, router, dl, done_tx)
+        });
         mlock(&self.loaded).insert(
             id,
             Loaded {
@@ -730,13 +740,14 @@ impl Kernel {
     ///
     /// **Unloads in reverse load order** (latest-bound first). `CreatureId`s are monotone, so a
     /// descending sort is reverse-chronological. This matters for the thread-count guard: that
-    /// guard compares each creature's pre-bind tid snapshot against its post-shutdown one, and the
-    /// snapshot is process-global. Tearing down latest-first means a creature being unloaded only
-    /// overlaps with *earlier*-bound creatures — whose drain threads were already present in its
-    /// pre-bind snapshot, so they don't read as "leaked." Unloading in arbitrary order instead makes
-    /// every still-loaded later creature's drain look like a fresh thread, tripping the bounded-leak
-    /// path spuriously on a perfectly clean shutdown. (The real fix for the underlying noise is
-    /// per-creature thread accounting; this ordering removes the common false positive.)
+    /// guard compares each dynamically loaded native creature's pre-bind tid snapshot against its
+    /// post-shutdown one, and the snapshot is process-global. Tearing down latest-first means a
+    /// native creature being unloaded only overlaps with *earlier*-bound creatures — whose drain
+    /// threads were already present in its pre-bind snapshot, so they don't read as "leaked."
+    /// Unloading in arbitrary order instead makes every still-loaded later creature's drain look
+    /// like a fresh thread, tripping the bounded-leak path spuriously on a perfectly clean native
+    /// unload. (The real fix for the underlying noise is per-creature thread accounting; this
+    /// ordering removes the common false positive.)
     pub fn shutdown_all(&self, deadline: Deadline) {
         let mut ids: Vec<CreatureId> = mlock(&self.loaded).keys().copied().collect();
         ids.sort_unstable_by_key(|id| std::cmp::Reverse(id.0)); // descending = reverse load order
@@ -770,16 +781,17 @@ impl Drop for Kernel {
 /// elsewhere so the **thread-count guard** silently no-ops on non-Linux (Linux-first;
 /// other OSes can grow their own primitive later).
 ///
-/// The guard compares pre-bind and post-shutdown snapshots: any tid present after but not before
-/// indicates the creature spawned a thread that didn't exit by `shutdown` (either it bypassed the
-/// SDK's managed `spawn` and went raw, or its managed thread is still hanging). The kernel reacts
-/// by refusing to `dlclose` that creature's library — a bounded leak rather than a UAF when a
-/// runaway thread later dereferences now-unmapped code.
+/// For a [`LoadedModule`] that owns a dynamically loaded native library, the guard compares
+/// pre-bind and post-shutdown snapshots: any tid present after but not before indicates the
+/// creature spawned a thread that didn't exit by `shutdown` (either it bypassed the SDK's managed
+/// `spawn` and went raw, or its managed thread is still hanging). The kernel reacts by refusing to
+/// `dlclose` that creature's library — a bounded leak rather than a UAF when a runaway thread later
+/// dereferences now-unmapped code. Other module kinds never call this helper during unload.
 ///
-/// Honest limit: a snapshot includes ALL process tids, so concurrent activity from other creatures
-/// pollutes the delta. The reload-loop test runs sequentially (no concurrent loads) so its
-/// readings are clean; production concurrency may produce false positives → bounded leaks. The
-/// proper fix is per-creature thread accounting.
+/// Honest limit: a native module's snapshot includes ALL process tids, so concurrent activity from
+/// other creatures can pollute its delta. The reload-loop test runs sequentially (no concurrent
+/// loads) so its readings are clean; production concurrency may produce false positives → bounded
+/// native-library leaks. The proper fix is per-creature thread accounting.
 fn snapshot_tids() -> Option<HashSet<u32>> {
     #[cfg(target_os = "linux")]
     {
@@ -810,16 +822,20 @@ fn run_drain(
     mut loaded: LoadedModule,
     ctx: CreatureCtx,
     bus: BusHandle,
+    lifecycle_bus: BusHandle,
     rx: InboxReceiver,
     me: CreatureId,
     router: Arc<Router>,
     deadline_ms: Arc<AtomicU64>,
     done_tx: SyncSender<()>,
 ) {
-    // **Thread-count guard, snapshot 1 of 2.** Capture the process's tids RIGHT before bind so
-    // the leak detector at unload can identify threads this creature spawned. Linux-only; `None`
-    // means no guard (non-Linux fallback — accept the narrower contract there).
-    let pre_bind_tids = snapshot_tids();
+    // **Native-library thread guard, snapshot 1 of 2.** Only a dynamically loaded native module
+    // can unmap executable code when its tier resources drop. In-process creatures and the
+    // wasm/script engines therefore skip the process-wide snapshots entirely: their unrelated
+    // runtime threads must never trigger the native `dlclose` leak path. Linux-only; `None` means
+    // no guard (non-Linux fallback — accept the narrower contract there).
+    let guard_unmanaged_threads = loaded.requires_unmanaged_thread_guard();
+    let pre_bind_tids = if guard_unmanaged_threads { snapshot_tids() } else { None };
 
     // bind(ctx) may panic (in-process creatures only — native catches inside the SDK glue and
     // signals via RC_PANIC on the first `handle`). A panic here means we never enter the loop;
@@ -841,7 +857,8 @@ fn run_drain(
                             // The signal rides on PROPRIOCEPTION (observability), not
                             // FITNESS (a budget event isn't a creature "bug," it's a declared-quota
                             // trajectory event).
-                            if let Some(mut signal) = outcome.budget_signal {
+                            let mut budget_signal = outcome.budget_signal;
+                            if let Some(signal) = budget_signal.as_mut() {
                                 // **Kernel-side enrichment.** The engine can't
                                 // see the outcome's dispatches list (it returns the Outcome and
                                 // hands it off); the kernel can. Fill in `dispatches_this_envelope`
@@ -852,7 +869,6 @@ fn run_drain(
                                 // [`policy_budget::BudgetGraceful`]'s productive classifier needs.
                                 signal.vector.dispatches_this_envelope =
                                     outcome.dispatches.len() as u32;
-                                publish_budget_signal(&bus, me, signal);
                             }
                             // Fitness here reflects "did the creature reply with useful work?"; a
                             // Hard signal with no dispatches is `false`. Without dispatches the
@@ -860,8 +876,7 @@ fn run_drain(
                             // selection wants to see. A Warn signal WITH dispatches is still
                             // `useful=true` — the creature did work and got a warning.
                             // Captured BEFORE we move `dispatches` into the bus.
-                            let useful =
-                                !outcome.dispatches.is_empty() || outcome.budget_signal.is_none();
+                            let useful = !outcome.dispatches.is_empty() || budget_signal.is_none();
                             for d in outcome.dispatches {
                                 // A creature's reply/work is its only output. Dropping it on a full
                                 // or unreachable target with no trace is exactly the "a migration can
@@ -877,7 +892,14 @@ fn run_drain(
                                     );
                                 }
                             }
+                            // Publish the per-envelope fitness fact before the budget event. A
+                            // budget subscriber may synchronously request unload; work and sense
+                            // produced by this completed handle must cross the sender-liveness
+                            // boundary before that control reaction can make `bus` stale.
                             publish_fitness(&bus, &router, me, useful);
+                            if let Some(signal) = budget_signal {
+                                publish_budget_signal(&bus, me, signal);
+                            }
                         }
                         Err(_panic) => {
                             // Creature-fault isolation (R9): a panic in `handle` (in-process OR
@@ -905,9 +927,10 @@ fn run_drain(
         loaded.instance.shutdown(Deadline::from_millis(ms))
     }));
 
-    // **Thread-count guard, snapshot 2 of 2.** Take it AFTER user `shutdown` returns — for
-    // native creatures, the SDK has already `join_all`-ed managed threads by this point, so any
-    // tid that's new vs `pre_bind_tids` is an UNMANAGED leak.
+    // **Native-library thread guard, snapshot 2 of 2.** For an opted-in native module, take it
+    // AFTER user `shutdown` returns. The SDK has already `join_all`-ed managed threads by this
+    // point, so any tid that's new vs `pre_bind_tids` is an UNMANAGED leak. Other module kinds
+    // skip this block and proceed directly to their normal resource drop.
     //
     // **Two-snapshot persistence check** (the false-positive guard). Process-level tid
     // monitoring is noisy: libtest worker threads, runtime-internal helpers (cargo, the rust test
@@ -916,26 +939,33 @@ fn run_drain(
     // shows any delta we take a SECOND one 50ms later. A real runaway thread is in both; a
     // transient is only in the first. The intersection is the persistent leak set. Fast path
     // (no extra sleep) when the immediate delta is already clean — overwhelmingly the common case.
-    let leaked_tids: HashSet<u32> = match (&pre_bind_tids, &snapshot_tids()) {
-        (Some(pre), Some(post)) => {
-            let immediate: HashSet<u32> = post.difference(pre).copied().collect();
-            if immediate.is_empty() {
-                immediate
-            } else {
-                // Possible leak: re-poll after a short grace so transient threads can exit.
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                match snapshot_tids() {
-                    Some(later) => immediate.intersection(&later).copied().collect(),
-                    None => immediate,
+    let leaked_tids: HashSet<u32> = if guard_unmanaged_threads {
+        match (&pre_bind_tids, snapshot_tids()) {
+            (Some(pre), Some(post)) => {
+                let immediate: HashSet<u32> = post.difference(pre).copied().collect();
+                if immediate.is_empty() {
+                    immediate
+                } else {
+                    // Possible leak: re-poll after a short grace so transient threads can exit.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    match snapshot_tids() {
+                        Some(later) => immediate.intersection(&later).copied().collect(),
+                        None => immediate,
+                    }
                 }
             }
+            _ => HashSet::new(), // no guard on non-Linux; fall through to normal drop
         }
-        _ => HashSet::new(), // no guard on non-Linux; fall through to normal drop
+    } else {
+        HashSet::new()
     };
 
     if leaked_tids.is_empty() {
-        let _ =
-            std::panic::catch_unwind(AssertUnwindSafe(|| publish_proprio(&bus, me, "unloaded")));
+        // The creature crossed the router's deregistration boundary before its inbox disconnected,
+        // so its BusHandle must stay stale. The kernel publishes this terminal fact on its behalf.
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            publish_proprio(&lifecycle_bus, me, "unloaded")
+        }));
         // `LoadedModule` fields drop in declaration order: instance (native `destroy`, library
         // still mapped) → resources (`dlclose`). This single drop *is* the safe-unload ordering.
         // We catch in case a creature's `Drop` panics (its destroy callback is already panic-
@@ -956,7 +986,7 @@ fn run_drain(
              library (never dlclose'd) to avoid a use-after-free — bounded leak, not UB"
         );
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            publish_proprio(&bus, me, "unload_leaked_resources")
+            publish_proprio(&lifecycle_bus, me, "unload_leaked_resources")
         }));
         let _ = std::panic::catch_unwind(AssertUnwindSafe(move || {
             let (instance, resources) = loaded.into_parts();

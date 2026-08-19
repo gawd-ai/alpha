@@ -1,7 +1,11 @@
 //! A misbehaving creature (detached thread / leaked `'static`) is **detected +
 //! contained, not UB**.
 //!
-//! The two specimens prove the discipline + the safety net together:
+//! Three cases prove the guard's scope and the native discipline + safety net together:
+//!
+//! - An **in-process instance** unloads normally even if an unrelated process thread starts after
+//!   bind. It owns no dynamically loaded library, so process-wide TID noise cannot select the leak
+//!   path.
 //!
 //! - **`welbehaved-thread-daemon`** spawns via the SDK's [`forge::spawn`] and signals stop in
 //!   `shutdown`; the SDK joins the worker before the kernel `dlclose`s the library. Clean unload,
@@ -16,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aether::{Address, Deadline, Dispatch, Topic};
@@ -28,14 +32,15 @@ use sigil::{Backend, Capabilities, Manifest};
 mod support;
 use support::native_cdylib;
 
-/// **Serialize these tests.** They share the process tid table, which the kernel's thread-count
-/// guard reads from `/proc/self/task/`. Running d1 in parallel with d2 lets d2's runaway thread
-/// appear in d1's post-shutdown snapshot — a false-positive triggering the leak path.
+/// **Serialize these tests.** The dynamically loaded native specimens share the process tid table,
+/// which their thread-count guard reads from `/proc/self/task/`. Running them in parallel lets one
+/// specimen's thread appear in another's post-shutdown snapshot — a false-positive triggering the
+/// leak path.
 ///
-/// This is the same limit the guard's doc names: per-creature thread tracking is future work; for now
-/// the guard counts at process granularity, so the test harness must serialize. Production code
-/// faces the same false-positive rate under concurrent loads (a bounded leak, not UAF — safe but
-/// noisy).
+/// This is the same limit the guard's doc names: per-creature thread tracking is future work; for
+/// now the native guard counts at process granularity, so the test harness must serialize.
+/// Production native unloads face the same false-positive rate under concurrency (a bounded leak,
+/// not UAF — safe but noisy); in-process, WASM, and Rhai resources do not participate.
 fn serial_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -71,7 +76,12 @@ impl Engine for CaptureNativeStages {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .insert(manifest.name.clone(), path.to_path_buf());
         }
-        NativeEngine.load(artifact, manifest)
+        let loaded = NativeEngine.load(artifact, manifest)?;
+        assert!(
+            loaded.requires_unmanaged_thread_guard(),
+            "a module returned by NativeEngine must retain the dlclose safety guard"
+        );
+        Ok(loaded)
     }
 }
 
@@ -95,6 +105,14 @@ fn drain_proprio_for(
                 if let Ok(p) = serde_json::from_slice::<Proprioception>(&env.payload) {
                     seen.push(p.event.clone());
                     if p.event == target {
+                        if matches!(target, "unloaded" | "unload_leaked_resources") {
+                            assert_eq!(
+                                env.header.from,
+                                Address::Creature(aether::KERNEL_ID),
+                                "terminal lifecycle facts must come from the live kernel handle, \
+                                 never the stale creature handle"
+                            );
+                        }
                         return (true, seen);
                     }
                 }
@@ -139,6 +157,53 @@ fn d1_welbehaved_thread_creature_unloads_cleanly_with_no_leak_event() {
         "welbehaved discipline must not trigger the leak path; events: {seen:?}"
     );
 
+    k.shutdown_all(Deadline::from_millis(500));
+}
+
+#[test]
+fn d1_in_process_instance_ignores_unrelated_process_threads_at_unload() {
+    struct Noop;
+    impl aether::Creature for Noop {
+        fn bind(&mut self, _ctx: aether::CreatureCtx) {}
+
+        fn handle(&mut self, _env: aether::Envelope) -> aether::Outcome {
+            aether::Outcome::none()
+        }
+    }
+
+    let _serial = serial_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let k = kernel();
+    let (sub, _bus, rx) = k.open_endpoint(Capabilities::default());
+    k.subscribe(Topic::new(Topic::PROPRIOCEPTION), sub);
+
+    let id = k
+        .load_instance(daemon_manifest("in-process-noop"), Box::new(Noop))
+        .expect("in-process creature loads");
+    let (_loaded_seen, _) = drain_proprio_for(&rx, "loaded", Duration::from_secs(2));
+
+    // Start a persistent, unrelated process thread only after the creature has bound. The old
+    // process-global guard classified this TID as belonging to the in-process creature and took
+    // the native-library leak path even though there was no library to protect.
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(0);
+    let unrelated = std::thread::spawn(move || {
+        ready_tx.send(()).expect("announce unrelated helper thread");
+        let _ = stop_rx.recv();
+    });
+    ready_rx.recv().expect("unrelated helper thread is live");
+
+    k.unload(id, Deadline::from_millis(500))
+        .expect("unrelated process threads cannot impede an in-process unload");
+    let (got_unloaded, seen) = drain_proprio_for(&rx, "unloaded", Duration::from_secs(2));
+
+    stop_tx.send(()).expect("stop unrelated helper thread");
+    unrelated.join().expect("join unrelated helper thread");
+
+    assert!(got_unloaded, "in-process unload must take the normal drop path; events: {seen:?}");
+    assert!(
+        !seen.iter().any(|event| event == "unload_leaked_resources"),
+        "in-process resources must never enter the native-library leak path; events: {seen:?}"
+    );
     k.shutdown_all(Deadline::from_millis(500));
 }
 

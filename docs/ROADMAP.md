@@ -8,8 +8,10 @@ invariants that constrain how it gets there. For what ships today, see
 ## The baseline
 
 The substrate loads and supervises three tiers: native `daemon`, WASM `beast`, and Rhai `critter`.
-Its managed author→build→sign surface covers daemon and critter today; beast artifacts are supplied
-externally and then enter the same admission/lifecycle path. Alpha places a creature on a node
+The released v0.4.4 baseline's managed author→build→sign surface covers daemon and critter; beast
+artifacts may be supplied externally and then enter the same admission/lifecycle path. v0.5.0 adds
+the no-Cargo `BuildBeast` path described below without changing that load path.
+Alpha places a creature on a node
 whose embodiment satisfies its declared requirements; quarantines it on a sensed fault and promotes
 a fit one; hands its **Abode** — identity and state — to another body with an acknowledged in-memory
 protocol whose overlap/crash limits are explicit, reconciling divergent copies on an injected
@@ -79,17 +81,53 @@ R8 unacknowledged-control recovery, store boundary matrices, and surface parity.
 memory, active-Home fork/merge, a global queue/cron/DAG product, dynamic MCP tool export, or a
 partition-solving global Home locator.
 
-## Where it goes next
+## v0.5.0 composition and successor direction
 
-- **Transport** — a UDP transport beside the authenticated TCP one, for lossy and intermittent links,
-  with richer partition tolerance.
-- **Interaction across the mesh (the v0.5.0 headline)** — AIs genuinely interacting across Realms and
-  Sanctums: two (or more) model-backed agents collaborating or conversing. v0.4.2 laid every rail —
+- **Transport** — a UDP application-envelope transport beside authenticated TCP remains a later,
+  uncommitted direction for lossy and intermittent links. v0.5.1 signed discovery may use datagrams or
+  mDNS for bootstrap; that does not promise arbitrary `aether::Envelope` carriage over UDP.
+- **Interaction across the mesh (the v0.5.0 headline)** — AIs genuinely interacting across
+  Realm-addressed Kernel nodes. The exact Accepted bar is
+  [TRD-007](trd/TRD-007-cross-mesh-model-collaboration.md): three separately signing agents—a Builder,
+  Reviewer, and Contract Tester—must make four signer-verified live decisions across two Realms. The
+  Builder chooses a nontrivial bounded affine program; the Reviewer materially narrows its domain;
+  the Contract Tester selects the actual ordered local/cross-Realm cases; and the Builder approves the
+  exact canonical projection. The same live Builder then confirms three strict, source-free
+  implementation records. Host validation and audited templates lower that approved `affine_i32_v1`
+  IR into Rust, no-import WAT, and Rhai before `BuildCargo`, `BuildBeast`, and `BuildCritter` sign it.
+  This is constrained typed synthesis, not model-authored arbitrary code or general agency. Because
+  backend is part of each signed manifest, the result has three distinct `FunctionId`s; one local and
+  one A-Home → B-executor Job per tier must return the host-derived results selected by the Contract
+  Tester. A scripted run, chat transcript, decorative third mind, completion-supplied source, canned
+  engine fixture, or generated-but-unbuilt output is not enough.
+  v0.4.2 laid every interaction rail —
   application traffic crosses a Realm boundary (the `omega-federator` forwards arbitrary envelopes, not
   just registry state), agents are *placed* across Realms (below), and a reserved SEER `Dialogue` topic
   plus the reference `dialogue-initiator` / `dialogue-responder` pair carry a multi-turn agent-to-agent
-  conversation (`alpha demo dialogue` runs two agents talking across a Realm boundary). v0.5.0 swaps the
-  reference agents for LLM-backed ones — the same wire, no refactor.
+  conversation. The default `alpha demo dialogue` run now supplies a hermetic regression; v0.5.0
+  product acceptance additionally requires the frozen commit to pass the exhaustive local
+  `tools/local-validation.sh` gate, producing a report plus copied-binary handoff. The unchanged
+  commit next passes short hosted sanity, then one fresh local `tools/v05-live-acceptance.sh` run
+  consumes that handoff. That run must retain seven provider calls and provider-reported receipts,
+  signed turns, decisions, lowered sources, artifacts, Bestiary/Job
+  proofs, and commit/binary/toolchain identity in a verified evidence directory with a separate
+  operator-signed seal. The exact packaged binary must then pass `dialogue verify-live` under pinned
+  commit/signer/prior-semantic inputs. Encrypted raw evidence, the disclosure-safe pack, exact binary,
+  and ceremony metadata move directly to immutable supported-lifetime storage, while the accepted
+  semantic remains in an external append-only registry. GitHub CI is only a short credential-free
+  merge/tag hygiene check, not the authoritative validation gate; it receives no provider/operator
+  keys or raw evidence. Provider metadata is not proof of model weights, and retained provenance is
+  not reproducible-build proof.
+  The typed beast uses a no-import host-side adapter over the existing payload ABI, not a host import
+  or new guest ABI. One bounded native Cargo compile is reused; beast/critter builds invoke no Cargo.
+  This is the same wire, not a refactor. The three minds occupy two in-process Kernel nodes; the
+  separate `cluster` runbook remains the three-process mesh proof. The causal graph remains bounded
+  pairwise Dialogue, not broadcast/group chat, arbitrary-N, quorum/consensus, or a durable group
+  transcript.
+- **Staged mesh autonomy after v0.5.0** — [ADR-0049](adr/ADR-0049-stage-v0.5-composition-and-mesh-autonomy.md)
+  targets operational Omega/Realm authority, membership, signed discovery, and authenticated routing/
+  Abode identity for **v0.5.1**, then `OfferUpdate` plus dynamic capability/placement advertisement for
+  **v0.5.2**. These are successor targets, not claims that the current tree already implements them.
 - **Placement** — cross-Realm placement now lands: a distributor fans placement Queries to peer-Realm
   advertisers through the Omega gateway and routes a chosen offer via `Address::Omega` (offers carry an
   optional `realm`, queries an optional `target_realm`; both elide from the wire when absent). What

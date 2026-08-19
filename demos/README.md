@@ -13,7 +13,7 @@ demos launch with `alpha demo run <name>`; the multi-process **cluster** runbook
 |---|---|---|---|
 | [**walkthrough**](walkthrough/) | `cargo run -p walkthrough` | **One node's loop.** A deterministic reference authoring agent turns an English request into a creature → compiles → ed25519-signs → admits → hot-loads → runs it (native *and* critter tiers), then a running self performs a signed **two-body hand-off inside one Sanctum**. The separate integration proof covers the cross-Sanctum transport variant. | `m3_authoring_loop.rs`, `critter_examples.rs`, `abode_migrate_local.rs`, `abode_migrate_cross_node.rs` |
 | [**federation**](federation/) | `cargo run -p federation` | **Many nodes, many Realms.** Several Sanctums across 2–3 Realms wired over real ed25519-authenticated TCP (loopback): a within-Realm cross-node fetch, then cross-Realm pull anti-entropy, **signed reputation**, **quarantine** propagation, and **Omega-addressed routing** (Loop 5, Acculturate). | `omega_federation_cross_node.rs`, `m2_two_node.rs`, `distributor_cross_node.rs` |
-| [**dialogue**](dialogue/) | `cargo run -p dialogue` | **Two reference agents conversing across a Realm boundary.** Two Sanctums in two Realms over real ed25519-authenticated TCP (loopback): a `dialogue-initiator` on one Realm holds a **multi-turn conversation** with a **stateful reference responder** on the other, each turn a SEER `dialogue` Query routed across the boundary by the **Omega gateway** — application traffic crossing the mesh, not just catalogue federation. Replace the reference agents with model-backed ones for the v0.5.0 composition. | `dialogue_seam.rs`, `omega_app_routing_cross_node.rs`, `distributor_cross_realm.rs` |
+| [**dialogue**](dialogue/) | `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo run --locked -p dialogue -- --fixture` | **Regression for the v0.5 live composition.** Three scripted, signing role models exercise four strict causal decisions, host validation/trusted lowering of one bounded affine IR into all tiers, durable publication, and six local/cross-Realm Jobs. This default run is hermetic regression only, not product acceptance; the authoritative local release tools are below. | `dialogue` regression, `agent_mind_authoring_loop.rs`, `build-beast/src/lib.rs`, `anima/src/wasm.rs`, `function_jobs{,_cross_realm}.rs` |
 | [**distribute**](distribute/) | `cargo run -p distribute` | **Cross-node artifact transfer.** Two Sanctums over ed25519-authenticated TCP (loopback): A publishes a creature; B performs a loss-free pull in **bounded GX chunks**, then admits + runs it with one `registry fetch-load` command. Per-chunk and whole-file SHA-256 integrity, missing-chunk retry, and tamper refusal are separately pinned by tests. | `m2_two_node.rs`, `fetch_load_verb.rs`, `gawdxfer/src/tests.rs`, `function_jobs_cross_realm_process.rs` |
 | [**bestiary-live**](bestiary-live/) | `alpha demo run bestiary-live` | **A real model into a durable Bestiary.** A live LLM authors a sandboxed critter with bounded compile-error retry; Alpha signs, hot-loads, runs, and publishes it using the safe deterministic curator. The demo verifies an `EntryProof`, replays the signed journal through a fresh store handle, and exercises store-level monotonic convergence. Cross-node `PushEntries` replication and optional AI curation are separate injectable/tested seams. **Opt-in / key-gated; the runner enables `openai`.** | `agent_mind_authoring_loop.rs`, `bestiary_durable_local.rs`, `bestiary_replication_cross_node.rs` |
 | [**cluster**](cluster/) | `cd demos/cluster && ./00-build.sh && ./01-boot.sh …` | **Three real Sanctum processes across both poles** (the deployable thing, not one process): node A an **`omega serve`** server, B/C **`alpha node`** operators. They form a **dynamic many-to-many mesh** from one seed via gossip, then **cross-execute** over it (author on an α operator, run from the Ω server) and prove a pre-admitted remote MCP hub can read B's live graph — all through fail-closed shell + HTTP + MCP steps. | `cluster_gossip_mesh.rs`, `omega_serve_federation.rs`, `m2_two_node.rs` |
@@ -22,7 +22,8 @@ demos launch with `alpha demo run <name>`; the multi-process **cluster** runbook
 
 - **walkthrough** is the fastest way to "get" Alpha's slice of the GAWD substrate. Its deterministic
   reference authoring step shells out to a real `cargo build`, so the *first* run is slow (a minute or two while the dependency
-  cache warms); later runs finish in seconds. It is gated in CI so it can never silently rot.
+  cache warms); later runs finish in seconds. The authoritative local validation gate runs it so it
+  cannot silently rot.
 - **federation** is configurable: `cargo run -p federation -- --realms 3 --sanctums 2`
   (each bounded to `1..=3`, default `2 2`, so the loopback mesh stays reliable). With one Realm or one
   Sanctum it gracefully narrates what to add to see the next layer. Set **`ALPHA_DURABLE_BESTIARY=1`**
@@ -31,11 +32,80 @@ demos launch with `alpha demo run <name>`; the multi-process **cluster** runbook
   minimal demo Sanctums rather than full `alpha node` / `omega serve` compositions; each Realm
   gateway binds its `omega-federator` through `omega::serve::boot_federator`, the same organ recipe
   the server uses.
-- **dialogue** is hermetic (no model, no network beyond loopback): it boots two real Sanctums in two
-  Realms and runs a live reference-agent conversation across the boundary. Where `federation` moves
-  catalogue + trust state between Realms, `dialogue` moves *application* traffic — a multi-turn SEER
-  `dialogue` exchange — through the Omega gateway, with the answering agent holding state across turns.
-  Replace the reference agents with LLM-backed ones and it is the v0.5.0 "AIs across the mesh" story.
+- **dialogue** has two intentionally different postures. Default/`--fixture` uses three strict
+  scripted `mind::Model`s to regression-test the entire mechanism and exact replay without provider
+  credentials. It can never satisfy v0.5 product acceptance. `--live` uses distinct Builder,
+  Reviewer, and Contract Tester Model injections for seven calls: the Builder drafts and finally
+  approves; Reviewer materially narrows both input bounds; Contract Tester selects the actual ordered
+  boundary/interior cases; then the same Builder confirms one digest-bound implementation record for
+  daemon, beast, and critter. Every decision is strict JSON, unknown-field rejecting, bounded, hashed,
+  and causally linked. The admitted program is exactly a finite-domain `affine_i32_v1` transform.
+  Models never supply Rust, WAT, Rhai, dependencies, or authority in this path: host validation
+  recomputes the exhaustive truth table and trusted templates lower it into all three backends before
+  the builders sign it. This is constrained typed synthesis, not arbitrary-code generation or
+  general agency.
+
+  Product acceptance is deliberately local. Freeze one clean exact commit, run
+  `tools/local-validation.sh` once with `--exact-commit` and `--output-dir` for exhaustive
+  credential-free validation and a report plus copied-binary handoff. Push that unchanged commit and
+  require its short hosted sanity check to pass. Then
+  configure the three role Models and private operator inputs outside the worktree and run
+  `tools/v05-live-acceptance.sh` with the exact `--candidate-sha`, absolute
+  `--validation-report`, and a new absolute `--output-dir`. See the
+  [release checklist](../RELEASE.md#local-v050-live-acceptance-gate) and each tool's `--help` for
+  the exact invocation. The live tool verifies the credential-free build handoff before secrets,
+  consumes the complete external prior-semantic registry, runs the copied candidate for both
+  generation and offline verification, encrypts the raw evidence, and creates the disclosure-safe
+  pack. Its output directory contains exactly the encrypted raw `.tar.gz.gpg` and disclosure-safe
+  verification `.tar.gz`, and stdout is a safe JSON summary. A one-off
+  self-chosen seal key is not release authority unless operator policy authorizes its public key.
+  `dialogue verify-live` independently pins the candidate SHA, authorized signer, signed seal,
+  evidence directory, exact binary, and the same prior semantics; it performs no provider calls and
+  consults no Git, running Sanctum, mutable Bestiary, or private key. Retaining that exact binary lets
+  the external acceptance record bind the embedded commit and observed bytes. This is provenance
+  evidence, not a reproducible-build proof.
+  The release tool takes each role through the corresponding `--builder-*`, `--reviewer-*`, and
+  `--contract-tester-*` model/base-URL/timeout/API-key-file flags. It also requires the seal key and
+  authorized signer, complete prior-semantic registry, encryption public key, and full recipient
+  fingerprint; its `--help` is authoritative. For an exploratory direct `dialogue --live` run, each
+  `ALPHA_DIALOGUE_{BUILDER,REVIEWER,CONTRACT_TESTER}` `_BASE_URL` defaults to exact loopback
+  `http://localhost:11434/v1`, `_TIMEOUT_SECS` defaults to 60 and is restricted to `1..=120`, and
+  `_API_KEY_FILE` takes precedence over `_API_KEY`. Live evidence accepts HTTPS origins or exact
+  loopback HTTP only and rejects URL user-info. The registry entry stays feature-lean, so
+  `alpha demo run dialogue --live` is not a substitute for either release tool.
+
+  On success the new private directory retains sanitized endpoint origins (never keys), exact prompts
+  and completions, provider-reported response/request IDs and model/finish metadata, replay records,
+  four signed Dialogue turns, all decisions, trusted-lowered sources, signed manifests/artifacts,
+  Bestiary proofs, and six per-Job bundles. Each Job bundle retains the caller-signed submission,
+  Home-signed `Submitted`/`DispatchGranted`/terminal events and terminal snapshot, full contiguous
+  event log, signed execution grant, exact `FunctionCall` with executor-signed route, deployment
+  receipt, and terminal execution receipt. A result record hashes all six bundles and the final run
+  summary anchors that record alongside exact commit/binary/toolchain identity. This proves the
+  signed intended Home/deployment topology and one-attempt history, not packet-level traversal. A verified
+  `evidence-index.v1.json` hashes every payload; a create-new `evidence-seal-<digest>.v1.json` sibling
+  binds that root to the operator key. Provider receipts improve traceability but do not prove which
+  weights produced a completion; trust in the seal signer is operator policy. Retain the directory
+  and sibling seal together. The release-qualifying local ceremony encrypts the raw prompt-bearing
+  bundle and produces a disclosure-safe pack; GitHub receives neither provider/operator keys nor raw
+  evidence. Hosted sanity is required merge/tag hygiene but is not the authoritative validation
+  gate. The safe pack contains the validation report, exact binary, signed seal/index, acceptance
+  manifest, six-field verifier report, README, and hashes. Before tagging, the release operator moves both packages,
+  exact binary, and ceremony metadata directly into immutable supported-lifetime storage and appends the
+  result/new semantic to an external signed acceptance registry. Provider receipts do not prove
+  model weights, and retained provenance does not prove reproducible compilation. Editing TRD-007
+  before tagging would change the proven commit; link that external record only in a later post-tag
+  documentation commit. TCP
+  authenticates peers but does not encrypt prompt content, so the demo's inter-Realm mesh remains
+  loopback.
+
+  Both modes use two in-process Kernel nodes, not three deployed processes. They preserve pairwise
+  Dialogue rather than adding broadcast/group chat, arbitrary-N orchestration, quorum/consensus, or a
+  durable group transcript. One native build runs in the bounded shared authoring cache;
+  beast/critter builds invoke no Cargo and neither Job world rebuilds.
+  Keep the dedicated authoring cache between runs to avoid recompiling dependencies. If its disk must
+  be reclaimed, first confirm no authoring build is active, then clean only that cache with
+  `cargo clean --target-dir target/gawd-build-cache`.
 - **distribute** is hermetic (no model, no network beyond loopback): it boots two real Sanctums and
   shows the loss-free `registry fetch-load` path pulling an artifact cross-node in bounded, windowed
   GX chunks and verifying per-chunk/whole-file GX integrity before admission. Missing-chunk
@@ -44,8 +114,9 @@ demos launch with `alpha demo run <name>`; the multi-process **cluster** runbook
 - **bestiary-live** is **opt-in and key-gated**: it needs a model and the `openai` feature. Set
   `ALPHA_LLM_MODEL` (and `ALPHA_LLM_BASE_URL` / `ALPHA_LLM_API_KEY`, or point at a local Ollama /
   LM-Studio) and run `cargo run -p bestiary-live --features openai`. With `ALPHA_LLM_MODEL` unset it
-  prints a hint and exits 0, so CI never makes a network call. `ALPHA_LLM_MAX_ATTEMPTS` (default 3)
-  is restricted to `1..=5`; `ALPHA_LLM_TIMEOUT_SECS` (default 60) is restricted to `1..=90`.
+  prints a hint and exits 0, so credential-free automation never makes a network call.
+  `ALPHA_LLM_MAX_ATTEMPTS` (default 3) is restricted to `1..=5`; `ALPHA_LLM_TIMEOUT_SECS` (default 60)
+  is restricted to `1..=90`.
 - **cluster** is the real-deployment shape: separate Sanctum *processes* across both poles — node A an
   `omega serve` server (the mesh anchor + an idle federator, since the cluster is single-Realm), B/C
   `alpha node` operators — that you drive by hand (or across real machines via `*_HOST` env vars — see
