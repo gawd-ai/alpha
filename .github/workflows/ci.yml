@@ -1,13 +1,16 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ master ]
   pull_request:
 
-# A newer push supersedes an older candidate on the same ref. Never run two Wasmtime-heavy clean
-# workspaces concurrently for one branch, and never tag a commit whose run was cancelled by a newer
-# candidate (RELEASE.md's exact-run check fails closed in that case).
+# A newer push supersedes an older candidate on the same ref. Never run two cold Rust jobs
+# concurrently for one branch, and never tag a commit whose run was cancelled by a newer candidate
+# (RELEASE.md's exact-run check fails closed in that case).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,18 +21,17 @@ env:
   # CI does clean builds, so incremental compilation only bloats the runner disk (it grows
   # `target/` with rebuild scaffolding that is never reused across a fresh job). Off.
   CARGO_INCREMENTAL: "0"
-  # Local profiles retain line tables for useful backtraces. The clean hosted gate has no reuse
-  # value for debug sections, and dozens of Wasmtime-linked integration binaries can otherwise
-  # exhaust the runner disk even though their executable behavior is identical.
+  # Local profiles retain line tables for useful backtraces. The cold hosted sanity gate has no
+  # reuse value for debug sections, and its one linked test binary needs no debug payload.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_TEST_THREADS: "1"
 
 jobs:
   ci:
-    name: fmt · clippy · build · docs · test · all demos
+    name: fmt · hygiene · typecheck · contract smokes
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -71,11 +73,9 @@ jobs:
           taskset --cpu-list "$first" true
           echo "ALPHA_CI_CPU=$first" >> "$GITHUB_ENV"
 
-      # Cache only the cargo download caches — NOT `target/`. This workspace statically links
-      # wasmtime into nearly every binary (~220 MB each with debuginfo), so a cached `target/` grows
-      # without bound across commits (cargo never GCs stale hashed artifacts) and, decompressed, was
-      # overflowing the hosted runner's ~14 GB disk. The registry/git caches give the real speedup
-      # (no re-download / re-index); `target/` rebuilds from them fast enough.
+      # Cache only Cargo downloads — never `target/`. A target cache grows stale hashed Wasmtime
+      # artifacts across commits and can overflow the hosted runner. Dependency downloads are safe
+      # to reuse; every sanity candidate is still compiled from a clean target tree.
       - name: Cache cargo registry + git
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -93,115 +93,38 @@ jobs:
 
       # The cluster runbook remains executable documentation. Parse every script before compiling so
       # a shell-language regression cannot ship behind otherwise-green Rust gates.
-      - name: Cluster runbook syntax
+      - name: Operator/release script syntax
         run: |
           set -eu
-          for script in demos/cluster/*.sh; do
+          for script in demos/cluster/*.sh tools/*.sh; do
             test -x "$script"
             bash -n "$script"
           done
 
-      - name: Clippy (warnings are errors)
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Fail immediately if Cargo.lock cannot describe the checked-in manifests. This performs no
+      # compilation and makes the lock invariant explicit instead of relying on a later command.
+      - name: Locked dependency graph
+        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
-      - name: Build
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo build --locked --workspace
-
-      # Reuse the workspace build above: this wrapper invokes no Cargo command and leaves no node
-      # running. Its whole process tree inherits the selected CPU, while timeout + the wrapper's
-      # exact-incarnation teardown bound both the behavioral proof and every exit path.
-      - name: Demo — cluster runbook (three processes, gossip, cross-run, remote MCP)
-        timeout-minutes: 5
-        env:
-          ALPHA_CLUSTER_RUN: ${{ runner.temp }}/alpha-cluster-${{ github.run_id }}-${{ github.run_attempt }}
-          BIN: ${{ github.workspace }}/target/debug/alpha
-          MCP: ${{ github.workspace }}/target/debug/alpha
-          OMEGA: ${{ github.workspace }}/target/debug/omega
+      # Hosted CI is a sanity signal, not the release-validation machine. Type-check the two public
+      # poles plus the v0.5 collaboration surface (including its opt-in provider cfg), but do not
+      # link the Wasmtime-heavy dialogue test graph or fan out across workspace targets. Workspace
+      # Clippy and all linked/composed validation belong to tools/local-validation.sh.
+      - name: Typecheck smoke (public poles and v0.5 dialogue)
         run: |
-          taskset --cpu-list "$ALPHA_CI_CPU" \
-            timeout --signal=TERM --kill-after=45s 180s \
-            demos/cluster/ci-smoke.sh
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo check --locked \
+            -p alpha -p omega -p dialogue \
+            --lib --bins --features alpha/openai,dialogue/openai
 
-      - name: Docs (rustdoc warnings are errors)
+      # Keep only leaf-level sanity tests linked on the constrained runner: provider endpoint/config
+      # handling and the shared Function/Job wire contract. Full dialogue, workspace, integration,
+      # demo, docs, Clippy, and live-model validation remain local release gates.
+      - name: Contract smokes (model seam + Function/Job wire; no network)
         run: |
-          taskset --cpu-list "$ALPHA_CI_CPU" env RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
-          # The documentation result has already been gated and no later phase consumes rendered
-          # HTML. Remove only this exact generated tree; keep compiled dependencies for tests/demos.
-          cargo clean --doc
+          taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked \
+            -p mind -p gawdfn --features mind/openai --lib -- --test-threads=1
 
-      # The suite includes the composed end-to-end loops and the cargo-compile
-      # tests, so the first compile in this job is heavy; later gates reuse this job's `target/`.
-      - name: Test
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked --workspace -- --test-threads=1
-
-      # The α front door: a smoke test that the single entry point builds and dispatches.
-      # `alpha node` / `alpha mcp` / `alpha demo` are exercised by the workspace tests above;
-      # the standalone demo crates are gated below. `version` proves the front-door dispatch itself.
-      - name: Front door — alpha version (the α entry point dispatches)
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p alpha -- version
-
-      - name: Fabric pole — omega version (the Ω entry point dispatches)
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p omega -- version
-
-      # The onboarding demo is the first thing a newcomer runs; gate it in CI so it
-      # can never silently rot. It drives a real author→compile→sign→load→run→migrate
-      # loop (the authoring step shells out to cargo), so it is compile-heavy on a cold cache.
-      - name: Demo — walkthrough (the onboarding loop runs end to end)
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p walkthrough
-
-      # The federation demo boots several Sanctums across 2–3 Realms over real loopback TCP and
-      # narrates the cross-node + cross-Realm fabric; gate the default 2×2 so the multi-node path
-      # can never silently rot. Fast (seconds) — no cargo authoring in this one.
-      - name: Demo — federation (the multi-Realm fabric runs end to end)
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p federation
-
-      # These two bounded applications are separate public demos, not aliases for the workspace
-      # tests. Execute their real binaries so registry/docs drift cannot leave a compiling but
-      # unusable example behind.
-      - name: Demo — distribute (bounded GX fetch-load runs end to end)
-        run: taskset --cpu-list "$ALPHA_CI_CPU" cargo run --locked -p distribute
-
-      # The workspace build above already produced the binary, so run it directly and avoid a second
-      # outer Cargo frontend/target mutation. The all-tier proof intentionally performs exactly one
-      # nested BuildCargo compile in target/gawd-build-cache; BuildCargo serializes the finite cache
-      # and pins one build job, one codegen unit, no incremental compilation, and its own timeout.
-      # CPU affinity and low priority are inherited by that child compiler.
-      # BuildBeast/BuildCritter invoke no Cargo, and the six Job executions reuse those three outputs.
-      # This is the strict scripted fixture: a credential-free regression of causal validation,
-      # trusted affine lowering, all three builders, durable proofs, and six Jobs. It deliberately
-      # produces no product-acceptance claim. v0.5 acceptance additionally requires a fresh live run
-      # on the exact clean commit with retained provider receipts and an operator-signed evidence seal.
-      - name: Demo — dialogue fixture (all-tier regression; not live product evidence)
-        timeout-minutes: 10
-        run: |
-          taskset --cpu-list "$ALPHA_CI_CPU" \
-            nice -n 10 \
-            timeout --signal=TERM --kill-after=30s 540s \
-            target/debug/dialogue --fixture
-
-      # The opt-in real-model author (`agent-mind`), `bestiary-live`, and three-role `dialogue` model
-      # paths live behind `--features openai`, which links `ureq` + a ring-backed rustls TLS stack
-      # the default build never touches. Gate those cfg branches so the composition roots and
-      # creatures cannot rot.
-      # No live model call is made in CI (no network, no key): this compiles and clippies the feature
-      # branches and runs model-independent unit tests. Passing this step cannot substitute for the
-      # exact-commit retained live acceptance ceremony documented in RELEASE.md and TRD-007.
-      - name: Clippy + test (the opt-in `openai` features)
-        run: |
-          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p agent-mind --all-targets --features openai -- -D warnings
-          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p alpha --features openai -- -D warnings
-          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p bestiary-live --all-targets --features openai -- -D warnings
-          taskset --cpu-list "$ALPHA_CI_CPU" cargo clippy --locked -p dialogue --all-targets --features openai -- -D warnings
-          taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked -p agent-mind --features openai -- --test-threads=1
-          # Credential-free/no-network tests exercise dialogue's live-role configuration,
-          # endpoint/key-file validation, and fail-closed preflight without making provider calls.
-          taskset --cpu-list "$ALPHA_CI_CPU" cargo test --locked -p dialogue --features openai -- --test-threads=1
-          # Exercise the public opt-in demo binary without credentials. Its no-model path must stay
-          # bounded, make no network call, explain the opt-in, and exit successfully.
-          taskset --cpu-list "$ALPHA_CI_CPU" env -u ALPHA_LLM_MODEL -u ALPHA_LLM_API_KEY \
-            cargo run --locked -p bestiary-live --features openai
-
-  # Supply-chain + license gate (config in `deny.toml`). Runs in parallel with the build job:
+  # Supply-chain + license gate (config in `deny.toml`). Runs in parallel with the sanity job:
   # a new dependency carrying a security advisory, an out-of-policy license, or an unexpected
   # source fails CI rather than landing silently. `--all-features` is REQUIRED here: the modern
   # cargo resolver prunes unused optional deps from `cargo metadata`, so without it the `ureq`/TLS/

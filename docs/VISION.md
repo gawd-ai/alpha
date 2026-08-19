@@ -356,15 +356,19 @@ templates lower that IR into daemon, beast, and critter code. This deliberately 
 typed synthesis, not arbitrary-code generation or general agency. The three builder-produced,
 signed, durably recovered artifacts have equal contracts and behavior but distinct immutable backend
 identities, and all three execute both locally and across a Realm boundary. Product acceptance needs
-a clean exact-commit live run after exact push CI in the protected release workflow. Its
-provider-reported receipts, signed decisions, sources, artifacts, and execution proofs are retained
+the clean exact commit to pass `tools/local-validation.sh` and produce the copied-binary handoff. The
+unchanged commit then passes short hosted sanity before a local `tools/v05-live-acceptance.sh` run
+consumes that handoff. Its provider-reported receipts, signed decisions, sources, artifacts, and
+execution proofs are retained
 under a verified evidence index and external operator seal; the exact packaged binary then validates
 the whole bundle offline with `dialogue verify-live` under pinned trust and prior-semantic inputs.
-Encrypted raw evidence, the disclosure-safe pack, workflow provenance attestations, and run metadata
-must graduate from 90-day staging to immutable supported-lifetime storage. Neither provider metadata
-nor workflow attestation proves model weights, and the latter is not reproducible-build proof. The
-scripted run is regression only. This remains bounded pairwise Dialogue, not generic group chat,
-arbitrary-N, quorum/consensus, a durable signed group transcript, or a three-process deployment proof.
+Encrypted raw evidence, the disclosure-safe pack, exact binary, and ceremony metadata must move
+directly to immutable supported-lifetime storage. GitHub CI remains a short credential-free sanity
+check required for merge/tag hygiene, not the authoritative validation gate; it receives neither
+provider/operator keys nor raw evidence. Provider metadata does not prove model weights, and retained
+provenance is not reproducible-build proof. The scripted run is regression only. This remains bounded
+pairwise Dialogue, not generic group chat, arbitrary-N, quorum/consensus, a durable signed group
+transcript, or a three-process deployment proof.
 The normative bar is [TRD-007](trd/TRD-007-cross-mesh-model-collaboration.md).
 
 None of this requires belief — only that the hard problems below actually hold. Get those

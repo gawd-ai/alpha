@@ -40,26 +40,31 @@ For how the system works, see [`docs/CONCEPTS.md`](docs/CONCEPTS.md),
   Cargo compile in `target/gawd-build-cache` (serialized, one job, one codegen unit, no incremental
   compilation); the constrained runner supplies one-CPU affinity and low priority. Beast and critter
   builds invoke no Cargo and both Job worlds reuse the built bytes.
-- **Live evidence is now part of product acceptance.** Default/`--fixture` dialogue and CI runs remain
-  credential-free regression only. After exact push CI, a qualifying `--live` run uses the protected
-  exact-SHA workflow to originate fresh semantics, retain seven provider calls and provider-reported
-  receipts plus signed turns, decisions, lowered sources, artifacts, Bestiary proofs, and six complete
-  signed Job submission/event/grant/call/deployment/result bundles in a verified hash-indexed
-  directory, and create a separate operator-signed evidence seal. The same copied candidate binary's
+- **Live evidence is now part of product acceptance.** Default/`--fixture` dialogue and hosted CI
+  checks remain credential-free regression only. The authoritative exhaustive credential-free gate
+  runs once locally on the frozen commit through `tools/local-validation.sh`, producing a report plus
+  exact copied-binary handoff. The unchanged commit then passes hosted CI's short sanity check. A
+  qualifying local `tools/v05-live-acceptance.sh` run consumes that handoff, originates fresh
+  semantics, and retains seven provider calls and provider-reported receipts plus signed turns,
+  decisions, lowered sources, artifacts, Bestiary proofs, and six complete signed Job
+  submission/event/grant/call/deployment/result bundles in a verified hash-indexed directory, and
+  creates a separate operator-signed evidence seal. The same copied candidate binary's
   standalone `dialogue verify-live` path revalidates the complete bundle offline under pinned
-  commit/signer/prior-semantic inputs. The workflow encrypts raw prompt-bearing evidence, creates a
-  disclosure-safe pack, and attests the binary and both packages; 90-day Actions retention is staging
-  before immutable supported-lifetime storage and an external append-only acceptance registry. The
-  retained routes prove intended signed Home/deployment topology and one-attempt histories, not
-  packet-level traversal. Provider metadata does not prove model weights, and workflow attestation is
+  commit/signer/prior-semantic inputs. The local ceremony encrypts raw prompt-bearing evidence and
+  creates a disclosure-safe pack containing the validation report, exact binary, signed seal/index,
+  acceptance manifest, six-field verifier report, README, and hashes; GitHub receives no provider/operator keys or raw
+  evidence. Both packages and the exact binary then move directly to immutable supported-lifetime storage and an
+  external append-only acceptance registry. The retained routes prove intended signed
+  Home/deployment topology and one-attempt histories, not
+  packet-level traversal. Provider metadata does not prove model weights, and retained provenance is
   not reproducible-build proof. TRD-007 and ADR-0049 deliberately remain Accepted, not
   Met/Implemented, in this frozen source candidate until the qualifying exact-commit live ceremony
   succeeds. Release policy forbids tracked edits between that proof and tag; a later post-tag
   documentation commit links the external acceptance record and advances those statuses.
-- CI now runs the public three-process cluster runbook through boot, exact gossip convergence,
-  cross-node execution, and a real remote MCP graph query. The smoke reuses already-built binaries,
-  inherits the one-CPU CI affinity, has a hard timeout, and guarantees bounded teardown without a
-  second Cargo build.
+- The authoritative local validation gate now runs the public three-process cluster runbook through
+  boot, exact gossip convergence, cross-node execution, and a real remote MCP graph query. The smoke
+  reuses already-built binaries, inherits the gate's one-CPU affinity, has a hard timeout, and
+  guarantees bounded teardown without a second Cargo build.
 - Cross-node integration fixtures now subscribe to live `peer_connected` readiness evidence before
   starting their sender-side transport, eliminating false timeouts caused by missing a non-replayed
   event under one-CPU scheduling.
@@ -167,11 +172,11 @@ the complete suite-compositional acceptance evidence is recorded in
   still fails closed.
 - **Resource-courteous build defaults.** Development and test profiles retain line tables for useful
   backtraces while disabling full debug/incremental artifact graphs and limiting code generation to
-  one unit. Workspace Cargo config defaults to one build job and one test thread. The heavyweight
-  gate runs once only in CI: every heavyweight command and its child tree is pinned to one allowed
-  CPU; superseded runs cancel; timeouts are finite; incremental output and clean-runner debug
-  sections are disabled; `target/` is never cached; and rendered rustdoc output is removed after its
-  gate without discarding compiled dependencies. Wasmtime's optional `parallel-compilation`/Rayon
+  one unit. Workspace Cargo config defaults to one build job and one test thread. For v0.4.4 the
+  heavyweight gate ran once in hosted CI; v0.5 supersedes that posture with the exact-commit local
+  validation tool and a short hosted sanity gate. Heavyweight commands and their child trees remain
+  pinned to one allowed CPU; timeouts are finite and incremental output is disabled. Wasmtime's
+  optional `parallel-compilation`/Rayon
   pool is excluded and guarded before compilation, while the engine's compatibility seam disables
   it if dependency feature unification ever makes the setter available. This keeps the
   Wasmtime-heavy matrix from monopolizing contributor CPUs or accumulating hundreds of GiB across
@@ -225,9 +230,9 @@ the complete suite-compositional acceptance evidence is recorded in
   explicit: hard cuts occur at durable protocol boundaries, not inside an unfinished GX transfer.
 - **Truthful, gated example applications.** `alpha demo` accepts only a bounded, validated list of
   registry-declared Cargo features, so the managed `bestiary-live` entry enables its opt-in model
-  backend without admitting arbitrary Cargo arguments. The required one-CPU CI job now executes all
-  four hermetic narrated applications and entry-smokes `bestiary-live` with credentials removed;
-  cluster scripts are syntax-checked and required to remain executable. The manual cluster runbook
+  backend without admitting arbitrary Cargo arguments. For v0.4.4, the required one-CPU CI job
+  executed all four hermetic narrated applications and entry-smoked `bestiary-live` with credentials
+  removed; v0.5 moves that exhaustive coverage into the local validation tool. The manual cluster runbook
   itself fails closed on graph convergence, exact cross-node output, stable MCP-hub pre-admission,
   and a real remote `alpha_cluster` reply. Demo prose now distinguishes reference agents from live
   models, a local two-body hand-off from its separate cross-Sanctum proof, the loss-free GX narration

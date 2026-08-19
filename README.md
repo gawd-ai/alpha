@@ -63,22 +63,29 @@ The live run must retain sanitized configurations, seven exact provider calls an
 receipts, four signed turns, decisions, lowered sources, artifacts, Bestiary proofs, six complete
 signed Job event/grant/call/deployment/result bundles, and exact
 commit/binary/toolchain identity in a hash-indexed evidence directory. An operator-controlled key
-signs a seal outside that directory. The protected exact-SHA release workflow builds/copies the
-candidate before materializing secrets, invokes the copied binary's standalone `dialogue verify-live`
-path with independently pinned trust/freshness inputs, encrypts raw prompt-bearing evidence, creates a
-disclosure-safe pack, and requests provenance attestations for the binary and both packages. Its
-90-day Actions artifacts are staging and must be promoted to immutable supported-lifetime storage.
-Provider receipts and workflow attestations are traceability/provenance metadata, not cryptographic
-proof of model weights; the latter are not a reproducible-build proof. This is constrained typed
+signs a seal outside that directory. Release validation is local: first run the exhaustive
+credential-free `tools/local-validation.sh` gate with an external `--output-dir` on the frozen exact
+commit; its handoff contains the validation report and copied candidate binary. Push that unchanged
+commit and require its short hosted sanity check to pass, then run `tools/v05-live-acceptance.sh`
+locally with that absolute `--validation-report` and a new absolute `--output-dir`. It validates the
+handoff before loading provider/operator keys, invokes the
+copied binary's standalone `dialogue verify-live` path with independently pinned trust/freshness
+inputs, encrypts raw prompt-bearing evidence, and creates a disclosure-safe pack containing the local
+validation report, exact binary, signed seal and index, acceptance manifest, six-field verifier
+report, README, and hashes. GitHub receives neither those keys nor raw evidence; hosted sanity is
+required merge/tag hygiene but is not the authoritative validation gate.
+Provider receipts are traceability metadata, not cryptographic proof of model weights,
+and the retained binary identity is not a reproducible-build proof. This is constrained typed
 synthesis and a bounded three-mind fan-out/fan-in, not arbitrary-code generation, general agency,
 broadcast/group chat, consensus, or a three-process deployment proof. See
-[the release gate](RELEASE.md#additional-v050-live-acceptance-gate),
+[the release gate](RELEASE.md#local-v050-live-acceptance-gate),
 [the demo instructions](demos/README.md#notes), and
 [TRD-007](docs/trd/TRD-007-cross-mesh-model-collaboration.md). The exact v0.5.0 source candidate
-deliberately carries pending TRD/ADR status: the protected external gate must succeed before its tag,
-and a later post-tag documentation commit links the acceptance record and advances status. Its final
-version/changelog metadata is already present before constrained push CI and the retained live run;
-changing tracked metadata after proof would create an unproved commit.
+deliberately carries pending TRD/ADR status: exact-commit validation, hosted sanity, live acceptance,
+and external retention must succeed before its tag, and a later post-tag documentation commit links
+the acceptance record and advances status. Its final
+version/changelog metadata is already present before exhaustive local validation and the retained
+live run; changing tracked metadata after proof would create an unproved commit.
 
 ### 2. Run a node, author a creature
 
@@ -352,8 +359,10 @@ CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo test --locked -p sanctum
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 10 cargo doc --locked -p sanctum --no-deps --open
 ```
 
-Use focused package tests while iterating; the full workspace gate runs once on the exact candidate in
-constrained CI, not again locally. Workspace Cargo config defaults to one build job and one libtest
+Use focused package tests while iterating. After freezing the exact candidate, run the authoritative
+full workspace gate once locally with `tools/local-validation.sh --exact-commit <40-hex-sha>`.
+Hosted GitHub CI is deliberately a short credential-free sanity check, not a second exhaustive run.
+Workspace Cargo config defaults to one build job and one libtest
 thread. The development/test profiles keep only line-table debug information, disable incremental
 artifacts, and use one codegen unit to keep repeat builds responsive and reduce generated volume.
 Cargo does not garbage-collect stale target variants; inspect before cleaning, and use the exact

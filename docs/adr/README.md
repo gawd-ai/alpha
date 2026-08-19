@@ -16,8 +16,8 @@ suite-compositional acceptance evidence is indexed by
 ADR-0049 begins the v0.5 planning series. It remains **Accepted**, not Implemented, in the frozen
 v0.5.0 source candidate while the exact-commit proof stays external until tag. It binds v0.5.0 to a
 retained, operator-sealed three-role live collaboration → strict affine IR → trusted three-backend
-lowering proof, protected exact-SHA workflow, offline verifier, encrypted/disclosure-safe evidence
-packaging, and immutable external retention in
+lowering proof, exhaustive exact-commit local validation, an intervening short hosted sanity check,
+a local offline verifier, encrypted/disclosure-safe evidence packaging, and immutable external retention in
 [TRD-007](../trd/TRD-007-cross-mesh-model-collaboration.md) and supersedes ADR-0043's historical
 milestone labels without rewriting its inventory. A later post-tag documentation commit links the
 accepted external record and advances the status.

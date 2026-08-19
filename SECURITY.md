@@ -23,10 +23,13 @@ is **not** hardened for hostile production deployment. Treat it accordingly:
 ## Live-model acceptance and retained evidence
 
 The v0.5.0 `dialogue --live` path is a release-acceptance harness, not a hardened agent
-service. The authoritative product ceremony is the protected
-[`v0.5 live acceptance`](.github/workflows/v05-live-acceptance.yml) workflow after successful push CI
-for the exact candidate SHA; a local run is exploratory unless it reproduces every protected control
-in the [release checklist](RELEASE.md#additional-v050-live-acceptance-gate). Treat provider
+service. Both authoritative gates run locally on the same frozen exact commit: exhaustive
+credential-free validation through `tools/local-validation.sh` with `--exact-commit` and
+`--output-dir`, followed by the retained live proof and packaging through
+`tools/v05-live-acceptance.sh` with the handoff's absolute `--validation-report`, the same
+`--candidate-sha`, and a new absolute `--output-dir`. Between them, push the unchanged commit and
+require its short hosted sanity check to pass. Hosted CI is required merge/tag hygiene but is not the
+authoritative validation gate, and it never receives provider/operator keys or raw evidence. Treat provider
 endpoints, prompts/completions, API keys, evidence, packaging keys, and the operator seal key as
 sensitive:
 
@@ -39,9 +42,10 @@ sensitive:
   normalized endpoint origin, requested/reported model labels, bounded prompts/completions, usage,
   and receipt metadata; path/query/fragment and API credentials are never serialized. Inspect
   retained prompts/completions before sharing them: absence of API keys does not make their content
-  non-sensitive. The protected workflow does not reference or materialize provider/operator secrets
-  until the exact binary has built and been copied outside the checkout; it then uses private `0600`
-  files and disables shell tracing for the live step.
+  non-sensitive. The credential-free local validation tool builds and copies the exact binary into
+  its handoff. The local acceptance tool verifies that handoff before it references or materializes
+  provider/operator secrets; it then uses private `0600` files and disables shell tracing for the
+  live step. Do not place these secrets in GitHub.
 - **Provider receipts are claims by the endpoint.** Response/request IDs, reported model, finish
   reason, token usage, and `store_requested=false` improve traceability. They are not cryptographic
   proof of the provider, model weights, training data, or inference process. The stock adapter asks
@@ -69,21 +73,24 @@ sensitive:
 - **Commit/binary provenance is bounded.** A qualifying live binary embeds the explicitly supplied
   `ALPHA_DIALOGUE_BUILD_COMMIT`, refuses a clean runtime HEAD mismatch, and records its own SHA-256
   and toolchain in the sealed summary. Retain those exact bytes. This detects substitution relative
-  to the release ceremony. The protected workflow also requests GitHub artifact attestations for the
-  copied binary and both output packages. Those attestations bind workflow provenance to exact
-  subjects; they complement the Ed25519 evidence seal and offline verifier, but are not a
-  reproducible-build proof and do not attest provider/model weights.
-- **Plaintext raw evidence never leaves the private runner area.** The workflow packages complete
+  to the release ceremony. The exact-commit binding, Ed25519 evidence seal, offline verifier, package
+  digests, and external signed acceptance record are complementary provenance controls; they are not
+  a reproducible-build proof and do not attest provider/model weights.
+- **Plaintext raw evidence stays local.** The local acceptance tool packages complete
   prompts/completions and evidence only into an OpenPGP-encrypted raw archive. Its separate
-  disclosure-safe pack is allowlisted to the exact binary, index, signed seal, acceptance manifest,
-  verifier report, and hashes. GitHub's 90-day Actions artifacts are temporary staging, not durable
-  release evidence. Before tagging, move the ciphertext, safe pack, attestations, and run metadata to
-  an access-controlled immutable store retained for the supported release lifetime, checking every
+  disclosure-safe pack is allowlisted to `local-validation.v1.json`, the copied dialogue binary,
+  `evidence-index.v1.json`, signed seal, `acceptance-manifest.v1.json`,
+  `offline-verification-report.v1.json`, `README.txt`, and `SHA256SUMS`. The acceptance manifest binds
+  the validation-report digest and portable sibling binary path/hash. A successful output directory
+  contains exactly the encrypted raw `.tar.gz.gpg` and disclosure-safe verification `.tar.gz`;
+  stdout is a disclosure-safe JSON summary. Neither plaintext raw evidence nor those packages leave
+  the local ceremony for hosted CI. Before tagging, move both packages and the exact binary directly to an
+  access-controlled immutable store retained for the supported release lifetime, checking every
   digest in transit. Never upload the plaintext raw archive.
-- **Novelty state is external and append-only.** A protected JSON registry supplies every previously
-  accepted semantic digest to both generation and offline verification. Append the newly verified
-  digest and its exact commit/run/index/binary/package/retention references only after acceptance;
-  never edit the proven source commit to record it before tagging.
+- **Novelty state is external and append-only.** An operator-controlled JSON registry supplies every
+  previously accepted semantic digest to both generation and offline verification. Append the newly
+  verified digest and its exact commit/ceremony/validation-report/index/binary/package/retention
+  references only after acceptance; never edit the proven source commit to record it before tagging.
 - **Trusted lowering limits executable authority.** The accepted v0.5 profile lets live models return
   only strict source-free `affine_i32_v1` decisions and implementation records. Host code validates
   the complete finite truth table and renders audited Rust, no-import WAT, and Rhai templates. This
@@ -93,7 +100,10 @@ sensitive:
 
 The credential-free `--fixture` run and recorded replay are regression tools only. They do not prove
 that a live model participated and cannot satisfy the v0.5 product gate. See
-[TRD-007](docs/trd/TRD-007-cross-mesh-model-collaboration.md) and [the release checklist](RELEASE.md).
+[TRD-007](docs/trd/TRD-007-cross-mesh-model-collaboration.md),
+[`tools/local-validation.sh`](tools/local-validation.sh),
+[`tools/v05-live-acceptance.sh`](tools/v05-live-acceptance.sh), and the
+[release checklist](RELEASE.md).
 
 ## The control plane (HTTP/WS + MCP surfaces)
 

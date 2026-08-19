@@ -17,11 +17,16 @@ The v0.5.0 `dialogue --fixture` path is an all-tier regression, not product acce
 Acceptance requires a fresh retained three-role live run: four signer-verified causal decisions
 approve one bounded affine IR, host validation/trusted lowering produces all three backend Functions,
 six Jobs run, and a private evidence directory plus external operator seal bind the exact commit.
-After exact push CI, the protected release workflow runs the packaged binary's offline verifier,
-encrypts the raw bundle, attests a disclosure-safe pack, and uploads 90-day staging artifacts. The
-release operator must then promote those exact objects to immutable supported-lifetime storage and
-append the externally signed acceptance record before tagging. See the operator guide for the
-distinction between this ceremony and local exploration.
+The frozen commit first passes the exhaustive local `tools/local-validation.sh` gate and produces its
+report plus copied-binary handoff. Push the unchanged commit and require short hosted sanity to pass;
+the local `tools/v05-live-acceptance.sh` ceremony then consumes that absolute validation report,
+runs the packaged binary's offline verifier, encrypts the raw bundle, and produces a disclosure-safe
+pack containing the validation report, exact binary, signed seal/index, acceptance manifest,
+six-field verifier report, README, and hashes. The release
+operator moves those exact objects
+directly to immutable supported-lifetime storage and appends the externally signed acceptance record
+before tagging. Hosted CI is required merge/tag hygiene, not the authoritative validation gate, and
+receives no keys or raw evidence. See the operator guide for the complete ceremony.
 Driving a node *remotely* is in the README quickstart —
 [*Drive it over MCP*](../../README.md#4-drive-it-over-mcp) and
 [*Drive it over HTTP*](../../README.md#5-drive-it-over-http).

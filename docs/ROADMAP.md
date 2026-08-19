@@ -105,15 +105,19 @@ partition-solving global Home locator.
   just registry state), agents are *placed* across Realms (below), and a reserved SEER `Dialogue` topic
   plus the reference `dialogue-initiator` / `dialogue-responder` pair carry a multi-turn agent-to-agent
   conversation. The default `alpha demo dialogue` run now supplies a hermetic regression; v0.5.0
-  product acceptance additionally requires one fresh exact-commit `--live` run after exact push CI
-  in the protected `v05-live-acceptance.yml` workflow. That run must retain seven provider calls and
-  provider-reported receipts, signed turns, decisions, lowered sources, artifacts, Bestiary/Job
+  product acceptance additionally requires the frozen commit to pass the exhaustive local
+  `tools/local-validation.sh` gate, producing a report plus copied-binary handoff. The unchanged
+  commit next passes short hosted sanity, then one fresh local `tools/v05-live-acceptance.sh` run
+  consumes that handoff. That run must retain seven provider calls and provider-reported receipts,
+  signed turns, decisions, lowered sources, artifacts, Bestiary/Job
   proofs, and commit/binary/toolchain identity in a verified evidence directory with a separate
   operator-signed seal. The exact packaged binary must then pass `dialogue verify-live` under pinned
-  commit/signer/prior-semantic inputs. Encrypted raw evidence, the disclosure-safe pack, workflow
-  attestations, and run metadata move from 90-day Actions staging to immutable supported-lifetime
-  storage, while the accepted semantic remains in an external append-only registry. Provider
-  metadata is not proof of model weights, and workflow attestation is not reproducible-build proof.
+  commit/signer/prior-semantic inputs. Encrypted raw evidence, the disclosure-safe pack, exact binary,
+  and ceremony metadata move directly to immutable supported-lifetime storage, while the accepted
+  semantic remains in an external append-only registry. GitHub CI is only a short credential-free
+  merge/tag hygiene check, not the authoritative validation gate; it receives no provider/operator
+  keys or raw evidence. Provider metadata is not proof of model weights, and retained provenance is
+  not reproducible-build proof.
   The typed beast uses a no-import host-side adapter over the existing payload ABI, not a host import
   or new guest ABI. One bounded native Cargo compile is reused; beast/critter builds invoke no Cargo.
   This is the same wire, not a refactor. The three minds occupy two in-process Kernel nodes; the

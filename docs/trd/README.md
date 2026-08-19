@@ -22,14 +22,17 @@ result is a fresh bounded `affine_i32_v1` data program; trusted host validation/
 daemon, beast, and critter source, three signed/recovered artifacts, three distinct immutable
 `FunctionId`s, and six tester-selected local/cross-Realm Job results. The clean exact-commit run must
 retain seven provider calls/receipts and all signed/build/execution proof under a verified evidence
-index plus an external operator seal. After exact push CI, the protected live-acceptance workflow
-must run the exact packaged binary's offline `dialogue verify-live` path, encrypt raw evidence,
-produce the disclosure-safe pack and provenance attestations, and upload 90-day staging artifacts.
-Before tagging, the operator ceremony must verify their promotion to immutable supported-lifetime
-storage and append the accepted novelty and exact artifact identities to the external signed,
-append-only registry. The fixture run is regression only. This is constrained typed synthesis, not
-arbitrary code, general agency, a generic group protocol, or three-process deployment evidence, and
-no wire or creature-ABI shape changes.
+index plus an external operator seal. The frozen commit must first pass the exhaustive local
+`tools/local-validation.sh` gate and produce its report plus copied-binary handoff. The unchanged
+exact commit must then pass the short hosted sanity gate without exposing provider/operator keys or
+raw evidence. The local `tools/v05-live-acceptance.sh` ceremony consumes the handoff, runs the exact
+packaged binary's offline `dialogue verify-live` path, encrypts raw evidence, and produces the
+disclosure-safe pack containing the validation report, exact binary, signed seal/index, acceptance
+manifest, six-field verifier report, README, and hashes. Before tagging, the operator moves those
+exact objects directly to immutable supported-lifetime storage, then appends the accepted novelty and
+artifact identities to the external signed, append-only registry. The fixture run is regression only.
+This is constrained typed synthesis, not arbitrary code, general agency, a generic group protocol,
+or three-process deployment evidence, and no wire or creature-ABI shape changes.
 
 ## The convergence bar
 
@@ -63,7 +66,9 @@ no wire or creature-ABI shape changes.
 
 `Draft` → `Accepted` (the requirements are agreed) → `Met` (implementation lands and acceptance passes).
 The index above is authoritative per document: TRD-001–005 are Met for v0.4.3, TRD-006 is Met for
-v0.4.4, and TRD-007 is Accepted for v0.5.0 but is not Met until the exact-commit constrained CI and
-fresh retained operator-sealed live proof are both Green. A TRD can be Met before its release heading is cut;
+v0.4.4, and TRD-007 is Accepted for v0.5.0 but is not Met until the exact commit passes exhaustive
+local validation, hosted sanity, a fresh retained operator-sealed local live proof, immutable
+retention, and the external signed acceptance record. A TRD can be Met before its release heading is
+cut;
 release/version state is tracked in the workspace manifests and changelog rather than inferred from
 this lifecycle.

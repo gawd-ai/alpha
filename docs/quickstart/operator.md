@@ -237,21 +237,55 @@ Jobs. Models do not supply executable source in this approved path. The three mi
 in-process Kernel nodes, not three deployed Sanctum processes. One native Cargo compile uses the
 shared `target/gawd-build-cache`; beast/critter builds invoke no Cargo.
 
-For v0.5.0 product acceptance, use the protected exact-SHA workflow in the
-[release checklist](../../RELEASE.md#additional-v050-live-acceptance-gate); the explicit
-OpenAI-feature command in the [demo README](../../demos/README.md#notes) is an exploratory operator
-path, not a weaker release gate. The workflow runs only after exact push CI, builds and copies the
-candidate binary before materializing provider/operator secrets, and supplies three role-configured
-Model injections plus the complete external prior-semantic registry. The same packaged binary then
-runs `dialogue verify-live` offline with the pinned candidate SHA, authorized seal signer, evidence
-directory, signed seal, and prior digests. It verifies seven provider calls/receipts, signed causal
-decisions, trusted-lowered sources, three artifacts and Bestiary proofs, six complete Job bundles,
-and source/result identity under the signed index. Raw prompt-bearing evidence is encrypted; the
-separate disclosure-safe pack, exact binary, and both packages receive workflow attestations. The
-90-day Actions artifacts must be promoted to immutable supported-lifetime storage before tag.
-Fixture runs remain regression only. Provider receipts and workflow attestations do not prove model
-weights, and the attestations are not a reproducible-build proof; this bounded affine profile is not
-arbitrary-code synthesis or general agency.
+For v0.5.0 product acceptance, freeze one exact clean commit and run the two local tools named by the
+[release checklist](../../RELEASE.md#local-v050-live-acceptance-gate). First run the exhaustive,
+credential-free `tools/local-validation.sh` gate with `--exact-commit` and `--output-dir`. Push that
+unchanged commit and require its short hosted sanity check to pass. Then configure the three role
+Models, authorized operator seal signer, encryption recipient, and complete external prior-semantic
+registry outside the worktree and run
+`tools/v05-live-acceptance.sh` from the validation handoff. It verifies the prepared report and copied
+candidate before loading those secrets, performs the fresh live run, then uses the same packaged
+binary to run `dialogue verify-live` offline with the pinned candidate SHA, authorized signer, signed
+seal, and prior digests. Verification covers seven provider
+calls/receipts, signed causal decisions, trusted-lowered sources, three artifacts and Bestiary proofs,
+six complete Job bundles, and source/result identity under the signed index. The tool encrypts raw
+prompt-bearing evidence and creates a separate disclosure-safe pack. Its frozen interface is:
+
+```sh
+release_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+tools/v05-live-acceptance.sh \
+  --candidate-sha "$release_commit" \
+  --validation-report /absolute/handoff/local-validation.v1.json \
+  --output-dir /absolute/new/live-acceptance-output \
+  --builder-model MODEL --builder-base-url URL --builder-timeout-secs 60 \
+  --builder-api-key-file /absolute/private/builder.key \
+  --reviewer-model MODEL --reviewer-base-url URL --reviewer-timeout-secs 60 \
+  --reviewer-api-key-file /absolute/private/reviewer.key \
+  --contract-tester-model MODEL --contract-tester-base-url URL \
+  --contract-tester-timeout-secs 60 \
+  --contract-tester-api-key-file /absolute/private/contract-tester.key \
+  --evidence-signing-key-file /absolute/private/evidence-seed.hex \
+  --expected-evidence-signer 0123456789abcdef...64-lowercase-hex-total \
+  --prior-semantic-registry-file /absolute/operator/prior-semantics.json \
+  --encryption-public-key-file /absolute/operator/release-key.asc \
+  --encryption-recipient FULL_FINGERPRINT
+```
+
+The new output directory contains exactly one encrypted raw `.tar.gz.gpg` and one disclosure-safe
+verification `.tar.gz`; stdout is a safe JSON summary with `status`, `candidate_sha`, the local
+validation-report, evidence-index, semantic, and binary digests, the authorized evidence signer,
+the three verifier-derived requested-model labels, and the portable file/SHA-256 pairs
+`encrypted_raw` and `verification_pack`. The safe archive contains the copied dialogue binary,
+`evidence-index.v1.json`, signed seal, `acceptance-manifest.v1.json`,
+`offline-verification-report.v1.json`, `local-validation.v1.json`, `README.txt`, and `SHA256SUMS`.
+The acceptance manifest binds the validation-report digest and portable sibling binary path/hash.
+Move those exact packages, binary, and ceremony metadata directly to immutable supported-lifetime
+storage before tag, then append the external signed acceptance record. Hosted GitHub CI is only a short credential-free
+merge/tag hygiene check, not the authoritative validation gate, and receives no provider/operator
+keys or raw evidence. Fixture runs remain regression only. Provider receipts do not prove model
+weights, and retained provenance is not a reproducible-build proof; this bounded affine profile is
+not arbitrary-code synthesis or general
+agency.
 See [`demos/`](../../demos/) for what each demo shows and the tests it rides on.
 
 ## 9. Shut down

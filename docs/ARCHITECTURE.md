@@ -241,15 +241,19 @@ terminal snapshot, execution grant/call/dispatch route, deployment receipt, and 
 receipt; the final summary anchors a record hashing all six bundles. That proves intended signed
 Home/deployment topology and one-attempt history, not packet-level traversal.
 The default scripted run is regression only. TRD-007 remains Accepted/not Met until one clean exact
-commit has both constrained push CI and a fresh protected-workflow live run retaining
-provider-reported receipts and all signed/build/execution evidence under a verified index plus
-external operator seal. The same packaged binary must independently accept that bundle through
-`dialogue verify-live` under pinned commit/signer/novelty inputs; encrypted raw evidence, the
-disclosure-safe pack, workflow provenance attestations, and run metadata then leave 90-day staging
-for immutable supported-lifetime storage. Provider metadata and workflow attestations do not prove
-model weights, and the latter are not a reproducible-build proof. This proves constrained typed
-synthesis, not arbitrary code, general agency, broadcast/group Dialogue, arbitrary-N consensus, a
-durable group transcript, or a three-process Sanctum deployment.
+commit passes the exhaustive local `tools/local-validation.sh` gate, which prepares a validation
+report plus copied-binary handoff. That unchanged commit must pass short hosted sanity before a fresh
+local `tools/v05-live-acceptance.sh` run consumes the handoff and retains provider-reported receipts
+and all signed/build/execution evidence under a verified index plus external operator seal. The same
+packaged binary must independently accept that bundle through `dialogue verify-live` under pinned
+commit/signer/novelty inputs; encrypted raw evidence, the disclosure-safe pack, exact binary, and
+ceremony metadata then move directly to immutable supported-lifetime storage. Hosted GitHub CI is
+required merge/tag hygiene but is not the authoritative validation gate; it receives neither
+provider/operator keys nor raw evidence.
+Provider metadata does not prove model weights, and the retained provenance is not a
+reproducible-build proof. This proves constrained typed synthesis, not arbitrary code, general
+agency, broadcast/group Dialogue, arbitrary-N consensus, a durable group transcript, or a
+three-process Sanctum deployment.
 
 ## The SDK (`forge`)
 

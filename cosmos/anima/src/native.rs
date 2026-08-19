@@ -613,8 +613,8 @@ impl Drop for NativeInstance {
         //
         // CROSS-ALLOCATOR FREE: `Box::from_raw` here frees memory the creature allocated inside its
         // `.so` (via `Box::into_raw` in the `declare_creature!` macro). This is only sound while both
-        // sides share one allocator — see the workspace `Cargo.toml` invariant ("no custom
-        // `#[global_allocator]`"). A future ABI extension will move this free to the
+        // sides share one allocator — see the workspace `Cargo.toml` invariant (no process-wide
+        // custom allocator). A future ABI extension will move this free to the
         // creature side (a `gawd_creature_v1_destroy(vtable)` symbol or a vtable drop slot).
         unsafe {
             ((*self.vtable).destroy)((*self.vtable).data);
